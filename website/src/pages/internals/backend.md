@@ -36,12 +36,19 @@ Defines the `Target` trait and registers `naravm`, `dummy`, and `stackvm`.
 `naravm` serializes Naravm 0.2 vmfiles; the other targets are inspection
 backends.
 
-The Naravm backend compiles `function main()` (which takes no parameters) to
-a single entrypoint function: integer (`u64`/`i64`/`u8`) and `f64` arithmetic,
-integer equality and ordering (`i64` ordering is emulated by flipping the
-sign bit before the unsigned `ltu`), boolean logic, branches, and `while`
-loops lower to `lv`/`lrf`, typed arithmetic, `eq`/`ltu`/`xor`, `jz`/`jmp`,
-and `calli` for `std.print` / `std.print_u64`. Registers are recycled past
-their last textual use so idiomatic programs fit the 32 value and 32
-reference registers. Float ordering, string equality, and calls to other user
-functions are rejected with diagnostics rather than miscompiled.
+The Naravm backend compiles every `function` item: `function main()` (which
+takes no parameters) becomes the `<entrypoint>` function and each other user
+function becomes its own Nara function: integer (`u64`/`i64`/`u8`) and `f64`
+arithmetic, integer equality and ordering (`i64` ordering is emulated by
+flipping the sign bit before the unsigned `ltu`), boolean logic, branches, and
+`while` loops lower to `lv`/`lrf`, typed arithmetic, `eq`/`ltu`/`xor`,
+`jz`/`jmp`, and `calli` for `std.print` / `std.print_u64` and for calls
+between user functions (including recursion). A call spills live caller
+registers (`pushv`/`pushrf`, including cached comparison temporaries), moves
+actuals into the callee slots (`rv11` upwards for values, `rf31` upwards for
+`string`/`File` references), emits `calli`, copies the return value out of
+`rv11` / `rf31`, then restores the spills; returns do the reverse. At most 15
+value and 9 reference parameters per function are supported. Registers are
+recycled past their last textual use so idiomatic programs fit the 32 value
+and 32 reference registers. Float ordering, string equality, and string
+ordering are rejected with diagnostics rather than miscompiled.

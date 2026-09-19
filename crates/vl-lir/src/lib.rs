@@ -10,13 +10,14 @@ use std::collections::{HashMap, HashSet};
 use vl_common::Scalar;
 use vl_common::Span;
 use vl_hir::{HirBinOp, HirExpr, HirItem, HirProgram, HirStmt, HirUnOp};
+use vl_typecheck::Ty;
 
 /// Virtual register.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Reg(pub u32);
 
-/// Three-address instructions. Strings are carried as raw bytes; codegen is
-/// intentionally not implemented yet.
+/// Three-address instructions. Strings are carried as raw bytes; backends
+/// in `vl-codegen` lower them to target concepts.
 #[derive(Debug, Clone)]
 pub enum Instr {
     Const {
@@ -112,6 +113,11 @@ impl std::fmt::Display for LirOp {
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
+    /// Declared parameter types in order (`Ty::Error` when missing/poisoned).
+    pub param_tys: Vec<Ty>,
+    /// Declared return type (`Ty::Error` when missing/poisoned; globals
+    /// record their value type here).
+    pub ret: Ty,
     pub instrs: Vec<Instr>,
 }
 
@@ -235,7 +241,9 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
     };
     for item in &prog.items {
         match item {
-            HirItem::Let { value, span, .. } => {
+            HirItem::Let {
+                id, value, span, ..
+            } => {
                 let mut l = Lowerer {
                     next: 0,
                     instrs: vec![],
@@ -254,14 +262,31 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                         span: *span,
                     });
                 }
+                // Globals record their value type so backends can treat the
+                // initializer uniformly with function returns.
+                let ret = typed
+                    .type_of_id(*id)
+                    .or_else(|| typed.type_of_id(value.id()))
+                    .unwrap_or(Ty::Error);
                 out.functions.push(Function {
                     name: "<global>".into(),
+                    param_tys: Vec::new(),
+                    ret,
                     instrs: l.instrs,
                 });
             }
             HirItem::Fn {
-                name, params, body, ..
+                name,
+                params,
+                ret,
+                body,
+                ..
             } => {
+                let param_tys = params
+                    .iter()
+                    .map(|(_, _, t, _)| t.map(Ty::from_vl).unwrap_or(Ty::Error))
+                    .collect::<Vec<_>>();
+                let ret_ty = ret.map(Ty::from_vl).unwrap_or(Ty::Error);
                 let mut l = Lowerer {
                     next: 0,
                     instrs: vec![],
@@ -343,6 +368,8 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                 });
                 out.functions.push(Function {
                     name: name.clone(),
+                    param_tys,
+                    ret: ret_ty,
                     instrs: l.instrs,
                 });
             }
@@ -883,6 +910,39 @@ mod tests {
         assert!(dump.contains("%0 = param 0"), "{dump}");
         assert!(dump.contains("%1 = param 1"), "{dump}");
         assert!(dump.contains("call add(%0, %1)"), "{dump}");
+    }
+
+    #[test]
+    fn function_signatures_carry_param_and_return_types() {
+        let src = r#"function greet(name: string, n: u64): string { name; } function main() { greet("hi", 1u64); }"#;
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let lir = lower(&hir, &typed);
+        let greet = lir.functions.iter().find(|f| f.name == "greet").unwrap();
+        assert_eq!(greet.param_tys, vec![Ty::String, Ty::U64]);
+        assert_eq!(greet.ret, Ty::String);
+        let main = lir.functions.iter().find(|f| f.name == "main").unwrap();
+        assert!(main.param_tys.is_empty());
+        assert_eq!(main.ret, Ty::Void);
+    }
+
+    #[test]
+    fn globals_record_their_value_type() {
+        let src = r#"let x = 1u64;"#;
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let lir = lower(&hir, &typed);
+        assert_eq!(lir.functions.len(), 1);
+        assert!(lir.functions[0].param_tys.is_empty());
+        assert_eq!(lir.functions[0].ret, Ty::U64);
     }
 
     #[test]

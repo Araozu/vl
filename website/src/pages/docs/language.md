@@ -63,6 +63,29 @@ A missing return type means `void`, so `function main()` is
 return must match the body's tail value; `void` results may only appear as bare
 statements.
 
+User functions are first-class callees: any `function` item can be called from
+any other function body (or from itself, recursively), regardless of definition
+order. Calls nest freely, and argument values are evaluated left to right:
+
+```vl
+function add(a: i64, b: i64): i64 {
+    a + b;
+}
+
+function twice(x: i64): i64 {
+    add(x, x);
+}
+
+function main() {
+    twice(add(1, 2));
+}
+```
+
+A call with the wrong number of arguments, or an argument of the wrong type,
+is a single error pointing at the call. Calling something that is not a
+`function` (for example a `let` binding), or binding a `void` result with
+`let`, is an error too. See `examples/calls.vl` for a complete program.
+
 Names must be defined before they are used, and a scope cannot define the same
 name twice. The compiler reports those problems at the source location.
 
@@ -186,8 +209,12 @@ available modules and functions are listed in the [standard library](/std).
 
 VL 0.1 is intentionally small: strings are byte strings, the standard modules
 are limited, and Naravm is the only runnable target. The Naravm backend runs
-`function main()` with integer arithmetic, comparisons, and control flow plus
-`std.print` / `std.print_u64`; float ordering, string equality, and calls to
-other user functions are rejected with a diagnostic. Use the [CLI reference](/cli)
-for inspection commands or [Compiler internals](/internals) for implementation
-details.
+every `function` item — `function main()` becomes the entrypoint and each
+other function becomes its own Nara function — with integer arithmetic,
+comparisons, and control flow plus `std.print` / `std.print_u64` and calls
+between user functions (including recursion). Value parameters arrive in
+`rv11` upwards and reference (`string`, `File`) parameters in `rf31` upwards;
+at most 15 value and 9 reference parameters per function are supported. Float
+ordering, string equality, and string ordering are rejected with a diagnostic.
+Use the [CLI reference](/cli) for inspection commands or
+[Compiler internals](/internals) for implementation details.

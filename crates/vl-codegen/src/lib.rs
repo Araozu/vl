@@ -6,9 +6,11 @@
 //! - [`DummyTarget`]: human-readable pseudo-assembly, used by tests and
 //!   `--emit asm` until a real target lands.
 //! - [`StackVmTarget`]: stack-machine text format sketch (still TBD).
-//! - [`NaraVmTarget`]: executable Naravm 0.2 vmfiles for `function main()`:
-//!   integer/float arithmetic, comparisons, and control flow plus
-//!   `std.print` / `std.print_u64`.
+//! - [`NaraVmTarget`]: executable Naravm 0.2 vmfiles: `function main()`
+//!   becomes the `<entrypoint>` function plus one Nara function per other
+//!   user function. Integer/float arithmetic, comparisons, and control flow
+//!   plus `std.print` / `std.print_u64` and user-function calls lower to
+//!   `calli`.
 //!
 //! Rule: new targets = new types implementing [`Target`]. Never branch
 //! the LIR or the driver on target names.
@@ -219,10 +221,11 @@ impl Target for StackVmTarget {
 
 // --------------------------------------------------------- Naravm ---
 
-/// Naravm 0.2 executable vmfile backend: compiles `function main()` to a
-/// single entrypoint function (see the internals book for the supported
-/// subset). Other functions in the LIR are not emitted; calls to anything
-/// but `std.print` / `std.print_u64` are diagnostics.
+/// Naravm 0.2 executable vmfile backend: compiles `function main()` to the
+/// `<entrypoint>` function plus one Nara function per other user function
+/// (see the internals book for the supported subset). Calls to
+/// `std.print` / `std.print_u64` and to user functions lower to `calli`;
+/// anything else is a diagnostic.
 pub struct NaraVmTarget;
 
 impl Target for NaraVmTarget {
@@ -231,14 +234,14 @@ impl Target for NaraVmTarget {
     }
 
     fn emit(&self, prog: &LirProgram) -> (Option<Artifact>, Vec<Diagnostic>) {
-        let Some(main) = prog.functions.iter().find(|f| f.name == "main") else {
+        if !prog.functions.iter().any(|f| f.name == "main") {
             return (
                 None,
                 vec![Diagnostic::error("program must define `function main()`").with_code("E400")],
             );
         };
         let mut diags = Vec::new();
-        let bytes = match nara_vmfile(prog, main, &mut diags) {
+        let bytes = match nara_vmfile(prog, &mut diags) {
             Some(bytes) if diags.iter().all(|d| !d.is_error()) => bytes,
             _ => return (None, diags),
         };
@@ -268,9 +271,30 @@ enum NaraKind {
     Bool,
     U8,
     String,
+    File,
 }
 
 impl NaraKind {
+    /// Map a VL-level type to its register file. `None` for `Void`/`Error`,
+    /// which never reach codegen through the driver (frontends reject them).
+    fn of_ty(ty: vl_typecheck::Ty) -> Option<Self> {
+        match ty {
+            vl_typecheck::Ty::U64 => Some(NaraKind::U64),
+            vl_typecheck::Ty::I64 => Some(NaraKind::I64),
+            vl_typecheck::Ty::F64 => Some(NaraKind::F64),
+            vl_typecheck::Ty::Bool => Some(NaraKind::Bool),
+            vl_typecheck::Ty::U8 => Some(NaraKind::U8),
+            vl_typecheck::Ty::String => Some(NaraKind::String),
+            vl_typecheck::Ty::File => Some(NaraKind::File),
+            vl_typecheck::Ty::Void | vl_typecheck::Ty::Error => None,
+        }
+    }
+
+    /// Reference kinds live in `rf`, everything else in `rv`.
+    fn is_ref(self) -> bool {
+        matches!(self, NaraKind::String | NaraKind::File)
+    }
+
     fn of_scalar(value: Scalar) -> Self {
         match value {
             Scalar::U64(_) => NaraKind::U64,
@@ -321,6 +345,11 @@ struct NaraEmit {
     patches: Vec<NaraPatch>,
     one_rv: Option<u8>,
     bias_rv: Option<u8>,
+    /// Next userland parameter slots for the function being emitted. Value
+    /// and reference parameters count independently from `rv11` / `rf31`
+    /// (matching the Naravm native convention).
+    param_vi: u8,
+    param_ri: u8,
 }
 
 struct NaraPatch {
@@ -331,6 +360,28 @@ struct NaraPatch {
 }
 
 impl NaraEmit {
+    /// Reset per-function state before emitting the next Nara function. The
+    /// constant/blob/value pools (and diagnostics) are shared across the
+    /// whole program; everything else starts over.
+    fn reset_fn(&mut self, last_use: std::collections::HashMap<vl_lir::Reg, usize>) {
+        self.bytecode = Vec::new();
+        self.rv_map.clear();
+        self.rf_map.clear();
+        self.kinds.clear();
+        self.invalid.clear();
+        self.next_rv = 0;
+        self.next_rf = 0x20;
+        self.free_rv.clear();
+        self.free_rf.clear();
+        self.last_use = last_use;
+        self.label_pos.clear();
+        self.patches.clear();
+        self.one_rv = None;
+        self.bias_rv = None;
+        self.param_vi = 0;
+        self.param_ri = 0;
+    }
+
     fn fresh_rv(&mut self, span: Span) -> Option<u8> {
         if let Some(rv) = self.free_rv.pop() {
             return Some(rv);
@@ -465,11 +516,18 @@ impl NaraEmit {
     }
 }
 
-fn nara_vmfile(
-    prog: &LirProgram,
-    main: &vl_lir::Function,
-    diags: &mut Vec<Diagnostic>,
-) -> Option<Vec<u8>> {
+/// Per-function emission context: the LIR signature plus program-wide
+/// callee tables built by the pre-pass.
+struct NaraFnCtx<'a> {
+    func: &'a vl_lir::Function,
+    is_main: bool,
+    sigs: &'a std::collections::HashMap<&'a str, &'a vl_lir::Function>,
+    fn_consts: &'a std::collections::HashMap<String, usize>,
+    print_fn_idx: usize,
+    print_u64_fn_idx: usize,
+}
+
+fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>> {
     let mut e = NaraEmit {
         blob: Vec::new(),
         values: Vec::new(),
@@ -485,11 +543,13 @@ fn nara_vmfile(
         next_rf: 0x20,
         free_rv: Vec::new(),
         free_rf: Vec::new(),
-        last_use: nara_last_use(main),
+        last_use: std::collections::HashMap::new(),
         label_pos: std::collections::HashMap::new(),
         patches: Vec::new(),
         one_rv: None,
         bias_rv: None,
+        param_vi: 0,
+        param_ri: 0,
     };
     // Pre-intern the module name, entrypoint, and std exports. These occupy
     // the first constant slots; user strings/values follow.
@@ -511,19 +571,113 @@ fn nara_vmfile(
         function: print_u64_idx,
     });
 
-    for (idx, ins) in main.instrs.iter().enumerate() {
-        nara_instr(&mut e, ins, print_fn_idx, print_u64_fn_idx);
-        nara_free_dead(&mut e, ins, idx);
-        if e.diags.iter().any(|d| d.is_error()) {
-            break;
+    // Pre-pass: intern every user function name plus a
+    // `Function{module, function}` constant for it, so (mutually) recursive
+    // calls resolve even when the callee is emitted later. `main` maps to
+    // the `<entrypoint>` name, which is what the VM registers.
+    let mut fn_consts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut fn_names: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for f in &prog.functions {
+        if f.name == "<global>" || fn_consts.contains_key(&f.name) {
+            continue;
+        }
+        if f.name == "main" {
+            if let Some(idx) = nara_push_fn_const(&mut e, module_idx, entry_name_idx) {
+                fn_consts.insert(f.name.clone(), idx);
+            }
+            continue;
+        }
+        let Some(name_idx) = e.add_string(f.name.as_bytes(), Span::empty(0)) else {
+            continue;
+        };
+        if let Some(idx) = nara_push_fn_const(&mut e, module_idx, name_idx) {
+            fn_consts.insert(f.name.clone(), idx);
+            fn_names.insert(f.name.clone(), name_idx);
         }
     }
     if e.diags.iter().any(|d| d.is_error()) {
         diags.append(&mut e.diags);
         return None;
     }
-    // Resolve jump targets. Offsets are relative to the end of their own
-    // instruction (matches the VM's `rip` after reading the offset).
+
+    let mut sigs: std::collections::HashMap<&str, &vl_lir::Function> =
+        std::collections::HashMap::new();
+    for f in &prog.functions {
+        if f.name != "<global>" {
+            sigs.entry(f.name.as_str()).or_insert(f);
+        }
+    }
+
+    let mut functions_out: Vec<(usize, Vec<u8>)> = Vec::new();
+    for f in &prog.functions {
+        if f.name == "<global>" {
+            continue;
+        }
+        let is_main = f.name == "main";
+        e.reset_fn(nara_last_use(f));
+        let ctx = NaraFnCtx {
+            func: f,
+            is_main,
+            sigs: &sigs,
+            fn_consts: &fn_consts,
+            print_fn_idx,
+            print_u64_fn_idx,
+        };
+        for (idx, ins) in f.instrs.iter().enumerate() {
+            nara_instr(&mut e, ins, &ctx);
+            nara_free_dead(&mut e, ins, idx);
+            if e.diags.iter().any(|d| d.is_error()) {
+                break;
+            }
+        }
+        if e.diags.iter().any(|d| d.is_error()) {
+            break;
+        }
+        if !nara_resolve_jumps(&mut e) {
+            break;
+        }
+        let name_idx = if is_main {
+            entry_name_idx
+        } else {
+            fn_names.get(&f.name).copied().unwrap_or(entry_name_idx)
+        };
+        functions_out.push((name_idx, std::mem::take(&mut e.bytecode)));
+    }
+    if e.diags.iter().any(|d| d.is_error()) {
+        diags.append(&mut e.diags);
+        return None;
+    }
+    Some(serialize_nara(
+        &e.values,
+        &e.blob,
+        &e.constants,
+        &functions_out,
+        module_idx,
+    ))
+}
+
+/// Push a `Function{module, function}` constant with the shared pool-limit
+/// diagnostic (E405) instead of silently overflowing the 8-bit index space.
+fn nara_push_fn_const(e: &mut NaraEmit, module: usize, function: usize) -> Option<usize> {
+    let idx = e.constants.len();
+    e.constants
+        .push(NaraConstant::Function { module, function });
+    if idx > u8::MAX as usize {
+        e.diags.push(
+            Diagnostic::error("Naravm constant pool has more than 256 entries")
+                .with_label(Span::empty(0), "defined here")
+                .with_note("function references use an 8-bit constant index")
+                .with_code("E405"),
+        );
+        return None;
+    }
+    Some(idx)
+}
+
+/// Resolve jump targets for the function in `e.bytecode`. Offsets are
+/// relative to the end of their own instruction (matches the VM's `rip`
+/// after reading the offset).
+fn nara_resolve_jumps(e: &mut NaraEmit) -> bool {
     for patch in &e.patches {
         let Some(target_pos) = e.label_pos.get(&patch.target).copied() else {
             e.diags.push(
@@ -549,30 +703,19 @@ fn nara_vmfile(
         e.bytecode[patch.pos + patch.len - 2] = bytes[0];
         e.bytecode[patch.pos + patch.len - 1] = bytes[1];
     }
-    if e.diags.iter().any(|d| d.is_error()) {
-        diags.append(&mut e.diags);
-        return None;
-    }
-    let functions = vec![(entry_name_idx, e.bytecode.clone())];
-    Some(serialize_nara(
-        &e.values,
-        &e.blob,
-        &e.constants,
-        &functions,
-        module_idx,
-    ))
+    !e.diags.iter().any(|d| d.is_error())
 }
 
-/// Scan `main` for the last textual use of every LIR register. Uses are
+/// Scan one function for the last textual use of every LIR register. Uses are
 /// operand positions (BinOp sides, copy sources, call args, branch
 /// conditions, return values); definitions do not count.
-fn nara_last_use(main: &vl_lir::Function) -> std::collections::HashMap<vl_lir::Reg, usize> {
+fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::Reg, usize> {
     use vl_lir::Instr as I;
     let mut last = std::collections::HashMap::new();
     let mut touch = |reg: vl_lir::Reg, idx: usize| {
         last.insert(reg, idx);
     };
-    for (idx, ins) in main.instrs.iter().enumerate() {
+    for (idx, ins) in func.instrs.iter().enumerate() {
         match ins {
             I::BinOp { lhs, rhs, .. } => {
                 touch(*lhs, idx);
@@ -662,7 +805,7 @@ fn nara_free_dead(e: &mut NaraEmit, ins: &Instr, idx: usize) {
     }
 }
 
-fn nara_instr(e: &mut NaraEmit, ins: &Instr, print_fn_idx: usize, print_u64_fn_idx: usize) {
+fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
     match ins {
         Instr::Const { dst, value, span } => {
             let kind = NaraKind::of_scalar(*value);
@@ -705,14 +848,18 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, print_fn_idx: usize, print_u64_fn_i
             e.kinds.insert(*dst, NaraKind::String);
             e.bytecode.extend_from_slice(&[0x03, rf, idx as u8]); // lrf
         }
-        Instr::Param { span, .. } => {
-            e.diags.push(
-                Diagnostic::error(
-                    "Naravm backend only supports `function main()` with no parameters",
-                )
-                .with_label(*span, "parameter here")
-                .with_code("E403"),
-            );
+        Instr::Param { dst, index, span } => {
+            if ctx.is_main {
+                e.diags.push(
+                    Diagnostic::error(
+                        "Naravm backend only supports `function main()` with no parameters",
+                    )
+                    .with_label(*span, "parameter here")
+                    .with_code("E403"),
+                );
+                return;
+            }
+            nara_param(e, ctx, *dst, *index, *span);
         }
         Instr::Copy { dst, src, span } => {
             if e.invalid.contains(src) {
@@ -735,7 +882,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, print_fn_idx: usize, print_u64_fn_i
                 e.kinds.insert(*dst, kind);
                 return;
             }
-            if kind == NaraKind::String {
+            if kind.is_ref() {
                 let (Some(s), Some(d)) = (
                     e.rf_map.get(src).copied(),
                     e.rf_map.get(dst).copied().or_else(|| {
@@ -797,7 +944,12 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, print_fn_idx: usize, print_u64_fn_i
             args,
             span,
         } => {
-            if callee == "std.print" || callee == "print" {
+            // User functions first: a user function may share a bare name
+            // with a std export, and the LIR callee spelling alone cannot
+            // tell them apart (imports are resolved away before lowering).
+            if ctx.sigs.contains_key(callee.as_str()) {
+                nara_user_call(e, ctx, *dst, callee, args, *span);
+            } else if callee == "std.print" || callee == "print" {
                 if args.len() != 1 {
                     e.diags.push(
                         Diagnostic::error("std.print expects one string argument")
@@ -816,7 +968,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, print_fn_idx: usize, print_u64_fn_i
                     return;
                 };
                 e.bytecode.extend_from_slice(&[0x05, 0x31, s]); // cprf rf31, src
-                nara_calli(e, print_fn_idx, *span);
+                nara_calli(e, ctx.print_fn_idx, *span);
             } else if callee == "std.print_u64" || callee == "print_u64" {
                 if args.len() != 1 {
                     e.diags.push(
@@ -852,20 +1004,22 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, print_fn_idx: usize, print_u64_fn_i
                 if s != 0x11 {
                     e.bytecode.extend_from_slice(&[0x04, 0x11, s]); // cpv rv11, src
                 }
-                nara_calli(e, print_u64_fn_idx, *span);
+                nara_calli(e, ctx.print_u64_fn_idx, *span);
             } else {
                 e.diags.push(
                     Diagnostic::error(format!(
                         "Naravm backend does not support call `{callee}` yet"
                     ))
                     .with_label(*span, "unsupported call")
-                    .with_note("only `std.print` and `std.print_u64` lower to Naravm calls")
+                    .with_note(
+                        "only `std.print`, `std.print_u64`, and user functions lower to Naravm calls",
+                    )
                     .with_code("E404"),
                 );
                 e.invalid.insert(*dst);
             }
         }
-        Instr::Ret { .. } => e.bytecode.push(0x00),
+        Instr::Ret { src, span } => nara_ret(e, ctx, *src, *span),
         Instr::BranchIfFalse { cond, target, span } => {
             let Some(c) = e.value_reg(*cond, *span) else {
                 return;
@@ -908,6 +1062,337 @@ fn nara_calli(e: &mut NaraEmit, fn_idx: usize, span: Span) {
         .extend_from_slice(&[0x20, (fn_idx >> 8) as u8, fn_idx as u8]);
 }
 
+/// Callee prologue for one `Param`: copy the incoming argument register
+/// (`rv11+i` for values, `rf31+j` for references — independent sequences)
+/// into a fresh machine register. `Void`/`Error` params cannot occur past
+/// the frontend; poison quietly instead of cascading.
+fn nara_param(e: &mut NaraEmit, ctx: &NaraFnCtx, dst: vl_lir::Reg, index: usize, span: Span) {
+    let ty = ctx
+        .func
+        .param_tys
+        .get(index)
+        .copied()
+        .unwrap_or(vl_typecheck::Ty::Error);
+    let Some(kind) = NaraKind::of_ty(ty) else {
+        e.invalid.insert(dst);
+        return;
+    };
+    if kind.is_ref() {
+        if e.param_ri >= 9 {
+            e.diags.push(
+                Diagnostic::error(
+                    "Naravm backend supports at most 9 reference parameters per function",
+                )
+                .with_label(span, "parameter here")
+                .with_code("E404"),
+            );
+            e.invalid.insert(dst);
+            return;
+        }
+        let src = 0x31 + e.param_ri;
+        e.param_ri += 1;
+        if !e.last_use.contains_key(&dst) {
+            // Dead parameter: the slot is still consumed positionally, but
+            // no machine register is spent on it.
+            return;
+        }
+        let Some(rf) = e.fresh_rf(span) else {
+            e.invalid.insert(dst);
+            return;
+        };
+        e.rf_map.insert(dst, rf);
+        e.kinds.insert(dst, kind);
+        e.bytecode.extend_from_slice(&[0x05, rf, src]); // cprf
+    } else {
+        if e.param_vi >= 15 {
+            e.diags.push(
+                Diagnostic::error(
+                    "Naravm backend supports at most 15 value parameters per function",
+                )
+                .with_label(span, "parameter here")
+                .with_code("E404"),
+            );
+            e.invalid.insert(dst);
+            return;
+        }
+        let src = 0x11 + e.param_vi;
+        e.param_vi += 1;
+        if !e.last_use.contains_key(&dst) {
+            return;
+        }
+        let Some(rv) = e.fresh_rv(span) else {
+            e.invalid.insert(dst);
+            return;
+        };
+        e.rv_map.insert(dst, rv);
+        e.kinds.insert(dst, kind);
+        e.bytecode.extend_from_slice(&[0x04, rv, src]); // cpv
+    }
+}
+
+/// One spilled caller register: the value and reference stacks are
+/// independent, so replaying the push sequence in reverse restores both.
+enum NaraSpill {
+    V(u8),
+    F(u8),
+}
+
+/// Call a user function: spill live caller registers (the register file is
+/// VM-global, shared across frames), move actuals into the callee's param
+/// slots, `calli`, copy the return out, then restore the spills.
+fn nara_user_call(
+    e: &mut NaraEmit,
+    ctx: &NaraFnCtx,
+    dst: vl_lir::Reg,
+    callee: &str,
+    args: &[vl_lir::Reg],
+    span: Span,
+) {
+    let Some(callee_fn) = ctx.sigs.get(callee).copied() else {
+        e.diags.push(
+            Diagnostic::error(format!(
+                "Naravm backend does not support call `{callee}` yet"
+            ))
+            .with_label(span, "unsupported call")
+            .with_note(
+                "only `std.print`, `std.print_u64`, and user functions lower to Naravm calls",
+            )
+            .with_code("E404"),
+        );
+        e.invalid.insert(dst);
+        return;
+    };
+    // Poisoned actuals stay quiet.
+    for arg in args {
+        if e.invalid.contains(arg) {
+            e.invalid.insert(dst);
+            return;
+        }
+    }
+    if args.len() != callee_fn.param_tys.len() {
+        e.diags.push(
+            Diagnostic::error(format!(
+                "codegen: arity mismatch calling `{callee}` (compiler bug)"
+            ))
+            .with_label(span, "call emitted here")
+            .with_code("E500"),
+        );
+        e.invalid.insert(dst);
+        return;
+    }
+    // Partition actuals by the caller's tracked register kind with the same
+    // two independent counters the prologue uses.
+    let mut actuals: Vec<(bool, u8)> = Vec::with_capacity(args.len());
+    let mut values = 0u8;
+    let mut refs = 0u8;
+    for arg in args {
+        match e.kinds.get(arg).copied() {
+            Some(kind) if kind.is_ref() => {
+                let Some(src) = e.rf_map.get(arg).copied() else {
+                    e.diags.push(
+                        Diagnostic::error(
+                            "Naravm backend could not resolve a call argument (compiler bug)",
+                        )
+                        .with_label(span, "call emitted here")
+                        .with_code("E500"),
+                    );
+                    e.invalid.insert(dst);
+                    return;
+                };
+                refs += 1;
+                actuals.push((true, src));
+            }
+            Some(_) => {
+                let Some(src) = e.rv_map.get(arg).copied() else {
+                    e.diags.push(
+                        Diagnostic::error(
+                            "Naravm backend could not resolve a call argument (compiler bug)",
+                        )
+                        .with_label(span, "call emitted here")
+                        .with_code("E500"),
+                    );
+                    e.invalid.insert(dst);
+                    return;
+                };
+                values += 1;
+                actuals.push((false, src));
+            }
+            None => {
+                e.diags.push(
+                    Diagnostic::error(
+                        "Naravm backend could not resolve a call argument (compiler bug)",
+                    )
+                    .with_label(span, "call emitted here")
+                    .with_code("E500"),
+                );
+                e.invalid.insert(dst);
+                return;
+            }
+        }
+    }
+    if values > 15 || refs > 9 {
+        e.diags.push(
+            Diagnostic::error(
+                "Naravm backend supports at most 15 value and 9 reference arguments per call",
+            )
+            .with_label(span, "call emitted here")
+            .with_code("E404"),
+        );
+        e.invalid.insert(dst);
+        return;
+    }
+    // Reserve the return register before spilling so it cannot alias a live
+    // caller register. This emits no code, only reserves a register number.
+    let ret_kind = NaraKind::of_ty(callee_fn.ret);
+    let ret_rv = match ret_kind {
+        Some(kind) if !kind.is_ref() => match e.fresh_rv(span) {
+            Some(rv) => Some(rv),
+            None => {
+                e.invalid.insert(dst);
+                return;
+            }
+        },
+        _ => None,
+    };
+    let ret_rf = match ret_kind {
+        Some(kind) if kind.is_ref() => match e.fresh_rf(span) {
+            Some(rf) => Some(rf),
+            None => {
+                e.invalid.insert(dst);
+                return;
+            }
+        },
+        _ => None,
+    };
+
+    let mut rvs: Vec<u8> = e.rv_map.values().copied().collect();
+    rvs.sort_unstable();
+    let mut rfs: Vec<u8> = e.rf_map.values().copied().collect();
+    rfs.sort_unstable();
+    let mut spills: Vec<NaraSpill> = Vec::new();
+    for rv in rvs {
+        e.bytecode.extend_from_slice(&[0x06, rv]); // pushv
+        spills.push(NaraSpill::V(rv));
+    }
+    // Cached comparison temporaries are live machine state too; without a
+    // spill the callee (which allocates from register 0) would clobber them.
+    if let Some(one) = e.one_rv {
+        e.bytecode.extend_from_slice(&[0x06, one]);
+        spills.push(NaraSpill::V(one));
+    }
+    if let Some(bias) = e.bias_rv {
+        e.bytecode.extend_from_slice(&[0x06, bias]);
+        spills.push(NaraSpill::V(bias));
+    }
+    for rf in rfs {
+        e.bytecode.extend_from_slice(&[0x08, rf]); // pushrf
+        spills.push(NaraSpill::F(rf));
+    }
+    let mut vi = 0u8;
+    let mut ri = 0u8;
+    for (is_ref, src) in &actuals {
+        if *is_ref {
+            e.bytecode.extend_from_slice(&[0x05, 0x31 + ri, *src]); // cprf
+            ri += 1;
+        } else {
+            e.bytecode.extend_from_slice(&[0x04, 0x11 + vi, *src]); // cpv
+            vi += 1;
+        }
+    }
+    let Some(fn_idx) = ctx.fn_consts.get(callee).copied() else {
+        e.diags.push(
+            Diagnostic::error(format!(
+                "codegen: missing function constant for `{callee}` (compiler bug)"
+            ))
+            .with_label(span, "call emitted here")
+            .with_code("E500"),
+        );
+        e.invalid.insert(dst);
+        return;
+    };
+    nara_calli(e, fn_idx, span);
+    match ret_kind {
+        // `Void`/`Error` returns map to nothing; the destination stays dead.
+        None => {}
+        Some(kind) if kind.is_ref() => {
+            let rf = ret_rf.expect("reserved above");
+            e.bytecode.extend_from_slice(&[0x05, rf, 0x31]); // cprf rf, rf31
+            e.rf_map.insert(dst, rf);
+            e.kinds.insert(dst, kind);
+        }
+        Some(kind) => {
+            let rv = ret_rv.expect("reserved above");
+            if rv != 0x11 {
+                e.bytecode.extend_from_slice(&[0x04, rv, 0x11]); // cpv rv, rv11
+            }
+            e.rv_map.insert(dst, rv);
+            e.kinds.insert(dst, kind);
+        }
+    }
+    for spill in spills.iter().rev() {
+        match spill {
+            NaraSpill::V(rv) => e.bytecode.extend_from_slice(&[0x07, *rv]), // popv
+            NaraSpill::F(rf) => e.bytecode.extend_from_slice(&[0x09, *rf]), // poprf
+        }
+    }
+}
+
+/// Function epilogue: move the tail value into the return slot (`rv11` /
+/// `rf31` per the declared return kind), then `ret`. `main` and `void`
+/// functions emit a bare `ret` as before.
+fn nara_ret(e: &mut NaraEmit, ctx: &NaraFnCtx, src: vl_lir::Reg, span: Span) {
+    if ctx.is_main {
+        e.bytecode.push(0x00);
+        return;
+    }
+    let ret = match NaraKind::of_ty(ctx.func.ret) {
+        None => {
+            e.bytecode.push(0x00);
+            return;
+        }
+        Some(kind) => kind,
+    };
+    if e.invalid.contains(&src) {
+        e.bytecode.push(0x00);
+        return;
+    }
+    if ret.is_ref() {
+        match e.rf_map.get(&src).copied() {
+            Some(s) => {
+                e.bytecode.extend_from_slice(&[0x05, 0x31, s]); // cprf rf31, src
+            }
+            None => {
+                e.diags.push(
+                    Diagnostic::error(
+                        "Naravm backend could not resolve the return register (compiler bug)",
+                    )
+                    .with_label(span, "return emitted here")
+                    .with_code("E500"),
+                );
+            }
+        }
+        e.bytecode.push(0x00);
+        return;
+    }
+    match e.rv_map.get(&src).copied() {
+        Some(s) => {
+            if s != 0x11 {
+                e.bytecode.extend_from_slice(&[0x04, 0x11, s]); // cpv rv11, src
+            }
+        }
+        None => {
+            e.diags.push(
+                Diagnostic::error(
+                    "Naravm backend could not resolve the return register (compiler bug)",
+                )
+                .with_label(span, "return emitted here")
+                .with_code("E500"),
+            );
+        }
+    }
+    e.bytecode.push(0x00);
+}
+
 fn nara_binop(
     e: &mut NaraEmit,
     dst: vl_lir::Reg,
@@ -938,7 +1423,7 @@ fn nara_binop(
         return;
     }
     let kind = lkind.unwrap_or(NaraKind::I64);
-    if kind == NaraKind::String {
+    if kind.is_ref() {
         e.diags.push(
             Diagnostic::error(format!(
                 "Naravm backend does not support `{op}` on strings yet"
@@ -1271,6 +1756,69 @@ mod tests {
     #[test]
     fn naravm_rejects_float_ordering_with_e404() {
         let lir = lir_of("function main() { if (1.5f64 < 2.5f64) { 1; } }");
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(artifact.is_none());
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E404")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn naravm_emits_user_calls_with_mixed_params_string_return_and_recursion() {
+        let lir = lir_of(
+            r#"
+use std;
+function add(a: u64, b: u64): u64 { a + b; }
+function greet(name: string, n: u64): string { name; }
+function fact(n: u64): u64 {
+    let r = 1u64;
+    if (n == 0u64) { r; } else { r = n * fact(n - 1u64); }
+    r;
+}
+function main() {
+    std.print(greet("hi\n", 1u64));
+    std.print_u64(add(fact(3u64), 1u64));
+}
+"#,
+        );
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let bytes = artifact.unwrap().bytes.unwrap();
+        assert_eq!(&bytes[..4], b"nara");
+        // calli = 0x20: main -> greet/add/fact plus the recursive fact call.
+        assert!(bytes.contains(&0x20), "no calli in {bytes:?}");
+    }
+
+    #[test]
+    fn naravm_rejects_unknown_callee_with_e404() {
+        use vl_common::Span;
+        use vl_lir::{Function, Instr, LirProgram, Reg};
+        let lir = LirProgram {
+            module: "t".into(),
+            functions: vec![Function {
+                name: "main".into(),
+                param_tys: vec![],
+                ret: vl_typecheck::Ty::Void,
+                instrs: vec![
+                    Instr::Const {
+                        dst: Reg(0),
+                        value: vl_common::Scalar::U64(1),
+                        span: Span::empty(0),
+                    },
+                    Instr::Call {
+                        dst: Reg(1),
+                        callee: "nope".into(),
+                        args: vec![Reg(0)],
+                        span: Span::empty(0),
+                    },
+                    Instr::Ret {
+                        src: Reg(1),
+                        span: Span::empty(0),
+                    },
+                ],
+            }],
+        };
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(artifact.is_none());
         assert!(

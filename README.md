@@ -84,10 +84,14 @@ Numeric literals use `u64`, `i64`, `f64`, and `u8` suffixes; bare integers are
 `f64`, `bool`, `u8`, `string`, `File`, and `void` (`void` only as a return).
 The language also supports double-quoted byte strings, `+ - * /`, unary `-`
 and `!`, comparisons (`== != < <= > >=`), short-circuit `&&` / `||`, parens,
-`let` plus `=` reassignment, typed `function` boundaries
+`let` plus `=` reassignment, user-defined functions with typed boundaries
 (`function add(a: i64, b: i64): i64`; an omitted return type means `void`),
-calls, `if`/`else` conditionals with mandatory parentheses, and `while` loops
-with `break` / `continue`.
+calls between user functions (nestable, order-independent, recursive;
+arity and argument types are checked, `void` results only as bare statements),
+`if`/`else` conditionals with mandatory parentheses, and `while` loops
+with `break` / `continue`. Every program must define a zero-argument
+`function main()` returning `void` as its entrypoint; other functions compile
+to their own Nara functions on the Naravm target (see `examples/calls.vl`).
 Branches may be single statements or brace-delimited blocks. `//` comments.
 String escapes are `\\0`,
 `\\n`, `\\r`, `\\t`, `\\\\`, and `\\"`; strings may not cross a newline.

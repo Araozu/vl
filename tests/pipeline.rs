@@ -87,6 +87,46 @@ fn function_calls_lower_to_lir_and_asm() {
 }
 
 #[test]
+fn naravm_emits_calls_vl_with_user_calls() {
+    use vl_codegen::Target;
+    let src = std::fs::read_to_string("examples/calls.vl").unwrap();
+    let lir = frontend(&src).expect("calls.vl must compile");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+    // calli = 0x20: main -> twice, twice -> add.
+    assert!(bytes.contains(&0x20), "expected calli instructions");
+}
+
+#[test]
+fn naravm_emits_mixed_params_string_return_and_recursion() {
+    use vl_codegen::Target;
+    let lir = frontend(
+        r#"
+use std;
+function add(a: u64, b: u64): u64 { a + b; }
+function greet(name: string): string { name; }
+function fact(n: u64): u64 {
+    let r = 1u64;
+    if (n == 0u64) { r; } else { r = n * fact(n - 1u64); }
+    r;
+}
+function main() {
+    std.print(greet("hi\n"));
+    std.print_u64(add(fact(3u64), 1u64));
+}
+"#,
+    )
+    .expect("mixed params, string return, and recursion must compile");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+    assert!(bytes.contains(&0x20), "expected calli instructions");
+}
+
+#[test]
 fn strings_lower_to_byte_constants() {
     let lir = frontend(r#"let greeting = "hi\n";"#).expect("string must compile");
     let dump = lir.dump();
