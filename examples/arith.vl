@@ -3,7 +3,7 @@ let a = 1 + 2 * 3;
 let b = (1 + 2) * 3;
 let c = -a + b;
 
-function main(): void {
+function main() {
     let d = a + b * c;
     d;
 }

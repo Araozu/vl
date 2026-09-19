@@ -36,7 +36,7 @@ export function renderParagraphs(text: string): string {
 }
 
 /// GitHub-style slug for heading anchors
-/// (`std.print(value: string) -> i64` → `stdprintvalue-string-returns-i64`).
+/// (`std.print(value: string) -> void` → `stdprintvalue-string-returns-void`).
 export function slug(text: string): string {
   return text
     .toLowerCase()

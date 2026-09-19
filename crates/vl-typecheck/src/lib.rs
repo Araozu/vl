@@ -190,8 +190,9 @@ impl Checker {
             } => {
                 let ret_ty = ret.map(Ty::from_vl).unwrap_or(Ty::Error);
                 self.record(*id, ret_ty);
-                // Missing annotations were already reported by the parser (E104);
-                // poison the scope quietly so no second error cascades.
+                // Bad annotations were already reported by the parser
+                // (E104/E105); poison the scope quietly so no second error
+                // cascades. (An omitted return parses as `void`, never `None`.)
                 let poisoned_sig =
                     ret_ty == Ty::Error || params.iter().any(|(_, _, t, _)| t.is_none());
                 for (_, def, ty, _) in params {
@@ -601,16 +602,15 @@ mod tests {
     #[test]
     fn call_with_correct_types_checks_clean() {
         let (_, diags) = check_src(
-            "function add(a: i64, b: i64): i64 { a + b; } function main(): void { add(1, 2); }",
+            "function add(a: i64, b: i64): i64 { a + b; } function main() { add(1, 2); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn call_with_wrong_arity_errors_once() {
-        let (_, diags) = check_src(
-            "function add(a: i64, b: i64): i64 { a + b; } function main(): void { add(1); }",
-        );
+        let (_, diags) =
+            check_src("function add(a: i64, b: i64): i64 { a + b; } function main() { add(1); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("expects 2"));
     }
@@ -618,7 +618,7 @@ mod tests {
     #[test]
     fn call_with_wrong_param_type_errors() {
         let (_, diags) = check_src(
-            r#"function add(a: i64, b: i64): i64 { a + b; } function main(): void { add(1, "s"); }"#,
+            r#"function add(a: i64, b: i64): i64 { a + b; } function main() { add(1, "s"); }"#,
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("expects `i64`"), "{diags:?}");
@@ -635,14 +635,13 @@ mod tests {
 
     #[test]
     fn void_function_accepts_any_tail() {
-        let (_, diags) = check_src("function main(): void { 1 + 2; }");
+        let (_, diags) = check_src("function main() { 1 + 2; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn binding_void_errors() {
-        let (_, diags) =
-            check_src("use std.print; function main(): void { let x = print(\"hi\"); }");
+        let (_, diags) = check_src("use std.print; function main() { let x = print(\"hi\"); }");
         assert!(
             diags.iter().any(|d| d.message.contains("void")),
             "{diags:?}"
@@ -651,14 +650,14 @@ mod tests {
 
     #[test]
     fn calling_a_let_binding_errors() {
-        let (_, diags) = check_src("let x = 1; function main(): void { x(); }");
+        let (_, diags) = check_src("let x = 1; function main() { x(); }");
         assert!(diags.iter().any(|d| d.message.contains("not a function")));
     }
 
     #[test]
     fn unresolved_callee_poisoned_quietly() {
         // E201 comes from resolve; typecheck must not add a second error.
-        let (toks, _) = vl_lex::lex("function main(): void { nope(1); }");
+        let (toks, _) = vl_lex::lex("function main() { nope(1); }");
         let (prog, _) = vl_syntax::parse(&toks, "");
         let (res, rdiags) = vl_semantic::resolve(&prog);
         assert!(rdiags.iter().any(|d| d.is_error()));

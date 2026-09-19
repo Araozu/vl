@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn dummy_emits_text() {
-        let lir = lir_of("function main(): void { 1 + 2; }");
+        let lir = lir_of("function main() { 1 + 2; }");
         let (art, diags) = DummyTarget.emit(&lir);
         assert!(diags.is_empty());
         assert!(art.unwrap().text.contains("add"));
@@ -480,9 +480,8 @@ mod tests {
 
     #[test]
     fn backends_emit_calls_and_parameters() {
-        let lir = lir_of(
-            "function add(a: i64, b: i64): i64 { a + b; } function main(): void { add(1, 2); }",
-        );
+        let lir =
+            lir_of("function add(a: i64, b: i64): i64 { a + b; } function main() { add(1, 2); }");
         let (art, diags) = DummyTarget.emit(&lir);
         assert!(diags.is_empty());
         let text = art.unwrap().text;
@@ -496,7 +495,7 @@ mod tests {
 
     #[test]
     fn naravm_rejects_constant_pool_indices_that_do_not_fit() {
-        let mut src = String::from("function main(): void {");
+        let mut src = String::from("function main() {");
         for i in 0..252 {
             src.push_str(&format!("let s{i} = \"s{i}\";"));
         }
@@ -512,7 +511,7 @@ mod tests {
 
     #[test]
     fn naravm_accepts_bare_print_from_single_export_use() {
-        let src = "use std.print; function main(): void { print(\"hi\\n\"); }";
+        let src = "use std.print; function main() { print(\"hi\\n\"); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, rdiags) = vl_semantic::resolve_with_modules(&prog, &modules());

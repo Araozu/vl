@@ -10,7 +10,8 @@ availability: VL 0.1+
 
 This guide takes you from a checkout to a running VL program. VL currently
 builds for Naravm, and every executable starts at one required, zero-argument
-entrypoint: `function main()`.
+entrypoint: `function main()`. (A missing return type means `void`, so this is
+`function main(): void`.)
 
 ## Before you begin
 

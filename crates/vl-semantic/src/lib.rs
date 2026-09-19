@@ -491,22 +491,21 @@ mod tests {
     #[test]
     fn call_callee_and_args_resolve() {
         let (_, diags) = resolve_src(
-            "function add(a: i64, b: i64): i64 { a + b; } function main(): void { add(1, 2); }",
+            "function add(a: i64, b: i64): i64 { a + b; } function main() { add(1, 2); }",
         );
         assert!(diags.iter().all(|d| !d.is_error()));
     }
 
     #[test]
     fn undefined_callee_errors() {
-        let (_, diags) = resolve_src("function main(): void { nope(1); }");
+        let (_, diags) = resolve_src("function main() { nope(1); }");
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("nope"));
     }
 
     #[test]
     fn forward_call_resolves_via_global_prepass() {
-        let (_, diags) =
-            resolve_src("function main(): void { helper(); } function helper(): i64 { 1; }");
+        let (_, diags) = resolve_src("function main() { helper(); } function helper(): i64 { 1; }");
         assert!(diags.iter().all(|d| !d.is_error()));
     }
 
@@ -519,20 +518,20 @@ mod tests {
 
     #[test]
     fn poisoned_module_alias_suppresses_qualified_use_cascade() {
-        let (_, diags) = resolve_src("use missing.module; function main(): void { module.foo(); }");
+        let (_, diags) = resolve_src("use missing.module; function main() { module.foo(); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("cannot find module"));
     }
 
     #[test]
     fn single_export_use_brings_bare_name_into_scope() {
-        let (_, diags) = resolve_src("use std.string.len; function main(): void { len(\"s\"); }");
+        let (_, diags) = resolve_src("use std.string.len; function main() { len(\"s\"); }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
     }
 
     #[test]
     fn bare_import_carries_its_signature() {
-        let (res, diags) = resolve_src("use std.string.len; function main(): void { len(\"s\"); }");
+        let (res, diags) = resolve_src("use std.string.len; function main() { len(\"s\"); }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
         let def = res.defs.iter().find(|d| d.name == "len").expect("len def");
         let sig = def.sig.as_ref().expect("extern sig");
@@ -542,7 +541,7 @@ mod tests {
 
     #[test]
     fn single_export_use_of_std_print_resolves() {
-        let (toks, _) = vl_lex::lex("use std.print; function main(): void { print(\"hi\"); }");
+        let (toks, _) = vl_lex::lex("use std.print; function main() { print(\"hi\"); }");
         let (prog, _) = vl_syntax::parse(&toks, "");
         let (_, diags) = resolve_with_modules(&prog, &vl_codegen_modules());
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
@@ -550,7 +549,7 @@ mod tests {
 
     #[test]
     fn single_export_use_with_unknown_export_is_one_error() {
-        let (_, diags) = resolve_src("use std.string.bogus; function main(): void { bogus(); }");
+        let (_, diags) = resolve_src("use std.string.bogus; function main() { bogus(); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("no export `bogus`"));
     }

@@ -116,7 +116,7 @@ fn run_frontend(
                 diags.push(
                     vl_common::Diagnostic::error("`main` must return `void`")
                         .with_label(mains[0].2, "entrypoint declared here")
-                        .with_note("write `function main(): void`")
+                        .with_note("omit the return type (it defaults to `void`)")
                         .with_code("E401"),
                 );
             }

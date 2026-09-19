@@ -369,8 +369,7 @@ mod tests {
 
     #[test]
     fn call_links_callee_def() {
-        let src =
-            "function add(a: i64, b: i64): i64 { a + b; } function main(): void { add(1, 2); }";
+        let src = "function add(a: i64, b: i64): i64 { a + b; } function main() { add(1, 2); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -393,7 +392,7 @@ mod tests {
 
     #[test]
     fn unresolved_call_poisoned_not_panic() {
-        let src = "function main(): void { nope(1); }";
+        let src = "function main() { nope(1); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);

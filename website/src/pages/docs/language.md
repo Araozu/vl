@@ -35,12 +35,13 @@ let result = (total + 2u64) * 3u64;
 
 ## Bindings and functions
 
-Use `let` to bind a value and `function` to name reusable work:
+Use `let` to bind a value and `function` to name reusable work. Parameters are
+typed, and the return type follows the parameter list:
 
 ```vl
 let greeting = "hello";
 
-function add(a, b) {
+function add(a: i64, b: i64): i64 {
     a + b;
 }
 
@@ -49,11 +50,16 @@ function main() {
 }
 ```
 
+A missing return type means `void`, so `function main()` is
+`function main(): void`. Calls check arity and argument types, and the declared
+return must match the body's tail value; `void` results may only appear as bare
+statements.
+
 Names must be defined before they are used, and a scope cannot define the same
 name twice. The compiler reports those problems at the source location.
 
-Every program must define a zero-argument `function main()`; it becomes the
-runtime entrypoint.
+Every program must define a zero-argument `function main()` returning `void`;
+it becomes the runtime entrypoint.
 
 ## Strings
 
@@ -76,6 +82,8 @@ are optional: each branch can be one statement or a brace-delimited block, and
 `else` is optional.
 
 ```vl
+use std.print;
+
 function main() {
     let ready = true;
     if (ready) {
@@ -109,11 +117,11 @@ A trailing export can be imported directly (`use std.print;` behaves like
 bring selected exports into the current file:
 
 ```vl
-use std.string.{new, len};
+use std.string.{len};
 
 function main() {
-    new();
-    len();
+    let n = len("hello");
+    n;
 }
 ```
 

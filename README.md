@@ -76,14 +76,15 @@ colours) and sets the exit code. Never add another reporting library.
 
 ```text
 let x = 1 + 2 * 3;
-function main(): void { let d = x - 1; d; }
+function main() { let d = x - 1; d; }
 ```
 
 Numeric literals use `u64`, `i64`, `f64`, and `u8` suffixes; bare integers are
 `i64`. Boolean literals are `true` and `false`. Value types are `u64`, `i64`,
 `f64`, `bool`, `u8`, `string`, `File`, and `void` (`void` only as a return).
 The language also supports double-quoted byte strings, `+ - * /`, unary `-`,
-parens, `let`, typed `function` boundaries (`function add(a: i64, b: i64): i64`),
+parens, `let`, typed `function` boundaries (`function add(a: i64, b: i64): i64`;
+an omitted return type means `void`),
 calls, and `if`/`else` conditionals with mandatory parentheses.
 Branches may be single statements or brace-delimited blocks. `//` comments.
 String escapes are `\\0`,

@@ -6,13 +6,11 @@ import { highlightVl } from '../../lib/vl-code';
 
 function signature(module: string, fn: {
   name: string;
-  params?: Array<{ name: string; type: string }>;
-  returns?: { type: string };
+  params: Array<{ name: string; type: string }>;
+  returns: { type: string };
 }): string {
-  if (!fn.params) return `${module}.${fn.name}`;
   const params = fn.params.map((p) => `${p.name}: ${p.type}`).join(', ');
-  const head = `${module}.${fn.name}(${params})`;
-  return fn.returns ? `${head} -> ${fn.returns.type}` : head;
+  return `${module}.${fn.name}(${params}) -> ${fn.returns.type}`;
 }
 
 export async function getStaticPaths() {
@@ -49,45 +47,41 @@ for (const fn of mod.functions) {
           <h2 id={slug(head)}>
             <code>{head}</code>
           </h2>
-          {fn.params && (
-            <table>
-              <thead>
+          <table>
+            <thead>
+              <tr>
+                <th>Parameter</th>
+                <th>Type</th>
+                <th>Description</th>
+              </tr>
+            </thead>
+            <tbody>
+              {fn.params.map((p) => (
                 <tr>
-                  <th>Parameter</th>
-                  <th>Type</th>
-                  <th>Description</th>
+                  <td>
+                    <code>{p.name}</code>
+                  </td>
+                  <td>
+                    <code>{p.type}</code>
+                  </td>
+                  <td>
+                    {p.detail ? <Fragment set:html={renderInline(p.detail)} /> : null}
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {fn.params.map((p) => (
-                  <tr>
-                    <td>
-                      <code>{p.name}</code>
-                    </td>
-                    <td>
-                      <code>{p.type}</code>
-                    </td>
-                    <td>
-                      {p.detail ? <Fragment set:html={renderInline(p.detail)} /> : null}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-          {fn.returns && (
-            <p>
-              <strong>Returns</strong> <code>{fn.returns.type}</code>
-              {fn.returns.detail ? (
-                <>
-                  {' — '}
-                  <Fragment set:html={renderInline(fn.returns.detail)} />
-                </>
-              ) : (
-                '.'
-              )}
-            </p>
-          )}
+              ))}
+            </tbody>
+          </table>
+          <p>
+            <strong>Returns</strong> <code>{fn.returns.type}</code>
+            {fn.returns.detail ? (
+              <>
+                {' — '}
+                <Fragment set:html={renderInline(fn.returns.detail)} />
+              </>
+            ) : (
+              '.'
+            )}
+          </p>
           <Fragment set:html={renderParagraphs(fn.detail)} />
           {fn.example && <Fragment set:html={exampleHtml.get(fn.name)} />}
         </Fragment>

@@ -2,7 +2,7 @@
 use std.string;
 use std.fs.{open, read};
 
-function main(): void {
+function main() {
     let f = open("data.txt");
     let s = read(f);
     let n = string.len(s);

@@ -19,7 +19,7 @@
   import_example: |
     use std.print;
 
-    function main(): void {
+    function main() {
         print("Hello, world!\n");
     }
   functions:
@@ -62,7 +62,7 @@
   import_example: |
     use std.fs.{open, read};
 
-    function main(): void {
+    function main() {
         let f = open("data.txt");
         let s = read(f);
         s;
@@ -112,8 +112,8 @@
   import_example: |
     use std.string.{len};
 
-    function main(): void {
-        let n = string.len("hi");
+    function main() {
+        let n = len("hi");
         n;
     }
   functions:
@@ -128,7 +128,7 @@
         Returns the length of a string. Checked during general module checking;
         the current Naravm target does not emit it yet.
       example: |
-        let n = string.len("hi");
+        let n = len("hi");
   outro: |
     VL strings are byte strings for now. See the [language guide](/docs/language)
     for literal syntax and supported escapes.

@@ -3,7 +3,7 @@
 //! Grammar (v0, TypeScript-like surface):
 //! ```text
 //! program := item*
-//! item    := `let` ident `=` expr `;` | `function` ident `(` params? `)` `:` type block
+//! item    := `let` ident `=` expr `;` | `function` ident `(` params? `)` (`:` type)? block
 //! params  := param (`,` param)*
 //! param   := ident `:` type
 //! type    := `u64` | `i64` | `f64` | `bool` | `u8` | `string` | `File` | `void` (`void` only as return)
@@ -21,8 +21,8 @@
 //! is a plain variable use so forward references to `function` items work.
 //! Semicolons are mandatory: every `let` and every expression statement
 //! ends with `;` (no bare trailing value like Rust).
-//! Function boundaries are typed: every param needs `: type` and every
-//! function needs `: type` as its return (use `void` for no value).
+//! Function boundaries are typed: every param needs `: type`; the return
+//! type may be omitted and defaults to `void`.
 //!
 //! The parser recovers per-item: one bad item doesn't kill the rest.
 
@@ -401,7 +401,9 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&TokenKind::RParen, "`)`")?;
-        // Return type is required: `): void` or `): i64`, etc.
+        // An omitted return type means `void`: `function main() { ... }` is
+        // `function main() { ... }`. Only a failed `: type` parse
+        // leaves `ret` as `None` (already reported; downstream stays quiet).
         let (ret, ret_span) = if matches!(self.peek().kind, TokenKind::Colon) {
             self.bump(); // `:`
             match self.parse_type() {
@@ -409,15 +411,7 @@ impl<'a> Parser<'a> {
                 None => (None, None),
             }
         } else {
-            let t = self.peek().clone();
-            self.diags.push(
-                Diagnostic::error(format!("function `{name}` is missing a return type"))
-                    .with_label(name_span, "declared here")
-                    .with_label(t.span, "expected `: type` here")
-                    .with_note("write `): void` when the function returns nothing")
-                    .with_code("E104"),
-            );
-            (None, None)
+            (Some(VlType::Void), None)
         };
         self.expect(&TokenKind::LBrace, "`{` for the function body")?;
         let mut body = Vec::new();
@@ -770,13 +764,13 @@ mod tests {
 
     #[test]
     fn expression_statement_requires_semi() {
-        let (_prog, diags) = parse_src("function main(): void { d }");
+        let (_prog, diags) = parse_src("function main() { d }");
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn function_keyword_parses_with_semi_body() {
-        let (prog, diags) = parse_src("function main(): void { d; }");
+        let (prog, diags) = parse_src("function main() { d; }");
         assert!(diags.is_empty());
         assert_eq!(prog.items.len(), 1);
     }
@@ -802,9 +796,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_return_type_is_an_error() {
-        let (_prog, diags) = parse_src("function main() { 1; }");
-        assert!(diags.iter().any(|d| d.code.as_deref() == Some("E104")));
+    fn omitted_return_type_defaults_to_void() {
+        let (prog, diags) = parse_src("function main() { 1; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { ret, .. } => assert_eq!(*ret, Some(VlType::Void)),
+            other => panic!("expected fn, got {other:?}"),
+        }
     }
 
     #[test]
@@ -821,7 +819,7 @@ mod tests {
 
     #[test]
     fn call_with_no_args_parses() {
-        let (prog, diags) = parse_src("function main(): void { foo(); }");
+        let (prog, diags) = parse_src("function main() { foo(); }");
         assert!(diags.is_empty());
         match &prog.items[0] {
             Item::Function { body, .. } => match &body[0] {
@@ -837,7 +835,7 @@ mod tests {
 
     #[test]
     fn call_with_args_and_nesting_parses() {
-        let (prog, diags) = parse_src("function main(): void { add(1, mul(2, 3)); }");
+        let (prog, diags) = parse_src("function main() { add(1, mul(2, 3)); }");
         assert!(diags.is_empty());
         match &prog.items[0] {
             Item::Function { body, .. } => match &body[0] {
@@ -875,7 +873,7 @@ mod tests {
     #[test]
     fn parses_module_use_and_qualified_call() {
         let (prog, diags) =
-            parse_src("use std.string.{len}; function main(): void { string.len(\"s\"); }");
+            parse_src("use std.string.{len}; function main() { string.len(\"s\"); }");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(
             matches!(&prog.items[0], Item::Use { path, names: Some(names), .. } if path == &vec![String::from("std"), String::from("string")] && names.len() == 1)
@@ -884,7 +882,7 @@ mod tests {
 
     #[test]
     fn parses_unbraced_conditional_branches() {
-        let (prog, diags) = parse_src("function main(): void { if (true) 1; else 2; }");
+        let (prog, diags) = parse_src("function main() { if (true) 1; else 2; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { body, .. } => assert!(matches!(body[0], Stmt::If { .. })),
@@ -894,9 +892,7 @@ mod tests {
 
     #[test]
     fn nested_function_recovery_makes_progress() {
-        let (toks, _) = vl_lex::lex(
-            "function main(): void { function nested(): void {} } function tail(): void {}",
-        );
+        let (toks, _) = vl_lex::lex("function main() { function nested() {} } function tail() {}");
         let (prog, diags) = parse(&toks, "");
         assert!(!diags.is_empty());
         assert!(prog
@@ -907,7 +903,7 @@ mod tests {
 
     #[test]
     fn lexical_poison_does_not_hide_later_function() {
-        let (toks, lex_diags) = vl_lex::lex("let broken = @; function tail(): void {} ");
+        let (toks, lex_diags) = vl_lex::lex("let broken = @; function tail() {} ");
         assert_eq!(lex_diags.len(), 1);
         let (prog, parse_diags) = parse(&toks, "");
         assert!(parse_diags.is_empty(), "{parse_diags:?}");
