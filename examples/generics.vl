@@ -18,8 +18,12 @@ function second[T](a: Array[T], fallback: T): T {
 }
 
 function main() {
-    let nums = [10, 20, 30];
-    std.print_u64(first(nums));
+    let nums: Array[u64] = Array.new(3);
+    nums[0] = 10;
+    nums[1] = 20;
+    nums[2] = 30;
+    let inferred = first(nums);
+    std.print_u64(inferred);
     std.print_u64(first::[u64](nums));
     std.print_u64(second(nums, 99));
     let words = ["hi", "bye"];

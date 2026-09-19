@@ -435,3 +435,39 @@ fn generic_main_is_rejected() {
         "{err:?}"
     );
 }
+
+#[test]
+fn annotated_let_with_contextual_new_compiles() {
+    let lir = frontend(
+        "use std; function first[T](a: Array[T]): T { return a[0]; } function main() { let scores: Array[u64] = Array.new(3); scores[0] = 10; let number = first(scores); std.print_u64(number); }",
+    )
+    .expect("annotated let must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("call first$u64"), "{dump}");
+    assert!(dump.contains("new_array"), "{dump}");
+
+    use vl_codegen::Target;
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+}
+
+#[test]
+fn inference_needs_no_annotation() {
+    // The turbofish is the escape hatch; plain calls must infer.
+    let lir = frontend(
+        "function first[T](a: Array[T]): T { return a[0]; } function main() { let numbers = [10, 20]; let number = first(numbers); number; }",
+    )
+    .expect("inference must work");
+    assert!(lir.dump().contains("call first$u64"));
+}
+
+#[test]
+fn annotated_let_mismatch_is_one_error() {
+    let err = frontend("function main() { let x: u64 = \"s\"; x; }").expect_err("must fail");
+    assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
+    assert!(
+        err.iter().any(|d| d.code.as_deref() == Some("E309")),
+        "{err:?}"
+    );
+}
