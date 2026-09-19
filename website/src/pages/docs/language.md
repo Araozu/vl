@@ -1,23 +1,40 @@
 ---
 layout: ../../layouts/Docs.astro
-title: Language tour · VL
+title: Language tour
+description: The v0 surface, scoping, and error promises.
+eyebrow: Article
+availability: VL 0.1+
 ---
 
-<h1>Language tour</h1>
-<p>A sketch of the v0 surface. For now, every value is an <code>int</code>.</p>
+# Language tour
 
-<h2>The whole of it, nearly</h2>
-<pre>let x = 1 + 2 * 3;
-function main() &#123; let d = x - 1; d; &#125;</pre>
-<p class="mt-4">Integers with <code>+ - * /</code>, unary minus, and parentheses. <code>let</code> binds a name, <code>function</code> takes parameters, <code>//</code> starts a comment that runs to the line end. Every statement ends with <code>;</code>.</p>
+A sketch of the v0 surface. For now, every value is an `int`.
 
-<h2>What the compiler promises</h2>
-<p>Scopes reject two things: names nobody defined, and names defined twice. After an error the compiler marks its nodes and stays quiet downstream, so you fix causes, not echoes.</p>
+```vl
+let x = 1 + 2 * 3;
+function main() { let d = x - 1; d; }
+```
 
-<h2>Still to write</h2>
-<ul class="list-disc space-y-1 pl-6">
-  <li>The grammar, with precedence</li>
-  <li>Scoping rules, stated precisely</li>
-  <li>Recovery and poisoning, with examples</li>
-  <li>What comes next: <code>bool</code>, <code>string</code>, function types</li>
-</ul>
+## Overview
+
+Integers with `+ - * /`, unary minus, and parentheses. `let` binds a name, `function` takes parameters, `//` starts a comment that runs to the line end. Every statement ends with `;`.
+
+Scopes reject two things: names nobody defined, and names defined twice. After an error the compiler marks its nodes and stays quiet downstream, so you fix causes, not echoes.
+
+## Topics
+
+### The grammar, with precedence
+
+Stub. Statements, expressions, and where `;` is required.
+
+### Scoping rules, stated precisely
+
+Stub. Undefined names, duplicate definitions, and shadowing.
+
+### Recovery and poisoning, with examples
+
+Stub. Per-item recovery and why `Ty::Error` passes through quietly.
+
+### What comes next
+
+Stub. `bool`, `string`, and function types after v0.

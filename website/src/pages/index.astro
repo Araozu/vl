@@ -3,70 +3,73 @@ import Base from '../layouts/Base.astro';
 import Playground from '../components/Playground.svelte';
 ---
 
-<Base title="VL — the handbook">
-  <section class="mx-auto max-w-5xl px-4 pb-20 pt-14 sm:px-6 sm:pt-20">
-    <p class="text-[1.1rem] italic text-muted">The handbook for a small language, version 0.</p>
-    <h1 class="mt-4 max-w-[16ch] text-[clamp(2.75rem,7vw,4.75rem)] font-medium leading-[1.02] tracking-[-0.015em] text-balance">
+<Base title="VL Documentation">
+  <section class="mx-auto max-w-[1100px] px-5 pb-20 pt-12 sm:px-8 lg:pt-16">
+    <p class="text-[0.85rem] text-muted"><a href="/docs" class="underline decoration-rule underline-offset-4 hover:text-body">VL</a> / Welcome</p>
+    <p class="mt-8 text-[0.95rem] font-medium text-muted">Article</p>
+    <h1 class="mt-1 max-w-[20ch] text-[clamp(2.2rem,5vw,3.4rem)] font-bold leading-[1.05] tracking-[-0.022em] text-ink text-balance">
       A small language you can read end to end.
     </h1>
-    <p class="mt-6 max-w-[62ch] text-[1.2rem] leading-[1.7] text-parchment">
-      VL is an expression language compiled by a split-crate Rust pipeline.
-      Every stage reports through Ariadne, recovers per item, and lets one
-      root cause stay one error.
+    <p class="mt-4 max-w-[68ch] text-[1.05rem] leading-[1.65] text-body">
+      An ordered, random-access compiler. VL is an expression language compiled
+      by a split-crate Rust pipeline. Every stage reports through Ariadne,
+      recovers per item, and lets one root cause stay one error.
     </p>
-    <div class="mt-8 flex flex-wrap items-baseline gap-x-8 gap-y-3 text-[1.1rem]">
-      <a href="/docs" class="rounded-full bg-gold px-6 py-3 font-medium text-night transition hover:bg-gold-bright">
-        Read the documentation
-      </a>
-      <a href="/api" class="text-gold underline decoration-1 underline-offset-4 transition hover:text-gold-bright">
-        Browse the API
-      </a>
+    <p class="mt-3 text-[0.82rem] text-muted">VL 0.1+ | macOS 13.0+ | Linux</p>
+
+    <div class="mt-6 overflow-hidden rounded-xl bg-decl px-5 py-4 font-mono text-[0.85rem] leading-[1.7] text-ink">
+      <p><span class="text-pink">let</span> x = [1, 3, 5, 7, 9, 11, 13, 15]</p>
+      <p><span class="text-pink">function</span> main() {"{ "}let d = x - 1; d;{" }"}</p>
     </div>
 
-    <figure class="mt-14">
-      <div class="rounded-[0.9rem] border border-rule bg-plate px-6 py-6 font-mono text-[0.95rem] leading-[1.8] text-[#efe6d2] sm:px-8">
-<pre class="m-0"><code>let x = 1 + 2 * 3;
-fn main() &#123; let d = x - 1; d &#125;</code></pre>
-      </div>
-      <figcaption class="mt-2.5 text-[1rem] italic text-muted">arith.vl, nearly the whole language.</figcaption>
-    </figure>
+    <hr class="mt-10 border-rule" />
 
-    <div class="mt-12">
-      <h2 class="max-w-[30ch] text-[clamp(1.6rem,3.5vw,2.2rem)] font-medium leading-tight tracking-[-0.01em] text-balance">
-        Try a line before you install anything.
-      </h2>
-      <div class="mt-5">
-        <Playground client:load />
-      </div>
-      <p class="mt-2.5 text-[1rem] italic text-muted">A sketch in Svelte. The real check runs in the Rust driver.</p>
+    <h2 class="mt-10 text-[1.7rem] font-bold tracking-[-0.018em] text-ink">Overview</h2>
+    <p class="mt-3 max-w-[70ch] leading-[1.65]">
+      VL programs are one of the most commonly read things in this repo. You use
+      <code class="rounded-md bg-pill px-1.5 py-0.5 font-mono text-[0.85em] text-ink">let</code> to organize your values
+      and <code class="rounded-md bg-pill px-1.5 py-0.5 font-mono text-[0.85em] text-ink">function</code> to hold
+      reusable work. For example:
+    </p>
+
+    <div class="mt-4 overflow-hidden rounded-xl bg-plate px-5 py-4 font-mono text-[0.83rem] leading-[1.7]">
+      <p class="text-faint">// An array of numbers, nearly the whole language</p>
+      <p><span class="text-pink">let</span> x = 1 + 2 * 3;</p>
+      <p><span class="text-pink">function</span> main() {"{ "}let d = x - 1; d;{" }"}</p>
+    </div>
+    <p class="mt-3 text-[0.9rem] text-muted">You can check an empty program by running the driver. For example:</p>
+
+    <div class="mt-4 overflow-hidden rounded-xl bg-plate px-5 py-4 font-mono text-[0.83rem] leading-[1.7]">
+      <p>cargo run -- check examples/hello.vl</p>
+      <p>cargo run -- build examples/arith.vl --emit lir</p>
     </div>
 
-    <div class="mt-16">
-      <h2 class="max-w-[30ch] text-[clamp(1.6rem,3.5vw,2.2rem)] font-medium leading-tight tracking-[-0.01em] text-balance">
-        How a program travels.
-      </h2>
-      <dl class="mt-6">
-        <div class="grid gap-1 border-t border-rule py-5 sm:grid-cols-[minmax(0,22ch)_1fr] sm:gap-6">
-          <dt class="font-mono text-[0.9rem] leading-relaxed text-parchment">vl-lex, vl-syntax, vl-semantic</dt>
-          <dd class="max-w-[62ch] text-[1.08rem] leading-[1.7] text-muted">Text becomes tokens, tokens become a tree, names resolve. Nothing here panics on your input.</dd>
-        </div>
-        <div class="grid gap-1 border-t border-rule py-5 sm:grid-cols-[minmax(0,22ch)_1fr] sm:gap-6">
-          <dt class="font-mono text-[0.9rem] leading-relaxed text-parchment">vl-hir, vl-typecheck, vl-lir</dt>
-          <dd class="max-w-[62ch] text-[1.08rem] leading-[1.7] text-muted">The tree is desugared, checked (everything is <code class="rounded bg-wash px-1.5 py-0.5 font-mono text-[0.85em] text-parchment">int</code> in v0), and lowered to three-address code.</dd>
-        </div>
-        <div class="grid gap-1 border-y border-rule py-5 sm:grid-cols-[minmax(0,22ch)_1fr] sm:gap-6">
-          <dt class="font-mono text-[0.9rem] leading-relaxed text-parchment">vl-codegen, vl driver</dt>
-          <dd class="max-w-[62ch] text-[1.08rem] leading-[1.7] text-muted">Backends implement one <code class="rounded bg-wash px-1.5 py-0.5 font-mono text-[0.85em] text-parchment">Target</code> trait. The driver owns the CLI and prints every diagnostic.</dd>
-        </div>
-      </dl>
+    <h2 class="mt-12 text-[1.7rem] font-bold tracking-[-0.018em] text-ink">Try a line</h2>
+    <p class="mt-3 max-w-[70ch] leading-[1.65]">A stub in Svelte. The real check runs in the Rust driver.</p>
+    <div class="mt-4">
+      <Playground client:load />
     </div>
 
-    <figure class="mt-14">
-      <div class="rounded-[0.9rem] border border-rule bg-plate px-6 py-6 font-mono text-[0.9rem] leading-[1.8] text-[#efe6d2] sm:px-8">
-<pre class="m-0"><code>cargo run -- check examples/hello.vl
-cargo run -- build examples/arith.vl --emit lir</code></pre>
-      </div>
-      <figcaption class="mt-2.5 text-[1rem] italic text-muted">Two commands. The first checks, the second shows its work.</figcaption>
-    </figure>
+    <h2 class="mt-12 text-[1.7rem] font-bold tracking-[-0.018em] text-ink">Topics</h2>
+    <h3 class="mt-6 text-[1.15rem] font-bold text-ink">Reading the docs</h3>
+    <p class="mt-2">In addition to this page, you can start from these entry points.</p>
+    <div class="mt-2">
+      <p class="mt-3"><a href="/docs" class="text-link hover:underline">Documentation</a></p>
+      <p class="ml-6 mt-1 text-muted">Three short chapters, front to back.</p>
+      <p class="mt-3"><a href="/api" class="text-link hover:underline">API reference</a></p>
+      <p class="ml-6 mt-1 text-muted">One page per crate layer, in dependency order.</p>
+      <p class="mt-3"><a href="/docs/cli" class="text-link hover:underline">CLI reference</a></p>
+      <p class="ml-6 mt-1 text-muted">Every subcommand of the <code class="rounded-md bg-pill px-1.5 py-0.5 font-mono text-[0.85em] text-ink">vl</code> driver.</p>
+    </div>
+
+    <h3 class="mt-8 text-[1.15rem] font-bold text-ink">How a program travels</h3>
+    <div class="mt-2">
+      <p class="mt-3 font-mono text-[0.85rem] text-ink">vl-lex, vl-syntax, vl-semantic</p>
+      <p class="ml-6 mt-1 text-muted">Text becomes tokens, tokens become a tree, names resolve. Nothing here panics on your input.</p>
+      <p class="mt-3 font-mono text-[0.85rem] text-ink">vl-hir, vl-typecheck, vl-lir</p>
+      <p class="ml-6 mt-1 text-muted">The tree is desugared, checked, and lowered to three-address code.</p>
+      <p class="mt-3 font-mono text-[0.85rem] text-ink">vl-codegen, vl driver</p>
+      <p class="ml-6 mt-1 text-muted">Backends implement one <code class="rounded-md bg-pill px-1.5 py-0.5 font-mono text-[0.85em] text-ink">Target</code> trait. The driver prints every diagnostic.</p>
+    </div>
   </section>
 </Base>

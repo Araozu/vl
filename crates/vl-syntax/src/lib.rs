@@ -8,9 +8,13 @@
 //! stmt    := `let` ident `=` expr `;` | expr `;`
 //! expr    := term ((`+`|`-`) term)*
 //! term    := factor ((`*`|`/`) factor)*
-//! factor  := int | ident | `(` expr `)` | `-` factor
+//! factor  := call | int | ident | `(` expr `)` | `-` factor
+//! call    := ident `(` args? `)`
+//! args    := expr (`,` expr)*
 //! ```
 //!
+//! Calls are callee-by-name (`ident(args)`), TypeScript-style. The callee
+//! is a plain variable use so forward references to `function` items work.
 //! Semicolons are mandatory: every `let` and every expression statement
 //! ends with `;` (no bare trailing value like Rust).
 //!
@@ -58,6 +62,12 @@ pub enum Stmt {
 pub enum Expr {
     Int(i64, Span),
     Var(String, Span),
+    Call {
+        callee: String,
+        callee_span: Span,
+        args: Vec<Expr>,
+        span: Span,
+    },
     Unary {
         op: UnOp,
         rhs: Box<Expr>,
@@ -89,6 +99,7 @@ impl Expr {
         match self {
             Expr::Int(_, s) => *s,
             Expr::Var(_, s) => *s,
+            Expr::Call { span, .. } => *span,
             Expr::Unary { span, .. } | Expr::Binary { span, .. } => *span,
         }
     }
@@ -349,9 +360,41 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Ident(_) => {
                 self.bump();
-                match t.kind {
-                    TokenKind::Ident(name) => Some(Expr::Var(name, t.span)),
+                let (name, name_span) = match t.kind {
+                    TokenKind::Ident(name) => (name, t.span),
                     _ => unreachable!(),
+                };
+                // `ident(args)` is a call; plain `ident` is a variable.
+                if matches!(self.peek().kind, TokenKind::LParen) {
+                    self.bump(); // `(`
+                    let mut args = Vec::new();
+                    if !matches!(self.peek().kind, TokenKind::RParen) {
+                        loop {
+                            match self.parse_expr() {
+                                Some(a) => args.push(a),
+                                None => return None,
+                            }
+                            match &self.peek().kind {
+                                TokenKind::Comma => {
+                                    self.bump();
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                    let close = match self.expect(&TokenKind::RParen, "`)`") {
+                        Some(c) => c,
+                        None => return None,
+                    };
+                    let span = Span::new(name_span.start, close.span.end);
+                    Some(Expr::Call {
+                        callee: name,
+                        callee_span: name_span,
+                        args,
+                        span,
+                    })
+                } else {
+                    Some(Expr::Var(name, name_span))
                 }
             }
             TokenKind::LParen => {
@@ -444,5 +487,48 @@ mod tests {
         let (prog, diags) = parse_src("function main() { d; }");
         assert!(diags.is_empty());
         assert_eq!(prog.items.len(), 1);
+    }
+
+    #[test]
+    fn call_with_no_args_parses() {
+        let (prog, diags) = parse_src("function main() { foo(); }");
+        assert!(diags.is_empty());
+        match &prog.items[0] {
+            Item::Function { body, .. } => match &body[0] {
+                Stmt::Expr(Expr::Call { callee, args, .. }) => {
+                    assert_eq!(callee, "foo");
+                    assert!(args.is_empty());
+                }
+                other => panic!("expected call, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_with_args_and_nesting_parses() {
+        let (prog, diags) = parse_src("function main() { add(1, mul(2, 3)); }");
+        assert!(diags.is_empty());
+        match &prog.items[0] {
+            Item::Function { body, .. } => match &body[0] {
+                Stmt::Expr(Expr::Call { callee, args, .. }) => {
+                    assert_eq!(callee, "add");
+                    assert_eq!(args.len(), 2);
+                    assert!(matches!(args[1], Expr::Call { .. }));
+                }
+                other => panic!("expected call, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_binds_tighter_than_add() {
+        let (prog, diags) = parse_src("let x = f(1) + 2;");
+        assert!(diags.is_empty());
+        match &prog.items[0] {
+            Item::Let { value, .. } => assert!(matches!(value, Expr::Binary { .. })),
+            other => panic!("expected let, got {other:?}"),
+        }
     }
 }

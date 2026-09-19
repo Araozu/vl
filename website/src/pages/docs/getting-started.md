@@ -1,25 +1,48 @@
 ---
 layout: ../../layouts/Docs.astro
-title: Getting started · VL
+title: Getting started
+description: Install Rust, check a program, build it, look inside.
+eyebrow: Article
+availability: VL 0.1+
 ---
 
-<h1>Getting started</h1>
-<p>A sketch of the final guide. The commands below already work.</p>
+# Getting started
 
-<h2>Ask for Rust, get a compiler</h2>
-<p>You need Rust stable 1.80 or newer, plus Cargo. Nothing else. Clone the repository; the compiler lives at the workspace root.</p>
+A sketch of the final guide. The commands below already work.
 
-<h2>Check a program</h2>
-<pre>cargo run -- check examples/hello.vl</pre>
-<p class="mt-4 text-muted">A clean program exits 0 and stays silent. A broken one exits 1 with an Ariadne report pointing at the span.</p>
+```text
+vl check <file>
+```
 
-<h2>Build it and look inside</h2>
-<pre>cargo run -- build examples/arith.vl --emit lir
-cargo run -- build examples/arith.vl --target stackvm</pre>
+## Overview
 
-<h2>Still to write</h2>
-<ul class="list-disc space-y-1 pl-6">
-  <li>Editor setup and <code>.vl</code> file association</li>
-  <li>A first program, walked line by line</li>
-  <li>How to read an Ariadne diagnostic</li>
-</ul>
+You need Rust stable 1.80 or newer, plus Cargo. Nothing else. Clone the repository; the compiler lives at the workspace root.
+
+Check a program:
+
+```sh
+cargo run -- check examples/hello.vl
+```
+
+A clean program exits 0 and stays silent. A broken one exits 1 with an Ariadne report pointing at the span.
+
+Build it and look inside:
+
+```sh
+cargo run -- build examples/arith.vl --emit lir
+cargo run -- build examples/arith.vl --target stackvm
+```
+
+## Topics
+
+### Editor setup and file association
+
+Stub. How to associate `.vl` files and where diagnostics surface.
+
+### A first program, walked line by line
+
+Stub. `hello.vl` from the first `function` to the exit code.
+
+### How to read an Ariadne diagnostic
+
+Stub. Spans, labels, and why one root cause stays one error.

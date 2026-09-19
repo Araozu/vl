@@ -1,21 +1,30 @@
 ---
 layout: ../../layouts/Docs.astro
-title: The driver · VL API
+title: The driver
+description: CLI wiring and the only place that prints a diagnostic.
+eyebrow: Reference
+availability: VL 0.1+
 section: api
 ---
 
-<h1>The driver</h1>
-<p>A sketch. The source is <code>src/main.rs</code> at the workspace root. It reads files, drives the stages in order, renders every diagnostic with <code>emit_all</code>, and chooses the exit code: 0 when clean, 1 when anything was reported.</p>
+# The driver
 
-<h2>What it owns</h2>
-<ul class="list-disc space-y-1 pl-6">
-  <li>Parsing the CLI (<code>check</code>, <code>build</code>, <code>lex</code>, <code>parse</code>, <code>targets</code>) with clap</li>
-  <li>Reading <code>.vl</code> sources off disk</li>
-  <li>Rendering <code>vl_common::Diagnostic</code> through Ariadne, in colour, on stderr</li>
-</ul>
+The source is `src/main.rs` at the workspace root. It reads files, drives the stages in order, renders every diagnostic with `emit_all`, and chooses the exit code: 0 when clean, 1 when anything was reported.
 
-<h2>Still to write</h2>
-<ul class="list-disc space-y-1 pl-6">
-  <li>Flags and exit codes per subcommand</li>
-  <li>Worked sessions beside the <a href="/docs/cli">CLI reference</a></li>
-</ul>
+## Overview
+
+The driver owns the CLI, the file I/O, the exit codes, and all printing. Libraries return diagnostics; they never print.
+
+## Topics
+
+### Parsing the CLI with clap
+
+Stub. `check`, `build`, `lex`, `parse`, and `targets`.
+
+### Reading `.vl` sources off disk
+
+Stub. Sources table, spans, and how paths reach diagnostics.
+
+### Rendering through Ariadne, in colour, on stderr
+
+Stub. Worked sessions beside the [CLI reference](/docs/cli).

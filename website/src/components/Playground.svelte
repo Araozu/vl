@@ -1,5 +1,5 @@
 <script lang="ts">
-  let source = $state('let x = 1 + 2 * 3;\nfn main() { let d = x - 1; d }');
+  let source = $state('let x = 1 + 2 * 3;\nfunction main() { let d = x - 1; d; }');
   let output = $state<string[]>(['// press Run — this sketch only pretends. The real pipeline lives in the Rust driver.']);
 
   function run() {
@@ -13,22 +13,22 @@
   }
 
   function loadSample(kind: 'hello' | 'arith' | 'error') {
-    if (kind === 'hello') source = 'fn main() { 42 }';
-    if (kind === 'arith') source = 'let x = 1 + 2 * 3;\nfn main() { let d = x - 1; d }';
-    if (kind === 'error') source = 'fn main() { undefined_var }';
+    if (kind === 'hello') source = 'function main() { 42; }';
+    if (kind === 'arith') source = 'let x = 1 + 2 * 3;\nfunction main() { let d = x - 1; d; }';
+    if (kind === 'error') source = 'function main() { undefined_var; }';
     output = ['// sample loaded — press Run'];
   }
 </script>
 
-<div class="overflow-hidden rounded-[0.9rem] border border-rule bg-plate text-[#efe6d2]">
-  <div class="flex flex-wrap items-center justify-between gap-2 border-b border-rule px-5 py-3">
-    <div class="flex gap-1 font-mono text-[0.82rem]">
-      <button class="rounded-md px-2.5 py-1 text-muted transition hover:bg-wash hover:text-parchment" onclick={() => loadSample('hello')}>hello.vl</button>
-      <button class="rounded-md px-2.5 py-1 text-muted transition hover:bg-wash hover:text-parchment" onclick={() => loadSample('arith')}>arith.vl</button>
-      <button class="rounded-md px-2.5 py-1 text-muted transition hover:bg-wash hover:text-parchment" onclick={() => loadSample('error')}>err.vl</button>
+<div class="overflow-hidden rounded-xl bg-plate text-ink">
+  <div class="flex flex-wrap items-center justify-between gap-2 border-b border-rule px-4 py-2.5">
+    <div class="flex gap-1 font-mono text-[0.8rem]">
+      <button class="rounded-md px-2.5 py-1 text-muted transition hover:bg-pill hover:text-ink" onclick={() => loadSample('hello')}>hello.vl</button>
+      <button class="rounded-md px-2.5 py-1 text-muted transition hover:bg-pill hover:text-ink" onclick={() => loadSample('arith')}>arith.vl</button>
+      <button class="rounded-md px-2.5 py-1 text-muted transition hover:bg-pill hover:text-ink" onclick={() => loadSample('error')}>err.vl</button>
     </div>
     <button
-      class="rounded-full bg-gold px-5 py-1.5 font-display text-[1rem] font-semibold text-night transition hover:bg-gold-bright"
+      class="rounded-full bg-accent px-4 py-1 text-[0.82rem] font-medium text-white transition hover:brightness-110"
       onclick={run}
     >
       Run
@@ -38,10 +38,10 @@
     <textarea
       bind:value={source}
       spellcheck={false}
-      class="min-h-56 resize-y bg-transparent p-5 font-mono text-[0.9rem] leading-[1.75] text-[#efe6d2] outline-none placeholder:text-faint"
+      class="min-h-48 resize-y bg-transparent p-4 font-mono text-[0.83rem] leading-[1.7] text-ink outline-none placeholder:text-faint"
       placeholder="write VL here…"
     ></textarea>
-    <div class="border-t border-rule p-5 font-mono text-[0.84rem] leading-[1.75] md:border-l md:border-t-0">
+    <div class="border-t border-rule p-4 font-mono text-[0.8rem] leading-[1.7] md:border-l md:border-t-0">
       {#each output as line}
         <p class="text-muted">{line}</p>
       {/each}

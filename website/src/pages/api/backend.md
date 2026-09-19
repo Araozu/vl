@@ -1,20 +1,34 @@
 ---
 layout: ../../layouts/Docs.astro
-title: Backend crates · VL API
+title: Backend crates
+description: A resolved tree in, backend output out.
+eyebrow: Reference
+availability: VL 0.1+
 section: api
 ---
 
-<h1>Backend crates</h1>
-<p>A sketch. A resolved tree in, backend output out.</p>
+# Backend crates
 
-<h2>vl-hir</h2>
-<p>The desugared tree, with node ids and <code>DefId</code> links. Still to write: the node catalogue.</p>
+A resolved tree in, backend output out.
 
-<h2>vl-typecheck</h2>
-<p>Types and their rules. In v0 everything is <code>int</code>. Still to write: the judgments.</p>
+```text
+vl-hir → vl-typecheck → vl-lir → vl-codegen
+```
 
-<h2>vl-lir</h2>
-<p>Target-agnostic three-address code. Still to write: the instruction set.</p>
+## Topics
 
-<h2>vl-codegen</h2>
-<p>Backends implement <code>Target</code> and register in <code>lookup</code> and <code>all_targets</code>. The placeholder backend stays until a real one takes its place as default. Still to write: how to add a backend.</p>
+### `vl-hir`
+
+The desugared tree, with node ids and `DefId` links. Stub: the node catalogue.
+
+### `vl-typecheck`
+
+Types and their rules. In v0 everything is `int`. Stub: the judgments.
+
+### `vl-lir`
+
+Target-agnostic three-address code. Stub: the instruction set.
+
+### `vl-codegen`
+
+Backends implement `Target` and register in `lookup` and `all_targets`. The placeholder backend stays until a real one takes its place as default. Stub: how to add a backend.

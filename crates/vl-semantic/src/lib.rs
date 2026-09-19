@@ -170,6 +170,33 @@ impl Resolver {
                     );
                 }
             },
+            Expr::Call {
+                callee,
+                callee_span,
+                args,
+                ..
+            } => {
+                // Callee is a plain name use so `function` items resolve
+                // (including forward references via the global pre-pass).
+                match self.lookup(callee) {
+                    Some(id) => {
+                        self.out
+                            .uses
+                            .insert((callee_span.start, callee_span.end), id);
+                    }
+                    None => {
+                        self.diags.push(
+                            Diagnostic::error(format!("cannot find `{callee}` in this scope"))
+                                .with_label(*callee_span, "undefined function")
+                                .with_note("did you mean to `function`-define it first?")
+                                .with_code("E201"),
+                        );
+                    }
+                }
+                for arg in args {
+                    self.resolve_expr(arg);
+                }
+            }
             Expr::Unary { rhs, .. } => self.resolve_expr(rhs),
             Expr::Binary { lhs, rhs, .. } => {
                 self.resolve_expr(lhs);
@@ -201,6 +228,25 @@ mod tests {
         let (toks, _) = vl_lex::lex("function f(x) { let x = 1; x; }");
         let (prog, _) = vl_syntax::parse(&toks, "");
         let (_, diags) = resolve(&prog);
+        assert!(diags.iter().all(|d| !d.is_error()));
+    }
+
+    #[test]
+    fn call_callee_and_args_resolve() {
+        let (_, diags) = resolve_src("function add(a, b) { a + b; } function main() { add(1, 2); }");
+        assert!(diags.iter().all(|d| !d.is_error()));
+    }
+
+    #[test]
+    fn undefined_callee_errors() {
+        let (_, diags) = resolve_src("function main() { nope(1); }");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("nope"));
+    }
+
+    #[test]
+    fn forward_call_resolves_via_global_prepass() {
+        let (_, diags) = resolve_src("function main() { helper(); } function helper() { 1; }");
         assert!(diags.iter().all(|d| !d.is_error()));
     }
 }

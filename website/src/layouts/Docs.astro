@@ -4,58 +4,121 @@ import Base from './Base.astro';
 interface Props {
   title?: string;
   description?: string;
-  section?: 'docs' | 'api';
+  eyebrow?: string;
+  availability?: string;
 }
 const fm = (Astro.props as { frontmatter?: Record<string, unknown> }).frontmatter ?? {};
 const title = (fm.title as string | undefined) ?? (Astro.props as Props).title ?? 'Documentation';
 const description = (fm.description as string | undefined) ?? (Astro.props as Props).description;
-const section = ((fm.section as string | undefined) ?? (Astro.props as Props).section ?? 'docs') as 'docs' | 'api';
+const eyebrow = (fm.eyebrow as string | undefined) ?? (Astro.props as Props).eyebrow ?? 'Article';
+const availability = (fm.availability as string | undefined) ?? (Astro.props as Props).availability ?? 'VL 0.1+';
 
-const docsNav = [
-  { href: '/docs', label: 'Overview' },
-  { href: '/docs/getting-started', label: 'Getting started' },
-  { href: '/docs/language', label: 'Language tour' },
-  { href: '/docs/cli', label: 'CLI reference' },
+// Sidebar mirrors the Swift reference: back link, product title, grey
+// section labels, icon rows, one selected pill, filter box pinned bottom.
+const groups = [
+  {
+    label: 'Essentials',
+    items: [
+      { href: '/docs', label: 'VL updates', icon: 'doc' },
+      { href: '/docs/getting-started', label: 'Getting started', icon: 'doc' },
+      { href: '/docs/language', label: 'Adopting VL in v0 apps', icon: 'doc' },
+    ],
+  },
+  {
+    label: 'Standard Library',
+    items: [
+      { href: '/docs/language', label: 'Int', icon: 'S', stub: true },
+      { href: '/docs/language', label: 'Double', icon: 'S', stub: true },
+      { href: '/docs/cli', label: 'String', icon: 'S', stub: true },
+      { href: '/docs', label: 'Array', icon: 'S', stub: true },
+    ],
+  },
+  {
+    label: 'Compiler Reference',
+    items: [
+      { href: '/api', label: 'Overview', icon: 'doc' },
+      { href: '/api/driver', label: 'The driver', icon: 'S' },
+      { href: '/api/frontend', label: 'Frontend crates', icon: 'S' },
+      { href: '/api/backend', label: 'Backend crates', icon: 'S' },
+      { href: '/docs/cli', label: 'CLI reference', icon: 'M' },
+    ],
+  },
 ];
 
-const apiNav = [
-  { href: '/api', label: 'Overview' },
-  { href: '/api/driver', label: 'The driver' },
-  { href: '/api/frontend', label: 'Frontend crates' },
-  { href: '/api/backend', label: 'Backend crates' },
-];
-
-const nav = section === 'api' ? apiNav : docsNav;
+// Breadcrumb: "VL / <page>"
+const shortTitle = String(title).split('·')[0].split('|')[0].trim();
 const pathname = Astro.url.pathname;
 ---
 
 <Base title={title} description={description}>
-  <div class="mx-auto max-w-5xl px-4 py-12 sm:px-6 sm:py-16">
-    <div class="grid gap-12 lg:grid-cols-[200px_minmax(0,1fr)]">
-      <aside class="lg:sticky lg:top-24 lg:self-start">
-        <p class="text-[1.05rem] italic text-muted">
-          {section === 'api' ? 'The crates, in dependency order.' : 'Read front to back, or dip in.'}
-        </p>
-        <nav class="mt-4 flex gap-x-5 gap-y-1 overflow-x-auto border-y border-rule py-3 lg:flex-col lg:gap-0 lg:py-1">
+  <div class="mx-auto max-w-[1400px]">
+    <div class="grid lg:grid-cols-[300px_minmax(0,1fr)]">
+      <!-- Sidebar -->
+      <aside class="hidden border-r border-rule lg:flex lg:min-h-[calc(100vh-6.5rem)] lg:flex-col">
+        <nav class="flex-1 px-3 py-4" aria-label="Documentation">
+          <a href="/docs" class="flex items-center gap-1.5 px-2 py-1.5 text-[0.83rem] font-medium text-body transition hover:text-ink">
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M7.5 2 4 6l3.5 4"/></svg>
+            All Technologies
+          </a>
+          <p class="px-2 pb-1 pt-3 text-[0.98rem] font-bold tracking-tight text-ink">VL</p>
           {
-            nav.map((item) => (
-              <a
-                href={item.href}
-                aria-current={pathname === item.href ? 'page' : undefined}
-                class:list={[
-                  'whitespace-nowrap py-1 text-[1.02rem] transition lg:border-b lg:border-rule lg:py-2.5 lg:last:border-b-0',
-                  pathname === item.href ? 'font-semibold text-gold' : 'text-muted hover:text-parchment',
-                ]}
-              >
-                {item.label}
-              </a>
+            groups.map((group) => (
+              <div class="mt-2">
+                <p class="px-2 py-1 text-[0.82rem] font-medium text-muted">{group.label}</p>
+                <ul>
+                  {group.items.map((item) => {
+                    const isCurrent = pathname === item.href && !(item as { stub?: boolean }).stub;
+                    return (
+                      <li>
+                        <a
+                          href={item.href}
+                          aria-current={isCurrent ? 'page' : undefined}
+                          class="side-link mt-px flex items-center gap-2 rounded-md px-2 py-[0.42rem] text-[0.85rem] text-body transition hover:text-ink"
+                        >
+                          {item.icon === 'doc' ? (
+                            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" class="flex-none text-faint" aria-hidden="true"><path d="M3 1.8h5.2L11 4.6V12.2H3V1.8Z"/><path d="M8 1.8v2.8h3"/></svg>
+                          ) : (
+                            <span class="side-badge" aria-hidden="true">{item.icon}</span>
+                          )}
+                          <span class="truncate">{item.label}</span>
+                        </a>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
             ))
           }
         </nav>
+        <div class="sticky bottom-0 border-t border-rule bg-black p-3">
+          <div class="flex items-center gap-2">
+            <label class="flex flex-1 items-center gap-2 rounded-lg border border-rule bg-panel px-3 py-1.5 text-[0.83rem] text-faint">
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M1.5 3.5h11M3.5 7h7M5.5 10.5h3"/></svg>
+              <input type="search" placeholder="Filter" class="w-full bg-transparent text-body outline-none placeholder:text-faint" />
+            </label>
+            <kbd class="rounded-lg border border-rule bg-panel px-2.5 py-1.5 font-mono text-[0.8rem] text-muted">/</kbd>
+          </div>
+        </div>
       </aside>
-      <article class="prose-vl min-w-0">
-        <slot />
-      </article>
+
+      <!-- Mobile nav: horizontal strip -->
+      <nav class="flex gap-2 overflow-x-auto border-b border-rule px-4 py-3 lg:hidden" aria-label="Documentation">
+        <a href="/docs" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">Docs</a>
+        <a href="/docs/getting-started" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">Getting started</a>
+        <a href="/docs/language" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">Language</a>
+        <a href="/docs/cli" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">CLI</a>
+        <a href="/api" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">API</a>
+      </nav>
+
+      <!-- Content -->
+      <div class="min-w-0 px-5 py-8 sm:px-10 lg:px-16 lg:py-10">
+        <p class="text-[0.82rem] text-muted"><a href="/docs" class="underline decoration-rule underline-offset-4 hover:text-body">VL</a> / {shortTitle}</p>
+        <p class="mt-6 text-[0.95rem] font-medium text-muted">{eyebrow}</p>
+        <div class="docs-prose">
+          <slot />
+        </div>
+        <p class="mt-5 text-[0.8rem] text-muted">{availability}</p>
+      </div>
     </div>
   </div>
 </Base>
