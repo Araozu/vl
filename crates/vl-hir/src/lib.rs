@@ -18,6 +18,7 @@ pub struct HirId(pub u32);
 
 #[derive(Debug, Clone)]
 pub struct HirProgram {
+    pub module: String,
     pub items: Vec<HirItem>,
 }
 
@@ -72,6 +73,7 @@ pub enum HirExpr {
         id: HirId,
         /// Resolved callee (`None` when resolution failed; quiet downstream).
         def: Option<DefId>,
+        external: bool,
         name: String,
         args: Vec<HirExpr>,
         span: Span,
@@ -142,13 +144,24 @@ impl<'a> Lowerer<'a> {
 /// unresolved names become `def: None` and are reported by earlier stages.
 pub fn lower(prog: &AstProgram, res: &vl_semantic::Resolution) -> HirProgram {
     let mut l = Lowerer { next: 0, res };
-    let items = prog.items.iter().map(|i| l.lower_item(i)).collect();
-    HirProgram { items }
+    let items = prog
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            AstItem::Use { .. } => None,
+            _ => Some(l.lower_item(i)),
+        })
+        .collect();
+    HirProgram {
+        module: prog.module.clone(),
+        items,
+    }
 }
 
 impl<'a> Lowerer<'a> {
     fn lower_item(&mut self, item: &AstItem) -> HirItem {
         match item {
+            AstItem::Use { .. } => unreachable!("use items are filtered before lowering"),
             AstItem::Let {
                 value,
                 span,
@@ -216,10 +229,10 @@ impl<'a> Lowerer<'a> {
                 value: value.clone(),
                 span: *s,
             },
-            AstExpr::Var(name, s) => HirExpr::Var {
+            AstExpr::Var { path, span: s } => HirExpr::Var {
                 id: self.id(),
                 def: self.def_at(*s),
-                name: name.clone(),
+                name: path.join("."),
                 span: *s,
             },
             AstExpr::Call {
@@ -230,7 +243,11 @@ impl<'a> Lowerer<'a> {
             } => HirExpr::Call {
                 id: self.id(),
                 def: self.def_at(*callee_span),
-                name: callee.clone(),
+                external: self
+                    .def_at(*callee_span)
+                    .and_then(|d| self.res.defs.iter().find(|def| def.id == d))
+                    .is_some_and(|def| matches!(def.kind, vl_semantic::DefKind::External)),
+                name: callee.join("."),
                 args: args.iter().map(|a| self.lower_expr(a)).collect(),
                 span: *span,
             },

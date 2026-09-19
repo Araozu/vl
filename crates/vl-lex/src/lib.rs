@@ -25,6 +25,7 @@ pub enum TokenKind {
     LBrace,
     RBrace,
     Comma,
+    Dot,
     Eof,
 }
 
@@ -103,6 +104,10 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
             }
             ',' => {
                 tokens.push(Token::new(TokenKind::Comma, Span::new(i, i + 1)));
+                i += 1;
+            }
+            '.' => {
+                tokens.push(Token::new(TokenKind::Dot, Span::new(i, i + 1)));
                 i += 1;
             }
             '0'..='9' => {

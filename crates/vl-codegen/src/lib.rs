@@ -26,6 +26,15 @@ pub trait Target {
     fn emit(&self, prog: &LirProgram) -> (Option<Artifact>, Vec<Diagnostic>);
 }
 
+/// Modules known to the target environment. Frontend resolution consumes the
+/// same catalog, so imports and emitted calls cannot drift apart.
+pub fn modules() -> Vec<vl_common::ModuleSpec> {
+    vec![
+        vl_common::ModuleSpec::new(&["std", "fs"], &["open", "read"]),
+        vl_common::ModuleSpec::new(&["std", "string"], &["new", "len"]),
+    ]
+}
+
 /// All backends the driver knows about.
 pub fn all_targets() -> Vec<&'static str> {
     vec![DummyTarget.name(), StackVmTarget.name()]
@@ -51,7 +60,7 @@ impl Target for DummyTarget {
     }
 
     fn emit(&self, prog: &LirProgram) -> (Option<Artifact>, Vec<Diagnostic>) {
-        let mut text = String::from("; vl dummy target — pseudo-assembly\n");
+        let mut text = format!("; vl dummy target — module {}\n", prog.module);
         for f in &prog.functions {
             text.push_str(&format!("{}:\n", f.name));
             for ins in &f.instrs {
@@ -116,7 +125,7 @@ impl Target for StackVmTarget {
                 Diagnostic::warning("stackvm backend is a sketch; output is not yet executable")
                     .with_note("track the target-platform decision before hardening this"),
             ];
-        let mut text = String::from("# vl stackvm sketch\n");
+        let mut text = format!("# vl stackvm sketch — module {}\n", prog.module);
         for f in &prog.functions {
             text.push_str(&format!(".fn {}\n", f.name));
             for ins in &f.instrs {

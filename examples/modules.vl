@@ -1,0 +1,9 @@
+// Every source file is a module named after its filename.
+use std.string;
+use std.fs.{open, read};
+
+function main() {
+    string.new();
+    open();
+    read();
+}

@@ -8,7 +8,7 @@ availability: VL 0.1+
 
 # Documentation
 
-Start here. In v0, VL is integers, arithmetic, `let`, `function`, and `//` comments, carried through a strict staged pipeline. Three short chapters cover it.
+Start here. In v0, VL is integers, arithmetic, `let`, `function`, modules, and `//` comments, carried through a strict staged pipeline.
 
 ```text
 .vl → vl-lex → vl-syntax → vl-semantic → vl-hir → vl-typecheck → vl-lir → vl-codegen

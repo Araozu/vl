@@ -8,10 +8,12 @@
 //! so rendering stays uniform. No `miette`, no hand-rolled caret code.
 
 pub mod diagnostic;
+pub mod module;
 pub mod source;
 pub mod span;
 
 pub use diagnostic::{Diagnostic, Label, Severity};
+pub use module::{ModulePath, ModuleSpec};
 pub use source::{FileId, Source, Sources};
 pub use span::Span;
 

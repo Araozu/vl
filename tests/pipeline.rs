@@ -93,3 +93,22 @@ fn unterminated_string_is_a_lex_error() {
         .iter()
         .any(|d| d.message.contains("unterminated string")));
 }
+
+#[test]
+fn module_imports_resolve_without_importing_descendants() {
+    let src = std::fs::read_to_string("examples/modules.vl").unwrap();
+    let lir = frontend(&src).expect("module imports must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("call string.new"), "{dump}");
+    assert!(dump.contains("call open"), "{dump}");
+}
+
+#[test]
+fn unknown_module_export_is_a_single_error() {
+    let (toks, _) = vl_lex::lex("use std.string.{missing}; function main() { missing(); }");
+    let (ast, _) = vl_syntax::parse(&toks, "");
+    let (_, diags) = vl_semantic::resolve(&ast);
+    assert!(diags
+        .iter()
+        .any(|d| d.message.contains("no export `missing`")));
+}

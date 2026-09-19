@@ -45,6 +45,33 @@ Scopes reject two things: names nobody defined, and names defined twice. After a
 
 ## Topics
 
+### Modules and namespaces
+
+Every `.vl` file is its own module. Its module name is the filename without the
+extension, so `reader.vl` is module `reader`. Target backends publish modules
+such as `std.fs` and `std.string`.
+
+Import a module with a dotted Rust-style `use`:
+
+```vl
+use std.string;
+
+function main() { string.new(); }
+```
+
+The import introduces only the final module name, not its descendants or
+exports. Use grouped imports when individual exports should be direct names:
+
+```vl
+use std.fs.{open, read};
+
+function main() { open(); read(); }
+```
+
+Unknown modules and exports are reported during name resolution. Qualified
+calls reach LIR and backend output with their full path (`string.new` after the
+module import).
+
 ### The grammar, with precedence
 
 Expressions include `int` and `string` literals. Arithmetic keeps its usual

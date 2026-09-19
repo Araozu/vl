@@ -86,6 +86,7 @@ pub struct Function {
 
 #[derive(Debug, Clone, Default)]
 pub struct LirProgram {
+    pub module: String,
     pub functions: Vec<Function>,
 }
 
@@ -149,7 +150,10 @@ impl Lowerer {
 /// Lower typed HIR to LIR. Poisoned (`Error`-typed) nodes are skipped —
 /// errors were already reported, so no new diagnostics are produced here.
 pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgram {
-    let mut out = LirProgram::default();
+    let mut out = LirProgram {
+        module: prog.module.clone(),
+        functions: Vec::new(),
+    };
     for item in &prog.items {
         match item {
             HirItem::Let { value, span, .. } => {

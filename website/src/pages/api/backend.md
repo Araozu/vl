@@ -34,3 +34,8 @@ Target-agnostic three-address code. Stub: the instruction set.
 ### `vl-codegen`
 
 Backends implement `Target` and register in `lookup` and `all_targets`. The placeholder backend stays until a real one takes its place as default. Stub: how to add a backend.
+
+Backends also publish the target module catalog. The current catalog includes
+`std.fs` (`open`, `read`) and `std.string` (`new`, `len`). Frontend imports are
+checked against this catalog, while LIR retains the source module name for
+backend placement.

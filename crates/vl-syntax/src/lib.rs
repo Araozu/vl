@@ -27,11 +27,17 @@ use vl_lex::{Token, TokenKind};
 
 #[derive(Debug, Clone)]
 pub struct Program {
+    pub module: String,
     pub items: Vec<Item>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Item {
+    Use {
+        path: Vec<String>,
+        names: Option<Vec<String>>,
+        span: Span,
+    },
     Let {
         name: String,
         name_span: Span,
@@ -62,9 +68,12 @@ pub enum Stmt {
 pub enum Expr {
     Int(i64, Span),
     String(Vec<u8>, Span),
-    Var(String, Span),
+    Var {
+        path: Vec<String>,
+        span: Span,
+    },
     Call {
-        callee: String,
+        callee: Vec<String>,
         callee_span: Span,
         args: Vec<Expr>,
         span: Span,
@@ -100,7 +109,7 @@ impl Expr {
         match self {
             Expr::Int(_, s) => *s,
             Expr::String(_, s) => *s,
-            Expr::Var(_, s) => *s,
+            Expr::Var { span, .. } => *span,
             Expr::Call { span, .. } => *span,
             Expr::Unary { span, .. } | Expr::Binary { span, .. } => *span,
         }
@@ -115,7 +124,11 @@ struct Parser<'a> {
     diags: Vec<Diagnostic>,
 }
 
-pub fn parse(toks: &[Token], _src: &str) -> (Program, Vec<Diagnostic>) {
+pub fn parse(toks: &[Token], src: &str) -> (Program, Vec<Diagnostic>) {
+    parse_with_module(toks, src, "<anonymous>")
+}
+
+pub fn parse_with_module(toks: &[Token], _src: &str, module: &str) -> (Program, Vec<Diagnostic>) {
     let mut p = Parser {
         toks,
         pos: 0,
@@ -128,7 +141,13 @@ pub fn parse(toks: &[Token], _src: &str) -> (Program, Vec<Diagnostic>) {
             None => p.recover_to_item_boundary(),
         }
     }
-    (Program { items }, p.diags)
+    (
+        Program {
+            module: module.into(),
+            items,
+        },
+        p.diags,
+    )
 }
 
 impl<'a> Parser<'a> {
@@ -182,20 +201,48 @@ impl<'a> Parser<'a> {
         match &self.peek().kind {
             TokenKind::Let => self.parse_let_item(),
             TokenKind::Function => self.parse_function_item(),
+            TokenKind::Ident(name) if name == "use" => self.parse_use_item(),
             TokenKind::Eof => None,
             _ => {
                 let t = self.peek().clone();
                 self.diags.push(
                     Diagnostic::error(format!(
-                        "expected an item (`let` or `function`), found {}",
+                        "expected an item (`use`, `let` or `function`), found {}",
                         describe(&t.kind)
                     ))
-                    .with_label(t.span, "items start with `let` or `function`")
+                    .with_label(t.span, "items start with `use`, `let` or `function`")
                     .with_code("E101"),
                 );
                 None
             }
         }
+    }
+
+    fn parse_use_item(&mut self) -> Option<Item> {
+        let start = self.bump().span;
+        let path = self.parse_path()?;
+        let names = if matches!(self.peek().kind, TokenKind::Dot) {
+            self.bump();
+            self.expect(&TokenKind::LBrace, "`{` after module path")?;
+            let mut names = Vec::new();
+            loop {
+                names.push(self.parse_ident()?.0);
+                if !matches!(self.peek().kind, TokenKind::Comma) {
+                    break;
+                }
+                self.bump();
+            }
+            self.expect(&TokenKind::RBrace, "`}` after imported names")?;
+            Some(names)
+        } else {
+            None
+        };
+        let semi = self.expect(&TokenKind::Semi, "`;`")?;
+        Some(Item::Use {
+            path,
+            names,
+            span: Span::new(start.start, semi.span.end),
+        })
     }
 
     fn parse_let_item(&mut self) -> Option<Item> {
@@ -311,6 +358,21 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_path(&mut self) -> Option<Vec<String>> {
+        let mut path = vec![self.parse_ident()?.0];
+        while matches!(self.peek().kind, TokenKind::Dot) {
+            if matches!(
+                self.toks.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::LBrace)
+            ) {
+                break;
+            }
+            self.bump();
+            path.push(self.parse_ident()?.0);
+        }
+        Some(path)
+    }
+
     fn parse_expr(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_term()?;
         loop {
@@ -365,12 +427,8 @@ impl<'a> Parser<'a> {
                 Some(Expr::String(value, t.span))
             }
             TokenKind::Ident(_) => {
-                self.bump();
-                let (name, name_span) = match t.kind {
-                    TokenKind::Ident(name) => (name, t.span),
-                    _ => unreachable!(),
-                };
-                // `ident(args)` is a call; plain `ident` is a variable.
+                let path = self.parse_path()?;
+                let end = self.toks[self.pos.saturating_sub(1)].span.end;
                 if matches!(self.peek().kind, TokenKind::LParen) {
                     self.bump(); // `(`
                     let mut args = Vec::new();
@@ -386,15 +444,18 @@ impl<'a> Parser<'a> {
                         }
                     }
                     let close = self.expect(&TokenKind::RParen, "`)`")?;
-                    let span = Span::new(name_span.start, close.span.end);
+                    let span = Span::new(t.span.start, close.span.end);
                     Some(Expr::Call {
-                        callee: name,
-                        callee_span: name_span,
+                        callee: path,
+                        callee_span: Span::new(t.span.start, end),
                         args,
                         span,
                     })
                 } else {
-                    Some(Expr::Var(name, name_span))
+                    Some(Expr::Var {
+                        path,
+                        span: Span::new(t.span.start, end),
+                    })
                 }
             }
             TokenKind::LParen => {
@@ -450,6 +511,7 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::LBrace => "`{`".into(),
         TokenKind::RBrace => "`}`".into(),
         TokenKind::Comma => "`,`".into(),
+        TokenKind::Dot => "`.`".into(),
         TokenKind::Eof => "end of file".into(),
     }
 }
@@ -497,7 +559,7 @@ mod tests {
         match &prog.items[0] {
             Item::Function { body, .. } => match &body[0] {
                 Stmt::Expr(Expr::Call { callee, args, .. }) => {
-                    assert_eq!(callee, "foo");
+                    assert_eq!(callee, &vec!["foo".to_string()]);
                     assert!(args.is_empty());
                 }
                 other => panic!("expected call, got {other:?}"),
@@ -513,7 +575,7 @@ mod tests {
         match &prog.items[0] {
             Item::Function { body, .. } => match &body[0] {
                 Stmt::Expr(Expr::Call { callee, args, .. }) => {
-                    assert_eq!(callee, "add");
+                    assert_eq!(callee, &vec!["add".to_string()]);
                     assert_eq!(args.len(), 2);
                     assert!(matches!(args[1], Expr::Call { .. }));
                 }
@@ -541,5 +603,15 @@ mod tests {
             &prog.items[0],
             Item::Let { value: Expr::String(value, _), .. } if value == b"hello"
         ));
+    }
+
+    #[test]
+    fn parses_module_use_and_qualified_call() {
+        let (prog, diags) =
+            parse_src("use std.string.{new, len}; function main() { string.new(); new(); }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(
+            matches!(&prog.items[0], Item::Use { path, names: Some(names), .. } if path == &vec![String::from("std"), String::from("string")] && names.len() == 2)
+        );
     }
 }

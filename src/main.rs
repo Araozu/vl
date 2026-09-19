@@ -65,14 +65,18 @@ struct Frontend {
     lir: vl_lir::LirProgram,
 }
 
-fn run_frontend(_filename: &str, text: &str) -> Result<Frontend, Vec<vl_common::Diagnostic>> {
+fn run_frontend(filename: &str, text: &str) -> Result<Frontend, Vec<vl_common::Diagnostic>> {
     let mut diags = Vec::new();
 
     let (toks, mut d) = vl_lex::lex(text);
     diags.append(&mut d);
-    let (ast, mut d) = vl_syntax::parse(&toks, text);
+    let module = std::path::Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename);
+    let (ast, mut d) = vl_syntax::parse_with_module(&toks, text, module);
     diags.append(&mut d);
-    let (res, mut d) = vl_semantic::resolve(&ast);
+    let (res, mut d) = vl_semantic::resolve_with_modules(&ast, &vl_codegen::modules());
     diags.append(&mut d);
     let hir = vl_hir::lower(&ast, &res);
     let (typed, mut d) = vl_typecheck::check(&hir);

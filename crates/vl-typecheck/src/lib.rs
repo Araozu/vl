@@ -154,6 +154,7 @@ impl Checker {
             HirExpr::Call {
                 id,
                 def,
+                external,
                 name,
                 args,
                 span,
@@ -168,6 +169,9 @@ impl Checker {
                     // Unresolved callee already reported; stay quiet.
                     return self.record(*id, Ty::Error);
                 };
+                if *external {
+                    return self.record(*id, Ty::Int);
+                }
                 if !self.typed.func_defs.contains(&d.0) {
                     self.diags.push(
                         Diagnostic::error(format!("`{name}` is not a function"))

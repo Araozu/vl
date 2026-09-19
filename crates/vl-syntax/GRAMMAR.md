@@ -9,7 +9,8 @@ Parser recovers per-item (and per-stmt inside `function`); one bad item hides no
 
 ```text
 program := item*
-item    := let_item | function_item
+item    := use_item | let_item | function_item
+use_item := "use" path ("." "{" ident ("," ident)* "}")? ";"
 let_item := "let" ident "=" expr ";"
 function_item := "function" ident "(" params? ")" block
 params   := ident ("," ident)*          ; no trailing comma
@@ -19,13 +20,14 @@ let_stmt := "let" ident "=" expr ";"
 expr_stmt := expr ";"                   ; mandatory, TS-style
 expr     := term (("+" | "-") term)*     ; left-assoc
 term     := factor (("*" | "/") factor)* ; left-assoc
-factor   := call | int | string | ident | "(" expr ")" | "-" factor
-call     := ident "(" args? ")"
+factor   := call | int | string | path | "(" expr ")" | "-" factor
+path     := ident ("." ident)*
+call     := path "(" args? ")"
 args     := expr ("," expr)*
 ```
 
 Terminal names are `vl-lex` `TokenKind`s: `Let Function Eq Semi LParen RParen
-LBrace RBrace Comma Plus Minus Star Slash Ident Int String Eof`.
+LBrace RBrace Comma Dot Plus Minus Star Slash Ident Int String Eof`.
 
 ### Notes
 
@@ -45,8 +47,8 @@ Item ::= Let { name, name_span, value: Expr, span }
        | Function { name, name_span, params: Vec<(String, Span)>, body: Vec<Stmt>, span }
 Stmt ::= Let { name, name_span, value: Expr, span }
        | Expr(Expr)
-Expr ::= Int(i64, Span) | String(Vec<u8>, Span) | Var(String, Span)
-        | Call { callee, callee_span, args, span }
+Expr ::= Int(i64, Span) | String(Vec<u8>, Span) | Var { path, span }
+         | Call { callee: path, callee_span, args, span }
         | Unary { op: Neg, rhs, span } | Binary { op, lhs, rhs, span }
 BinOp ::= Add | Sub | Mul | Div
 UnOp  ::= Neg
@@ -95,3 +97,10 @@ Missing `;` (`let x = 1`) → `E100`; `@` never reaches here (lexer `E000`).
 No `return`, no `if`/`else`/`while`, no types/annotations
 (TS-like surface only: `let`, `function`, calls, braces, mandatory `;`),
 no trailing comma in params, no bool literals.
+
+## Modules
+
+Each source file is a module named after its filename without the `.vl`
+extension. `use std.string;` brings the `string` module name into scope, but
+not its exports, so members are written `string.new()`. Grouped imports bring
+only listed exports into scope: `use std.fs.{open, read};`.

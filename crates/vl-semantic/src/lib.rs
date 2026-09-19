@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use vl_common::{Diagnostic, Span};
+use vl_common::{Diagnostic, ModuleSpec, Span};
 use vl_syntax::{Expr, Item, Program, Stmt};
 
 /// A definition site: which item/scope and which binding.
@@ -19,6 +19,13 @@ pub struct Def {
     pub id: DefId,
     pub name: String,
     pub span: Span,
+    pub kind: DefKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefKind {
+    Local,
+    External,
 }
 
 /// Resolution result: every variable *use* span maps to its [`Def`].
@@ -36,6 +43,7 @@ impl Resolution {
             id: id.clone(),
             name,
             span,
+            kind: DefKind::Local,
         });
         id
     }
@@ -59,18 +67,36 @@ struct Resolver {
     scopes: Vec<HashMap<String, DefId>>,
     out: Resolution,
     diags: Vec<Diagnostic>,
+    modules: Vec<ModuleSpec>,
+    imports: HashMap<String, ModuleSpec>,
 }
 
 pub fn resolve(prog: &Program) -> (Resolution, Vec<Diagnostic>) {
+    resolve_with_modules(prog, &default_modules())
+}
+
+pub fn resolve_with_modules(
+    prog: &Program,
+    modules: &[ModuleSpec],
+) -> (Resolution, Vec<Diagnostic>) {
     let mut r = Resolver {
         scopes: vec![HashMap::new()],
         out: Resolution::default(),
         diags: vec![],
+        modules: modules.to_vec(),
+        imports: HashMap::new(),
     };
+
+    for item in &prog.items {
+        if let Item::Use { path, names, span } = item {
+            r.resolve_use(path, names.as_deref(), *span);
+        }
+    }
 
     // Pass 1: declare top-level names so forward references work.
     for item in &prog.items {
         match item {
+            Item::Use { .. } => {}
             Item::Let {
                 name, name_span, ..
             } => {
@@ -87,6 +113,7 @@ pub fn resolve(prog: &Program) -> (Resolution, Vec<Diagnostic>) {
     // Pass 2: resolve bodies.
     for item in &prog.items {
         match item {
+            Item::Use { .. } => {}
             Item::Let { value, .. } => {
                 r.resolve_expr(value);
             }
@@ -165,16 +192,19 @@ impl Resolver {
     fn resolve_expr(&mut self, expr: &Expr) {
         match expr {
             Expr::Int(_, _) | Expr::String(_, _) => {}
-            Expr::Var(name, span) => match self.lookup(name) {
+            Expr::Var { path, span } => match self.lookup_path(path, *span) {
                 Some(id) => {
                     self.out.uses.insert((span.start, span.end), id);
                 }
                 None => {
                     self.diags.push(
-                        Diagnostic::error(format!("cannot find `{name}` in this scope"))
-                            .with_label(*span, "undefined variable")
-                            .with_note("did you mean to `let`-bind it first?")
-                            .with_code("E201"),
+                        Diagnostic::error(format!(
+                            "cannot find `{}` in this scope",
+                            path.join(".")
+                        ))
+                        .with_label(*span, "undefined variable")
+                        .with_note("did you mean to `let`-bind it first?")
+                        .with_code("E201"),
                     );
                 }
             },
@@ -186,7 +216,7 @@ impl Resolver {
             } => {
                 // Callee is a plain name use so `function` items resolve
                 // (including forward references via the global pre-pass).
-                match self.lookup(callee) {
+                match self.lookup_path(callee, *callee_span) {
                     Some(id) => {
                         self.out
                             .uses
@@ -194,10 +224,13 @@ impl Resolver {
                     }
                     None => {
                         self.diags.push(
-                            Diagnostic::error(format!("cannot find `{callee}` in this scope"))
-                                .with_label(*callee_span, "undefined function")
-                                .with_note("did you mean to `function`-define it first?")
-                                .with_code("E201"),
+                            Diagnostic::error(format!(
+                                "cannot find `{}` in this scope",
+                                callee.join(".")
+                            ))
+                            .with_label(*callee_span, "undefined function")
+                            .with_note("did you mean to `function`-define it first?")
+                            .with_code("E201"),
                         );
                     }
                 }
@@ -212,6 +245,83 @@ impl Resolver {
             }
         }
     }
+
+    fn resolve_use(&mut self, path: &[String], names: Option<&[String]>, span: Span) {
+        let key = path.join(".");
+        let Some(module) = self
+            .modules
+            .iter()
+            .find(|m| m.path.as_string() == key)
+            .cloned()
+        else {
+            self.diags.push(
+                Diagnostic::error(format!("cannot find module `{key}`"))
+                    .with_label(span, "unknown module")
+                    .with_code("E202"),
+            );
+            return;
+        };
+        match names {
+            None => {
+                self.imports
+                    .insert(path.last().cloned().unwrap_or_default(), module);
+            }
+            Some(names) => {
+                for name in names {
+                    if !module.exports.iter().any(|export| export == name) {
+                        self.diags.push(
+                            Diagnostic::error(format!("module `{key}` has no export `{name}`"))
+                                .with_label(span, "unknown module export")
+                                .with_code("E203"),
+                        );
+                    } else {
+                        self.imports.insert(
+                            name.clone(),
+                            ModuleSpec {
+                                path: vl_common::ModulePath::new(vec![key.clone(), name.clone()]),
+                                exports: vec![],
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn lookup_path(&mut self, path: &[String], span: Span) -> Option<DefId> {
+        if path.len() == 1 {
+            if let Some(id) = self.lookup(&path[0]) {
+                return Some(id);
+            }
+            if self.imports.contains_key(&path[0]) {
+                return Some(self.external_def(path[0].clone(), span));
+            }
+            return None;
+        }
+        let module = self.imports.get(&path[0]).cloned()?;
+        if path.len() != 2 || !module.exports.iter().any(|export| export == &path[1]) {
+            return None;
+        }
+        Some(self.external_def(path.join("."), span))
+    }
+
+    fn external_def(&mut self, name: String, span: Span) -> DefId {
+        let id = DefId(self.out.defs.len() as u32);
+        self.out.defs.push(Def {
+            id: id.clone(),
+            name,
+            span,
+            kind: DefKind::External,
+        });
+        id
+    }
+}
+
+pub fn default_modules() -> Vec<ModuleSpec> {
+    vec![
+        ModuleSpec::new(&["std", "fs"], &["open", "read"]),
+        ModuleSpec::new(&["std", "string"], &["new", "len"]),
+    ]
 }
 
 #[cfg(test)]
