@@ -2,8 +2,9 @@
 use std.string;
 use std.fs.{open, read};
 
-function main() {
-    string.new();
-    open();
-    read();
+function main(): void {
+    let f = open("data.txt");
+    let s = read(f);
+    let n = string.len(s);
+    n;
 }

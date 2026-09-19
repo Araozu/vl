@@ -20,6 +20,9 @@ pub struct Def {
     pub name: String,
     pub span: Span,
     pub kind: DefKind,
+    /// Compiler-owned extern signature. `Some` for `External` defs resolved
+    /// from the module catalog; `None` for locals and poisoned imports.
+    pub sig: Option<vl_common::FuncSig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +47,7 @@ impl Resolution {
             name,
             span,
             kind: DefKind::Local,
+            sig: None,
         });
         id
     }
@@ -121,17 +125,20 @@ pub fn resolve_with_modules(
             }
             Item::Function { params, body, .. } => {
                 r.scopes.push(HashMap::new());
-                for (p, s) in params {
-                    if r.scopes.last().is_some_and(|scope| scope.contains_key(p)) {
+                for p in params {
+                    if r.scopes
+                        .last()
+                        .is_some_and(|scope| scope.contains_key(&p.name))
+                    {
                         let previous = r
                             .scopes
                             .last()
-                            .and_then(|scope| scope.get(p))
+                            .and_then(|scope| scope.get(&p.name))
                             .and_then(|id| r.out.defs.iter().find(|d| d.id == *id))
                             .map(|d| d.span);
                         let mut diagnostic =
-                            Diagnostic::error(format!("duplicate parameter `{p}`"))
-                                .with_label(*s, "redefined here")
+                            Diagnostic::error(format!("duplicate parameter `{}`", p.name))
+                                .with_label(p.name_span, "redefined here")
                                 .with_code("E200");
                         if let Some(previous) = previous {
                             diagnostic = diagnostic.with_bare_label(previous);
@@ -139,8 +146,8 @@ pub fn resolve_with_modules(
                         r.diags.push(diagnostic);
                         continue;
                     }
-                    let id = r.out.intern_def(p.clone(), *s);
-                    r.scopes.last_mut().unwrap().insert(p.clone(), id);
+                    let id = r.out.intern_def(p.name.clone(), p.name_span);
+                    r.scopes.last_mut().unwrap().insert(p.name.clone(), id);
                 }
                 for stmt in body {
                     r.resolve_stmt(stmt);
@@ -305,7 +312,7 @@ impl Resolver {
                     .find(|m| m.path.as_string() == parent_key)
                     .cloned()
                 {
-                    if parent.exports.iter().any(|export| export == &leaf) {
+                    if parent.lookup(&leaf).is_some() {
                         self.imports.insert(
                             leaf.clone(),
                             ModuleSpec {
@@ -343,7 +350,7 @@ impl Resolver {
             }
             Some(names) => {
                 for name in names {
-                    if !module.exports.iter().any(|export| export == name) {
+                    if module.lookup(name).is_none() {
                         self.poisoned_imports.insert(name.clone());
                         self.poisoned_imports.insert(format!("{key}.{name}"));
                         self.diags.push(
@@ -365,51 +372,94 @@ impl Resolver {
         }
     }
 
+    /// Resolve the compiler-owned signature for a bare imported name
+    /// (`use std.print;` then `print()`). The synthetic import path encodes
+    /// the parent module + leaf (`std.print`), which we split to find the
+    /// original export.
+    fn sig_for_bare_import(&self, alias: &str) -> Option<vl_common::FuncSig> {
+        let synthetic = self.imports.get(alias)?;
+        // Synthetic singletons carry no exports; real module aliases (e.g.
+        // `use std.string`) do and are not bare-callable.
+        if !synthetic.exports.is_empty() {
+            return None;
+        }
+        let full = synthetic.path.as_string();
+        let (parent_key, leaf) = full.rsplit_once('.')?;
+        // `ModulePath::new(vec![key, name])` stores the dotted key as one
+        // segment, so split the string form rather than the segments.
+        let parent = self
+            .modules
+            .iter()
+            .find(|m| m.path.as_string() == parent_key)?;
+        parent.lookup(leaf).map(|e| e.sig.clone())
+    }
+
     fn lookup_path(&mut self, path: &[String], span: Span) -> Option<DefId> {
         if path.len() == 1 {
             if let Some(id) = self.lookup(&path[0]) {
                 return Some(id);
             }
             if self.imports.contains_key(&path[0]) {
-                return Some(self.external_def(path[0].clone(), span));
+                let sig = self.sig_for_bare_import(&path[0]);
+                return Some(self.external_def(path[0].clone(), span, sig));
             }
             if self.poisoned_imports.contains(&path[0]) {
-                return Some(self.external_def(path[0].clone(), span));
+                return Some(self.external_def(path[0].clone(), span, None));
             }
             return None;
         }
         if self.poisoned_imports.contains(&path.join(".")) {
-            return Some(self.external_def(path.join("."), span));
+            return Some(self.external_def(path.join("."), span, None));
         }
         // `use missing.module;` poisons the imported alias (`module`), not
         // only the full source path. Treat qualified uses through that alias
         // as poisoned too, so the E202 root cause does not cascade into E201.
         if self.poisoned_imports.contains(&path[0]) {
-            return Some(self.external_def(path.join("."), span));
+            return Some(self.external_def(path.join("."), span, None));
         }
         let module = self.imports.get(&path[0]).cloned()?;
-        if path.len() != 2 || !module.exports.iter().any(|export| export == &path[1]) {
+        if path.len() != 2 {
             return None;
         }
-        Some(self.external_def(path.join("."), span))
+        let export = module.lookup(&path[1])?;
+        let sig = export.sig.clone();
+        Some(self.external_def(path.join("."), span, Some(sig)))
     }
 
-    fn external_def(&mut self, name: String, span: Span) -> DefId {
+    fn external_def(&mut self, name: String, span: Span, sig: Option<vl_common::FuncSig>) -> DefId {
         let id = DefId(self.out.defs.len() as u32);
         self.out.defs.push(Def {
             id: id.clone(),
             name,
             span,
             kind: DefKind::External,
+            sig,
         });
         id
     }
 }
 
 pub fn default_modules() -> Vec<ModuleSpec> {
+    use vl_common::VlType as T;
     vec![
-        ModuleSpec::new(&["std", "fs"], &["open", "read"]),
-        ModuleSpec::new(&["std", "string"], &["new", "len"]),
+        ModuleSpec::new(
+            &["std"],
+            &[
+                ("print", &[("value", T::String)], T::Void),
+                ("print_u64", &[("value", T::U64)], T::Void),
+            ],
+        ),
+        ModuleSpec::new(
+            &["std", "fs"],
+            &[
+                ("open", &[("path", T::String)], T::File),
+                ("read", &[("file", T::File)], T::String),
+            ],
+        ),
+        ModuleSpec::new(
+            &["std", "string"],
+            &[("len", &[("value", T::String)], T::U64)],
+        ),
     ]
 }
 
@@ -432,7 +482,7 @@ mod tests {
 
     #[test]
     fn shadowing_is_a_warning_only() {
-        let (toks, _) = vl_lex::lex("function f(x) { let x = 1; x; }");
+        let (toks, _) = vl_lex::lex("function f(x: i64): i64 { let x = 1; x; }");
         let (prog, _) = vl_syntax::parse(&toks, "");
         let (_, diags) = resolve(&prog);
         assert!(diags.iter().all(|d| !d.is_error()));
@@ -440,47 +490,59 @@ mod tests {
 
     #[test]
     fn call_callee_and_args_resolve() {
-        let (_, diags) =
-            resolve_src("function add(a, b) { a + b; } function main() { add(1, 2); }");
+        let (_, diags) = resolve_src(
+            "function add(a: i64, b: i64): i64 { a + b; } function main(): void { add(1, 2); }",
+        );
         assert!(diags.iter().all(|d| !d.is_error()));
     }
 
     #[test]
     fn undefined_callee_errors() {
-        let (_, diags) = resolve_src("function main() { nope(1); }");
+        let (_, diags) = resolve_src("function main(): void { nope(1); }");
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("nope"));
     }
 
     #[test]
     fn forward_call_resolves_via_global_prepass() {
-        let (_, diags) = resolve_src("function main() { helper(); } function helper() { 1; }");
+        let (_, diags) =
+            resolve_src("function main(): void { helper(); } function helper(): i64 { 1; }");
         assert!(diags.iter().all(|d| !d.is_error()));
     }
 
     #[test]
     fn duplicate_parameters_are_an_error() {
-        let (_, diags) = resolve_src("function f(x, x) { x; }");
+        let (_, diags) = resolve_src("function f(x: i64, x: i64): i64 { x; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("duplicate parameter"));
     }
 
     #[test]
     fn poisoned_module_alias_suppresses_qualified_use_cascade() {
-        let (_, diags) = resolve_src("use missing.module; function main() { module.foo(); }");
+        let (_, diags) = resolve_src("use missing.module; function main(): void { module.foo(); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("cannot find module"));
     }
 
     #[test]
     fn single_export_use_brings_bare_name_into_scope() {
-        let (_, diags) = resolve_src("use std.string.new; function main() { new(); }");
+        let (_, diags) = resolve_src("use std.string.len; function main(): void { len(\"s\"); }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
     }
 
     #[test]
+    fn bare_import_carries_its_signature() {
+        let (res, diags) = resolve_src("use std.string.len; function main(): void { len(\"s\"); }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let def = res.defs.iter().find(|d| d.name == "len").expect("len def");
+        let sig = def.sig.as_ref().expect("extern sig");
+        assert_eq!(sig.ret, vl_common::VlType::U64);
+        assert_eq!(sig.params.len(), 1);
+    }
+
+    #[test]
     fn single_export_use_of_std_print_resolves() {
-        let (toks, _) = vl_lex::lex("use std.print; function main() { print(); }");
+        let (toks, _) = vl_lex::lex("use std.print; function main(): void { print(\"hi\"); }");
         let (prog, _) = vl_syntax::parse(&toks, "");
         let (_, diags) = resolve_with_modules(&prog, &vl_codegen_modules());
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
@@ -488,16 +550,32 @@ mod tests {
 
     #[test]
     fn single_export_use_with_unknown_export_is_one_error() {
-        let (_, diags) = resolve_src("use std.string.bogus; function main() { bogus(); }");
+        let (_, diags) = resolve_src("use std.string.bogus; function main(): void { bogus(); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("no export `bogus`"));
     }
 
     fn vl_codegen_modules() -> Vec<ModuleSpec> {
+        use vl_common::VlType as T;
         vec![
-            ModuleSpec::new(&["std"], &["print", "print_u64"]),
-            ModuleSpec::new(&["std", "fs"], &["open", "read"]),
-            ModuleSpec::new(&["std", "string"], &["new", "len"]),
+            ModuleSpec::new(
+                &["std"],
+                &[
+                    ("print", &[("value", T::String)], T::Void),
+                    ("print_u64", &[("value", T::U64)], T::Void),
+                ],
+            ),
+            ModuleSpec::new(
+                &["std", "fs"],
+                &[
+                    ("open", &[("path", T::String)], T::File),
+                    ("read", &[("file", T::File)], T::String),
+                ],
+            ),
+            ModuleSpec::new(
+                &["std", "string"],
+                &[("len", &[("value", T::String)], T::U64)],
+            ),
         ]
     }
 }

@@ -106,13 +106,14 @@ fn module_imports_resolve_without_importing_descendants() {
     let src = std::fs::read_to_string("examples/modules.vl").unwrap();
     let lir = frontend(&src).expect("module imports must compile");
     let dump = lir.dump();
-    assert!(dump.contains("call string.new"), "{dump}");
+    assert!(dump.contains("call string.len"), "{dump}");
     assert!(dump.contains("call open"), "{dump}");
+    assert!(dump.contains("call read"), "{dump}");
 }
 
 #[test]
 fn unknown_module_export_is_a_single_error() {
-    let (toks, _) = vl_lex::lex("use std.string.{missing}; function main() { missing(); }");
+    let (toks, _) = vl_lex::lex("use std.string.{missing}; function main(): void { missing(); }");
     let (ast, _) = vl_syntax::parse(&toks, "");
     let (_, diags) = vl_semantic::resolve(&ast);
     assert!(diags
@@ -122,9 +123,10 @@ fn unknown_module_export_is_a_single_error() {
 
 #[test]
 fn scalar_literals_and_if_lower_to_typed_control_flow() {
-    let lir =
-        frontend("function main() { let x = 1u64; if (true) { x; } else { 255u8; } 1.5f64; }")
-            .expect("scalar literals and if must compile");
+    let lir = frontend(
+        "function main(): void { let x = 1u64; if (true) { x; } else { 255u8; } 1.5f64; }",
+    )
+    .expect("scalar literals and if must compile");
     let dump = lir.dump();
     assert!(dump.contains("const 1u64"), "{dump}");
     assert!(dump.contains("const 1.5f64"), "{dump}");
@@ -134,7 +136,8 @@ fn scalar_literals_and_if_lower_to_typed_control_flow() {
 
 #[test]
 fn if_requires_a_boolean_condition() {
-    let err = frontend("function main() { if (1) { 2; } }").expect_err("if condition must be bool");
+    let err =
+        frontend("function main(): void { if (1) { 2; } }").expect_err("if condition must be bool");
     assert!(
         err.iter().any(|d| d.message.contains("must be bool")),
         "{err:?}"
@@ -143,7 +146,36 @@ fn if_requires_a_boolean_condition() {
 
 #[test]
 fn unbraced_conditional_branches_compile() {
-    let lir = frontend("function main() { if (true) 1u64; else 2u64; }")
+    let lir = frontend("function main(): void { if (true) 1u64; else 2u64; }")
         .expect("unbraced branches must compile");
     assert!(lir.dump().contains("branch_if_false"));
+}
+
+#[test]
+fn extern_call_arg_types_are_checked() {
+    let err = frontend("use std; function main(): void { std.print(1); }")
+        .expect_err("print expects string");
+    assert!(
+        err.iter().any(|d| d.message.contains("expects `string`")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn extern_call_arity_is_checked() {
+    let err = frontend("use std; function main(): void { std.print(\"a\", \"b\"); }")
+        .expect_err("print expects one arg");
+    assert!(
+        err.iter().any(|d| d.message.contains("expects 1")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn missing_annotations_are_an_error() {
+    let err = frontend("function add(a, b) { a + b; }").expect_err("must fail");
+    assert!(
+        err.iter().any(|d| d.code.as_deref() == Some("E104")),
+        "{err:?}"
+    );
 }

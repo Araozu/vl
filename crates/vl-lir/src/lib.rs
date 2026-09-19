@@ -244,7 +244,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                     next_label: 0,
                 };
 
-                for (index, (_, def, span)) in params.iter().enumerate() {
+                for (index, (_, def, _, span)) in params.iter().enumerate() {
                     let dst = l.reg();
                     l.instrs.push(Instr::Param {
                         dst,
@@ -472,7 +472,8 @@ mod tests {
 
     #[test]
     fn lowers_call_and_parameter_registers() {
-        let src = "function add(a, b) { a + b; } function main() { add(1, 2); }";
+        let src =
+            "function add(a: i64, b: i64): i64 { a + b; } function main(): void { add(1, 2); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -488,7 +489,7 @@ mod tests {
 
     #[test]
     fn local_reads_use_the_declared_value() {
-        let src = "function main() { let x = 7; x + 1; }";
+        let src = "function main(): void { let x = 7; x + 1; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);

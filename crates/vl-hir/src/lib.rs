@@ -5,7 +5,7 @@
 //! resolved by `vl-semantic` (or `None` when resolution failed, so later
 //! stages can skip rather than cascade errors).
 
-use vl_common::{Scalar, Span};
+use vl_common::{Scalar, Span, VlType};
 use vl_semantic::DefId;
 use vl_syntax::{
     BinOp as AstBinOp, Expr as AstExpr, Item as AstItem, Program as AstProgram, Stmt as AstStmt,
@@ -34,7 +34,12 @@ pub enum HirItem {
         id: HirId,
         def: Option<DefId>,
         name: String,
-        params: Vec<(String, Option<DefId>, Span)>,
+        /// `(name, def, type, span)`. `ty` is `None` when the annotation was
+        /// missing/unknown (already reported; typecheck poisons quietly).
+        params: Vec<(String, Option<DefId>, Option<VlType>, Span)>,
+        /// Declared return type. `None` means missing (already reported).
+        ret: Option<VlType>,
+        ret_span: Option<Span>,
         body: Vec<HirStmt>,
         span: Span,
     },
@@ -80,6 +85,9 @@ pub enum HirExpr {
         /// Resolved callee (`None` when resolution failed; quiet downstream).
         def: Option<DefId>,
         external: bool,
+        /// Compiler-owned extern signature copied from the resolved `Def`.
+        /// `None` for locals, poisoned imports, or unresolved callees.
+        extern_sig: Option<vl_common::FuncSig>,
         name: String,
         args: Vec<HirExpr>,
         span: Span,
@@ -186,6 +194,8 @@ impl<'a> Lowerer<'a> {
                 name,
                 name_span,
                 params,
+                ret,
+                ret_span,
                 body,
                 span,
                 ..
@@ -195,8 +205,17 @@ impl<'a> Lowerer<'a> {
                 name: name.clone(),
                 params: params
                     .iter()
-                    .map(|(n, s)| (n.clone(), self.def_at_site(*s), *s))
+                    .map(|p| {
+                        (
+                            p.name.clone(),
+                            self.def_at_site(p.name_span),
+                            p.ty,
+                            p.name_span,
+                        )
+                    })
                     .collect(),
+                ret: *ret,
+                ret_span: *ret_span,
                 body: body.iter().map(|s| self.lower_stmt(s)).collect(),
                 span: *span,
             },
@@ -259,17 +278,28 @@ impl<'a> Lowerer<'a> {
                 callee_span,
                 args,
                 span,
-            } => HirExpr::Call {
-                id: self.id(),
-                def: self.def_at(*callee_span),
-                external: self
-                    .def_at(*callee_span)
-                    .and_then(|d| self.res.defs.iter().find(|def| def.id == d))
-                    .is_some_and(|def| matches!(def.kind, vl_semantic::DefKind::External)),
-                name: callee.join("."),
-                args: args.iter().map(|a| self.lower_expr(a)).collect(),
-                span: *span,
-            },
+            } => {
+                let def = self.def_at(*callee_span);
+                let resolved = def
+                    .as_ref()
+                    .and_then(|d| self.res.defs.iter().find(|r| r.id == *d));
+                let external =
+                    resolved.is_some_and(|r| matches!(r.kind, vl_semantic::DefKind::External));
+                let extern_sig = if external {
+                    resolved.and_then(|r| r.sig.clone())
+                } else {
+                    None
+                };
+                HirExpr::Call {
+                    id: self.id(),
+                    def,
+                    external,
+                    extern_sig,
+                    name: callee.join("."),
+                    args: args.iter().map(|a| self.lower_expr(a)).collect(),
+                    span: *span,
+                }
+            }
             AstExpr::Unary { op, rhs, span } => {
                 let rhs = self.lower_expr(rhs);
                 let zero = match &rhs {
@@ -339,7 +369,8 @@ mod tests {
 
     #[test]
     fn call_links_callee_def() {
-        let src = "function add(a, b) { a + b; } function main() { add(1, 2); }";
+        let src =
+            "function add(a: i64, b: i64): i64 { a + b; } function main(): void { add(1, 2); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -362,7 +393,7 @@ mod tests {
 
     #[test]
     fn unresolved_call_poisoned_not_panic() {
-        let src = "function main() { nope(1); }";
+        let src = "function main(): void { nope(1); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);

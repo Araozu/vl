@@ -32,11 +32,33 @@ pub trait Target {
 
 /// Modules known to the target environment. Frontend resolution consumes the
 /// same catalog, so imports and emitted calls cannot drift apart.
+///
+/// This is where the language's extern type surface is *declared*: every
+/// export carries VL-level param names/types and a return type. Backends map
+/// these VL types to target concepts (e.g. VL `string` -> Naravm blob).
+/// Fallible VM operations (`!File`, `!String` via `errno`/`0x30`) are modeled
+/// as plain returns for now; error handling is out of scope for VL.
 pub fn modules() -> Vec<vl_common::ModuleSpec> {
+    use vl_common::VlType as T;
     vec![
-        vl_common::ModuleSpec::new(&["std"], &["print", "print_u64"]),
-        vl_common::ModuleSpec::new(&["std", "fs"], &["open", "read"]),
-        vl_common::ModuleSpec::new(&["std", "string"], &["new", "len"]),
+        vl_common::ModuleSpec::new(
+            &["std"],
+            &[
+                ("print", &[("value", T::String)], T::Void),
+                ("print_u64", &[("value", T::U64)], T::Void),
+            ],
+        ),
+        vl_common::ModuleSpec::new(
+            &["std", "fs"],
+            &[
+                ("open", &[("path", T::String)], T::File),
+                ("read", &[("file", T::File)], T::String),
+            ],
+        ),
+        vl_common::ModuleSpec::new(
+            &["std", "string"],
+            &[("len", &[("value", T::String)], T::U64)],
+        ),
     ]
 }
 
@@ -44,8 +66,12 @@ pub fn modules() -> Vec<vl_common::ModuleSpec> {
 /// catalog remains useful to frontend/library tests; drivers should resolve
 /// against this target-specific view so accepted calls are actually emit-able.
 pub fn modules_for_target(target: &str) -> Vec<vl_common::ModuleSpec> {
+    use vl_common::VlType as T;
     match target {
-        "naravm" => vec![vl_common::ModuleSpec::new(&["std"], &["print"])],
+        "naravm" => vec![vl_common::ModuleSpec::new(
+            &["std"],
+            &[("print", &[("value", T::String)], T::Void)],
+        )],
         _ => modules(),
     }
 }
@@ -441,7 +467,7 @@ mod tests {
 
     #[test]
     fn dummy_emits_text() {
-        let lir = lir_of("function main() { 1 + 2; }");
+        let lir = lir_of("function main(): void { 1 + 2; }");
         let (art, diags) = DummyTarget.emit(&lir);
         assert!(diags.is_empty());
         assert!(art.unwrap().text.contains("add"));
@@ -454,7 +480,9 @@ mod tests {
 
     #[test]
     fn backends_emit_calls_and_parameters() {
-        let lir = lir_of("function add(a, b) { a + b; } function main() { add(1, 2); }");
+        let lir = lir_of(
+            "function add(a: i64, b: i64): i64 { a + b; } function main(): void { add(1, 2); }",
+        );
         let (art, diags) = DummyTarget.emit(&lir);
         assert!(diags.is_empty());
         let text = art.unwrap().text;
@@ -468,7 +496,7 @@ mod tests {
 
     #[test]
     fn naravm_rejects_constant_pool_indices_that_do_not_fit() {
-        let mut src = String::from("function main() {");
+        let mut src = String::from("function main(): void {");
         for i in 0..252 {
             src.push_str(&format!("let s{i} = \"s{i}\";"));
         }
@@ -484,7 +512,7 @@ mod tests {
 
     #[test]
     fn naravm_accepts_bare_print_from_single_export_use() {
-        let src = "use std.print; function main() { print(\"hi\\n\"); }";
+        let src = "use std.print; function main(): void { print(\"hi\\n\"); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, rdiags) = vl_semantic::resolve_with_modules(&prog, &modules());

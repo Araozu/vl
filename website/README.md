@@ -7,7 +7,7 @@ pure Markdown styled by
 
 ```sh
 pnpm install
-pnpm dev      # http://localhost:4321
+pnpm dev      # http://localhost:4330
 pnpm build
 ```
 

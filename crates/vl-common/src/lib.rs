@@ -10,6 +10,7 @@
 pub mod diagnostic;
 pub mod module;
 pub mod source;
+pub mod ty;
 
 /// Scalar values shared by the frontend and target-neutral IR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,9 +24,10 @@ pub enum Scalar {
 pub mod span;
 
 pub use diagnostic::{Diagnostic, Label, Severity};
-pub use module::{ModulePath, ModuleSpec};
+pub use module::{Export, ExportDecl, FuncSig, ModulePath, ModuleSpec, ParamSig};
 pub use source::{FileId, Source, Sources};
 pub use span::Span;
+pub use ty::{ParseTyError, VlType};
 
 /// Convenience alias: pipeline stages return values plus diagnostics
 /// instead of failing fast, so one run can surface many errors.

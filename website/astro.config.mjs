@@ -6,6 +6,7 @@ import vlLang from './src/grammars/vl.tmLanguage.json';
 
 // https://astro.build/config
 export default defineConfig({
+  server: { port: 4330 },
   integrations: [mdx(), svelte()],
   markdown: {
     shikiConfig: {

@@ -88,8 +88,12 @@ fn run_frontend(
             .iter()
             .filter_map(|item| match item {
                 vl_syntax::Item::Function {
-                    name, params, span, ..
-                } if name == "main" => Some((params.len(), *span)),
+                    name,
+                    params,
+                    ret,
+                    span,
+                    ..
+                } if name == "main" => Some((params.len(), *ret, *span)),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -98,12 +102,24 @@ fn run_frontend(
                 vl_common::Diagnostic::error("program must define `function main()`")
                     .with_code("E400"),
             );
-        } else if mains[0].0 != 0 {
-            diags.push(
-                vl_common::Diagnostic::error("`main` must not take parameters")
-                    .with_label(mains[0].1, "entrypoint declared here")
-                    .with_code("E401"),
-            );
+        } else {
+            if mains[0].0 != 0 {
+                diags.push(
+                    vl_common::Diagnostic::error("`main` must not take parameters")
+                        .with_label(mains[0].2, "entrypoint declared here")
+                        .with_code("E401"),
+                );
+            }
+            // The entrypoint returns nothing; `void` keeps VL's type surface
+            // total while the VM decides its own halt representation.
+            if mains[0].1 != Some(vl_common::VlType::Void) {
+                diags.push(
+                    vl_common::Diagnostic::error("`main` must return `void`")
+                        .with_label(mains[0].2, "entrypoint declared here")
+                        .with_note("write `function main(): void`")
+                        .with_code("E401"),
+                );
+            }
         }
     }
     let hir = vl_hir::lower(&ast, &res);

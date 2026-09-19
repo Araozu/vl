@@ -32,6 +32,7 @@ pub enum TokenKind {
     RBrace,
     Comma,
     Dot,
+    Colon,
     /// A token whose source span already has a lexer diagnostic. Parsers
     /// consume it without inventing follow-on syntax errors.
     Invalid,
@@ -116,6 +117,10 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
             }
             ',' => {
                 tokens.push(Token::new(TokenKind::Comma, Span::new(i, i + 1)));
+                i += 1;
+            }
+            ':' => {
+                tokens.push(Token::new(TokenKind::Colon, Span::new(i, i + 1)));
                 i += 1;
             }
             '.' => {
