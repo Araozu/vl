@@ -43,6 +43,8 @@ pub enum TokenKind {
     RParen,
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
     Comma,
     Dot,
     Colon,
@@ -186,6 +188,14 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
             }
             '}' => {
                 tokens.push(Token::new(TokenKind::RBrace, Span::new(i, i + 1)));
+                i += 1;
+            }
+            '[' => {
+                tokens.push(Token::new(TokenKind::LBracket, Span::new(i, i + 1)));
+                i += 1;
+            }
+            ']' => {
+                tokens.push(Token::new(TokenKind::RBracket, Span::new(i, i + 1)));
                 i += 1;
             }
             ',' => {
@@ -471,6 +481,14 @@ mod tests {
         assert!(kinds.iter().any(|k| matches!(k, TokenKind::Break)));
         assert!(kinds.iter().any(|k| matches!(k, TokenKind::Continue)));
         assert!(kinds.iter().any(|k| matches!(k, TokenKind::Return)));
+    }
+
+    #[test]
+    fn lexes_brackets_for_arrays() {
+        let (toks, diags) = lex("a[0u64] = [1u64, 2u64];");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::LBracket)));
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::RBracket)));
     }
 
     #[test]
