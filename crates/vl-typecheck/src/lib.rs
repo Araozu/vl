@@ -305,22 +305,15 @@ impl<'a> Checker<'a> {
 
     fn check_item(&mut self, item: &HirItem) {
         match item {
-            HirItem::Let { id, def, value, .. } => {
-                let ty = self.infer_expr(value);
-                if ty == Ty::Void {
-                    self.diags.push(
-                        Diagnostic::error("cannot bind a `void` value")
-                            .with_label(value.span(), "`void` is not a value")
-                            .with_note("`void` calls may only appear as bare statements")
-                            .with_code("E308"),
-                    );
-                    self.record(*id, Ty::Error);
-                    if let Some(def) = def {
-                        self.bindings.insert(def.0, Ty::Error);
-                        self.typed.globals.push(format!("let#{}", id.0));
-                    }
-                    return;
-                }
+            HirItem::Let {
+                id,
+                def,
+                ty,
+                ty_span,
+                value,
+                ..
+            } => {
+                let ty = self.let_type(ty, ty_span, value);
                 self.record(*id, ty.clone());
                 if let Some(def) = def {
                     self.bindings.insert(def.0, ty);
@@ -413,26 +406,98 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Check a `let` initializer against its optional annotation. Returns
+    /// the binding type (`Error` when poisoned). An `Array[T]` annotation on
+    /// a bare `Array.new(n)` supplies `T` contextually; every other shape
+    /// infers first (integer literals coerced by the annotation) and then
+    /// must be compatible with it.
+    fn let_type(&mut self, ty: &Option<VlType>, ty_span: &Option<Span>, value: &HirExpr) -> Ty {
+        // Failed annotation (parser-reported): infer inner errors only.
+        if ty.is_none() && ty_span.is_some() {
+            let _ = self.infer_expr(value);
+            return Ty::Error;
+        }
+        let ann = ty.as_ref().map(|v| Ty::from_vl_in(v, &self.type_env));
+        if let (
+            Some(Ty::Array(elem)),
+            HirExpr::Call {
+                name,
+                type_args,
+                args,
+                span,
+                id: call_id,
+                ..
+            },
+        ) = (ann.as_ref(), value)
+        {
+            if name == "Array.new" && type_args.is_empty() {
+                let mut arg_tys = Vec::with_capacity(args.len());
+                let mut poisoned = false;
+                for arg in args {
+                    let t = self.infer_expr(arg);
+                    if t == Ty::Error {
+                        poisoned = true;
+                    }
+                    arg_tys.push(t);
+                }
+                if poisoned {
+                    return Ty::Error;
+                }
+                return self.check_array_new_elem(
+                    name,
+                    *span,
+                    (**elem).clone(),
+                    args,
+                    &arg_tys,
+                    *call_id,
+                );
+            }
+        }
+        let inferred = match &ann {
+            Some(a) => self.infer_expr_expected(value, a),
+            None => self.infer_expr(value),
+        };
+        if inferred == Ty::Error {
+            return Ty::Error;
+        }
+        if inferred == Ty::Void {
+            self.diags.push(
+                Diagnostic::error("cannot bind a `void` value")
+                    .with_label(value.span(), "`void` is not a value")
+                    .with_note("`void` calls may only appear as bare statements")
+                    .with_code("E308"),
+            );
+            return Ty::Error;
+        }
+        if let Some(a) = &ann {
+            if !types_compatible(&inferred, a) {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "cannot initialize `{a}` binding with `{inferred}` value"
+                    ))
+                    .with_label(value.span(), format!("expected `{a}` here"))
+                    .with_code("E309"),
+                );
+                return Ty::Error;
+            }
+        }
+        inferred
+    }
+
     /// Check a statement. There are no implicit returns: `let` initializers
     /// and bare expression values are discarded and never satisfy a declared
     /// return type — only an explicit `return expr;` does.
     fn check_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
-            HirStmt::Let { id, def, value, .. } => {
-                let ty = self.infer_expr(value);
-                if ty == Ty::Void {
-                    self.diags.push(
-                        Diagnostic::error("cannot bind a `void` value")
-                            .with_label(value.span(), "`void` is not a value")
-                            .with_note("`void` calls may only appear as bare statements")
-                            .with_code("E308"),
-                    );
-                    self.record(*id, Ty::Error);
-                    if let Some(def) = def {
-                        self.bindings.insert(def.0, Ty::Error);
-                    }
-                    return;
-                }
+            HirStmt::Let {
+                id,
+                def,
+                ty,
+                ty_span,
+                value,
+                ..
+            } => {
+                let ty = self.let_type(ty, ty_span, value);
                 self.record(*id, ty.clone());
                 if let Some(def) = def {
                     self.bindings.insert(def.0, ty);
@@ -884,7 +949,9 @@ impl<'a> Checker<'a> {
     }
 
     /// `Array.new::[T](count)`: one `u64` argument, returns `Array[T]`.
-    /// (Arity of the type argument itself is enforced by `vl-semantic`.)
+    /// A bare `Array.new(count)` only typechecks under an annotated `let`
+    /// (handled in [`Checker::let_type`](Self::let_type)); everywhere else
+    /// it is E303 here. (Arity above one is enforced by `vl-semantic`.)
     fn check_array_new(
         &mut self,
         name: &str,
@@ -895,11 +962,36 @@ impl<'a> Checker<'a> {
         id: vl_hir::HirId,
     ) -> Ty {
         let [elem_vl] = type_args else {
-            // E303 already reported by vl-semantic; stay quiet.
+            self.diags.push(
+                Diagnostic::error("`Array.new` needs an element type")
+                    .with_label(
+                        span,
+                        "write `Array.new::[T](count)`, or annotate the `let`: `let a: Array[T] = Array.new(count)`",
+                    )
+                    .with_code("E303"),
+            );
             return self.record(id, Ty::Error);
         };
         let elem = self.vl_to_ty_reported(elem_vl, span);
         if elem == Ty::Error {
+            return self.record(id, Ty::Error);
+        }
+        self.check_array_new_elem(name, span, elem, args, arg_tys, id)
+    }
+
+    /// Core constructor check once the element type is known (explicitly or
+    /// from a `let` annotation). The count coerces integer literals to `u64`.
+    fn check_array_new_elem(
+        &mut self,
+        name: &str,
+        span: Span,
+        elem: Ty,
+        args: &[HirExpr],
+        arg_tys: &[Ty],
+        id: vl_hir::HirId,
+    ) -> Ty {
+        // Poisoned arguments stay quiet (root cause already reported).
+        if arg_tys.contains(&Ty::Error) {
             return self.record(id, Ty::Error);
         }
         if elem == Ty::Void {
@@ -921,11 +1013,18 @@ impl<'a> Checker<'a> {
             );
             return self.record(id, Ty::Error);
         }
-        if arg_tys[0] != Ty::Error && !types_compatible(&arg_tys[0], &Ty::U64) {
+        if arg_tys.contains(&Ty::Error) {
+            return self.record(id, Ty::Error);
+        }
+        self.coerce_expr_literals(&args[0], &Ty::U64);
+        let ct = self.typed.type_of_id(args[0].id()).unwrap_or(Ty::Error);
+        if ct == Ty::Error {
+            return self.record(id, Ty::Error);
+        }
+        if !types_compatible(&ct, &Ty::U64) {
             self.diags.push(
                 Diagnostic::error(format!(
-                    "`{name}` parameter `count` expects `u64`, got `{}`",
-                    arg_tys[0]
+                    "`{name}` parameter `count` expects `u64`, got `{ct}`"
                 ))
                 .with_label(args[0].span(), "expected `u64` here")
                 .with_code("E306"),
@@ -1133,13 +1232,21 @@ impl<'a> Checker<'a> {
             HirExpr::String { id, .. } => self.record(*id, Ty::String),
             HirExpr::ArrayLiteral { id, elems, .. } => {
                 if elems.is_empty() {
+                    // Contextual empty: coercion already recorded the
+                    // annotation (`let e: Array[u64] = [];`); honor it.
+                    // A repeat visit after an error stays quiet.
+                    match self.typed.type_of_id(*id) {
+                        Some(t @ Ty::Array(_)) => return self.record(*id, t),
+                        Some(Ty::Error) => return self.record(*id, Ty::Error),
+                        _ => {}
+                    }
                     // No element to infer from: point at the typed
                     // constructor instead of guessing.
                     self.diags.push(
                         Diagnostic::error("cannot infer the element type of `[]`")
                             .with_label(
                                 expr.span(),
-                                "empty array literal needs `Array.new::[T](n)`",
+                                "empty array literal needs a type: `let e: Array[T] = [];` or `Array.new::[T](n)`",
                             )
                             .with_code("E302"),
                     );
@@ -1260,18 +1367,19 @@ impl<'a> Checker<'a> {
                     return self.record(*id, Ty::Error);
                 };
                 if *external {
+                    // `Array.new` carries its element type in the call (or
+                    // the surrounding `let`), not the catalog: resolve it
+                    // here, before the signature check (a bare `Array.new`
+                    // has no prebuilt signature by design).
+                    if name == "Array.new" {
+                        return self.check_array_new(name, *span, type_args, args, &arg_tys, *id);
+                    }
                     let Some(sig) = extern_sig else {
                         // Poisoned import (E202/E203 already reported).
                         return self.record(*id, Ty::Error);
                     };
                     if poisoned {
                         return self.record(*id, Ty::Error);
-                    }
-                    // `Array.new::[T]` carries its element type in the call,
-                    // not the catalog: resolve it here (reporting unbound
-                    // names) instead of trusting the prebuilt signature.
-                    if name == "Array.new" {
-                        return self.check_array_new(name, *span, type_args, args, &arg_tys, *id);
                     }
                     return self.check_call_args(
                         name,
@@ -1701,12 +1809,75 @@ mod tests {
     }
 
     #[test]
-    fn array_new_without_type_arg_is_quietly_poisoned() {
-        // vl-semantic reports E303; typecheck must not cascade.
-        let (toks, _) = vl_lex::lex("function main() { let a = Array.new(1u64); a; }");
-        let (prog, _) = vl_syntax::parse(&toks, "");
-        let (res, rdiags) = vl_semantic::resolve(&prog);
-        assert!(rdiags.iter().any(|d| d.is_error()));
+    fn bare_array_new_without_annotation_is_one_error() {
+        let (_, diags) = check_src("function main() { let a = Array.new(3); a; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("needs an element type")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn annotated_let_supplies_array_new_element() {
+        let (typed, diags) =
+            check_src("function main() { let scores: Array[u64] = Array.new(3); scores; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed
+            .types
+            .values()
+            .any(|t| *t == Ty::Array(Box::new(Ty::U64))));
+    }
+
+    #[test]
+    fn annotated_let_accepts_empty_literal() {
+        let (_, diags) = check_src("function main() { let e: Array[u64] = []; e[0] = 1; e; }");
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn annotated_let_rejects_mismatch() {
+        let (_, diags) = check_src("function main() { let x: u64 = \"s\"; x; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E309")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn annotated_let_coerces_int_literals() {
+        let (_, diags) = check_src("function main() { let x: u64 = 3; x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn annotated_let_with_explicit_turbofish_checks() {
+        let (_, diags) =
+            check_src("function main() { let a: Array[u64] = Array.new::[u64](3); a; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        let (_, diags) =
+            check_src("function main() { let a: Array[string] = Array.new::[u64](3); a; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+    }
+
+    #[test]
+    fn annotated_let_in_generic_body() {
+        let (_, diags) = check_src(
+            "function f[T](x: T): T { let y: T = x; let a: Array[T] = Array.new(1); return y; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn failed_annotation_poisons_quietly() {
+        // Parser reports E105; typecheck must not cascade.
+        let (toks, _) = vl_lex::lex("function main() { let x: Bogus = 1; x; }");
+        let (prog, pdiags) = vl_syntax::parse(&toks, "");
+        assert!(pdiags.iter().any(|d| d.is_error()));
+        let (res, _) = vl_semantic::resolve(&prog);
         let hir = vl_hir::lower(&prog, &res);
         let (_, tdiags) = check(&hir);
         assert!(tdiags.is_empty(), "{tdiags:?}");
