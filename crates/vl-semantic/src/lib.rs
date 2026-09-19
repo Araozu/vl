@@ -336,22 +336,62 @@ impl Resolver {
             Expr::Call {
                 callee,
                 callee_span,
+                type_args,
+                type_args_span,
                 args,
                 ..
             } => {
-                // `U64Array.new(count)` is a builtin constructor: it needs no
-                // import and resolves to a synthetic external def carrying
+                // `Array.new::[T](count)` is a builtin constructor: it needs
+                // no import and resolves to a synthetic external def carrying
                 // its signature, so typechecking and HIR reuse the normal
                 // extern-call path (LIR desugars it to an allocation).
-                if callee.len() == 2 && callee[0] == "U64Array" && callee[1] == "new" {
+                if callee.len() == 2 && callee[0] == "Array" && callee[1] == "new" {
+                    let [elem] = type_args.as_slice() else {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "`Array.new` expects exactly one type argument, got {}",
+                                type_args.len()
+                            ))
+                            .with_label(
+                                type_args_span.unwrap_or(*callee_span),
+                                "write `Array.new::[T](count)`, e.g. `Array.new::[u64](3u64)`",
+                            )
+                            .with_code("E303"),
+                        );
+                        let id = self.external_def(callee.join("."), *callee_span, None);
+                        self.out
+                            .uses
+                            .insert((callee_span.start, callee_span.end), id);
+                        for arg in args {
+                            self.resolve_expr(arg);
+                        }
+                        return;
+                    };
                     let sig = vl_common::FuncSig::new(
                         &[("count", vl_common::VlType::U64)],
-                        vl_common::VlType::U64Array,
+                        vl_common::VlType::Array(Box::new(elem.clone())),
                     );
                     let id = self.external_def(callee.join("."), *callee_span, Some(sig));
                     self.out
                         .uses
                         .insert((callee_span.start, callee_span.end), id);
+                    for arg in args {
+                        self.resolve_expr(arg);
+                    }
+                    return;
+                }
+                // Removed predecessor: point at the replacement instead of a
+                // bare "undefined function".
+                if callee.first().is_some_and(|head| head == "U64Array") {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "cannot find `{}` in this scope",
+                            callee.join(".")
+                        ))
+                        .with_label(*callee_span, "`U64Array` was removed")
+                        .with_note("use `Array[u64]` and `Array.new::[u64](n)` instead")
+                        .with_code("E201"),
+                    );
                     for arg in args {
                         self.resolve_expr(arg);
                     }
@@ -685,18 +725,35 @@ mod tests {
     }
 
     #[test]
-    fn u64array_new_needs_no_import_and_carries_its_signature() {
-        let (res, diags) = resolve_src("function main() { let a = U64Array.new(3u64); a; }");
+    fn array_new_needs_no_import_and_carries_its_signature() {
+        let (res, diags) = resolve_src("function main() { let a = Array.new::[u64](3u64); a; }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
         let def = res
             .defs
             .iter()
-            .find(|d| d.name == "U64Array.new")
-            .expect("U64Array.new def");
+            .find(|d| d.name == "Array.new")
+            .expect("Array.new def");
         let sig = def.sig.as_ref().expect("extern sig");
-        assert_eq!(sig.ret, vl_common::VlType::U64Array);
+        assert_eq!(
+            sig.ret,
+            vl_common::VlType::Array(Box::new(vl_common::VlType::U64))
+        );
         assert_eq!(sig.params.len(), 1);
         assert_eq!(sig.params[0].ty, vl_common::VlType::U64);
+    }
+
+    #[test]
+    fn array_new_without_type_arg_is_one_error() {
+        let (_, diags) = resolve_src("function main() { let a = Array.new(3u64); a; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("exactly one type argument"));
+    }
+
+    #[test]
+    fn u64array_callee_points_at_the_replacement() {
+        let (_, diags) = resolve_src("function main() { let a = U64Array.new(3u64); a; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("U64Array"));
     }
 
     #[test]
