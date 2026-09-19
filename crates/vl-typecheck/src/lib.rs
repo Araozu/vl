@@ -1,13 +1,14 @@
 //! vl-typecheck: type checking over HIR.
 //!
-//! v0 type system: exactly one type, `int`. Every expression must be `int`.
-//! That sounds trivial, but the scaffolding is the point — [`check`]
-//! walks the HIR, annotates each node with [`Ty`], and quietly poisons
-//! nodes whose names failed resolution (already reported upstream, so no
-//! cascading second error).
+//! v0 type system: exactly one value type, `int`. Every expression must be
+//! `int`; every `function` takes `int`s and returns an `int`. That sounds
+//! trivial, but the scaffolding is the point — [`check`] walks the HIR,
+//! annotates each node with [`Ty`], enforces call arity/callability, and
+//! quietly poisons nodes whose names failed resolution (already reported
+//! upstream, so no cascading second error).
 //!
-//! When the language grows (strings, bools, functions), only [`Ty`]
-//! and `infer_expr` need to change; the driver and later stages keep
+//! When the language grows (strings, bools, richer function types), only
+//! [`Ty`] and `infer_expr` need to change; the driver and later stages keep
 //! working because they consume [`TypedProgram`].
 
 use std::collections::HashMap;
@@ -39,6 +40,10 @@ pub struct TypedProgram {
     pub types: HashMap<u32, Ty>,
     /// Top-level value names in order (for LIR/codegen).
     pub globals: Vec<String>,
+    /// Function `DefId.0` -> parameter count (for arity checks + LIR).
+    pub func_arity: HashMap<u32, usize>,
+    /// `DefId.0` of every `function` item (callability checks).
+    pub func_defs: std::collections::HashSet<u32>,
 }
 
 impl TypedProgram {
@@ -52,6 +57,16 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
         typed: TypedProgram::default(),
         diags: vec![],
     };
+    // Pass 1: collect function signatures so calls resolve arity
+    // regardless of definition order (matches the resolver pre-pass).
+    for item in &prog.items {
+        if let HirItem::Fn { def, params, .. } = item
+            && let Some(d) = def
+        {
+            cx.typed.func_defs.insert(d.0);
+            cx.typed.func_arity.insert(d.0, params.len());
+        }
+    }
     for item in &prog.items {
         cx.check_item(item);
     }

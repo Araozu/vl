@@ -31,6 +31,7 @@ pub enum HirItem {
     },
     Fn {
         id: HirId,
+        def: Option<DefId>,
         name: String,
         params: Vec<(String, Option<DefId>, Span)>,
         body: Vec<HirStmt>,
@@ -62,6 +63,14 @@ pub enum HirExpr {
         name: String,
         span: Span,
     },
+    Call {
+        id: HirId,
+        /// Resolved callee (`None` when resolution failed; quiet downstream).
+        def: Option<DefId>,
+        name: String,
+        args: Vec<HirExpr>,
+        span: Span,
+    },
     Binary {
         id: HirId,
         op: HirBinOp,
@@ -82,7 +91,10 @@ pub enum HirBinOp {
 impl HirExpr {
     pub fn id(&self) -> HirId {
         match self {
-            HirExpr::Int { id, .. } | HirExpr::Var { id, .. } | HirExpr::Binary { id, .. } => *id,
+            HirExpr::Int { id, .. }
+            | HirExpr::Var { id, .. }
+            | HirExpr::Call { id, .. }
+            | HirExpr::Binary { id, .. } => *id,
         }
     }
 
@@ -90,6 +102,7 @@ impl HirExpr {
         match self {
             HirExpr::Int { span, .. }
             | HirExpr::Var { span, .. }
+            | HirExpr::Call { span, .. }
             | HirExpr::Binary { span, .. } => *span,
         }
     }
@@ -139,12 +152,14 @@ impl<'a> Lowerer<'a> {
             }
             AstItem::Function {
                 name,
+                name_span,
                 params,
                 body,
                 span,
                 ..
             } => HirItem::Fn {
                 id: self.id(),
+                def: self.def_at(*name_span),
                 name: name.clone(),
                 params: params
                     .iter()
@@ -188,6 +203,18 @@ impl<'a> Lowerer<'a> {
                 def: self.def_at(*s),
                 name: name.clone(),
                 span: *s,
+            },
+            AstExpr::Call {
+                callee,
+                callee_span,
+                args,
+                span,
+            } => HirExpr::Call {
+                id: self.id(),
+                def: self.def_at(*callee_span),
+                name: callee.clone(),
+                args: args.iter().map(|a| self.lower_expr(a)).collect(),
+                span: *span,
             },
             AstExpr::Unary { op, rhs, span } => {
                 let rhs = self.lower_expr(rhs);
@@ -240,5 +267,42 @@ mod tests {
         let hir = lower(&prog, &res);
         assert_eq!(hir.items.len(), 1);
         assert!(matches!(hir.items[0], HirItem::Let { .. }));
+    }
+
+    #[test]
+    fn call_links_callee_def() {
+        let src = "function add(a, b) { a + b; } function main() { add(1, 2); }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = lower(&prog, &res);
+        assert_eq!(hir.items.len(), 2);
+        match &hir.items[1] {
+            HirItem::Fn { body, .. } => match &body[0] {
+                HirStmt::Expr(HirExpr::Call { name, args, def, .. }) => {
+                    assert_eq!(name, "add");
+                    assert_eq!(args.len(), 2);
+                    assert!(def.is_some());
+                }
+                other => panic!("expected call, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unresolved_call_poisoned_not_panic() {
+        let src = "function main() { nope(1); }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Fn { body, .. } => assert!(matches!(
+                &body[0],
+                HirStmt::Expr(HirExpr::Call { def: None, .. })
+            )),
+            other => panic!("expected fn, got {other:?}"),
+        }
     }
 }

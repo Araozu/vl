@@ -1,0 +1,17 @@
+---
+- name: Setup target machine
+  become: false
+  hosts: all
+  vars:
+    remote_folder: '{{ _remote_folder }}'
+    project_name: '{{ _project_name }}'
+    project_stage: '{{ _project_stage }}'
+
+  tasks:
+    - name: Ensure target directory exists
+      file:
+        path: '{{ remote_folder }}'
+        state: directory
+        mode: '0755'
+        owner: '{{ ansible_user }}'
+        group: '{{ ansible_user }}'

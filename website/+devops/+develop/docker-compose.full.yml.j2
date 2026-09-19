@@ -1,0 +1,20 @@
+services:
+  {{ project_name }}-full-{{ project_stage }}:
+    image: ${{ (project_name + "_full") | upper | replace("-", "_") }}_REGISTRY_URL:${{ (project_name + "_full") | upper | replace("-", "_") }}_VERSION
+    container_name: {{ project_name }}-full-{{ project_stage }}
+    restart: unless-stopped
+    environment:
+      - TZ=America/Lima
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.vl-docs.rule=Host(`vl.nara-lang.org`)"
+      - "traefik.http.routers.vl-docs.entrypoints=websecure"
+      - "traefik.http.routers.vl-docs.tls=true"
+      - "traefik.http.routers.vl-docs.tls.certresolver=http"
+      - "traefik.http.services.vl-docs.loadbalancer.server.port=80"
+
+networks:
+  proxy:
+    external: true

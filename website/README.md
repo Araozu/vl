@@ -15,3 +15,17 @@ pnpm build
 - `src/pages/docs/` — overview, getting-started, language, cli (markdown only)
 - `src/pages/api/` — overview, driver, frontend, backend (markdown only)
 - `src/components/Playground.svelte` — interactive stub (Svelte)
+
+## Deploy (`+devops/`)
+
+Same shape as `nikki.nara-lang.org`: multi-stage Dockerfile (pnpm build →
+nginx serves `dist/`), Jenkins pipeline per stage, Ansible to the target host,
+Traefik on the `proxy` network terminates TLS for `vl.nara-lang.org`.
+
+```sh
+docker build --pull -f +devops/docker/Dockerfile -t vl-docs:local .
+docker run --rm -p 8080:80 vl-docs:local
+```
+
+Stage config lives in `+devops/+develop/` (`Jenkinsfile`, `inventory.yml`,
+`docker-compose.full.yml.j2`); shared playbooks in `+devops/ansible/`.

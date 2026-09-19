@@ -1,0 +1,34 @@
+---
+- name: Start service
+  become: false
+  hosts: all
+  vars:
+    remote_folder: '{{ _remote_folder_path }}'
+    project_name: '{{ _project_name }}'
+    project_stage: '{{ _project_stage }}'
+    project_service: '{{ _project_service }}'
+    project_services: "{{ _project_services.split(',') }}"
+
+  tasks:
+    - name: Copy Docker Compose file to service directory
+      template:
+        src: '../+{{ project_stage }}/docker-compose.{{ project_service }}.yml.j2'
+        dest: '{{ remote_folder }}/docker-compose.{{ project_service }}.yml'
+        owner: '{{ ansible_user }}'
+        group: '{{ ansible_user }}'
+        mode: '0644'
+        force: true
+
+    - name: Start service with Docker Compose
+      community.docker.docker_compose_v2:
+        project_src: '{{ remote_folder }}'
+        files: >
+          {{
+            project_services | map('regex_replace', '^(.*)$', 'docker-compose.\1.yml') | list
+          }}
+        env_files: >
+          {{
+            project_services | map('regex_replace', '^(.*)$', '.version.\1') | list
+          }}
+        wait: true
+        wait_timeout: 60

@@ -1,0 +1,107 @@
+pipeline {
+    environment {
+        BUILD_REF = sh(script: "echo -n '${BUILD_TAG}' | sha256sum | cut -c1-12", returnStdout: true).trim()
+
+        PROJECT_NAME    = "vl-docs"
+        PROJECT_SERVICE = "full"
+        PROJECT_STAGE   = "develop"
+
+        REMOTE_USER   = "docker_admin"
+        REMOTE_IP     = "localhost"
+        REMOTE_FOLDER = "/home/docker_admin/${PROJECT_NAME}-${PROJECT_STAGE}/"
+
+        REGISTRY_URL         = "docker.io"
+        REGISTRY_USER        = "araozu"
+        PROJECT_TRIPLET      = "${PROJECT_NAME}-${PROJECT_SERVICE}-${PROJECT_STAGE}"
+        FULL_REGISTRY_URL    = "${REGISTRY_URL}/${REGISTRY_USER}/${PROJECT_TRIPLET}"
+
+        // SSH credentials
+        SSH_CRED = "ssh-id_docker_admin_hetzner"
+
+        // ansible variables
+        PROJECT_SERVICES = "full"
+    }
+    agent {
+        node {
+            label "fernando-helsinki-01"
+        }
+    }
+    stages {
+        stage('Build and push Docker image') {
+            steps {
+                // Context is website/: the Astro site root.
+                dir ("website") {
+                    script {
+                        docker.build(
+                            "${FULL_REGISTRY_URL}:${BUILD_REF}",
+                            "--pull -f +devops/docker/Dockerfile .",
+                        )
+                    }
+                }
+            }
+        }
+        stage("Create ansible inventory") {
+            steps {
+                dir ("website/+devops/+${PROJECT_STAGE}") {
+                    sh """
+                        sed -i 's/REMOTE_IP/${REMOTE_IP}/g' inventory.yml &&
+                        sed -i 's/REMOTE_USER/${REMOTE_USER}/g' inventory.yml
+                    """
+                }
+            }
+        }
+        stage("Setup target") {
+            steps {
+                dir ("website/+devops/+${PROJECT_STAGE}") {
+                    ansiblePlaybook(
+                        credentialsId: SSH_CRED,
+                        inventory: "inventory.yml",
+                        playbook: "../ansible/setup_target.yml",
+                        extraVars: [
+                            _remote_folder: REMOTE_FOLDER,
+                            _project_name: PROJECT_NAME,
+                            _project_stage: PROJECT_STAGE,
+                        ],
+                    )
+                }
+            }
+        }
+        stage("Fetch image at server") {
+            steps {
+                dir ("website/+devops/+${PROJECT_STAGE}") {
+                    ansiblePlaybook(
+                        credentialsId: SSH_CRED,
+                        inventory: "inventory.yml",
+                        playbook: "../ansible/service_pull_and_setup.yml",
+                        extraVars: [
+                            _remote_folder: REMOTE_FOLDER,
+                            _image_tag: BUILD_REF,
+                            _full_registry_url: FULL_REGISTRY_URL,
+                            _project_name: PROJECT_NAME,
+                            _project_stage: PROJECT_STAGE,
+                            _project_service: PROJECT_SERVICE,
+                        ],
+                    )
+                }
+            }
+        }
+        stage("Up services") {
+            steps {
+                dir ("website/+devops/+${PROJECT_STAGE}") {
+                    ansiblePlaybook(
+                        credentialsId: SSH_CRED,
+                        inventory: "inventory.yml",
+                        playbook: "../ansible/start_service.yml",
+                        extraVars: [
+                            _remote_folder_path: REMOTE_FOLDER,
+                            _project_name: PROJECT_NAME,
+                            _project_services: PROJECT_SERVICES,
+                            _project_stage: PROJECT_STAGE,
+                            _project_service: PROJECT_SERVICE,
+                        ],
+                    )
+                }
+            }
+        }
+    }
+}
