@@ -141,6 +141,10 @@
         {
           "name": "punctuation.bracket.curly.vl",
           "match": "[{}]"
+        },
+        {
+          "name": "punctuation.bracket.square.vl",
+          "match": "[\\[\\]]"
         }
       ]
     }

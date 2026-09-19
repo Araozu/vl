@@ -109,6 +109,43 @@ let quote = "say \\"hi\\"";
 Strings are byte strings for now rather than a full text type. See the
 [standard library](/std) for the functions that work with them.
 
+## Arrays
+
+`U64Array` is a fixed-length heap array of `u64`. `U64Array.new(n)` allocates
+a zero-filled array of `n` elements — it is a builtin constructor, so no
+import is needed — and `[1u64, 2u64]` is an array literal (empty `[]` is the
+length-0 array). Elements and indices are always `u64` (write `3u64`, not `3`):
+
+```vl
+function main() {
+    let a = U64Array.new(3u64);
+    a[0u64] = 10u64;
+    a[1u64] = 20u64;
+    a[2u64] = 30u64;
+    let b = [1u64, 2u64, 3u64];
+    b[0u64] = 5u64;
+}
+```
+
+`a[i]` reads element `i` and `a[i] = v;` writes it. Arrays are reference
+values: they can be passed to functions and returned from them:
+
+```vl
+function sum(a: U64Array, n: u64): u64 {
+    let total = 0u64;
+    let i = 0u64;
+    while (i < n) {
+        total = total + a[i];
+        i = i + 1u64;
+    }
+    return total;
+}
+```
+
+Reading or writing out of bounds traps at runtime. There is no `len` query
+yet — track the length alongside the array (as `n` above). See
+`examples/arrays.vl` for a complete program.
+
 ## Conditionals
 
 Conditionals require parenthesized boolean conditions. Branch braces
@@ -215,8 +252,11 @@ every `function` item — `function main()` becomes the entrypoint and each
 other function becomes its own Nara function — with integer arithmetic,
 comparisons, and control flow plus `std.print` / `std.print_u64` and calls
 between user functions (including recursion). Value parameters arrive in
-`rv11` upwards and reference (`string`, `File`) parameters in `rf31` upwards;
+`rv11` upwards and reference (`string`, `File`, `U64Array`) parameters in
+`rf31` upwards;
 at most 15 value and 9 reference parameters per function are supported. Float
 ordering, string equality, and string ordering are rejected with a diagnostic.
+`U64Array` values are Naravm memory containers; out-of-bounds element access
+traps, and there is no length query yet.
 Use the [CLI reference](/cli) for inspection commands or
 [Compiler internals](/internals) for implementation details.
