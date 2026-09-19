@@ -111,14 +111,15 @@ Strings are byte strings for now rather than a full text type. See the
 
 ## Arrays
 
-`U64Array` is a fixed-length heap array of `u64`. `U64Array.new(n)` allocates
-a zero-filled array of `n` elements — it is a builtin constructor, so no
-import is needed — and `[1u64, 2u64]` is an array literal (empty `[]` is the
-length-0 array). Elements and indices are always `u64` (write `3u64`, not `3`):
+`Array[T]` is a fixed-length heap array of `T`. `Array.new::[u64](n)`
+allocates a zero-filled array of `n` elements — it is a builtin constructor,
+so no import is needed — and `[1u64, 2u64]` is an array literal (every element
+must share one type; empty `[]` cannot infer it, so use the constructor).
+Indices are always `u64` (write `3u64`, not `3`):
 
 ```vl
 function main() {
-    let a = U64Array.new(3u64);
+    let a = Array.new::[u64](3u64);
     a[0u64] = 10u64;
     a[1u64] = 20u64;
     a[2u64] = 30u64;
@@ -131,7 +132,7 @@ function main() {
 values: they can be passed to functions and returned from them:
 
 ```vl
-function sum(a: U64Array, n: u64): u64 {
+function sum(a: Array[u64], n: u64): u64 {
     let total = 0u64;
     let i = 0u64;
     while (i < n) {
@@ -141,6 +142,29 @@ function sum(a: U64Array, n: u64): u64 {
     return total;
 }
 ```
+
+## Generics
+
+Functions declare type parameters after the name (`[T]`), and calls either
+infer them from the value arguments or pass them explicitly with a turbofish
+(`::[T]`). `f[T](...)` without `::` is indexing, not a generic call:
+
+```vl
+function first[T](a: Array[T]): T {
+    return a[0u64];
+}
+
+function main() {
+    let nums = [10u64, 20u64];
+    let a = first(nums);          // T = u64, inferred
+    let b = first::[u64](nums);   // same, explicit
+    let words = ["hi", "bye"];
+    let c = first(words);         // T = string
+}
+```
+
+Each concrete call monomorphizes (`first$u64`, `first$string` in LIR dumps);
+uninstantiated generics emit nothing, and a generic `main` is rejected.
 
 Reading or writing out of bounds traps at runtime. There is no `len` query
 yet — track the length alongside the array (as `n` above). See
@@ -252,11 +276,11 @@ every `function` item — `function main()` becomes the entrypoint and each
 other function becomes its own Nara function — with integer arithmetic,
 comparisons, and control flow plus `std.print` / `std.print_u64` and calls
 between user functions (including recursion). Value parameters arrive in
-`rv11` upwards and reference (`string`, `File`, `U64Array`) parameters in
+`rv11` upwards and reference (`string`, `File`, `Array[T]`) parameters in
 `rf31` upwards;
 at most 15 value and 9 reference parameters per function are supported. Float
 ordering, string equality, and string ordering are rejected with a diagnostic.
-`U64Array` values are Naravm memory containers; out-of-bounds element access
+`Array[T]` values are Naravm memory containers; out-of-bounds element access
 traps, and there is no length query yet.
 Use the [CLI reference](/cli) for inspection commands or
 [Compiler internals](/internals) for implementation details.

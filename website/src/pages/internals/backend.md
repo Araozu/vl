@@ -22,9 +22,11 @@ Lowers the resolved syntax tree into a desugared tree with node ids and
 
 ## `vl-typecheck`
 
-Checks `u64`, `i64`, `f64`, `bool`, `u8`, `U64Array`, and byte-string values,
-producing typed HIR and diagnostics. Array literals must hold `u64` elements;
-indexing requires a `U64Array` base and a `u64` index.
+Checks `u64`, `i64`, `f64`, `bool`, `u8`, `Array[T]`, and byte-string values,
+producing typed HIR and diagnostics. Array literals must hold one uniform
+element type; indexing requires an `Array[T]` base and a `u64` index.
+Generic functions check once with opaque parameters and monomorphize per
+concrete call (`f$u64`, ...).
 
 ## `vl-lir`
 
@@ -48,10 +50,11 @@ between user functions (including recursion). A call spills live caller
 registers (`pushv`/`pushrf`, including cached comparison temporaries), moves
 actuals into the callee slots (`rv11` upwards for values, `rf31` upwards for
 `string`/`File` references), emits `calli`, copies the return value out of
-`rv11` / `rf31`, then restores the spills; returns do the reverse. `U64Array`
+`rv11` / `rf31`, then restores the spills; returns do the reverse. `Array[T]`
 values are reference values backed by Naravm memory containers: `new` lowers
-to `create`, literals to `createi` plus `setvati` stores, reads to `getvat`,
-and writes to `setvat`. At most 15
+to `create` (value counts for value elements, ref counts for reference
+elements), literals to `createi` plus `setvati`/`setrfati` stores, reads to
+`getvat`/`getrfat`, and writes to `setvat`/`setrfat`. At most 15
 value and 9 reference parameters per function are supported. Registers are
 recycled past their last use so idiomatic programs fit the 32 value
 and 32 reference registers; liveness extends across loop back edges so values

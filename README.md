@@ -81,10 +81,14 @@ function main() { let d = x - 1; }
 
 Numeric literals use `u64`, `i64`, `f64`, and `u8` suffixes; bare integers are
 `i64`. Boolean literals are `true` and `false`. Value types are `u64`, `i64`,
-`f64`, `bool`, `u8`, `string`, `File`, `U64Array`, and `void` (`void` only as a return).
-`U64Array` is a fixed-length heap array of `u64`: `U64Array.new(n)` allocates a
-zero-filled array of `n` elements (no import needed), `[1u64, 2u64]` is an array
-literal, `a[i]` reads element `i`, and `a[i] = v;` writes it (see `examples/arrays.vl`).
+`f64`, `bool`, `u8`, `string`, `File`, `Array[T]`, and `void` (`void` only as a return).
+`Array[T]` is a fixed-length heap array of `T`: `Array.new::[u64](n)` allocates
+a zero-filled array of `n` elements (no import needed), `[1u64, 2u64]` is an
+array literal, `a[i]` reads element `i`, and `a[i] = v;` writes it
+(see `examples/arrays.vl`). Indices are always `u64`.
+Functions can declare type parameters (`function first[T](a: Array[T]): T`);
+calls infer them (`first(a)`) or pass them explicitly (`first::[u64](a)`)
+(see `examples/generics.vl`).
 The language also supports double-quoted byte strings, `+ - * /`, unary `-`
 and `!`, comparisons (`== != < <= > >=`), short-circuit `&&` / `||`, parens,
 `let` plus `=` reassignment, user-defined functions with typed boundaries
