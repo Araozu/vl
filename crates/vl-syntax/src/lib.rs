@@ -3,10 +3,11 @@
 //! Grammar (v0, TypeScript-like surface):
 //! ```text
 //! program := item*
-//! item    := `let` ident `=` expr `;` | `function` ident `(` params? `)` (`:` type)? block
+//! item    := `let` ident `=` expr `;` | `function` ident type-params? `(` params? `)` (`:` type)? block
+//! type-params := `[` ident (`,` ident)* `]`
 //! params  := param (`,` param)*
 //! param   := ident `:` type
-//! type    := `u64` | `i64` | `f64` | `bool` | `u8` | `string` | `File` | `U64Array` | `void` (`void` only as return)
+//! type    := `u64` | `i64` | `f64` | `bool` | `u8` | `string` | `File` | `Array` `[` type `]` | type-param | `void` (`void` only as return)
 //! block   := `{` stmt* `}`
 //! stmt    := `let` ident `=` expr `;` | ident `=` expr `;` | index `=` expr `;`
 //!          | `if` `(` expr `)` branch (`else` branch)?
@@ -25,15 +26,22 @@
 //! postfix := primary (`[` expr `]`)*
 //! primary := literal | array-literal | call | `(` expr `)`
 //! array-literal := `[` (expr (`,` expr)* `,`?)? `]`
-//! call    := ident `(` args? `)`
+//! call    := path (`::` `[` type (`,` type)* `]`)? `(` args? `)`
+//! path    := ident (`.` ident)*
 //! args    := expr (`,` expr)*
 //! ```
 //!
-//! `U64Array` is a fixed-length heap array of `u64`: `U64Array.new(n)` creates
-//! a zero-filled array of `n` elements, `[1u64, 2u64]` is an array literal
-//! (empty `[]` is the length-0 array), `a[i]` reads element `i`, and
-//! `a[i] = v;` writes it. Indices and elements are always `u64`.
+//! `Array[T]` is a fixed-length heap array of `T`: `Array.new::[u64](n)`
+//! creates a zero-filled array of `n` elements, `[1u64, 2u64]` is an array
+//! literal, `a[i]` reads element `i`, and `a[i] = v;` writes it. Indices are
+//! always `u64`; elements have the array's `T`.
 //!
+//! Generic functions declare type parameters after the name
+//! (`function first[T](a: Array[T]): T { ... }`). Calls infer them from the
+//! value arguments (`first(a)`) or pass them explicitly with a turbofish
+//! (`first::[u64](a)`). `f[T](args)` without `::` is *not* a generic call —
+//! it parses as indexing `f[T]` (which is not callable), and the parser says
+//! so explicitly.
 //!
 //! Calls are callee-by-name (`ident(args)`), TypeScript-style. The callee
 //! is a plain variable use so forward references to `function` items work.
@@ -70,6 +78,13 @@ pub struct Param {
     pub ty_span: Option<Span>,
 }
 
+/// One declared type parameter: `T` in `function first[T](...)`.
+#[derive(Debug, Clone)]
+pub struct TypeParam {
+    pub name: String,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub enum Item {
     Use {
@@ -86,6 +101,9 @@ pub enum Item {
     Function {
         name: String,
         name_span: Span,
+        /// Declared type parameters (`[]` when monomorphic). Names are
+        /// validated by the parser (distinct, not primitives).
+        type_params: Vec<TypeParam>,
         params: Vec<Param>,
         /// `None` when the return annotation was missing (already reported).
         ret: Option<VlType>,
@@ -145,8 +163,9 @@ pub enum Stmt {
 pub enum Expr {
     Literal(Scalar, Span),
     String(Vec<u8>, Span),
-    /// Array literal: `[1u64, 2u64]` (empty `[]` is the length-0 `U64Array`).
-    /// Element types are enforced later (`u64` only for now).
+    /// Array literal: `[1u64, 2u64]`. Element types are enforced later
+    /// (all elements must share one `T`, giving `Array[T]`). Empty `[]`
+    /// has no element to infer from and is rejected by typechecking.
     ArrayLiteral {
         elems: Vec<Expr>,
         span: Span,
@@ -164,6 +183,10 @@ pub enum Expr {
     Call {
         callee: Vec<String>,
         callee_span: Span,
+        /// Explicit type arguments from a turbofish (`f::[u64](...)`).
+        /// Empty when inference should fill them in (`f(...)`).
+        type_args: Vec<VlType>,
+        type_args_span: Option<Span>,
         args: Vec<Expr>,
         span: Span,
     },
@@ -372,13 +395,53 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_type(&mut self) -> Option<(VlType, Span)> {
+    /// Parse a type. `allowed` holds the enclosing function's type parameter
+    /// names: a bare unknown identifier resolves to `Param(name)` only when
+    /// listed there, otherwise it is E105. `strict` controls whether an
+    /// unlisted unknown identifier is reported here (`true`, for declaration
+    /// positions where the scope is known) or silently becomes a `Param`
+    /// (`false`, for turbofish type arguments in expression position, where
+    /// the scope is not threaded through — typechecking reports it).
+    fn parse_type(&mut self, allowed: &[String], strict: bool) -> Option<(VlType, Span)> {
         let t = self.peek().clone();
         match t.kind {
             TokenKind::Ident(name) => {
+                // `Array[T]`: the bracket must immediately follow. A bare
+                // `Array` without arguments is an error (unless a type
+                // parameter literally named `Array` is in scope).
+                if name == "Array"
+                    && !allowed.iter().any(|a| a == "Array")
+                    && matches!(
+                        self.toks.get(self.pos + 1).map(|t| &t.kind),
+                        Some(TokenKind::LBracket)
+                    )
+                {
+                    return self.parse_array_type(allowed, strict);
+                }
                 self.bump();
+                if name == "Array" && !allowed.iter().any(|a| a == "Array") {
+                    self.diags.push(
+                        Diagnostic::error("`Array` expects an element type")
+                            .with_label(t.span, "write `Array[T]`, e.g. `Array[u64]`")
+                            .with_code("E104"),
+                    );
+                    return None;
+                }
+                // Removed predecessor type: point at the replacement.
+                if name == "U64Array" {
+                    self.diags.push(
+                        Diagnostic::error("unknown type `U64Array`")
+                            .with_label(t.span, "`U64Array` was removed; use `Array[u64]`")
+                            .with_code("E105"),
+                    );
+                    return None;
+                }
                 match name.parse::<VlType>() {
                     Ok(ty) => Some((ty, t.span)),
+                    Err(_) if allowed.iter().any(|a| a == &name) => {
+                        Some((VlType::Param(name), t.span))
+                    }
+                    Err(_) if !strict => Some((VlType::Param(name), t.span)),
                     Err(e) => {
                         self.diags.push(
                             Diagnostic::error(e.to_string())
@@ -394,7 +457,7 @@ impl<'a> Parser<'a> {
                     Diagnostic::error(format!("expected a type, found {}", describe(&t.kind)))
                         .with_label(
                             t.span,
-                            "expected one of u64, i64, f64, bool, u8, string, File, U64Array, void",
+                            "expected one of u64, i64, f64, bool, u8, string, File, Array[T], void",
                         )
                         .with_code("E104"),
                 );
@@ -403,7 +466,28 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_param(&mut self) -> Option<Param> {
+    /// Parse the `[T]` tail of `Array[T]` (the `Array` ident and the lookahead
+    /// were already established by [`parse_type`](Self::parse_type)).
+    fn parse_array_type(&mut self, allowed: &[String], strict: bool) -> Option<(VlType, Span)> {
+        let head = self.bump(); // `Array`
+        self.bump(); // `[` (established by lookahead)
+        let (elem, _) = self.parse_type(allowed, strict)?;
+        if elem.is_void() {
+            self.diags.push(
+                Diagnostic::error("`Array[void]` is not a value type")
+                    .with_label(head.span, "`void` has no values to store")
+                    .with_code("E104"),
+            );
+            return None;
+        }
+        let close = self.expect(&TokenKind::RBracket, "`]` after the element type")?;
+        Some((
+            VlType::Array(Box::new(elem)),
+            Span::new(head.span.start, close.span.end),
+        ))
+    }
+
+    fn parse_param(&mut self, allowed: &[String]) -> Option<Param> {
         let (name, name_span) = self.parse_ident()?;
         if !matches!(self.peek().kind, TokenKind::Colon) {
             let t = self.peek().clone();
@@ -422,7 +506,7 @@ impl<'a> Parser<'a> {
             });
         }
         self.bump(); // `:`
-        match self.parse_type() {
+        match self.parse_type(allowed, true) {
             Some((ty, ty_span)) => {
                 if ty.is_void() {
                     self.diags.push(
@@ -453,15 +537,70 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse `[T, U]` after a function name. Returns the declared type
+    /// parameters (empty when there is no bracket). Reports duplicates,
+    /// empty lists, and shadowing of primitive type names.
+    fn parse_type_params(&mut self) -> Option<Vec<TypeParam>> {
+        if !matches!(self.peek().kind, TokenKind::LBracket) {
+            return Some(Vec::new());
+        }
+        self.bump(); // `[`
+        let mut params = Vec::new();
+        if matches!(self.peek().kind, TokenKind::RBracket) {
+            let t = self.bump();
+            self.diags.push(
+                Diagnostic::error("expected at least one type parameter")
+                    .with_label(t.span, "empty `[]` here")
+                    .with_note("write `function f[T](...)` or drop the brackets")
+                    .with_code("E104"),
+            );
+            return Some(params);
+        }
+        loop {
+            match self.parse_ident() {
+                Some((name, span)) => {
+                    if name.parse::<VlType>().is_ok() {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "type parameter `{name}` shadows a primitive type"
+                            ))
+                            .with_label(span, "pick another name, e.g. `T`")
+                            .with_code("E104"),
+                        );
+                    } else if params.iter().any(|p: &TypeParam| p.name == name) {
+                        self.diags.push(
+                            Diagnostic::error(format!("duplicate type parameter `{name}`"))
+                                .with_label(span, "redefined here")
+                                .with_code("E200"),
+                        );
+                    } else {
+                        params.push(TypeParam { name, span });
+                    }
+                }
+                None => return None,
+            }
+            match &self.peek().kind {
+                TokenKind::Comma => {
+                    self.bump();
+                }
+                _ => break,
+            }
+        }
+        self.expect(&TokenKind::RBracket, "`]` after type parameters")?;
+        Some(params)
+    }
+
     fn parse_function_item(&mut self) -> Option<Item> {
         let function_tok = self.bump(); // `function`
         let (name, name_span) = self.parse_ident()?;
+        let type_params = self.parse_type_params()?;
+        let allowed: Vec<String> = type_params.iter().map(|p| p.name.clone()).collect();
         self.expect(&TokenKind::LParen, "`(`")?;
         let mut params = Vec::new();
         if !matches!(self.peek().kind, TokenKind::RParen) {
             loop {
                 {
-                    let p = self.parse_param()?;
+                    let p = self.parse_param(&allowed)?;
                     params.push(p)
                 }
                 match &self.peek().kind {
@@ -478,7 +617,7 @@ impl<'a> Parser<'a> {
         // leaves `ret` as `None` (already reported; downstream stays quiet).
         let (ret, ret_span) = if matches!(self.peek().kind, TokenKind::Colon) {
             self.bump(); // `:`
-            match self.parse_type() {
+            match self.parse_type(&allowed, true) {
                 Some((ty, span)) => (Some(ty), Some(span)),
                 None => (None, None),
             }
@@ -503,6 +642,7 @@ impl<'a> Parser<'a> {
         Some(Item::Function {
             name,
             name_span,
+            type_params,
             params,
             ret,
             ret_span,
@@ -570,9 +710,11 @@ impl<'a> Parser<'a> {
             // comparison statement): when no `=` follows, rewind and fall
             // through to the expression-statement path.
             let save = self.pos;
+            let diags_len = self.diags.len();
             let base = self.parse_postfix()?;
             if !matches!(self.peek().kind, TokenKind::Eq) {
                 self.pos = save;
+                self.diags.truncate(diags_len);
                 let value = self.parse_expr()?;
                 self.expect(&TokenKind::Semi, "`;`")?;
                 Some(Stmt::Expr(value))
@@ -908,8 +1050,14 @@ impl<'a> Parser<'a> {
     /// Postfix indexing: `primary` followed by any number of `[expr]`.
     /// Array literals consume their own brackets, so `[1u64][0]` reads
     /// element 0 of a one-element literal.
+    ///
+    /// `f[T](args)` without `::` is not a generic call: it parses here as
+    /// indexing `f[T]` followed by a stray `(`, which gets one targeted
+    /// error pointing at the turbofish (`f::[T](args)`). Index results are
+    /// never callable, so no valid program is rejected by this rule.
     fn parse_postfix(&mut self) -> Option<Expr> {
         let mut base = self.parse_primary()?;
+        let mut indexed = false;
         while matches!(self.peek().kind, TokenKind::LBracket) {
             self.bump(); // `[`
             let index = self.parse_expr()?;
@@ -920,8 +1068,51 @@ impl<'a> Parser<'a> {
                 index: Box::new(index),
                 span,
             };
+            indexed = true;
+        }
+        if indexed && matches!(self.peek().kind, TokenKind::LParen) {
+            let paren = self.peek().clone();
+            self.diags.push(
+                Diagnostic::error("cannot call an index expression")
+                    .with_label(base.span(), "this is `path[index]`, not a generic call")
+                    .with_label(
+                        paren.span,
+                        "explicit type arguments use `::`: write `f::[T](...)`",
+                    )
+                    .with_code("E103"),
+            );
+            return None;
         }
         Some(base)
+    }
+
+    /// Parse an optional turbofish (`::[T, U]`) after a call path. Type
+    /// arguments parse permissively (unknown names become type parameters);
+    /// typechecking reports the ones nothing binds.
+    fn parse_type_args(&mut self) -> Option<(Vec<VlType>, Option<Span>)> {
+        if !matches!(self.peek().kind, TokenKind::ColonColon)
+            || !matches!(
+                self.toks.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::LBracket)
+            )
+        {
+            return Some((Vec::new(), None));
+        }
+        self.bump(); // `::`
+        let open = self.bump(); // `[`
+        let mut args = Vec::new();
+        loop {
+            let (ty, _) = self.parse_type(&[], false)?;
+            args.push(ty);
+            match &self.peek().kind {
+                TokenKind::Comma => {
+                    self.bump();
+                }
+                _ => break,
+            }
+        }
+        let close = self.expect(&TokenKind::RBracket, "`]` after type arguments")?;
+        Some((args, Some(Span::new(open.span.start, close.span.end))))
     }
 
     fn parse_primary(&mut self) -> Option<Expr> {
@@ -954,6 +1145,17 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(_) => {
                 let path = self.parse_path()?;
                 let end = self.toks[self.pos.saturating_sub(1)].span.end;
+                let (type_args, type_args_span) = self.parse_type_args()?;
+                if !type_args.is_empty() && !matches!(self.peek().kind, TokenKind::LParen) {
+                    let t = self.peek().clone();
+                    self.diags.push(
+                        Diagnostic::error("expected `(...)` after type arguments")
+                            .with_label(t.span, "explicit type arguments only apply to calls")
+                            .with_note("write `f::[T](args)`; `f::[T]` alone is not a value")
+                            .with_code("E103"),
+                    );
+                    return None;
+                }
                 if matches!(self.peek().kind, TokenKind::LParen) {
                     self.bump(); // `(`
                     let mut args = Vec::new();
@@ -973,6 +1175,8 @@ impl<'a> Parser<'a> {
                     Some(Expr::Call {
                         callee: path,
                         callee_span: Span::new(t.span.start, end),
+                        type_args,
+                        type_args_span,
                         args,
                         span,
                     })
@@ -1075,6 +1279,7 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::Comma => "`,`".into(),
         TokenKind::Dot => "`.`".into(),
         TokenKind::Colon => "`:`".into(),
+        TokenKind::ColonColon => "`::`".into(),
         TokenKind::Invalid => "invalid token".into(),
         TokenKind::Eof => "end of file".into(),
     }
@@ -1088,6 +1293,17 @@ mod tests {
         let (toks, lex_diags) = vl_lex::lex(src);
         assert!(lex_diags.is_empty());
         parse(&toks, src)
+    }
+
+    /// Search message, labels, and note for a substring.
+    fn mentions(diags: &[Diagnostic], s: &str) -> bool {
+        diags.iter().any(|d| {
+            d.message.contains(s)
+                || d.labels
+                    .iter()
+                    .any(|l| l.message.as_deref().is_some_and(|m| m.contains(s)))
+                || d.note.as_deref().is_some_and(|n| n.contains(s))
+        })
     }
 
     #[test]
@@ -1301,12 +1517,12 @@ mod tests {
     #[test]
     fn parses_array_literal_index_and_index_assign() {
         let (prog, diags) = parse_src(
-            "function get(a: U64Array): u64 { a[0u64] = 1u64; return a[0u64]; } function main() { let b = [1u64, 2u64,]; let e = []; }",
+            "function get(a: Array[u64]): u64 { a[0u64] = 1u64; return a[0u64]; } function main() { let b = [1u64, 2u64,]; let e = []; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { params, body, .. } => {
-                assert_eq!(params[0].ty, Some(VlType::U64Array));
+                assert_eq!(params[0].ty, Some(VlType::Array(Box::new(VlType::U64))));
                 assert!(matches!(body[0], Stmt::IndexAssign { .. }));
                 assert!(matches!(
                     body[1],
@@ -1337,6 +1553,117 @@ mod tests {
             }
             other => panic!("expected fn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_nested_array_types() {
+        let (prog, diags) =
+            parse_src("function f(a: Array[Array[u64]]): Array[string] { return [\"s\"]; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { params, ret, .. } => {
+                assert_eq!(
+                    params[0].ty,
+                    Some(VlType::Array(Box::new(VlType::Array(Box::new(
+                        VlType::U64
+                    )))))
+                );
+                assert_eq!(*ret, Some(VlType::Array(Box::new(VlType::String))));
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_array_without_element_is_an_error() {
+        let (_prog, diags) = parse_src("function f(a: Array): void { return; }");
+        assert!(diags.iter().any(|d| d.code.as_deref() == Some("E104")));
+    }
+
+    #[test]
+    fn u64array_is_removed_with_a_hint() {
+        let (_prog, diags) = parse_src("function f(a: U64Array): void { return; }");
+        assert!(mentions(&diags, "Array[u64]"), "{diags:?}");
+    }
+
+    #[test]
+    fn parses_generic_function_and_turbofish_call() {
+        let (prog, diags) = parse_src(
+            "function first[T](a: Array[T]): T { return a[0u64]; } function main() { first([1u64]); first::[u64]([1u64]); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function {
+                type_params,
+                params,
+                ret,
+                ..
+            } => {
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].name, "T");
+                assert_eq!(
+                    params[0].ty,
+                    Some(VlType::Array(Box::new(VlType::Param("T".into()))))
+                );
+                assert_eq!(*ret, Some(VlType::Param("T".into())));
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+        match &prog.items[1] {
+            Item::Function { body, .. } => {
+                match &body[0] {
+                    Stmt::Expr(Expr::Call {
+                        type_args, args, ..
+                    }) => {
+                        assert!(type_args.is_empty());
+                        assert_eq!(args.len(), 1);
+                    }
+                    other => panic!("expected inferred call, got {other:?}"),
+                }
+                match &body[1] {
+                    Stmt::Expr(Expr::Call {
+                        type_args, args, ..
+                    }) => {
+                        assert_eq!(*type_args, vec![VlType::U64]);
+                        assert_eq!(args.len(), 1);
+                    }
+                    other => panic!("expected turbofish call, got {other:?}"),
+                }
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_type_params_are_an_error() {
+        let (_prog, diags) = parse_src("function f[T, T](x: T): T { return x; }");
+        assert!(diags.iter().any(|d| d.code.as_deref() == Some("E200")));
+    }
+
+    #[test]
+    fn type_param_shadowing_primitive_is_an_error() {
+        let (_prog, diags) = parse_src("function f[u64](x: u64): u64 { return x; }");
+        assert!(diags
+            .iter()
+            .any(|d| d.message.contains("shadows a primitive")));
+    }
+
+    #[test]
+    fn unknown_type_param_in_signature_is_an_error() {
+        let (_prog, diags) = parse_src("function f[T](x: U): U { return x; }");
+        assert!(diags.iter().any(|d| d.code.as_deref() == Some("E105")));
+    }
+
+    #[test]
+    fn bracket_call_without_turbofish_is_an_index_error() {
+        let (_prog, diags) = parse_src("function main() { f[T](1u64); }");
+        assert!(mentions(&diags, "f::[T]"), "{diags:?}");
+    }
+
+    #[test]
+    fn turbofish_without_call_is_an_error() {
+        let (_prog, diags) = parse_src("function main() { f::[u64]; }");
+        assert!(diags.iter().any(|d| d.code.as_deref() == Some("E103")));
     }
 
     #[test]
