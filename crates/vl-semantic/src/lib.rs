@@ -581,6 +581,9 @@ impl Resolver {
     }
 }
 
+/// Default module catalog used by [`resolve`]. Must mirror
+/// `vl_codegen::modules` (which owns the extern signatures); the two cannot
+/// share code without an import cycle, so keep them in sync by hand.
 pub fn default_modules() -> Vec<ModuleSpec> {
     use vl_common::VlType as T;
     vec![
@@ -588,6 +591,7 @@ pub fn default_modules() -> Vec<ModuleSpec> {
             &["std"],
             &[
                 ("print", &[("value", T::String)], T::Void),
+                ("println", &[("value", T::String)], T::Void),
                 ("print_u64", &[("value", T::U64)], T::Void),
             ],
         ),
@@ -788,6 +792,7 @@ mod tests {
                 &["std"],
                 &[
                     ("print", &[("value", T::String)], T::Void),
+                    ("println", &[("value", T::String)], T::Void),
                     ("print_u64", &[("value", T::U64)], T::Void),
                 ],
             ),

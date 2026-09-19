@@ -31,7 +31,9 @@ function main() {
 }
 ```
 
-The `print` call writes the string without adding another newline.
+The `print` call writes the string without adding another newline. To end
+the line automatically, use `println` instead — `println("Hello, world!")`
+prints the same bytes as `print("Hello, world!\n")`.
 
 ## Check the source
 

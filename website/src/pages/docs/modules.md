@@ -10,7 +10,8 @@ availability: VL 0.1+
 
 As a program grows, put related code in separate files and reuse it with
 imports. VL also provides a small standard library for common operations such
-as printing.
+as printing (`std.print` writes a string as-is; `std.println` appends a
+newline).
 
 ## Source files are modules
 

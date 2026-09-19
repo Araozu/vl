@@ -9,7 +9,7 @@
 //! - [`NaraVmTarget`]: executable Naravm 0.2 vmfiles: `function main()`
 //!   becomes the `<entrypoint>` function plus one Nara function per other
 //!   user function. Integer/float arithmetic, comparisons, and control flow
-//!   plus `std.print` / `std.print_u64` and user-function calls lower to
+//!   plus `std.print` / `std.println` / `std.print_u64` and user-function calls lower to
 //!   `calli`.
 //!
 //! Rule: new targets = new types implementing [`Target`]. Never branch
@@ -49,6 +49,7 @@ pub fn modules() -> Vec<vl_common::ModuleSpec> {
             &["std"],
             &[
                 ("print", &[("value", T::String)], T::Void),
+                ("println", &[("value", T::String)], T::Void),
                 ("print_u64", &[("value", T::U64)], T::Void),
             ],
         ),
@@ -76,6 +77,7 @@ pub fn modules_for_target(target: &str) -> Vec<vl_common::ModuleSpec> {
             &["std"],
             &[
                 ("print", &[("value", T::String)], T::Void),
+                ("println", &[("value", T::String)], T::Void),
                 ("print_u64", &[("value", T::U64)], T::Void),
             ],
         )],
@@ -249,7 +251,8 @@ impl Target for StackVmTarget {
 /// Naravm 0.2 executable vmfile backend: compiles `function main()` to the
 /// `<entrypoint>` function plus one Nara function per other user function
 /// (see the internals book for the supported subset). Calls to
-/// `std.print` / `std.print_u64` and to user functions lower to `calli`;
+/// `std.print` / `std.println` / `std.print_u64` and to user functions lower
+/// to `calli`;
 /// `Array[T]` values lower to memory containers (`create`/`getvat`/`setvat`
 /// for value elements, `getrfat`/`setrfat` for reference elements);
 /// anything else is a diagnostic.
@@ -1128,6 +1131,38 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 };
                 e.bytecode.extend_from_slice(&[0x05, 0x31, s]); // cprf rf31, src
                 nara_calli(e, ctx.print_fn_idx, *span);
+            } else if callee == "std.println" || callee == "println" {
+                if args.len() != 1 {
+                    e.diags.push(
+                        Diagnostic::error("std.println expects one string argument")
+                            .with_label(*span, "invalid call")
+                            .with_code("E401"),
+                    );
+                    e.invalid.insert(*dst);
+                    return;
+                }
+                if e.invalid.contains(&args[0]) {
+                    e.invalid.insert(*dst);
+                    return;
+                }
+                let Some(s) = e.ref_reg(args[0], *span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x05, 0x31, s]); // cprf rf31, src
+                nara_calli(e, ctx.print_fn_idx, *span);
+                // `println` is `print` plus a trailing newline. The VM has no
+                // native newline call, so lower it to a second `print("\n")`.
+                let (Some(idx), Some(nl)) = (e.add_string(b"\n", *span), e.fresh_rf(*span)) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x03, nl, idx as u8]); // lrf
+                e.bytecode.extend_from_slice(&[0x05, 0x31, nl]); // cprf rf31, nl
+                nara_calli(e, ctx.print_fn_idx, *span);
+                // The newline register is a backend temporary, not a LIR
+                // value, so recycle it immediately for the next call.
+                e.free_rf.push(nl);
             } else if callee == "std.print_u64" || callee == "print_u64" {
                 if args.len() != 1 {
                     e.diags.push(
@@ -1171,7 +1206,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                     ))
                     .with_label(*span, "unsupported call")
                     .with_note(
-                        "only `std.print`, `std.print_u64`, and user functions lower to Naravm calls",
+                        "only `std.print`, `std.println`, `std.print_u64`, and user functions lower to Naravm calls",
                     )
                     .with_code("E404"),
                 );
@@ -1514,7 +1549,7 @@ fn nara_user_call(
             ))
             .with_label(span, "unsupported call")
             .with_note(
-                "only `std.print`, `std.print_u64`, and user functions lower to Naravm calls",
+                "only `std.print`, `std.println`, `std.print_u64`, and user functions lower to Naravm calls",
             )
             .with_code("E404"),
         );
@@ -2383,6 +2418,36 @@ function main() {
         assert!(tdiags.is_empty(), "{tdiags:?}");
         let lir = vl_lir::lower(&hir, &typed);
         assert!(lir.dump().contains("call print"), "{}", lir.dump());
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+    }
+
+    #[test]
+    fn naravm_emits_println_as_print_plus_newline() {
+        let lir = lir_of("use std; function main() { std.println(\"hi\"); }");
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let bytes = artifact.unwrap().bytes.unwrap();
+        assert_eq!(&bytes[..4], b"nara");
+        // One `println` lowers to two `print` calls (value + "\n"),
+        // so at least two calli (0x20) must be present.
+        let callis = bytes.iter().filter(|b| **b == 0x20).count();
+        assert!(callis >= 2, "expected two print calls, got {callis}");
+    }
+
+    #[test]
+    fn naravm_accepts_bare_println_from_single_export_use() {
+        let src = "use std.println; function main() { println(\"hi\"); }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, rdiags) = vl_semantic::resolve_with_modules(&prog, &modules());
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, tdiags) = vl_typecheck::check(&hir);
+        assert!(tdiags.is_empty(), "{tdiags:?}");
+        let lir = vl_lir::lower(&hir, &typed);
+        assert!(lir.dump().contains("call println"), "{}", lir.dump());
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
         assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");

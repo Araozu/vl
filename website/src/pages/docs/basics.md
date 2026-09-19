@@ -30,6 +30,10 @@ Read this from top to bottom:
 4. `std.print(...)` calls a function.
 5. The semicolon marks the end of the call.
 
+`std.print` writes the string exactly as given. When you want the line to
+end with a newline, call `std.println("Hello, VL!")` instead — it appends
+`"\n"` for you.
+
 Every runnable program needs a zero-argument `function main()` that returns
 `void`. A missing return type means `void`, so `function main()` and
 `function main(): void` mean the same thing.

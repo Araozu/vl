@@ -37,6 +37,22 @@
         string argument.
       example: |
         print("ready\n");
+    - name: println
+      params:
+        - name: value
+          type: string
+          detail: Byte string to write. A single trailing newline is added.
+      returns:
+        type: void
+      detail: |
+        Writes one byte string to standard output, followed by a newline.
+        `println("hi")` prints the same bytes as `print("hi\n")`.
+
+        `std.println` is supported by the Naravm target and currently expects exactly one
+        string argument. The VM has no native newline operation, so it lowers
+        to two `print` calls (the value, then `"\n"`).
+      example: |
+        println("ready");
     - name: print_u64
       params:
         - name: value

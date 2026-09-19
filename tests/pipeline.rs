@@ -26,6 +26,30 @@ fn hello_compiles_to_lir() {
 }
 
 #[test]
+fn println_compiles_and_runs_on_naravm() {
+    use vl_codegen::Target;
+    let lir = frontend("use std; function main() { std.println(\"hi\"); std.print(\"x\\n\"); }")
+        .expect("println must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("call std.println"), "{dump}");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+    assert!(bytes.contains(&0x20), "expected calli instructions");
+}
+
+#[test]
+fn println_arg_types_are_checked() {
+    let err = frontend("use std; function main() { std.println(1); }")
+        .expect_err("println expects string");
+    assert!(
+        err.iter().any(|d| d.message.contains("expects `string`")),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn naravm_emits_executable_vmfile() {
     use vl_codegen::Target;
     let src = std::fs::read_to_string("examples/hello.vl").unwrap();
