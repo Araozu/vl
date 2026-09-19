@@ -48,6 +48,8 @@ pub enum TokenKind {
     Comma,
     Dot,
     Colon,
+    /// Turbofish separator (`::`): `f::[T](args)`, `Array.new::[u64](n)`.
+    ColonColon,
     /// A token whose source span already has a lexer diagnostic. Parsers
     /// consume it without inventing follow-on syntax errors.
     Invalid,
@@ -203,8 +205,13 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 i += 1;
             }
             ':' => {
-                tokens.push(Token::new(TokenKind::Colon, Span::new(i, i + 1)));
-                i += 1;
+                if bytes.get(i + 1) == Some(&b':') {
+                    tokens.push(Token::new(TokenKind::ColonColon, Span::new(i, i + 2)));
+                    i += 2;
+                } else {
+                    tokens.push(Token::new(TokenKind::Colon, Span::new(i, i + 1)));
+                    i += 1;
+                }
             }
             '.' => {
                 tokens.push(Token::new(TokenKind::Dot, Span::new(i, i + 1)));
@@ -519,5 +526,13 @@ mod tests {
         assert!(matches!(toks[4].kind, TokenKind::U8(255)));
         assert!(matches!(toks[5].kind, TokenKind::Bool(true)));
         assert!(matches!(toks[6].kind, TokenKind::Bool(false)));
+    }
+
+    #[test]
+    fn lexes_turbofish_separator() {
+        let (toks, diags) = lex("f::[u64](1u64); a: u64;");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::ColonColon)));
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Colon)));
     }
 }
