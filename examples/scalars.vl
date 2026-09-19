@@ -1,7 +1,7 @@
-// Scalar literal suffixes and boolean conditional statements.
-let count = 255u8;
-let total = 1u64;
-let delta = -1i64;
+// Contextual integer literals and boolean conditional statements.
+let count = 255;
+let total = 1;
+let delta = -1;
 let ratio = 1.5f64;
 
 function main() {

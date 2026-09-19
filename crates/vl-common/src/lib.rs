@@ -15,6 +15,8 @@ pub mod ty;
 /// Scalar values shared by the frontend and target-neutral IR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scalar {
+    /// An integer literal before type checking supplies its context.
+    Int(i64),
     U64(u64),
     I64(i64),
     F64(u64),

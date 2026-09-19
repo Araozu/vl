@@ -200,6 +200,7 @@ fn dummy_instr(ins: &Instr) -> String {
 
 fn scalar_text(value: Scalar) -> String {
     match value {
+        Scalar::Int(v) => format!("{v}int"),
         Scalar::U64(v) => format!("{v}u64"),
         Scalar::I64(v) => format!("{v}i64"),
         Scalar::F64(v) => format!("{}f64", f64::from_bits(v)),
@@ -310,6 +311,9 @@ impl NaraKind {
     /// reject them; instances are always concrete).
     fn of_ty(ty: &vl_typecheck::Ty) -> Option<Self> {
         match ty {
+            // Untyped integer literals use the target's unsigned value lane
+            // until a signed/byte context has selected a concrete type.
+            vl_typecheck::Ty::Int => Some(NaraKind::U64),
             vl_typecheck::Ty::U64 => Some(NaraKind::U64),
             vl_typecheck::Ty::I64 => Some(NaraKind::I64),
             vl_typecheck::Ty::F64 => Some(NaraKind::F64),
@@ -329,6 +333,7 @@ impl NaraKind {
 
     fn of_scalar(value: Scalar) -> Self {
         match value {
+            Scalar::Int(_) => NaraKind::U64,
             Scalar::U64(_) => NaraKind::U64,
             Scalar::I64(_) => NaraKind::I64,
             Scalar::F64(_) => NaraKind::F64,
@@ -339,6 +344,7 @@ impl NaraKind {
 
     fn scalar_bits(value: Scalar) -> u64 {
         match value {
+            Scalar::Int(v) => v as u64,
             Scalar::U64(v) => v,
             Scalar::I64(v) => v as u64,
             Scalar::F64(v) => v,

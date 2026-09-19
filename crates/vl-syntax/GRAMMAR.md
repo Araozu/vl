@@ -37,7 +37,7 @@ factor   := unary (("*" | "/") unary)*   ; left-assoc
 unary    := ("-" | "!") unary | call
 call     := path "(" args? ")"
 args     := expr ("," expr)*
-literal  := i64 | u64 | f64 | u8 | bool
+literal  := int | i64 | u64 | f64 | u8 | bool
 path     := ident ("." ident)*
 ```
 

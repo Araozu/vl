@@ -10,6 +10,7 @@ use vl_common::{Diagnostic, Span};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenKind {
     Ident(String),
+    Int(i64),
     I64(i64),
     U64(u64),
     F64(u64),
@@ -249,7 +250,7 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                     match suffix {
                         "" => number
                             .parse::<i64>()
-                            .map(TokenKind::I64)
+                            .map(TokenKind::Int)
                             .map_err(|_| "integer literal out of range"),
                         "i64" => number
                             .parse::<i64>()
@@ -517,15 +518,16 @@ mod tests {
 
     #[test]
     fn lexes_scalar_suffixes_and_bools() {
-        let (toks, diags) = lex("1u64 -1i64 1.5f64 255u8 true false");
+        let (toks, diags) = lex("1 1u64 -1i64 1.5f64 255u8 true false");
         assert!(diags.is_empty(), "{diags:?}");
-        assert!(matches!(toks[0].kind, TokenKind::U64(1)));
-        assert!(matches!(toks[1].kind, TokenKind::Minus));
-        assert!(matches!(toks[2].kind, TokenKind::I64(1)));
-        assert!(matches!(toks[3].kind, TokenKind::F64(_)));
-        assert!(matches!(toks[4].kind, TokenKind::U8(255)));
-        assert!(matches!(toks[5].kind, TokenKind::Bool(true)));
-        assert!(matches!(toks[6].kind, TokenKind::Bool(false)));
+        assert!(matches!(toks[0].kind, TokenKind::Int(1)));
+        assert!(matches!(toks[1].kind, TokenKind::U64(1)));
+        assert!(matches!(toks[2].kind, TokenKind::Minus));
+        assert!(matches!(toks[3].kind, TokenKind::I64(1)));
+        assert!(matches!(toks[4].kind, TokenKind::F64(_)));
+        assert!(matches!(toks[5].kind, TokenKind::U8(255)));
+        assert!(matches!(toks[6].kind, TokenKind::Bool(true)));
+        assert!(matches!(toks[7].kind, TokenKind::Bool(false)));
     }
 
     #[test]

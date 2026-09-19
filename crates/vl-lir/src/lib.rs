@@ -244,6 +244,7 @@ fn fmt_instr(ins: &Instr) -> String {
 
 fn fmt_scalar(value: Scalar) -> String {
     match value {
+        Scalar::Int(v) => format!("{v}int"),
         Scalar::U64(v) => format!("{v}u64"),
         Scalar::I64(v) => format!("{v}i64"),
         Scalar::F64(v) => format!("{}f64", f64::from_bits(v)),
@@ -406,7 +407,7 @@ fn lower_fn_epilogue(l: &mut Lowerer, topped_return: bool) {
         let r = l.reg();
         l.instrs.push(Instr::Const {
             dst: r,
-            value: Scalar::I64(0),
+            value: Scalar::Int(0),
             span: Span::empty(0),
         });
         l.instrs.push(Instr::Ret {
@@ -590,9 +591,16 @@ impl Lowerer<'_> {
         match expr {
             HirExpr::Literal { value, span, .. } => {
                 let dst = self.reg();
+                let ty = self.resolved_ty(expr.id())?;
+                let value = match (value, ty) {
+                    (Scalar::Int(v), Ty::U64) => Scalar::U64(*v as u64),
+                    (Scalar::Int(v), Ty::I64) => Scalar::I64(*v),
+                    (Scalar::Int(v), Ty::U8) => Scalar::U8(*v as u8),
+                    (value, _) => *value,
+                };
                 self.instrs.push(Instr::Const {
                     dst,
-                    value: *value,
+                    value,
                     span: *span,
                 });
                 Some(dst)
@@ -1346,9 +1354,9 @@ mod tests {
         let (typed, diags) = vl_typecheck::check(&hir);
         assert!(diags.is_empty());
         let dump = lower(&hir, &typed).dump();
-        assert!(dump.contains("const 7i64"), "{dump}");
+        assert!(dump.contains("const 7int"), "{dump}");
         // Explicit `return` is the tail: no default-zero fallthrough.
-        assert!(!dump.contains("const 0i64"), "{dump}");
+        assert!(!dump.contains("const 0int"), "{dump}");
     }
 
     #[test]
@@ -1363,8 +1371,8 @@ mod tests {
         let dump = lower(&hir, &typed).dump();
         // Discarded tail still lowers, but the function epilogue is the
         // default zero (void fallthrough), not the tail value.
-        assert!(dump.contains("const 7i64"), "{dump}");
-        assert!(dump.contains("const 0i64"), "{dump}");
+        assert!(dump.contains("const 7int"), "{dump}");
+        assert!(dump.contains("const 0int"), "{dump}");
     }
 
     #[test]

@@ -3,17 +3,17 @@
 use std;
 
 function main() {
-    let i = 5u64;
-    while (i > 0u64) {
-        if (i == 3u64) {
+    let i = 5;
+    while (i > 0) {
+        if (i == 3) {
             std.print("three\n");
         } else {
             std.print_u64(i);
         }
-        i = i - 1u64;
+        i = i - 1;
     }
     let ready = true;
-    if (ready && i == 0u64) {
+    if (ready && i == 0) {
         std.print("done\n");
     }
     while (!ready) {

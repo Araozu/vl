@@ -351,11 +351,11 @@ fn array_new_needs_no_import() {
 
 #[test]
 fn array_element_mismatch_is_one_error() {
-    let err = frontend("function main() { let a = [1, 2u64]; a; }").expect_err("must fail");
+    let err = frontend("function main() { let a = [1, 2.0f64]; a; }").expect_err("must fail");
     assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
     assert!(
         err.iter()
-            .any(|d| d.message.contains("expects `i64` elements")),
+            .any(|d| d.message.contains("expects `int` elements")),
         "{err:?}"
     );
 }
@@ -370,7 +370,7 @@ fn array_index_shapes_are_checked() {
     );
 
     let err =
-        frontend("function main() { let a = [1u64]; let x = a[0]; x; }").expect_err("must fail");
+        frontend("function main() { let a = [1u64]; let x = a[true]; x; }").expect_err("must fail");
     assert!(
         err.iter().any(|d| d.message.contains("must be `u64`")),
         "{err:?}"

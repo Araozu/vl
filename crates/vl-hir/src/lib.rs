@@ -108,7 +108,7 @@ pub enum HirExpr {
         value: Vec<u8>,
         span: Span,
     },
-    /// Array literal: `[1u64, 2u64]`.
+    /// Array literal: `[1, 2]`; integer element types are contextual.
     ArrayLiteral {
         id: HirId,
         elems: Vec<HirExpr>,
@@ -439,7 +439,7 @@ impl<'a> Lowerer<'a> {
                     let rhs = self.lower_expr(rhs);
                     let zero = match &rhs {
                         HirExpr::Literal { value, .. } => scalar_zero(*value),
-                        _ => Scalar::I64(0),
+                        _ => Scalar::Int(0),
                     };
                     let zero_span = Span::empty(span.start);
                     HirExpr::Binary {
@@ -490,6 +490,7 @@ impl<'a> Lowerer<'a> {
 
 fn scalar_zero(value: Scalar) -> Scalar {
     match value {
+        Scalar::Int(_) => Scalar::Int(0),
         Scalar::U64(_) => Scalar::U64(0),
         Scalar::I64(_) => Scalar::I64(0),
         Scalar::F64(_) => Scalar::F64(0.0f64.to_bits()),

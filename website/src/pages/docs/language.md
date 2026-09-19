@@ -21,8 +21,9 @@ function main() {
 
 ## Values and expressions
 
-Numeric literals are `i64` by default. Add a suffix when you need `u64`, `f64`,
-or `u8`; boolean literals are `true` and `false`. Numeric values support `+`,
+Integer literals are untyped until context selects `u64`, `i64`, or `u8`;
+floating literals retain the `f64` suffix. Boolean literals are `true` and
+`false`. Numeric values support `+`,
 `-`, `*`, `/`, unary minus, and parentheses. Comparisons use `==`, `!=`, `<`,
 `<=`, `>`, `>=`; boolean values combine with `&&`, `||`, and prefix `!`.
 `&&` and `||` short-circuit left to right. Calls use the familiar `name(args)`
@@ -30,15 +31,15 @@ form.
 
 ```vl
 let ready = true;
-let big = total >= 10u64;
+let big = total >= 10;
 let ok = ready && big || !ready;
 ```
 
 ```vl
-let count = 255u8;
-let total = 1u64;
+let count = 255;
+let total = 1;
 let ratio = 1.5f64;
-let result = (total + 2u64) * 3u64;
+let result = (total + 2) * 3;
 ```
 
 ## Bindings and functions
@@ -113,18 +114,18 @@ Strings are byte strings for now rather than a full text type. See the
 
 `Array[T]` is a fixed-length heap array of `T`. `Array.new::[u64](n)`
 allocates a zero-filled array of `n` elements — it is a builtin constructor,
-so no import is needed — and `[1u64, 2u64]` is an array literal (every element
+so no import is needed — and `[1, 2]` is an array literal (every element
 must share one type; empty `[]` cannot infer it, so use the constructor).
-Indices are always `u64` (write `3u64`, not `3`):
+Indices are always `u64`; integer literals are coerced from their context:
 
 ```vl
 function main() {
-    let a = Array.new::[u64](3u64);
-    a[0u64] = 10u64;
-    a[1u64] = 20u64;
-    a[2u64] = 30u64;
-    let b = [1u64, 2u64, 3u64];
-    b[0u64] = 5u64;
+    let a = Array.new::[u64](3);
+    a[0] = 10;
+    a[1] = 20;
+    a[2] = 30;
+    let b = [1, 2, 3];
+    b[0] = 5;
 }
 ```
 
@@ -133,11 +134,11 @@ values: they can be passed to functions and returned from them:
 
 ```vl
 function sum(a: Array[u64], n: u64): u64 {
-    let total = 0u64;
-    let i = 0u64;
+    let total = 0;
+    let i = 0;
     while (i < n) {
         total = total + a[i];
-        i = i + 1u64;
+        i = i + 1;
     }
     return total;
 }
@@ -151,11 +152,11 @@ infer them from the value arguments or pass them explicitly with a turbofish
 
 ```vl
 function first[T](a: Array[T]): T {
-    return a[0u64];
+    return a[0];
 }
 
 function main() {
-    let nums = [10u64, 20u64];
+    let nums = [10, 20];
     let a = first(nums);          // T = u64, inferred
     let b = first::[u64](nums);   // same, explicit
     let words = ["hi", "bye"];
@@ -219,10 +220,10 @@ and `continue` jumps to its next iteration check:
 use std.print_u64;
 
 function main() {
-    let i = 3u64;
-    while (i > 0u64) {
+    let i = 3;
+    while (i > 0) {
         print_u64(i);
-        i = i - 1u64;
+        i = i - 1;
     }
 }
 ```

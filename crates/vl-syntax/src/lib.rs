@@ -1118,6 +1118,10 @@ impl<'a> Parser<'a> {
     fn parse_primary(&mut self) -> Option<Expr> {
         let t = self.peek().clone();
         match t.kind {
+            TokenKind::Int(v) => {
+                self.bump();
+                Some(Expr::Literal(Scalar::Int(v), t.span))
+            }
             TokenKind::I64(v) => {
                 self.bump();
                 Some(Expr::Literal(Scalar::I64(v), t.span))
@@ -1241,7 +1245,8 @@ fn discriminant(k: &TokenKind) -> std::mem::Discriminant<TokenKind> {
 fn describe(k: &TokenKind) -> String {
     match k {
         TokenKind::Ident(n) => format!("identifier `{n}`"),
-        TokenKind::I64(v) => format!("integer `{v}`"),
+        TokenKind::Int(v) => format!("integer `{v}`"),
+        TokenKind::I64(v) => format!("i64 literal `{v}`"),
         TokenKind::U64(v) => format!("u64 literal `{v}`"),
         TokenKind::F64(v) => format!("f64 literal `{}`", f64::from_bits(*v)),
         TokenKind::U8(v) => format!("u8 literal `{v}`"),

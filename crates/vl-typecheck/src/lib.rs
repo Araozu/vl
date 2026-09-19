@@ -26,6 +26,8 @@ use vl_hir::{HirBinOp, HirExpr, HirItem, HirProgram, HirStmt, HirUnOp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ty {
+    /// Integer literal whose concrete integer type is supplied by context.
+    Int,
     U64,
     I64,
     F64,
@@ -47,6 +49,7 @@ impl std::fmt::Display for Ty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Ty::U64 => write!(f, "u64"),
+            Ty::Int => write!(f, "int"),
             Ty::I64 => write!(f, "i64"),
             Ty::F64 => write!(f, "f64"),
             Ty::Bool => write!(f, "bool"),
@@ -122,6 +125,7 @@ pub fn mangle(name: &str, args: &[Ty]) -> String {
 
 fn mangle_ty(ty: &Ty) -> String {
     match ty {
+        Ty::Int => "int".into(),
         Ty::U64 => "u64".into(),
         Ty::I64 => "i64".into(),
         Ty::F64 => "f64".into(),
@@ -456,7 +460,7 @@ impl<'a> Checker<'a> {
                         );
                     }
                     Some(e) => {
-                        let got = self.infer_expr(e);
+                        let got = self.infer_expr_expected(e, &self.fn_ret.clone());
                         // Poisoned values already reported; mark seen so the
                         // missing-`return` check does not cascade.
                         if got == Ty::Error || self.fn_ret == Ty::Error {
@@ -477,7 +481,7 @@ impl<'a> Checker<'a> {
                             );
                             return;
                         }
-                        if got != self.fn_ret {
+                        if !types_compatible(&got, &self.fn_ret) {
                             self.diags.push(
                                 Diagnostic::error(format!(
                                     "function `{}` declares return `{}` but returns `{got}`",
@@ -495,11 +499,16 @@ impl<'a> Checker<'a> {
                 }
             }
             HirStmt::Assign { id, def, value, .. } => {
-                let got = self.infer_expr(value);
                 let Some(def) = def else {
                     // Unresolved target already reported (E201); stay quiet.
                     self.record(*id, Ty::Error);
                     return;
+                };
+                let expected = self.bindings.get(&def.0).cloned();
+                let got = if let Some(ty) = expected.as_ref() {
+                    self.infer_expr_expected(value, ty)
+                } else {
+                    self.infer_expr(value)
                 };
                 if got == Ty::Error {
                     self.record(*id, Ty::Error);
@@ -528,7 +537,7 @@ impl<'a> Checker<'a> {
                             self.record(*id, Ty::Error);
                             return;
                         }
-                        if got != want {
+                        if !types_compatible(&got, &want) {
                             self.diags.push(
                                 Diagnostic::error(format!(
                                     "cannot assign `{got}` to `{want}` binding"
@@ -551,9 +560,8 @@ impl<'a> Checker<'a> {
                 ..
             } => {
                 let at = self.infer_expr(array);
-                let it = self.infer_expr(index);
-                let vt = self.infer_expr(value);
-                if at == Ty::Error || it == Ty::Error || vt == Ty::Error {
+                let it = self.infer_expr_expected(index, &Ty::U64);
+                if at == Ty::Error || it == Ty::Error {
                     self.record(*id, Ty::Error);
                     return;
                 }
@@ -566,7 +574,12 @@ impl<'a> Checker<'a> {
                     self.record(*id, Ty::Error);
                     return;
                 };
-                if it != Ty::U64 {
+                let vt = self.infer_expr_expected(value, &elem);
+                if vt == Ty::Error {
+                    self.record(*id, Ty::Error);
+                    return;
+                }
+                if !types_compatible(&it, &Ty::U64) {
                     self.diags.push(
                         Diagnostic::error(format!("array index must be `u64`, got `{it}`"))
                             .with_label(index.span(), "expected `u64` here")
@@ -575,7 +588,7 @@ impl<'a> Checker<'a> {
                     self.record(*id, Ty::Error);
                     return;
                 }
-                if vt != elem {
+                if !types_compatible(&vt, &elem) {
                     self.diags.push(
                         Diagnostic::error(format!(
                             "cannot store `{vt}` in `{at}` (elements are `{elem}`)"
@@ -669,7 +682,9 @@ impl<'a> Checker<'a> {
                 continue;
             }
             let want = Ty::from_vl_in(&params[i].ty, &self.type_env);
-            if *got == Ty::Void || want == Ty::Void {
+            self.coerce_expr_literals(arg, &want);
+            let got = self.infer_expr(arg);
+            if got == Ty::Void || want == Ty::Void {
                 self.diags.push(
                     Diagnostic::error(format!(
                         "`{name}` parameter `{}` cannot be `void`",
@@ -680,7 +695,7 @@ impl<'a> Checker<'a> {
                 );
                 return self.record(id, Ty::Error);
             }
-            if *got != want {
+            if !types_compatible(&got, &want) {
                 self.diags.push(
                     Diagnostic::error(format!(
                         "`{name}` parameter `{}` expects `{}`, got `{got}`",
@@ -836,7 +851,7 @@ impl<'a> Checker<'a> {
         match (formal, actual) {
             (Ty::Param(p), t) => {
                 if let Some(bound) = binds.get(p) {
-                    if bound != t {
+                    if !types_compatible(t, bound) {
                         diags.push(
                             Diagnostic::error(format!(
                                 "`{name}` infers conflicting types for `{p}`: `{bound}` vs `{t}`"
@@ -906,7 +921,7 @@ impl<'a> Checker<'a> {
             );
             return self.record(id, Ty::Error);
         }
-        if arg_tys[0] != Ty::Error && arg_tys[0] != Ty::U64 {
+        if arg_tys[0] != Ty::Error && !types_compatible(&arg_tys[0], &Ty::U64) {
             self.diags.push(
                 Diagnostic::error(format!(
                     "`{name}` parameter `count` expects `u64`, got `{}`",
@@ -1061,6 +1076,37 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn infer_expr_expected(&mut self, expr: &HirExpr, expected: &Ty) -> Ty {
+        self.coerce_expr_literals(expr, expected);
+        self.infer_expr(expr)
+    }
+
+    /// Give untyped integer literals the concrete type required by a use site.
+    /// Updating the recorded types here also lets LIR select the right integer
+    /// register class without adding conversion instructions.
+    fn coerce_expr_literals(&mut self, expr: &HirExpr, expected: &Ty) {
+        match expr {
+            HirExpr::Literal { id, value, .. }
+                if matches!(value, Scalar::Int(_)) && is_integer(expected) =>
+            {
+                self.record(*id, expected.clone());
+            }
+            HirExpr::ArrayLiteral { id, elems, .. } => {
+                if let Ty::Array(elem) = expected {
+                    for e in elems {
+                        self.coerce_expr_literals(e, elem);
+                    }
+                    self.record(*id, expected.clone());
+                }
+            }
+            HirExpr::Binary { lhs, rhs, .. } if is_integer(expected) => {
+                self.coerce_expr_literals(lhs, expected);
+                self.coerce_expr_literals(rhs, expected);
+            }
+            _ => {}
+        }
+    }
+
     /// Template function name for a `DefId.0` (worklist helper).
     fn instance_name(&self, def: u32) -> Option<String> {
         self.prog.items.iter().find_map(|item| match item {
@@ -1073,7 +1119,17 @@ impl<'a> Checker<'a> {
 
     fn infer_expr(&mut self, expr: &HirExpr) -> Ty {
         match expr {
-            HirExpr::Literal { id, value, .. } => self.record(*id, scalar_ty(*value)),
+            HirExpr::Literal { id, value, .. } => {
+                let ty = if matches!(value, Scalar::Int(_)) {
+                    self.typed
+                        .type_of_id(*id)
+                        .filter(is_integer)
+                        .unwrap_or_else(|| scalar_ty(*value))
+                } else {
+                    scalar_ty(*value)
+                };
+                self.record(*id, ty)
+            }
             HirExpr::String { id, .. } => self.record(*id, Ty::String),
             HirExpr::ArrayLiteral { id, elems, .. } => {
                 if elems.is_empty() {
@@ -1089,12 +1145,17 @@ impl<'a> Checker<'a> {
                     );
                     return self.record(*id, Ty::Error);
                 }
-                let first = self.infer_expr(&elems[0]);
+                let mut first = self.infer_expr(&elems[0]);
                 let mut poisoned = first == Ty::Error;
                 for elem in &elems[1..] {
                     let t = self.infer_expr(elem);
                     if t == Ty::Error {
                         poisoned = true;
+                    } else if !poisoned && first == Ty::Int && is_integer(&t) {
+                        self.coerce_expr_literals(&elems[0], &t);
+                        first = t;
+                    } else if !poisoned && t == Ty::Int && is_integer(&first) {
+                        self.coerce_expr_literals(elem, &first);
                     } else if !poisoned && t != first {
                         self.diags.push(
                             Diagnostic::error(format!(
@@ -1105,6 +1166,16 @@ impl<'a> Checker<'a> {
                         );
                         poisoned = true;
                     }
+                }
+                // An array literal with no concrete integer context still
+                // needs a runtime element type. Use the target's default
+                // unsigned lane, while contextual uses above can select i64
+                // or u8 before this point.
+                if !poisoned && first == Ty::Int {
+                    for elem in elems {
+                        self.coerce_expr_literals(elem, &Ty::U64);
+                    }
+                    first = Ty::U64;
                 }
                 // One bad element poisons the whole literal (single root
                 // cause, no cascade).
@@ -1117,7 +1188,7 @@ impl<'a> Checker<'a> {
                 id, base, index, ..
             } => {
                 let bt = self.infer_expr(base);
-                let it = self.infer_expr(index);
+                let it = self.infer_expr_expected(index, &Ty::U64);
                 if bt == Ty::Error || it == Ty::Error {
                     return self.record(*id, Ty::Error);
                 }
@@ -1129,7 +1200,7 @@ impl<'a> Checker<'a> {
                     );
                     return self.record(*id, Ty::Error);
                 };
-                if it != Ty::U64 {
+                if !types_compatible(&it, &Ty::U64) {
                     self.diags.push(
                         Diagnostic::error(format!("array index must be `u64`, got `{it}`"))
                             .with_label(index.span(), "expected `u64` here")
@@ -1250,12 +1321,14 @@ impl<'a> Checker<'a> {
                 if poisoned {
                     return self.record(*id, Ty::Error);
                 }
-                for (i, got) in arg_tys.iter().enumerate() {
-                    if *got == Ty::Error {
+                for (i, original_got) in arg_tys.iter().enumerate() {
+                    if *original_got == Ty::Error {
                         continue;
                     }
                     let want = &param_tys[i];
-                    if *got == Ty::Void || *want == Ty::Void {
+                    self.coerce_expr_literals(&args[i], want);
+                    let got = self.infer_expr(&args[i]);
+                    if got == Ty::Void || *want == Ty::Void {
                         self.diags.push(
                             Diagnostic::error(format!(
                                 "`{name}` parameter `{}` cannot be `void`",
@@ -1266,7 +1339,7 @@ impl<'a> Checker<'a> {
                         );
                         return self.record(*id, Ty::Error);
                     }
-                    if *got != *want {
+                    if !types_compatible(&got, want) {
                         self.diags.push(
                             Diagnostic::error(format!(
                                 "`{name}` parameter `{}` expects `{}`, got `{got}`",
@@ -1341,7 +1414,14 @@ impl<'a> Checker<'a> {
                 }
                 match op {
                     HirBinOp::Add | HirBinOp::Sub | HirBinOp::Mul | HirBinOp::Div => {
-                        if lt != rt || !is_numeric(&lt) {
+                        if lt == Ty::Int && is_integer(&rt) {
+                            self.coerce_expr_literals(lhs, &rt);
+                        } else if rt == Ty::Int && is_integer(&lt) {
+                            self.coerce_expr_literals(rhs, &lt);
+                        }
+                        let lt = self.infer_expr(lhs);
+                        let rt = self.infer_expr(rhs);
+                        if !types_compatible(&lt, &rt) || !is_numeric(&lt) {
                             self.diags.push(mismatch(*span, &lt, &rt));
                             return self.record(*id, Ty::Error);
                         }
@@ -1356,14 +1436,28 @@ impl<'a> Checker<'a> {
                         self.record(*id, lt)
                     }
                     HirBinOp::Eq | HirBinOp::Ne => {
-                        if lt != rt || !is_comparable(&lt) {
+                        if lt == Ty::Int && is_integer(&rt) {
+                            self.coerce_expr_literals(lhs, &rt);
+                        } else if rt == Ty::Int && is_integer(&lt) {
+                            self.coerce_expr_literals(rhs, &lt);
+                        }
+                        let lt = self.infer_expr(lhs);
+                        let rt = self.infer_expr(rhs);
+                        if !types_compatible(&lt, &rt) || !is_comparable(&lt) {
                             self.diags.push(mismatch(*span, &lt, &rt));
                             return self.record(*id, Ty::Error);
                         }
                         self.record(*id, Ty::Bool)
                     }
                     HirBinOp::Lt | HirBinOp::Le | HirBinOp::Gt | HirBinOp::Ge => {
-                        if lt != rt || !is_numeric(&lt) {
+                        if lt == Ty::Int && is_integer(&rt) {
+                            self.coerce_expr_literals(lhs, &rt);
+                        } else if rt == Ty::Int && is_integer(&lt) {
+                            self.coerce_expr_literals(rhs, &lt);
+                        }
+                        let lt = self.infer_expr(lhs);
+                        let rt = self.infer_expr(rhs);
+                        if !types_compatible(&lt, &rt) || !is_numeric(&lt) {
                             self.diags.push(mismatch(*span, &lt, &rt));
                             return self.record(*id, Ty::Error);
                         }
@@ -1519,6 +1613,7 @@ fn is_zero_literal(expr: &HirExpr) -> bool {
 
 fn scalar_is_zero(value: Scalar) -> bool {
     match value {
+        Scalar::Int(v) => v == 0,
         Scalar::I64(v) => v == 0,
         Scalar::U64(v) => v == 0,
         Scalar::U8(v) => v == 0,
@@ -1529,6 +1624,7 @@ fn scalar_is_zero(value: Scalar) -> bool {
 
 fn scalar_ty(value: Scalar) -> Ty {
     match value {
+        Scalar::Int(_) => Ty::Int,
         Scalar::U64(_) => Ty::U64,
         Scalar::I64(_) => Ty::I64,
         Scalar::F64(_) => Ty::F64,
@@ -1537,14 +1633,24 @@ fn scalar_ty(value: Scalar) -> Ty {
     }
 }
 
+fn is_integer(ty: &Ty) -> bool {
+    matches!(ty, Ty::Int | Ty::U64 | Ty::I64 | Ty::U8)
+}
+
+fn types_compatible(got: &Ty, want: &Ty) -> bool {
+    got == want
+        || (*got == Ty::Int && is_integer(want))
+        || matches!((got, want), (Ty::Array(g), Ty::Array(w)) if types_compatible(g, w))
+}
+
 fn is_numeric(ty: &Ty) -> bool {
-    matches!(ty, Ty::U64 | Ty::I64 | Ty::F64 | Ty::U8)
+    matches!(ty, Ty::Int | Ty::U64 | Ty::I64 | Ty::F64 | Ty::U8)
 }
 
 fn is_comparable(ty: &Ty) -> bool {
     matches!(
         ty,
-        Ty::U64 | Ty::I64 | Ty::F64 | Ty::Bool | Ty::U8 | Ty::String
+        Ty::Int | Ty::U64 | Ty::I64 | Ty::F64 | Ty::Bool | Ty::U8 | Ty::String
     )
 }
 
@@ -1569,15 +1675,17 @@ mod tests {
     }
 
     #[test]
-    fn array_literal_requires_uniform_elements() {
+    fn integer_literals_coerce_in_array_context() {
         let (_, diags) = check_src("function main() { let a = [1, 2u64]; a; }");
-        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
-        assert!(
-            diags
-                .iter()
-                .any(|d| d.message.contains("expects `i64` elements")),
-            "{diags:?}"
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn integer_literals_coerce_at_concrete_boundaries() {
+        let (_, diags) = check_src(
+            "function take(a: u64, b: i64, c: u8): u64 { return a; } function main(): u64 { take(1, 2, 3); return 4; }",
         );
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
@@ -1606,7 +1714,7 @@ mod tests {
 
     #[test]
     fn array_new_arg_is_checked() {
-        let (_, diags) = check_src("function main() { let a = Array.new::[u64](1); a; }");
+        let (_, diags) = check_src("function main() { let a = Array.new::[u64](1.0f64); a; }");
         assert!(
             diags.iter().any(|d| d.message.contains("expects `u64`")),
             "{diags:?}"
@@ -1672,12 +1780,9 @@ mod tests {
     }
 
     #[test]
-    fn mixed_numeric_comparison_errors() {
+    fn untyped_integer_comparison_uses_concrete_context() {
         let (_, diags) = check_src("function main() { let x = 1 < 2u64; x; }");
-        assert!(
-            diags.iter().any(|d| d.code.as_deref() == Some("E302")),
-            "{diags:?}"
-        );
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]

@@ -52,7 +52,7 @@ bytes; no UTF-8 decoding is performed.
 | `continue` | `Continue` | `start..end` of word |
 | `return` | `Return` | `start..end` of word |
 | `[a-zA-Z_][a-zA-Z0-9_]*` | `Ident(String)` | `start..end` of word |
-| `[0-9]+` | `I64(i64)` | `start..end` of digits |
+| `[0-9]+` | `Int(i64)` | `start..end` of digits |
 | `[0-9]+u64` | `U64(u64)` | `start..end` |
 | `[0-9]+i64` | `I64(i64)` | `start..end` |
 | `[0-9]+u8` | `U8(u8)` | `start..end` |
@@ -75,7 +75,7 @@ Notes:
 
 * Maximal munch: `letx` → `Ident("letx")`, not `Let` + `Ident`. Same for `function1`, `letter`, `functional`.
 * Ident continuation in code is `(b as char).is_alphanumeric() || b == b'_'` — for ASCII input this equals `[0-9A-Za-z_]`. Non-ASCII bytes fall through to the error arm.
-* Unsuffixed integer literals are `i64`; suffixed literals are checked against their declared type.
+* Unsuffixed integer literals are untyped `int`; a contextual concrete integer type is selected during type checking.
   Floating literals require the `f64` suffix.
 * All spans are byte offsets, half-open `[start, end)` (`vl_common::Span`). Single-char punct is always length 1.
 * `Eof` is always appended, even when errors occurred: `Span::empty(src.len())`.
