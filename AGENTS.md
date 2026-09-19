@@ -2,6 +2,11 @@
 
 Read this before touching code. Short on purpose.
 
+## Language
+
+VL surface syntax is TypeScript-like (`let`, `function`, braces, `//` comments).
+Semicolons are mandatory; keep new syntax TS-consistent.
+
 ## Layout
 
 Workspace crates (dependency order, lower first):

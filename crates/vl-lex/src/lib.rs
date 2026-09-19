@@ -12,7 +12,7 @@ pub enum TokenKind {
     Ident(String),
     Int(i64),
     Let,
-    Fn,
+    Function,
     Plus,
     Minus,
     Star,
@@ -128,7 +128,7 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 let word = &src[start..i];
                 let kind = match word {
                     "let" => TokenKind::Let,
-                    "fn" => TokenKind::Fn,
+                    "function" => TokenKind::Function,
                     _ => TokenKind::Ident(word.to_string()),
                 };
                 tokens.push(Token::new(kind, Span::new(start, i)));
@@ -139,7 +139,7 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 diags.push(
                     Diagnostic::error(format!("unexpected character `{c}`"))
                         .with_label(Span::new(i, end), "unexpected here")
-                        .with_note("identifiers use letters, digits and `_`; see `let`, `fn`")
+                        .with_note("identifiers use letters, digits and `_`; see `let`, `function`")
                         .with_code("E000"),
                 );
                 i += 1;
@@ -161,6 +161,13 @@ mod tests {
         assert!(diags.is_empty());
         assert!(matches!(toks[0].kind, TokenKind::Let));
         assert!(matches!(toks[1].kind, TokenKind::Ident(_)));
+    }
+
+    #[test]
+    fn lexes_function_keyword() {
+        let (toks, diags) = lex("function main() {}");
+        assert!(diags.is_empty());
+        assert!(matches!(toks[0].kind, TokenKind::Function));
     }
 
     #[test]

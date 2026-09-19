@@ -1,15 +1,18 @@
 //! vl-syntax: recursive-descent parser, tokens -> AST.
 //!
-//! Grammar (v0):
+//! Grammar (v0, TypeScript-like surface):
 //! ```text
 //! program := item*
-//! item    := `let` ident `=` expr `;` | `fn` ident `(` params? `)` block
-//! block   := `{` stmt* expr? `}`
-//! stmt    := `let` ident `=` expr `;`
+//! item    := `let` ident `=` expr `;` | `function` ident `(` params? `)` block
+//! block   := `{` stmt* `}`
+//! stmt    := `let` ident `=` expr `;` | expr `;`
 //! expr    := term ((`+`|`-`) term)*
 //! term    := factor ((`*`|`/`) factor)*
 //! factor  := int | ident | `(` expr `)` | `-` factor
 //! ```
+//!
+//! Semicolons are mandatory: every `let` and every expression statement
+//! ends with `;` (no bare trailing value like Rust).
 //!
 //! The parser recovers per-item: one bad item doesn't kill the rest.
 
@@ -31,7 +34,7 @@ pub enum Item {
         value: Expr,
         span: Span,
     },
-    Fn {
+    Function {
         name: String,
         name_span: Span,
         params: Vec<(String, Span)>,
@@ -154,7 +157,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     return;
                 }
-                TokenKind::Let | TokenKind::Fn => return,
+                TokenKind::Let | TokenKind::Function => return,
                 _ => {
                     self.bump();
                 }
@@ -165,16 +168,16 @@ impl<'a> Parser<'a> {
     fn parse_item(&mut self) -> Option<Item> {
         match &self.peek().kind {
             TokenKind::Let => self.parse_let_item(),
-            TokenKind::Fn => self.parse_fn_item(),
+            TokenKind::Function => self.parse_function_item(),
             TokenKind::Eof => None,
             _ => {
                 let t = self.peek().clone();
                 self.diags.push(
                     Diagnostic::error(format!(
-                        "expected an item (`let` or `fn`), found {}",
+                        "expected an item (`let` or `function`), found {}",
                         describe(&t.kind)
                     ))
-                    .with_label(t.span, "items start with `let` or `fn`")
+                    .with_label(t.span, "items start with `let` or `function`")
                     .with_code("E101"),
                 );
                 None
@@ -196,8 +199,8 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_fn_item(&mut self) -> Option<Item> {
-        let fn_tok = self.bump(); // `fn`
+    fn parse_function_item(&mut self) -> Option<Item> {
+        let function_tok = self.bump(); // `function`
         let (name, name_span) = self.parse_ident()?;
         self.expect(&TokenKind::LParen, "`(`")?;
         let mut params = Vec::new();
@@ -226,12 +229,12 @@ impl<'a> Parser<'a> {
             }
         }
         let close = self.expect(&TokenKind::RBrace, "`}`")?;
-        Some(Item::Fn {
+        Some(Item::Function {
             name,
             name_span,
             params,
             body,
-            span: Span::new(fn_tok.span.start, close.span.end),
+            span: Span::new(function_tok.span.start, close.span.end),
         })
     }
 
@@ -249,7 +252,9 @@ impl<'a> Parser<'a> {
                 span: Span::new(let_tok.span.start, semi.span.end),
             })
         } else {
-            self.parse_expr().map(Stmt::Expr)
+            let value = self.parse_expr()?;
+            self.expect(&TokenKind::Semi, "`;`")?;
+            Some(Stmt::Expr(value))
         }
     }
 
@@ -260,7 +265,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     return;
                 }
-                TokenKind::RBrace | TokenKind::Let | TokenKind::Fn => return,
+                TokenKind::RBrace | TokenKind::Let | TokenKind::Function => return,
                 _ => {
                     self.bump();
                 }
@@ -389,7 +394,7 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::Ident(n) => format!("identifier `{n}`"),
         TokenKind::Int(v) => format!("integer `{v}`"),
         TokenKind::Let => "`let`".into(),
-        TokenKind::Fn => "`fn`".into(),
+        TokenKind::Function => "`function`".into(),
         TokenKind::Plus => "`+`".into(),
         TokenKind::Minus => "`-`".into(),
         TokenKind::Star => "`*`".into(),
@@ -426,5 +431,18 @@ mod tests {
     fn missing_semi_is_an_error() {
         let (_prog, diags) = parse_src("let x = 1");
         assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn expression_statement_requires_semi() {
+        let (_prog, diags) = parse_src("function main() { d }");
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn function_keyword_parses_with_semi_body() {
+        let (prog, diags) = parse_src("function main() { d; }");
+        assert!(diags.is_empty());
+        assert_eq!(prog.items.len(), 1);
     }
 }

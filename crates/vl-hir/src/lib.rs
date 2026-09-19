@@ -137,7 +137,7 @@ impl<'a> Lowerer<'a> {
                     span: *span,
                 }
             }
-            AstItem::Fn {
+            AstItem::Function {
                 name,
                 params,
                 body,

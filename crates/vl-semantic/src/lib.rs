@@ -68,7 +68,7 @@ pub fn resolve(prog: &Program) -> (Resolution, Vec<Diagnostic>) {
             } => {
                 r.declare_global(name.clone(), *name_span);
             }
-            Item::Fn {
+            Item::Function {
                 name, name_span, ..
             } => {
                 r.declare_global(name.clone(), *name_span);
@@ -82,7 +82,7 @@ pub fn resolve(prog: &Program) -> (Resolution, Vec<Diagnostic>) {
             Item::Let { value, .. } => {
                 r.resolve_expr(value);
             }
-            Item::Fn { params, body, .. } => {
+            Item::Function { params, body, .. } => {
                 r.scopes.push(HashMap::new());
                 for (p, s) in params {
                     let id = r.out.intern_def(p.clone(), *s);
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn shadowing_is_a_warning_only() {
-        let (toks, _) = vl_lex::lex("fn f(x) { let x = 1; x }");
+        let (toks, _) = vl_lex::lex("function f(x) { let x = 1; x; }");
         let (prog, _) = vl_syntax::parse(&toks, "");
         let (_, diags) = resolve(&prog);
         assert!(diags.iter().all(|d| !d.is_error()));

@@ -1,0 +1,72 @@
+---
+import Base from '../layouts/Base.astro';
+import Playground from '../components/Playground.svelte';
+---
+
+<Base title="VL — the handbook">
+  <section class="mx-auto max-w-5xl px-4 pb-20 pt-14 sm:px-6 sm:pt-20">
+    <p class="text-[1.1rem] italic text-muted">The handbook for a small language, version 0.</p>
+    <h1 class="mt-4 max-w-[16ch] text-[clamp(2.75rem,7vw,4.75rem)] font-medium leading-[1.02] tracking-[-0.015em] text-balance">
+      A small language you can read end to end.
+    </h1>
+    <p class="mt-6 max-w-[62ch] text-[1.2rem] leading-[1.7] text-parchment">
+      VL is an expression language compiled by a split-crate Rust pipeline.
+      Every stage reports through Ariadne, recovers per item, and lets one
+      root cause stay one error.
+    </p>
+    <div class="mt-8 flex flex-wrap items-baseline gap-x-8 gap-y-3 text-[1.1rem]">
+      <a href="/docs" class="rounded-full bg-gold px-6 py-3 font-medium text-night transition hover:bg-gold-bright">
+        Read the documentation
+      </a>
+      <a href="/api" class="text-gold underline decoration-1 underline-offset-4 transition hover:text-gold-bright">
+        Browse the API
+      </a>
+    </div>
+
+    <figure class="mt-14">
+      <div class="rounded-[0.9rem] border border-rule bg-plate px-6 py-6 font-mono text-[0.95rem] leading-[1.8] text-[#efe6d2] sm:px-8">
+<pre class="m-0"><code>let x = 1 + 2 * 3;
+fn main() &#123; let d = x - 1; d &#125;</code></pre>
+      </div>
+      <figcaption class="mt-2.5 text-[1rem] italic text-muted">arith.vl, nearly the whole language.</figcaption>
+    </figure>
+
+    <div class="mt-12">
+      <h2 class="max-w-[30ch] text-[clamp(1.6rem,3.5vw,2.2rem)] font-medium leading-tight tracking-[-0.01em] text-balance">
+        Try a line before you install anything.
+      </h2>
+      <div class="mt-5">
+        <Playground client:load />
+      </div>
+      <p class="mt-2.5 text-[1rem] italic text-muted">A sketch in Svelte. The real check runs in the Rust driver.</p>
+    </div>
+
+    <div class="mt-16">
+      <h2 class="max-w-[30ch] text-[clamp(1.6rem,3.5vw,2.2rem)] font-medium leading-tight tracking-[-0.01em] text-balance">
+        How a program travels.
+      </h2>
+      <dl class="mt-6">
+        <div class="grid gap-1 border-t border-rule py-5 sm:grid-cols-[minmax(0,22ch)_1fr] sm:gap-6">
+          <dt class="font-mono text-[0.9rem] leading-relaxed text-parchment">vl-lex, vl-syntax, vl-semantic</dt>
+          <dd class="max-w-[62ch] text-[1.08rem] leading-[1.7] text-muted">Text becomes tokens, tokens become a tree, names resolve. Nothing here panics on your input.</dd>
+        </div>
+        <div class="grid gap-1 border-t border-rule py-5 sm:grid-cols-[minmax(0,22ch)_1fr] sm:gap-6">
+          <dt class="font-mono text-[0.9rem] leading-relaxed text-parchment">vl-hir, vl-typecheck, vl-lir</dt>
+          <dd class="max-w-[62ch] text-[1.08rem] leading-[1.7] text-muted">The tree is desugared, checked (everything is <code class="rounded bg-wash px-1.5 py-0.5 font-mono text-[0.85em] text-parchment">int</code> in v0), and lowered to three-address code.</dd>
+        </div>
+        <div class="grid gap-1 border-y border-rule py-5 sm:grid-cols-[minmax(0,22ch)_1fr] sm:gap-6">
+          <dt class="font-mono text-[0.9rem] leading-relaxed text-parchment">vl-codegen, vl driver</dt>
+          <dd class="max-w-[62ch] text-[1.08rem] leading-[1.7] text-muted">Backends implement one <code class="rounded bg-wash px-1.5 py-0.5 font-mono text-[0.85em] text-parchment">Target</code> trait. The driver owns the CLI and prints every diagnostic.</dd>
+        </div>
+      </dl>
+    </div>
+
+    <figure class="mt-14">
+      <div class="rounded-[0.9rem] border border-rule bg-plate px-6 py-6 font-mono text-[0.9rem] leading-[1.8] text-[#efe6d2] sm:px-8">
+<pre class="m-0"><code>cargo run -- check examples/hello.vl
+cargo run -- build examples/arith.vl --emit lir</code></pre>
+      </div>
+      <figcaption class="mt-2.5 text-[1rem] italic text-muted">Two commands. The first checks, the second shows its work.</figcaption>
+    </figure>
+  </section>
+</Base>

@@ -1,0 +1,61 @@
+---
+import Base from './Base.astro';
+
+interface Props {
+  title?: string;
+  description?: string;
+  section?: 'docs' | 'api';
+}
+const fm = (Astro.props as { frontmatter?: Record<string, unknown> }).frontmatter ?? {};
+const title = (fm.title as string | undefined) ?? (Astro.props as Props).title ?? 'Documentation';
+const description = (fm.description as string | undefined) ?? (Astro.props as Props).description;
+const section = ((fm.section as string | undefined) ?? (Astro.props as Props).section ?? 'docs') as 'docs' | 'api';
+
+const docsNav = [
+  { href: '/docs', label: 'Overview' },
+  { href: '/docs/getting-started', label: 'Getting started' },
+  { href: '/docs/language', label: 'Language tour' },
+  { href: '/docs/cli', label: 'CLI reference' },
+];
+
+const apiNav = [
+  { href: '/api', label: 'Overview' },
+  { href: '/api/driver', label: 'The driver' },
+  { href: '/api/frontend', label: 'Frontend crates' },
+  { href: '/api/backend', label: 'Backend crates' },
+];
+
+const nav = section === 'api' ? apiNav : docsNav;
+const pathname = Astro.url.pathname;
+---
+
+<Base title={title} description={description}>
+  <div class="mx-auto max-w-5xl px-4 py-12 sm:px-6 sm:py-16">
+    <div class="grid gap-12 lg:grid-cols-[200px_minmax(0,1fr)]">
+      <aside class="lg:sticky lg:top-24 lg:self-start">
+        <p class="text-[1.05rem] italic text-muted">
+          {section === 'api' ? 'The crates, in dependency order.' : 'Read front to back, or dip in.'}
+        </p>
+        <nav class="mt-4 flex gap-x-5 gap-y-1 overflow-x-auto border-y border-rule py-3 lg:flex-col lg:gap-0 lg:py-1">
+          {
+            nav.map((item) => (
+              <a
+                href={item.href}
+                aria-current={pathname === item.href ? 'page' : undefined}
+                class:list={[
+                  'whitespace-nowrap py-1 text-[1.02rem] transition lg:border-b lg:border-rule lg:py-2.5 lg:last:border-b-0',
+                  pathname === item.href ? 'font-semibold text-gold' : 'text-muted hover:text-parchment',
+                ]}
+              >
+                {item.label}
+              </a>
+            ))
+          }
+        </nav>
+      </aside>
+      <article class="prose-vl min-w-0">
+        <slot />
+      </article>
+    </div>
+  </div>
+</Base>

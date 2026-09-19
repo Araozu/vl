@@ -76,15 +76,15 @@ colours) and sets the exit code. Never add another reporting library.
 
 ```text
 let x = 1 + 2 * 3;
-fn main() { let d = x - 1; d }
+function main() { let d = x - 1; d; }
 ```
 
-Ints, `+ - * /`, unary `-`, parens, `let`, `fn` with params, `//` comments.
-Type system: everything is `int`. See crate docs for the grammar.
+Ints, `+ - * /`, unary `-`, parens, `let`, `function` with params, `//` comments.
+Semicolons are mandatory. Type system: everything is `int`. See crate docs for the grammar.
 
 ## Roadmap
 
 1. Decide target platform → harden/add a `vl-codegen` backend.
 2. Thread locals through LIR (vars currently materialise as consts).
-3. Grow types (`bool`, `string`, fn types) in `vl-typecheck`.
+3. Grow types (`bool`, `string`, function types) in `vl-typecheck`.
 4. Bytecode/assembly emission + runner.
