@@ -5,6 +5,8 @@
   --font-sans: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
   --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 
+  --color-canvas: #000000;
+  --color-header: #161617;
   --color-ink: #f5f5f7;
   --color-body: #d2d2d7;
   --color-muted: #86868b;
@@ -18,14 +20,36 @@
   --color-link-hover: #53a9ff;
   --color-accent: #0071e3;
   --color-pink: #ff7ab2;
+  --color-inverse: #ffffff;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --color-canvas: #ffffff;
+    --color-header: #fbfbfd;
+    --color-ink: #1d1d1f;
+    --color-body: #515154;
+    --color-muted: #6e6e73;
+    --color-faint: #86868b;
+    --color-rule: #d2d2d7;
+    --color-panel: #f5f5f7;
+    --color-plate: #f5f5f7;
+    --color-decl: #f2f2f7;
+    --color-pill: #e5e5ea;
+    --color-link: #0071e3;
+    --color-link-hover: #0077ed;
+    --color-accent: #0071e3;
+    --color-pink: #ff375f;
+    --color-inverse: #ffffff;
+  }
 }
 
 html {
-  color-scheme: dark;
+  color-scheme: light dark;
 }
 
 body {
-  background: #000;
+  background: var(--color-canvas);
   color: var(--color-body);
   font-family: var(--font-sans);
   font-feature-settings: "cv11", "ss01";
@@ -149,7 +173,7 @@ body {
 /* Fenced code blocks: the grey rounded plates in the screenshots */
 .docs-prose pre {
   background: var(--color-plate);
-  color: #f5f5f7;
+  color: var(--color-ink);
   border: 0;
   border-radius: 0.85rem;
   padding: 1rem 1.2rem;
@@ -230,7 +254,7 @@ body {
 
 .side-link[aria-current="page"] {
   background: var(--color-pill);
-  color: #fff;
+  color: var(--color-ink);
 }
 
 @media (prefers-reduced-motion: reduce) {
