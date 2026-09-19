@@ -234,6 +234,18 @@ impl Resolver {
                     }
                 }
             }
+            Stmt::IndexAssign {
+                array,
+                index,
+                value,
+                ..
+            } => {
+                // Element write: every side is an expression (the array base
+                // is usually a variable, resolved through `resolve_expr`).
+                self.resolve_expr(array);
+                self.resolve_expr(index);
+                self.resolve_expr(value);
+            }
             Stmt::Expr(e) => self.resolve_expr(e),
             Stmt::Return { value, .. } => {
                 if let Some(e) = value {
@@ -296,6 +308,15 @@ impl Resolver {
     fn resolve_expr(&mut self, expr: &Expr) {
         match expr {
             Expr::Literal(_, _) | Expr::String(_, _) => {}
+            Expr::ArrayLiteral { elems, .. } => {
+                for elem in elems {
+                    self.resolve_expr(elem);
+                }
+            }
+            Expr::Index { base, index, .. } => {
+                self.resolve_expr(base);
+                self.resolve_expr(index);
+            }
             Expr::Var { path, span } => match self.lookup_path(path, *span) {
                 Some(id) => {
                     self.out.uses.insert((span.start, span.end), id);
@@ -318,6 +339,24 @@ impl Resolver {
                 args,
                 ..
             } => {
+                // `U64Array.new(count)` is a builtin constructor: it needs no
+                // import and resolves to a synthetic external def carrying
+                // its signature, so typechecking and HIR reuse the normal
+                // extern-call path (LIR desugars it to an allocation).
+                if callee.len() == 2 && callee[0] == "U64Array" && callee[1] == "new" {
+                    let sig = vl_common::FuncSig::new(
+                        &[("count", vl_common::VlType::U64)],
+                        vl_common::VlType::U64Array,
+                    );
+                    let id = self.external_def(callee.join("."), *callee_span, Some(sig));
+                    self.out
+                        .uses
+                        .insert((callee_span.start, callee_span.end), id);
+                    for arg in args {
+                        self.resolve_expr(arg);
+                    }
+                    return;
+                }
                 // Callee is a plain name use so `function` items resolve
                 // (including forward references via the global pre-pass).
                 match self.lookup_path(callee, *callee_span) {
@@ -635,6 +674,35 @@ mod tests {
         let (_, diags) = resolve_src("use std.string.bogus; function main() { bogus(); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("no export `bogus`"));
+    }
+
+    #[test]
+    fn array_literal_index_and_index_assign_resolve() {
+        let (_, diags) = resolve_src(
+            "function main() { let a = [1u64, 2u64]; a[0u64] = 3u64; let x = a[1u64]; }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+    }
+
+    #[test]
+    fn u64array_new_needs_no_import_and_carries_its_signature() {
+        let (res, diags) = resolve_src("function main() { let a = U64Array.new(3u64); a; }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let def = res
+            .defs
+            .iter()
+            .find(|d| d.name == "U64Array.new")
+            .expect("U64Array.new def");
+        let sig = def.sig.as_ref().expect("extern sig");
+        assert_eq!(sig.ret, vl_common::VlType::U64Array);
+        assert_eq!(sig.params.len(), 1);
+        assert_eq!(sig.params[0].ty, vl_common::VlType::U64);
+    }
+
+    #[test]
+    fn index_into_undefined_array_errors() {
+        let (_, diags) = resolve_src("function main() { let x = missing[0u64]; x; }");
+        assert!(diags.iter().any(|d| d.code.as_deref() == Some("E201")));
     }
 
     fn vl_codegen_modules() -> Vec<ModuleSpec> {
