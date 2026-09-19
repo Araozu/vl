@@ -166,6 +166,30 @@ fn dummy_instr(ins: &Instr) -> String {
             format!("call %{}, {callee}({args})", dst.0)
         }
         Instr::Ret { src, .. } => format!("ret %{}", src.0),
+        Instr::NewArray { dst, len, .. } => {
+            format!("new_array %{}, %{}", dst.0, len.0)
+        }
+        Instr::ArrayLit { dst, elems, .. } => {
+            let elems = elems
+                .iter()
+                .map(|e| format!("%{}", e.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("new_array_lit %{}, [{elems}]", dst.0)
+        }
+        Instr::ArrayGet {
+            dst, array, index, ..
+        } => {
+            format!("array_get %{}, %{}[%{}]", dst.0, array.0, index.0)
+        }
+        Instr::ArraySet {
+            array,
+            index,
+            value,
+            ..
+        } => {
+            format!("array_set %{}[%{}], %{}", array.0, index.0, value.0)
+        }
         Instr::BranchIfFalse { cond, target, .. } => {
             format!("branch_if_false %{}, L{}", cond.0, target)
         }
@@ -225,6 +249,7 @@ impl Target for StackVmTarget {
 /// `<entrypoint>` function plus one Nara function per other user function
 /// (see the internals book for the supported subset). Calls to
 /// `std.print` / `std.print_u64` and to user functions lower to `calli`;
+/// `U64Array` values lower to memory containers (`create`/`getvat`/`setvat`);
 /// anything else is a diagnostic.
 pub struct NaraVmTarget;
 
@@ -272,6 +297,8 @@ enum NaraKind {
     U8,
     String,
     File,
+    /// Fixed-length heap array of `u64` (a memory container of values).
+    U64Array,
 }
 
 impl NaraKind {
@@ -286,13 +313,14 @@ impl NaraKind {
             vl_typecheck::Ty::U8 => Some(NaraKind::U8),
             vl_typecheck::Ty::String => Some(NaraKind::String),
             vl_typecheck::Ty::File => Some(NaraKind::File),
+            vl_typecheck::Ty::U64Array => Some(NaraKind::U64Array),
             vl_typecheck::Ty::Void | vl_typecheck::Ty::Error => None,
         }
     }
 
     /// Reference kinds live in `rf`, everything else in `rv`.
     fn is_ref(self) -> bool {
-        matches!(self, NaraKind::String | NaraKind::File)
+        matches!(self, NaraKind::String | NaraKind::File | NaraKind::U64Array)
     }
 
     fn of_scalar(value: Scalar) -> Self {
@@ -336,15 +364,16 @@ struct NaraEmit {
     /// Recycled machine registers whose LIR value is dead past its last use.
     free_rv: Vec<u8>,
     free_rf: Vec<u8>,
-    /// LIR reg -> index of its last textual use. After emitting that use the
-    /// machine register is recycled. (Single static definition per reg, so a
-    /// textual scan is sound; loop back-edges re-execute definitions before
-    /// their uses.)
+    /// LIR reg -> index of its last use. After emitting that use the
+    /// machine register is recycled. Loop back edges extend liveness to the
+    /// jump (see `nara_last_use`), so mid-loop frees never clobber values
+    /// that re-execute.
     last_use: std::collections::HashMap<vl_lir::Reg, usize>,
     label_pos: std::collections::HashMap<u32, usize>,
     patches: Vec<NaraPatch>,
     one_rv: Option<u8>,
     bias_rv: Option<u8>,
+    zero_rv: Option<u8>,
     /// Next userland parameter slots for the function being emitted. Value
     /// and reference parameters count independently from `rv11` / `rf31`
     /// (matching the Naravm native convention).
@@ -378,6 +407,7 @@ impl NaraEmit {
         self.patches.clear();
         self.one_rv = None;
         self.bias_rv = None;
+        self.zero_rv = None;
         self.param_vi = 0;
         self.param_ri = 0;
     }
@@ -474,6 +504,19 @@ impl NaraEmit {
         Some(rv)
     }
 
+    /// A cached zero register, for container `create` calls that need an
+    /// explicit "0 references" count operand.
+    fn ensure_zero(&mut self, span: Span) -> Option<u8> {
+        if let Some(rv) = self.zero_rv {
+            return Some(rv);
+        }
+        let idx = self.add_value(0, span)?;
+        let rv = self.fresh_rv(span)?;
+        self.bytecode.extend_from_slice(&[0x02, rv, idx as u8]);
+        self.zero_rv = Some(rv);
+        Some(rv)
+    }
+
     fn ensure_bias(&mut self, span: Span) -> Option<u8> {
         if let Some(rv) = self.bias_rv {
             return Some(rv);
@@ -514,6 +557,33 @@ impl NaraEmit {
         );
         None
     }
+
+    /// Resolve a `U64Array` operand to its reference register. Types were
+    /// enforced upstream, so anything unresolvable here is either poisoned
+    /// (quiet) or a compiler bug (loud E500).
+    fn array_reg(&mut self, reg: vl_lir::Reg, span: Span) -> Option<u8> {
+        if self.kinds.get(&reg).copied() == Some(NaraKind::U64Array) {
+            if let Some(rf) = self.rf_map.get(&reg).copied() {
+                return Some(rf);
+            }
+        } else if !self.invalid.contains(&reg) && self.kinds.contains_key(&reg) {
+            self.diags.push(
+                Diagnostic::error("Naravm backend found a non-array where an array was expected")
+                    .with_label(span, "emitted here")
+                    .with_code("E500"),
+            );
+            return None;
+        }
+        if self.invalid.contains(&reg) {
+            return None;
+        }
+        self.diags.push(
+            Diagnostic::error("Naravm backend could not resolve an array register (compiler bug)")
+                .with_label(span, "emitted here")
+                .with_code("E500"),
+        );
+        None
+    }
 }
 
 /// Per-function emission context: the LIR signature plus program-wide
@@ -548,6 +618,7 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
         patches: Vec::new(),
         one_rv: None,
         bias_rv: None,
+        zero_rv: None,
         param_vi: 0,
         param_ri: 0,
     };
@@ -706,16 +777,27 @@ fn nara_resolve_jumps(e: &mut NaraEmit) -> bool {
     !e.diags.iter().any(|d| d.is_error())
 }
 
-/// Scan one function for the last textual use of every LIR register. Uses are
+/// Scan one function for the last use of every LIR register. Uses are
 /// operand positions (BinOp sides, copy sources, call args, branch
 /// conditions, return values); definitions do not count.
+///
+/// A purely textual scan is unsound for loops: a register last used *inside*
+/// a loop body re-executes that use on every back edge, so freeing its
+/// machine register mid-loop lets a later temporary clobber a still-live
+/// value (e.g. a loop-invariant parameter). Every backward jump therefore
+/// extends the liveness of the registers it loops over to the jump itself.
 fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::Reg, usize> {
     use vl_lir::Instr as I;
-    let mut last = std::collections::HashMap::new();
+    let mut uses: std::collections::HashMap<vl_lir::Reg, Vec<usize>> =
+        std::collections::HashMap::new();
     let mut touch = |reg: vl_lir::Reg, idx: usize| {
-        last.insert(reg, idx);
+        uses.entry(reg).or_default().push(idx);
     };
+    let mut label_pos: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     for (idx, ins) in func.instrs.iter().enumerate() {
+        if let I::Label { id, .. } = ins {
+            label_pos.insert(*id, idx);
+        }
         match ins {
             I::BinOp { lhs, rhs, .. } => {
                 touch(*lhs, idx);
@@ -732,6 +814,28 @@ fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::R
                     touch(*arg, idx);
                 }
             }
+            I::NewArray { len, .. } => {
+                touch(*len, idx);
+            }
+            I::ArrayLit { elems, .. } => {
+                for elem in elems {
+                    touch(*elem, idx);
+                }
+            }
+            I::ArrayGet { array, index, .. } => {
+                touch(*array, idx);
+                touch(*index, idx);
+            }
+            I::ArraySet {
+                array,
+                index,
+                value,
+                ..
+            } => {
+                touch(*array, idx);
+                touch(*index, idx);
+                touch(*value, idx);
+            }
             I::BranchIfFalse { cond, .. } => {
                 touch(*cond, idx);
             }
@@ -744,6 +848,30 @@ fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::R
             | I::Jump { .. }
             | I::Label { .. } => {}
         }
+    }
+    // Backward-jump ranges: (header position, jump position). A register used
+    // anywhere inside such a range stays live until the jump.
+    let mut loops: Vec<(usize, usize)> = Vec::new();
+    for (idx, ins) in func.instrs.iter().enumerate() {
+        let target = match ins {
+            I::Jump { target, .. } | I::BranchIfFalse { target, .. } => target,
+            _ => continue,
+        };
+        if let Some(header) = label_pos.get(target).copied() {
+            if header < idx {
+                loops.push((header, idx));
+            }
+        }
+    }
+    let mut last = std::collections::HashMap::new();
+    for (reg, idxs) in uses {
+        let mut end = idxs.iter().copied().max().unwrap_or(0);
+        for (header, jump) in &loops {
+            if idxs.iter().any(|u| *header <= *u && *u <= *jump) {
+                end = end.max(*jump);
+            }
+        }
+        last.insert(reg, end);
     }
     last
 }
@@ -770,6 +898,26 @@ fn nara_free_dead(e: &mut NaraEmit, ins: &Instr, idx: usize) {
         }
         I::Call { args, .. } => {
             dead.extend(args.iter().copied());
+        }
+        I::NewArray { len, .. } => {
+            dead.push(*len);
+        }
+        I::ArrayLit { elems, .. } => {
+            dead.extend(elems.iter().copied());
+        }
+        I::ArrayGet { array, index, .. } => {
+            dead.push(*array);
+            dead.push(*index);
+        }
+        I::ArraySet {
+            array,
+            index,
+            value,
+            ..
+        } => {
+            dead.push(*array);
+            dead.push(*index);
+            dead.push(*value);
         }
         I::BranchIfFalse { cond, .. } => {
             dead.push(*cond);
@@ -1018,6 +1166,127 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 );
                 e.invalid.insert(*dst);
             }
+        }
+        Instr::NewArray { dst, len, span } => {
+            if !e.last_use.contains_key(dst) {
+                // Dead allocation (e.g. an unused `let`): spend no machine
+                // register on it.
+                e.kinds.insert(*dst, NaraKind::U64Array);
+                return;
+            }
+            if e.invalid.contains(len) {
+                e.invalid.insert(*dst);
+                return;
+            }
+            let (Some(n), Some(zero)) = (e.value_reg(*len, *span), e.ensure_zero(*span)) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(rf) = e.fresh_rf(*span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            e.rf_map.insert(*dst, rf);
+            e.kinds.insert(*dst, NaraKind::U64Array);
+            e.bytecode.extend_from_slice(&[0x26, rf, n, zero]); // create
+        }
+        Instr::ArrayLit { dst, elems, span } => {
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, NaraKind::U64Array);
+                return;
+            }
+            for elem in elems {
+                if e.invalid.contains(elem) {
+                    e.invalid.insert(*dst);
+                    return;
+                }
+            }
+            let Some(rf) = e.fresh_rf(*span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            // One scratch value register covers the dynamic length and every
+            // dynamic index of oversized literals (> 255 elements); the
+            // common path stays on the immediate `createi`/`setvati` forms.
+            let scratch = if elems.len() > u8::MAX as usize {
+                let (Some(s), Some(len_idx), Some(zero)) = (
+                    e.fresh_rv(*span),
+                    e.add_value(elems.len() as u64, *span),
+                    e.ensure_zero(*span),
+                ) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x02, s, len_idx as u8]); // lv
+                e.bytecode.extend_from_slice(&[0x26, rf, s, zero]); // create
+                Some(s)
+            } else {
+                e.bytecode
+                    .extend_from_slice(&[0x27, rf, elems.len() as u8, 0]); // createi
+                None
+            };
+            e.rf_map.insert(*dst, rf);
+            e.kinds.insert(*dst, NaraKind::U64Array);
+            for (i, elem) in elems.iter().enumerate() {
+                let Some(v) = e.value_reg(*elem, *span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                if i <= u8::MAX as usize {
+                    e.bytecode.extend_from_slice(&[0x2d, rf, i as u8, v]); // setvati
+                } else {
+                    let s = scratch.expect("scratch exists when a literal index exceeds u8");
+                    let Some(idx) = e.add_value(i as u64, *span) else {
+                        e.invalid.insert(*dst);
+                        return;
+                    };
+                    e.bytecode.extend_from_slice(&[0x02, s, idx as u8]); // lv
+                    e.bytecode.extend_from_slice(&[0x29, rf, s, v]); // setvat
+                }
+            }
+        }
+        Instr::ArrayGet {
+            dst,
+            array,
+            index,
+            span,
+        } => {
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, NaraKind::U64);
+                return;
+            }
+            let (Some(a), Some(i)) = (e.array_reg(*array, *span), e.value_reg(*index, *span))
+            else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(d) = e.fresh_rv(*span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            e.rv_map.insert(*dst, d);
+            e.kinds.insert(*dst, NaraKind::U64);
+            e.bytecode.extend_from_slice(&[0x28, d, a, i]); // getvat
+        }
+        Instr::ArraySet {
+            array,
+            index,
+            value,
+            span,
+        } => {
+            // Statement-only: no destination to poison. Poisoned sides stay
+            // quiet; unresolvable sides are already diagnosed by the helpers.
+            if e.invalid.contains(array) || e.invalid.contains(index) || e.invalid.contains(value) {
+                return;
+            }
+            let (Some(a), Some(i), Some(v)) = (
+                e.array_reg(*array, *span),
+                e.value_reg(*index, *span),
+                e.value_reg(*value, *span),
+            ) else {
+                return;
+            };
+            e.bytecode.extend_from_slice(&[0x29, a, i, v]); // setvat
         }
         Instr::Ret { src, span } => nara_ret(e, ctx, *src, *span),
         Instr::BranchIfFalse { cond, target, span } => {
@@ -1284,6 +1553,10 @@ fn nara_user_call(
         e.bytecode.extend_from_slice(&[0x06, bias]);
         spills.push(NaraSpill::V(bias));
     }
+    if let Some(zero) = e.zero_rv {
+        e.bytecode.extend_from_slice(&[0x06, zero]);
+        spills.push(NaraSpill::V(zero));
+    }
     for rf in rfs {
         e.bytecode.extend_from_slice(&[0x08, rf]); // pushrf
         spills.push(NaraSpill::F(rf));
@@ -1426,7 +1699,7 @@ fn nara_binop(
     if kind.is_ref() {
         e.diags.push(
             Diagnostic::error(format!(
-                "Naravm backend does not support `{op}` on strings yet"
+                "Naravm backend does not support `{op}` on `{kind:?}` yet"
             ))
             .with_label(span, "unsupported operation")
             .with_code("E404"),
@@ -1487,9 +1760,11 @@ fn nara_binop(
                 NaraKind::U64 | NaraKind::I64 | NaraKind::F64 | NaraKind::Bool | NaraKind::U8
             ) {
                 e.diags.push(
-                    Diagnostic::error("Naravm backend does not support equality on strings yet")
-                        .with_label(span, "unsupported operation")
-                        .with_code("E404"),
+                    Diagnostic::error(format!(
+                        "Naravm backend does not support equality on `{kind:?}` yet"
+                    ))
+                    .with_label(span, "unsupported operation")
+                    .with_code("E404"),
                 );
                 fail(e);
                 return;
@@ -1507,9 +1782,11 @@ fn nara_binop(
                 NaraKind::U64 | NaraKind::I64 | NaraKind::F64 | NaraKind::Bool | NaraKind::U8
             ) {
                 e.diags.push(
-                    Diagnostic::error("Naravm backend does not support equality on strings yet")
-                        .with_label(span, "unsupported operation")
-                        .with_code("E404"),
+                    Diagnostic::error(format!(
+                        "Naravm backend does not support equality on `{kind:?}` yet"
+                    ))
+                    .with_label(span, "unsupported operation")
+                    .with_code("E404"),
                 );
                 fail(e);
                 return;
@@ -1694,6 +1971,25 @@ fn stackvm_instr(ins: &Instr) -> String {
             format!("call {callee}({args})")
         }
         Instr::Ret { .. } => "ret".into(),
+        Instr::NewArray { dst, len, .. } => {
+            format!("new_array %{} len %{}", dst.0, len.0)
+        }
+        Instr::ArrayLit { dst, elems, .. } => {
+            format!("array_lit %{} of {} elems", dst.0, elems.len())
+        }
+        Instr::ArrayGet {
+            dst, array, index, ..
+        } => {
+            format!("array_get %{} %{}[%{}]", dst.0, array.0, index.0)
+        }
+        Instr::ArraySet {
+            array,
+            index,
+            value,
+            ..
+        } => {
+            format!("array_set %{}[%{}] %{}", array.0, index.0, value.0)
+        }
         Instr::BranchIfFalse { cond, target, .. } => {
             format!("branch_if_false %{} -> L{}", cond.0, target)
         }
@@ -1722,6 +2018,77 @@ mod tests {
         let hir = vl_hir::lower(&prog, &res);
         let (typed, _) = vl_typecheck::check(&hir);
         vl_lir::lower(&hir, &typed)
+    }
+
+    #[test]
+    fn loop_invariant_registers_stay_live_across_back_edges() {
+        // Regression test: the textual last use of `n` is the loop
+        // condition, but its machine register must survive the back edge.
+        // Freeing it mid-loop used to let a temporary clobber it, hanging
+        // `sum` forever.
+        let lir = lir_of("function sum(a: U64Array, n: u64): u64 { let t = 0u64; let i = 0u64; while (i < n) { t = t + a[i]; i = i + 1u64; } return t; } function main() {}");
+        let f = lir.functions.iter().find(|f| f.name == "sum").unwrap();
+        let uses = nara_last_use(f);
+        let n = match f.instrs[1] {
+            Instr::Param { dst, .. } => dst,
+            ref other => panic!("expected param, got {other:?}"),
+        };
+        let back_edge = f
+            .instrs
+            .iter()
+            .rposition(|i| matches!(i, Instr::Jump { .. }))
+            .expect("loop back edge");
+        assert!(
+            uses[&n] >= back_edge,
+            "invariant must outlive the loop: last={} back_edge={}",
+            uses[&n],
+            back_edge
+        );
+    }
+
+    #[test]
+    fn naravm_emits_arrays_with_container_ops() {
+        let lir = lir_of(
+            "use std; function get(a: U64Array): u64 { return a[0u64]; } function main() { let a = U64Array.new(2u64); a[0u64] = 1u64; a[1u64] = 2u64; let b = [3u64, 4u64]; std.print_u64(get(a) + b[1u64]); }",
+        );
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let bytes = artifact.unwrap().bytes.unwrap();
+        assert_eq!(&bytes[..4], b"nara");
+        // create = 0x26 (U64Array.new), createi = 0x27 (literal),
+        // getvat = 0x28 (reads), setvat/setvati = 0x29/0x2D (writes).
+        for op in [0x26u8, 0x27, 0x28, 0x2du8] {
+            assert!(bytes.contains(&op), "no {op:#x} in {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn naravm_passes_arrays_through_calls() {
+        let lir = lir_of(
+            "function fill(a: U64Array): U64Array { a[0u64] = 7u64; return a; } function main() { let a = fill(U64Array.new(1u64)); }",
+        );
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+    }
+
+    #[test]
+    fn dummy_and_stackvm_emit_array_instrs() {
+        let lir = lir_of("function main() { let a = [1u64]; a[0u64] = 2u64; let x = a[0u64]; }");
+        let (art, diags) = DummyTarget.emit(&lir);
+        assert!(diags.is_empty());
+        let text = art.unwrap().text;
+        assert!(
+            text.contains("array_get") && text.contains("array_set"),
+            "{text}"
+        );
+
+        let (art, _) = StackVmTarget.emit(&lir);
+        let text = art.unwrap().text;
+        assert!(
+            text.contains("array_get") && text.contains("array_set"),
+            "{text}"
+        );
     }
 
     #[test]
