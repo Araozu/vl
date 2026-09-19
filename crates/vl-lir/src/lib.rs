@@ -62,6 +62,32 @@ pub enum Instr {
         args: Vec<Reg>,
         span: Span,
     },
+    /// Allocate a zero-filled `U64Array` with room for `len` (`u64`) elements.
+    NewArray {
+        dst: Reg,
+        len: Reg,
+        span: Span,
+    },
+    /// Build a `U64Array` from element registers, in order.
+    ArrayLit {
+        dst: Reg,
+        elems: Vec<Reg>,
+        span: Span,
+    },
+    /// Read element `index` (a `u64` register) from a `U64Array`.
+    ArrayGet {
+        dst: Reg,
+        array: Reg,
+        index: Reg,
+        span: Span,
+    },
+    /// Write `value` into element `index` of a `U64Array`. Statement-only.
+    ArraySet {
+        array: Reg,
+        index: Reg,
+        value: Reg,
+        span: Span,
+    },
     /// Explicit `return` (or fallthrough / global initializer value).
     Ret {
         src: Reg,
@@ -167,6 +193,30 @@ fn fmt_instr(ins: &Instr) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("%{} = call {callee}({args})", dst.0)
+        }
+        Instr::NewArray { dst, len, .. } => {
+            format!("%{} = new_array %{}", dst.0, len.0)
+        }
+        Instr::ArrayLit { dst, elems, .. } => {
+            let elems = elems
+                .iter()
+                .map(|e| format!("%{}", e.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("%{} = array_lit [{elems}]", dst.0)
+        }
+        Instr::ArrayGet {
+            dst, array, index, ..
+        } => {
+            format!("%{} = array_get %{}[%{}]", dst.0, array.0, index.0)
+        }
+        Instr::ArraySet {
+            array,
+            index,
+            value,
+            ..
+        } => {
+            format!("array_set %{}[%{}], %{}", array.0, index.0, value.0)
         }
         Instr::Ret { src, .. } => format!("ret %{}", src.0),
         Instr::BranchIfFalse { cond, target, .. } => {
@@ -347,6 +397,16 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                             l.lower_assign(def.as_ref(), value, typed, *span);
                             topped_return = false;
                         }
+                        HirStmt::IndexAssign {
+                            array,
+                            index,
+                            value,
+                            span,
+                            ..
+                        } => {
+                            l.lower_index_assign(array, index, value, typed, *span);
+                            topped_return = false;
+                        }
                         HirStmt::While {
                             condition,
                             body,
@@ -437,9 +497,51 @@ impl Lowerer {
                 reg
             }
             HirExpr::Var { .. } => None,
+            HirExpr::ArrayLiteral { elems, span, .. } => {
+                let mut regs = Vec::with_capacity(elems.len());
+                for elem in elems {
+                    regs.push(self.lower_expr(elem, typed)?);
+                }
+                let dst = self.reg();
+                self.instrs.push(Instr::ArrayLit {
+                    dst,
+                    elems: regs,
+                    span: *span,
+                });
+                Some(dst)
+            }
+            HirExpr::Index {
+                base, index, span, ..
+            } => {
+                let array = self.lower_expr(base, typed)?;
+                let index = self.lower_expr(index, typed)?;
+                let dst = self.reg();
+                self.instrs.push(Instr::ArrayGet {
+                    dst,
+                    array,
+                    index,
+                    span: *span,
+                });
+                Some(dst)
+            }
             HirExpr::Call {
                 name, args, span, ..
             } => {
+                // The `U64Array.new(len)` builtin desugars to an allocation:
+                // arity and argument types were enforced by `vl-typecheck`.
+                if name == "U64Array.new" {
+                    if args.len() != 1 {
+                        return None;
+                    }
+                    let len = self.lower_expr(&args[0], typed)?;
+                    let dst = self.reg();
+                    self.instrs.push(Instr::NewArray {
+                        dst,
+                        len,
+                        span: *span,
+                    });
+                    return Some(dst);
+                }
                 let mut arg_regs = Vec::with_capacity(args.len());
                 for arg in args {
                     arg_regs.push(self.lower_expr(arg, typed)?);
@@ -530,6 +632,15 @@ impl Lowerer {
             } => {
                 self.lower_assign(def.as_ref(), value, typed, *span);
             }
+            HirStmt::IndexAssign {
+                array,
+                index,
+                value,
+                span,
+                ..
+            } => {
+                self.lower_index_assign(array, index, value, typed, *span);
+            }
             HirStmt::While {
                 condition,
                 body,
@@ -612,6 +723,31 @@ impl Lowerer {
                 });
             }
         }
+    }
+
+    /// Element write: evaluate the array, index, and value, then emit one
+    /// [`Instr::ArraySet`]. Poisoned sides emit nothing (already reported).
+    fn lower_index_assign(
+        &mut self,
+        array: &HirExpr,
+        index: &HirExpr,
+        value: &HirExpr,
+        typed: &vl_typecheck::TypedProgram,
+        span: Span,
+    ) {
+        let (Some(array), Some(index), Some(value)) = (
+            self.lower_expr(array, typed),
+            self.lower_expr(index, typed),
+            self.lower_expr(value, typed),
+        ) else {
+            return;
+        };
+        self.instrs.push(Instr::ArraySet {
+            array,
+            index,
+            value,
+            span,
+        });
     }
 
     /// Short-circuit `&&`: sides evaluate at most once, left to right.
@@ -888,6 +1024,24 @@ impl Lowerer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrays_lower_to_dedicated_instrs() {
+        let src = "function get(a: U64Array): u64 { a[0u64] = 1u64; return a[1u64]; } function main() { let a = U64Array.new(2u64); let b = [1u64, 2u64]; let e = []; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let dump = lower(&hir, &typed).dump();
+        assert!(dump.contains("new_array"), "{dump}");
+        assert!(dump.contains("array_lit"), "{dump}");
+        assert!(dump.contains("array_get"), "{dump}");
+        assert!(dump.contains("array_set"), "{dump}");
+        assert!(!dump.contains("U64Array.new"), "{dump}");
+    }
 
     #[test]
     fn while_emits_labels_and_back_edge() {
