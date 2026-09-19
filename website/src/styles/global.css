@@ -283,6 +283,17 @@ pre.astro-code {
   color: var(--color-ink);
 }
 
+/* Brand mark: source art is black fill; invert on the dark surface. */
+.logo-mark {
+  height: 1.35rem;
+  width: auto;
+}
+@media (prefers-color-scheme: dark) {
+  .logo-mark {
+    filter: invert(1);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

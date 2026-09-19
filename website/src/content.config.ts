@@ -13,13 +13,10 @@ const stdlibParam = z.object({
 
 const stdlibFunction = z.object({
   name: z.string(),
-  // Structured signature. Absent while the language has not fixed the
-  // function's type surface — the compiler only knows export names
-  // (plus: `print` takes one string, every external call types as `i64`).
-  params: z.array(stdlibParam).optional(),
-  returns: z
-    .object({ type: z.string(), detail: z.string().optional() })
-    .optional(),
+  // Structured signature. Mirrors the compiler-owned extern signatures
+  // (`vl-codegen::modules`); every export is fully typed.
+  params: z.array(stdlibParam),
+  returns: z.object({ type: z.string(), detail: z.string().optional() }),
   detail: z.string(),
   example: z.string().optional(),
 });

@@ -1,7 +1,8 @@
 # VL standard library catalog.
 #
-# Single source of truth for the `std` docs section: module pages, the
-# overview list, and the sidebar are all generated from this file.
+# Docs mirror of the compiler-owned extern signatures (`vl-codegen::modules`).
+# The compiler enforces these; this file only renders them. Keep them in sync:
+# if a signature changes in `crates/vl-codegen/src/lib.rs`, update it here.
 # `id` is the URL slug (`/std/<id>`); `order` fixes sidebar order.
 
 - id: std
@@ -18,7 +19,7 @@
   import_example: |
     use std.print;
 
-    function main() {
+    function main(): void {
         print("Hello, world!\n");
     }
   functions:
@@ -28,7 +29,7 @@
           type: string
           detail: Byte string to write. No implicit newline is added.
       returns:
-        type: i64
+        type: void
       detail: |
         Writes one byte string to standard output. It does not add an implicit newline.
 
@@ -42,11 +43,10 @@
           type: u64
           detail: Unsigned integer to write.
       returns:
-        type: i64
+        type: void
       detail: |
-        The module catalog reserves `print_u64` for unsigned integer output. It is
-        recognized during general module checking, but the current Naravm target does
-        not emit it yet.
+        Unsigned integer output. It is checked during general module checking
+        (`vl check`), but the current Naravm target does not emit it yet.
   outro: |
     For the current target and command options, see the [CLI reference](/cli).
 
@@ -61,17 +61,44 @@
     language. Import individual functions with a grouped import:
   import_example: |
     use std.fs.{open, read};
+
+    function main(): void {
+        let f = open("data.txt");
+        let s = read(f);
+        s;
+    }
   functions:
     - name: open
+      params:
+        - name: path
+          type: string
+          detail: Byte string path of the file to open.
+      returns:
+        type: File
       detail: |
-        Opens a file. The callable surface is present in the module catalog; the
+        Opens a file, yielding a `File` object (Naravm `ObjectFile`).
+
+        Fallible at the VM level (`errno`/`0x30`); VL error handling is out of
+        scope for now, so the language surface is a plain `File` return. The
         current Naravm target does not emit file-system calls yet.
+      example: |
+        let f = open("data.txt");
     - name: read
+      params:
+        - name: file
+          type: File
+          detail: Open file to read from.
+      returns:
+        type: string
       detail: |
-        Reads from an opened file. Like `open`, this function is currently a checked
-        language surface rather than a runnable Naravm operation.
+        Reads from an opened file, yielding a byte string.
+
+        Like `open`, fallible at the VM level but surfaced as a plain `string`
+        return until VL gains error handling. Not yet emitted by Naravm.
+      example: |
+        let s = read(f);
   outro: |
-    When target support lands, this page will document argument and result types.
+    `File` is a VL object type mapping to the VM `ObjectFile`. See the [language guide](/docs/language) for the type list.
 
 - id: string
   order: 3
@@ -80,20 +107,28 @@
   title: std.string module
   description: String functions in the VL standard library catalog.
   intro: |
-    The `std.string` module reserves helpers for creating and measuring byte
-    strings. Import the functions you need:
+    The `std.string` module holds helpers for measuring byte strings.
+    Import the functions you need:
   import_example: |
-    use std.string.{new, len};
+    use std.string.{len};
+
+    function main(): void {
+        let n = string.len("hi");
+        n;
+    }
   functions:
-    - name: new
-      detail: |
-        Creates a string value. The function is present in the language module
-        catalog; its target-specific argument and result behavior is still being
-        defined.
     - name: len
+      params:
+        - name: value
+          type: string
+          detail: Byte string to measure.
+      returns:
+        type: u64
       detail: |
-        Returns the length of a string. The function is present in the language module
-        catalog; the current Naravm target does not emit it yet.
+        Returns the length of a string. Checked during general module checking;
+        the current Naravm target does not emit it yet.
+      example: |
+        let n = string.len("hi");
   outro: |
     VL strings are byte strings for now. See the [language guide](/docs/language)
     for literal syntax and supported escapes.

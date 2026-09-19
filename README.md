@@ -76,21 +76,25 @@ colours) and sets the exit code. Never add another reporting library.
 
 ```text
 let x = 1 + 2 * 3;
-function main() { let d = x - 1; d; }
+function main(): void { let d = x - 1; d; }
 ```
 
 Numeric literals use `u64`, `i64`, `f64`, and `u8` suffixes; bare integers are
-`i64`. Boolean literals are `true` and `false`. The language also supports
-double-quoted byte strings, `+ - * /`, unary `-`, parens, `let`, `function`
-with params and calls, and `if`/`else` conditionals with mandatory parentheses.
+`i64`. Boolean literals are `true` and `false`. Value types are `u64`, `i64`,
+`f64`, `bool`, `u8`, `string`, `File`, and `void` (`void` only as a return).
+The language also supports double-quoted byte strings, `+ - * /`, unary `-`,
+parens, `let`, typed `function` boundaries (`function add(a: i64, b: i64): i64`),
+calls, and `if`/`else` conditionals with mandatory parentheses.
 Branches may be single statements or brace-delimited blocks. `//` comments.
 String escapes are `\\0`,
 `\\n`, `\\r`, `\\t`, `\\\\`, and `\\"`; strings may not cross a newline.
-Semicolons are mandatory. Strings are carried as bytes through LIR; codegen
-support is not implemented yet. See crate docs for the grammar.
+Semicolons are mandatory. Strings are carried as bytes through LIR. Extern
+signatures (`std.print`, `std.fs`, `std.string`) are declared in
+`vl-codegen::modules` and enforced by `vl-typecheck`; backends map VL types to
+target concepts. See crate docs for the grammar.
 
 ## Roadmap
 
 1. Harden/add more `vl-codegen` backends.
-2. Grow richer string/function types in `vl-typecheck`.
+2. Fallible externs (`!File`, `!string` via `errno`/`0x30`) once VL gains error handling.
 3. Bytecode/assembly emission + runner.

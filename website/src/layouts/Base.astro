@@ -33,14 +33,16 @@ const navLink = (key: keyof typeof sectionMeta) =>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content={description} />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" href="/logo.svg" />
     <title>{title}</title>
   </head>
   <body class="min-h-screen bg-canvas font-sans text-body antialiased">
     <!-- Top developer bar, Swift-docs style -->
-    <header class="sticky top-0 z-40 border-b border-rule bg-header/95 backdrop-blur">
+    <header class="sticky top-0 z-40 border-b border-rule bg-header/85 backdrop-blur">
       <nav class="mx-auto flex h-12 max-w-350 items-center justify-between gap-4 px-4 sm:px-6">
-        <a href="/" class="flex items-baseline gap-1.5 text-[1.05rem] font-semibold tracking-tight text-ink">
-          <span aria-hidden="true" class="text-[1rem]">◼</span> VL&nbsp;<span class="font-normal text-muted">Developer</span>
+        <a href="/" class="flex items-center gap-2 text-[1.05rem] font-semibold tracking-tight text-ink">
+          <img src="/logo.svg" alt="VL logo" width="22" height="22" class="logo-mark" /><span class="font-normal text-muted">Developer</span>
         </a>
         <div class="hidden items-center gap-6 text-[0.82rem] text-body lg:flex">
           <a href="/docs" class={navLink('docs')}>Documentation</a>
@@ -68,11 +70,5 @@ const navLink = (key: keyof typeof sectionMeta) =>
     <main>
       <slot />
     </main>
-    <footer class="border-t border-rule bg-canvas py-8">
-      <div class="mx-auto flex max-w-350 flex-col gap-1 px-4 text-[0.8rem] text-faint sm:flex-row sm:items-baseline sm:justify-between sm:px-6">
-        <p>VL — a small language with a legible compiler.</p>
-        <p>Set in Inter. Respects your system appearance.</p>
-      </div>
-    </footer>
   </body>
 </html>
