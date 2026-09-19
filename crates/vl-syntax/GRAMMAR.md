@@ -19,13 +19,13 @@ let_stmt := "let" ident "=" expr ";"
 expr_stmt := expr ";"                   ; mandatory, TS-style
 expr     := term (("+" | "-") term)*     ; left-assoc
 term     := factor (("*" | "/") factor)* ; left-assoc
-factor   := call | int | ident | "(" expr ")" | "-" factor
+factor   := call | int | string | ident | "(" expr ")" | "-" factor
 call     := ident "(" args? ")"
 args     := expr ("," expr)*
 ```
 
 Terminal names are `vl-lex` `TokenKind`s: `Let Function Eq Semi LParen RParen
-LBrace RBrace Comma Plus Minus Star Slash Ident Int Eof`.
+LBrace RBrace Comma Plus Minus Star Slash Ident Int String Eof`.
 
 ### Notes
 
@@ -45,7 +45,7 @@ Item ::= Let { name, name_span, value: Expr, span }
        | Function { name, name_span, params: Vec<(String, Span)>, body: Vec<Stmt>, span }
 Stmt ::= Let { name, name_span, value: Expr, span }
        | Expr(Expr)
-Expr ::= Int(i64, Span) | Var(String, Span)
+Expr ::= Int(i64, Span) | String(Vec<u8>, Span) | Var(String, Span)
         | Call { callee, callee_span, args, span }
         | Unary { op: Neg, rhs, span } | Binary { op, lhs, rhs, span }
 BinOp ::= Add | Sub | Mul | Div
@@ -94,4 +94,4 @@ Missing `;` (`let x = 1`) → `E100`; `@` never reaches here (lexer `E000`).
 
 No `return`, no `if`/`else`/`while`, no types/annotations
 (TS-like surface only: `let`, `function`, calls, braces, mandatory `;`),
-no trailing comma in params, no string/bool literals.
+no trailing comma in params, no bool literals.

@@ -78,3 +78,18 @@ fn function_calls_lower_to_lir_and_asm() {
     assert!(diags.is_empty());
     assert!(artifact.unwrap().text.contains("call"));
 }
+
+#[test]
+fn strings_lower_to_byte_constants() {
+    let lir = frontend(r#"let greeting = "hi\n";"#).expect("string must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("string [104, 105, 10]"), "{dump}");
+}
+
+#[test]
+fn unterminated_string_is_a_lex_error() {
+    let err = frontend("let x = \"not closed\nlet y = 1;").expect_err("must fail");
+    assert!(err
+        .iter()
+        .any(|d| d.message.contains("unterminated string")));
+}

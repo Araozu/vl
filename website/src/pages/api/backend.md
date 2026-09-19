@@ -23,7 +23,9 @@ The desugared tree, with node ids and `DefId` links. Stub: the node catalogue.
 
 ### `vl-typecheck`
 
-Types and their rules. In v0 everything is `int`. Stub: the judgments.
+Types and their rules. v0 has `int` and byte-string values. String codegen is
+not implemented yet; strings currently stop at target-neutral LIR. Stub: the
+full judgments.
 
 ### `vl-lir`
 

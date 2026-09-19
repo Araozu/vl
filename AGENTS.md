@@ -42,6 +42,9 @@ cargo run -- check examples/hello.vl
 cargo run -- build examples/arith.vl --emit lir
 ```
 
+For website commands, use the system-installed `pnpm` directly. Do not invoke
+Corepack or use `corepack pnpm`.
+
 Golden update (only for intended LIR changes, review the diff):
 
 ```sh

@@ -57,6 +57,11 @@ pub enum HirExpr {
         value: i64,
         span: Span,
     },
+    String {
+        id: HirId,
+        value: Vec<u8>,
+        span: Span,
+    },
     Var {
         id: HirId,
         def: Option<DefId>,
@@ -92,6 +97,7 @@ impl HirExpr {
     pub fn id(&self) -> HirId {
         match self {
             HirExpr::Int { id, .. }
+            | HirExpr::String { id, .. }
             | HirExpr::Var { id, .. }
             | HirExpr::Call { id, .. }
             | HirExpr::Binary { id, .. } => *id,
@@ -101,6 +107,7 @@ impl HirExpr {
     pub fn span(&self) -> Span {
         match self {
             HirExpr::Int { span, .. }
+            | HirExpr::String { span, .. }
             | HirExpr::Var { span, .. }
             | HirExpr::Call { span, .. }
             | HirExpr::Binary { span, .. } => *span,
@@ -185,7 +192,7 @@ impl<'a> Lowerer<'a> {
                 name_span,
                 ..
             } => {
-                let def = self.def_at(*name_span);
+                let def = self.def_at_site(*name_span);
                 HirStmt::Let {
                     id: self.id(),
                     def,
@@ -202,6 +209,11 @@ impl<'a> Lowerer<'a> {
             AstExpr::Int(v, s) => HirExpr::Int {
                 id: self.id(),
                 value: *v,
+                span: *s,
+            },
+            AstExpr::String(value, s) => HirExpr::String {
+                id: self.id(),
+                value: value.clone(),
                 span: *s,
             },
             AstExpr::Var(name, s) => HirExpr::Var {

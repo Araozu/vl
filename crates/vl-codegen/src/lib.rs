@@ -71,6 +71,7 @@ impl Target for DummyTarget {
 fn dummy_instr(ins: &Instr) -> String {
     match ins {
         Instr::Const { dst, value, .. } => format!("mov %{}, {value}", dst.0),
+        Instr::StringConst { dst, .. } => format!("string %{} (unsupported)", dst.0),
         Instr::Param { dst, index, .. } => format!("param %{}, {index}", dst.0),
         Instr::Copy { dst, src, .. } => format!("mov %{}, %{}", dst.0, src.0),
         Instr::BinOp {
@@ -135,6 +136,7 @@ impl Target for StackVmTarget {
 fn stackvm_instr(ins: &Instr) -> String {
     match ins {
         Instr::Const { value, .. } => format!("push {value}"),
+        Instr::StringConst { dst, .. } => format!("string %{} (unsupported)", dst.0),
         Instr::Param { index, .. } => format!("param {index}"),
         Instr::Copy { .. } => "dup".into(),
         Instr::BinOp { op, .. } => match op {

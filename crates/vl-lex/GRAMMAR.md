@@ -8,7 +8,7 @@ Signature: `lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>)`. Never panics.
 ```text
 source   := (trivia | token)* EOF
 trivia   := whitespace | comment
-token    := keyword | ident | int | punct
+token    := keyword | ident | int | string | punct
 EOF      := synthetic, zero-width span at src.len()
 ```
 
@@ -31,8 +31,13 @@ The `\n` itself is then whitespace. Unterminated comment at EOF just stops.
 keyword := "let" | "function"      ; exact match, else ident
 ident   := [a-zA-Z_] [a-zA-Z0-9_]* ; stored as Ident(String)
 int     := [0-9]+                  ; stored as Int(i64), see errors
+string  := `"` string_char* `"`  ; stored as String(Vec<u8>)
 punct   := "+" | "-" | "*" | "/" | "=" | ";" | "(" | ")" | "{" | "}" | ","
 ```
+
+`string_char` is any byte other than `"`, `\\`, `\n`, or `\r`, or one of the
+escapes `\\0`, `\\n`, `\\r`, `\\t`, `\\\\`, and `\\"`. String contents are
+bytes; no UTF-8 decoding is performed.
 
 | Spelling | `TokenKind` | Span |
 |---|---|---|
@@ -40,6 +45,7 @@ punct   := "+" | "-" | "*" | "/" | "=" | ";" | "(" | ")" | "{" | "}" | ","
 | `function` | `Function` | `start..end` of word |
 | `[a-zA-Z_][a-zA-Z0-9_]*` | `Ident(String)` | `start..end` of word |
 | `[0-9]+` | `Int(i64)` | `start..end` of digits |
+| `"..."` | `String(Vec<u8>)` | `start..end` including quotes |
 | `+` | `Plus` | `i..i+1` |
 | `-` | `Minus` | `i..i+1` |
 | `*` | `Star` | `i..i+1` |
@@ -66,6 +72,8 @@ Notes:
 |---|---|---|---|
 | `E000` | `unexpected character \`{c}\`` + note `identifiers use letters, digits and \`_\`; see \`let\`, \`function\`` | `i..i+1` | emit diag, `i += 1`, no token |
 | `E001` | `integer literal out of range` + label `does not fit in i64` | `start..i` of digit run | emit diag, no token, continue after run |
+| `E002` | `unterminated string literal` | opening quote through line end/EOF | emit diag, no token; continue lexing |
+| `E003` | `unknown string escape` | backslash and escaped byte | emit diag; no string token |
 
 One diag per offending byte / per bad literal. Lexing never stops early.
 
@@ -76,9 +84,10 @@ One diag per offending byte / per bad literal. Lexing never stops early.
 "// hi\nlet a=1;" → Let Ident("a") Eq Int(1) Semi Eof
 "let x = @;"      → Let Ident("x") Eq Semi Eof + E000 on `@` (0-width? no: 1-byte span)
 "99999999999999999999" → Eof only + E001 over the whole run
+"a\\n" → String([97, 10])
 ```
 
 ## Explicitly NOT lexed in v0
 
-No `== != <= >= ! && ||`, no strings/chars, no floats, no hex/binary/octal ints,
+No `== != <= >= ! && ||`, no chars, no floats, no hex/binary/octal ints,
 no block comments (`/* */`), no escapes, no `_`-separators in ints (`1_000` → `Int(1)` + `Ident("_000")` — wait, actually `_000` starts with `_` so it lexes as ident; beware).

@@ -2,7 +2,7 @@
   "name": "vl-docs",
   "version": "0.1.0",
   "private": true,
-  "packageManager": "pnpm@11.13.0",
+  "packageManager": "pnpm@12.4.2",
   "type": "module",
   "scripts": {
     "dev": "astro dev",

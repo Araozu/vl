@@ -11,6 +11,7 @@ use vl_common::{Diagnostic, Span};
 pub enum TokenKind {
     Ident(String),
     Int(i64),
+    String(Vec<u8>),
     Let,
     Function,
     Plus,
@@ -119,6 +120,71 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                     ),
                 }
             }
+            '"' => {
+                let start = i;
+                i += 1;
+                let mut value = Vec::new();
+                let mut valid = true;
+                let mut closed = false;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'"' => {
+                            i += 1;
+                            closed = true;
+                            break;
+                        }
+                        b'\n' | b'\r' => break,
+                        b'\\' => {
+                            i += 1;
+                            if i >= bytes.len() {
+                                break;
+                            }
+                            if matches!(bytes[i], b'\n' | b'\r') {
+                                break;
+                            }
+                            let escaped = match bytes[i] {
+                                b'0' => Some(0),
+                                b'n' => Some(b'\n'),
+                                b'r' => Some(b'\r'),
+                                b't' => Some(b'\t'),
+                                b'\\' => Some(b'\\'),
+                                b'"' => Some(b'"'),
+                                _ => None,
+                            };
+                            if let Some(byte) = escaped {
+                                value.push(byte);
+                            } else {
+                                valid = false;
+                                diags.push(
+                                    Diagnostic::error("unknown string escape")
+                                        .with_label(Span::new(i - 1, i + 1), "unknown escape")
+                                        .with_note("supported escapes are `\\0`, `\\n`, `\\r`, `\\t`, `\\\\`, and `\\\"`")
+                                        .with_code("E003"),
+                                );
+                            }
+                            i += 1;
+                        }
+                        byte => {
+                            value.push(byte);
+                            i += 1;
+                        }
+                    }
+                }
+                if !closed {
+                    let end = i;
+                    diags.push(
+                        Diagnostic::error("unterminated string literal")
+                            .with_label(
+                                Span::new(start, end),
+                                "string must close before the line ends",
+                            )
+                            .with_code("E002"),
+                    );
+                    // Leave the newline for the normal whitespace path.
+                } else if valid {
+                    tokens.push(Token::new(TokenKind::String(value), Span::new(start, i)));
+                }
+            }
             'a'..='z' | 'A'..='Z' | '_' => {
                 let start = i;
                 while i < bytes.len() && ((bytes[i] as char).is_alphanumeric() || bytes[i] == b'_')
@@ -175,5 +241,31 @@ mod tests {
         let (toks, diags) = lex("let x = @;");
         assert_eq!(diags.len(), 1);
         assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Eof)));
+    }
+
+    #[test]
+    fn lexes_byte_string_and_common_escapes() {
+        let (toks, diags) = lex("\"a\\n\\t\\\\\\\"\\0\"");
+        assert!(diags.is_empty());
+        assert!(matches!(
+            &toks[0].kind,
+            TokenKind::String(value) if value == b"a\n\t\\\"\0"
+        ));
+    }
+
+    #[test]
+    fn unterminated_string_stops_at_newline() {
+        let (toks, diags) = lex("\"not closed\nlet x = 1;");
+        assert!(diags.iter().any(|d| d.message.contains("unterminated")));
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Let)));
+    }
+
+    #[test]
+    fn unknown_escape_is_a_diagnostic() {
+        let (toks, diags) = lex(r#""bad\q""#);
+        assert!(diags
+            .iter()
+            .any(|d| d.message.contains("unknown string escape")));
+        assert!(!toks.iter().any(|t| matches!(t.kind, TokenKind::String(_))));
     }
 }

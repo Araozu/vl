@@ -164,7 +164,7 @@ impl Resolver {
 
     fn resolve_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Int(_, _) => {}
+            Expr::Int(_, _) | Expr::String(_, _) => {}
             Expr::Var(name, span) => match self.lookup(name) {
                 Some(id) => {
                     self.out.uses.insert((span.start, span.end), id);

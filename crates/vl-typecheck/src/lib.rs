@@ -1,7 +1,7 @@
 //! vl-typecheck: type checking over HIR.
 //!
-//! v0 type system: exactly one value type, `int`. Every expression must be
-//! `int`; every `function` takes `int`s and returns an `int`. That sounds
+//! The value types currently include `int` and byte strings. Arithmetic requires
+//! `int`; function boundaries remain unchecked in v0. That sounds
 //! trivial, but the scaffolding is the point — [`check`] walks the HIR,
 //! annotates each node with [`Ty`], enforces call arity/callability, and
 //! quietly poisons nodes whose names failed resolution (already reported
@@ -20,6 +20,7 @@ use vl_hir::{HirBinOp, HirExpr, HirItem, HirProgram, HirStmt};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ty {
     Int,
+    String,
     /// Poison: an earlier error made this node's type unknowable.
     /// Poisoned nodes don't produce follow-on errors.
     Error,
@@ -29,6 +30,7 @@ impl std::fmt::Display for Ty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Ty::Int => write!(f, "int"),
+            Ty::String => write!(f, "string"),
             Ty::Error => write!(f, "<error>"),
         }
     }
@@ -56,6 +58,7 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
     let mut cx = Checker {
         typed: TypedProgram::default(),
         diags: vec![],
+        bindings: HashMap::new(),
     };
     // Pass 1: collect function signatures so calls resolve arity
     // regardless of definition order (matches the resolver pre-pass).
@@ -79,6 +82,7 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
 struct Checker {
     typed: TypedProgram,
     diags: Vec<Diagnostic>,
+    bindings: HashMap<u32, Ty>,
 }
 
 impl Checker {
@@ -92,29 +96,37 @@ impl Checker {
             HirItem::Let { id, def, value, .. } => {
                 let ty = self.infer_expr(value);
                 self.record(*id, ty);
-                if def.is_none() {
-                    // Name resolution already reported this; stay quiet.
-                } else {
+                if let Some(def) = def {
+                    self.bindings.insert(def.0, ty);
                     self.typed.globals.push(format!("let#{}", id.0));
+                } else {
+                    // Name resolution already reported this; stay quiet.
                 }
             }
             HirItem::Fn {
                 id, params, body, ..
             } => {
                 self.record(*id, Ty::Int);
+                for (_, def, _) in params {
+                    if let Some(def) = def {
+                        self.bindings.insert(def.0, Ty::Int);
+                    }
+                }
                 for stmt in body {
                     self.check_stmt(stmt);
                 }
-                let _ = params;
             }
         }
     }
 
     fn check_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
-            HirStmt::Let { id, value, .. } => {
+            HirStmt::Let { id, def, value, .. } => {
                 let ty = self.infer_expr(value);
                 self.record(*id, ty);
+                if let Some(def) = def {
+                    self.bindings.insert(def.0, ty);
+                }
             }
             HirStmt::Expr(e) => {
                 self.infer_expr(e);
@@ -125,13 +137,18 @@ impl Checker {
     fn infer_expr(&mut self, expr: &HirExpr) -> Ty {
         match expr {
             HirExpr::Int { id, .. } => self.record(*id, Ty::Int),
+            HirExpr::String { id, .. } => self.record(*id, Ty::String),
             HirExpr::Var { id, def, .. } => {
                 // Unresolved names were already reported by `vl-semantic`;
                 // poison quietly instead of cascading a second error.
                 if def.is_none() {
                     self.record(*id, Ty::Error)
                 } else {
-                    self.record(*id, Ty::Int)
+                    let ty = def
+                        .as_ref()
+                        .and_then(|def| self.bindings.get(&def.0).copied())
+                        .unwrap_or(Ty::Int);
+                    self.record(*id, ty)
                 }
             }
             HirExpr::Call {
@@ -235,6 +252,20 @@ mod tests {
     fn ints_check_clean() {
         let (_, diags) = check_src("let x = 1 + 2 * 3;");
         assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn strings_check_as_string_type() {
+        let (typed, diags) = check_src(r#"let greeting = "hello";"#);
+        assert!(diags.is_empty());
+        assert_eq!(typed.types.values().next(), Some(&Ty::String));
+    }
+
+    #[test]
+    fn string_bindings_keep_their_type() {
+        let (typed, diags) = check_src(r#"let greeting = "hello"; let copy = greeting;"#);
+        assert!(diags.is_empty());
+        assert_eq!(typed.types.get(&3), Some(&Ty::String));
     }
 
     #[test]

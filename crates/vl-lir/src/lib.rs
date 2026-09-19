@@ -14,12 +14,18 @@ use vl_hir::{HirBinOp, HirExpr, HirItem, HirProgram, HirStmt};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Reg(pub u32);
 
-/// Three-address instructions. v0 covers integer arithmetic only.
+/// Three-address instructions. Strings are carried as raw bytes; codegen is
+/// intentionally not implemented yet.
 #[derive(Debug, Clone)]
 pub enum Instr {
     Const {
         dst: Reg,
         value: i64,
+        span: Span,
+    },
+    StringConst {
+        dst: Reg,
+        value: Vec<u8>,
         span: Span,
     },
     /// Function parameter copied into a virtual register at entry.
@@ -100,6 +106,9 @@ impl LirProgram {
 fn fmt_instr(ins: &Instr) -> String {
     match ins {
         Instr::Const { dst, value, .. } => format!("%{} = const {value}", dst.0),
+        Instr::StringConst { dst, value, .. } => {
+            format!("%{} = string {value:?}", dst.0)
+        }
         Instr::Param { dst, index, .. } => format!("%{} = param {index}", dst.0),
         Instr::Copy { dst, src, .. } => format!("%{} = copy %{}", dst.0, src.0),
         Instr::BinOp {
@@ -230,6 +239,15 @@ impl Lowerer {
                 self.instrs.push(Instr::Const {
                     dst,
                     value: *value,
+                    span: *span,
+                });
+                Some(dst)
+            }
+            HirExpr::String { value, span, .. } => {
+                let dst = self.reg();
+                self.instrs.push(Instr::StringConst {
+                    dst,
+                    value: value.clone(),
                     span: *span,
                 });
                 Some(dst)

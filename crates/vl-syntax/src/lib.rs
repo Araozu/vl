@@ -8,7 +8,7 @@
 //! stmt    := `let` ident `=` expr `;` | expr `;`
 //! expr    := term ((`+`|`-`) term)*
 //! term    := factor ((`*`|`/`) factor)*
-//! factor  := call | int | ident | `(` expr `)` | `-` factor
+//! factor  := call | int | string | ident | `(` expr `)` | `-` factor
 //! call    := ident `(` args? `)`
 //! args    := expr (`,` expr)*
 //! ```
@@ -61,6 +61,7 @@ pub enum Stmt {
 #[derive(Debug, Clone)]
 pub enum Expr {
     Int(i64, Span),
+    String(Vec<u8>, Span),
     Var(String, Span),
     Call {
         callee: String,
@@ -98,6 +99,7 @@ impl Expr {
     pub fn span(&self) -> Span {
         match self {
             Expr::Int(_, s) => *s,
+            Expr::String(_, s) => *s,
             Expr::Var(_, s) => *s,
             Expr::Call { span, .. } => *span,
             Expr::Unary { span, .. } | Expr::Binary { span, .. } => *span,
@@ -358,6 +360,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Some(Expr::Int(v, t.span))
             }
+            TokenKind::String(value) => {
+                self.bump();
+                Some(Expr::String(value, t.span))
+            }
             TokenKind::Ident(_) => {
                 self.bump();
                 let (name, name_span) = match t.kind {
@@ -430,6 +436,7 @@ fn describe(k: &TokenKind) -> String {
     match k {
         TokenKind::Ident(n) => format!("identifier `{n}`"),
         TokenKind::Int(v) => format!("integer `{v}`"),
+        TokenKind::String(_) => "string literal".into(),
         TokenKind::Let => "`let`".into(),
         TokenKind::Function => "`function`".into(),
         TokenKind::Plus => "`+`".into(),
@@ -524,5 +531,15 @@ mod tests {
             Item::Let { value, .. } => assert!(matches!(value, Expr::Binary { .. })),
             other => panic!("expected let, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_string_literal() {
+        let (prog, diags) = parse_src(r#"let s = "hello";"#);
+        assert!(diags.is_empty());
+        assert!(matches!(
+            &prog.items[0],
+            Item::Let { value: Expr::String(value, _), .. } if value == b"hello"
+        ));
     }
 }
