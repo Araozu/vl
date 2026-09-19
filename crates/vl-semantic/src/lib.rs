@@ -345,19 +345,24 @@ impl Resolver {
                 // no import and resolves to a synthetic external def carrying
                 // its signature, so typechecking and HIR reuse the normal
                 // extern-call path (LIR desugars it to an allocation).
+                // A bare `Array.new(count)` carries no type argument: it
+                // resolves the same way with no signature, and typechecking
+                // either infers `T` from an annotated `let` or reports E303.
                 if callee.len() == 2 && callee[0] == "Array" && callee[1] == "new" {
                     let [elem] = type_args.as_slice() else {
-                        self.diags.push(
-                            Diagnostic::error(format!(
-                                "`Array.new` expects exactly one type argument, got {}",
-                                type_args.len()
-                            ))
-                            .with_label(
-                                type_args_span.unwrap_or(*callee_span),
-                                "write `Array.new::[T](count)`, e.g. `Array.new::[u64](3u64)`",
-                            )
-                            .with_code("E303"),
-                        );
+                        if type_args.len() > 1 {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "`Array.new` expects exactly one type argument, got {}",
+                                    type_args.len()
+                                ))
+                                .with_label(
+                                    type_args_span.unwrap_or(*callee_span),
+                                    "write `Array.new::[T](count)`, e.g. `Array.new::[u64](3)`",
+                                )
+                                .with_code("E303"),
+                            );
+                        }
                         let id = self.external_def(callee.join("."), *callee_span, None);
                         self.out
                             .uses
@@ -743,8 +748,22 @@ mod tests {
     }
 
     #[test]
-    fn array_new_without_type_arg_is_one_error() {
-        let (_, diags) = resolve_src("function main() { let a = Array.new(3u64); a; }");
+    fn array_new_without_type_arg_defers_to_typechecking() {
+        // No turbofish: resolution succeeds with no signature; typechecking
+        // either infers `T` from an annotated `let` or reports E303.
+        let (res, diags) = resolve_src("function main() { let a = Array.new(3); a; }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let def = res
+            .defs
+            .iter()
+            .find(|d| d.name == "Array.new")
+            .expect("Array.new def");
+        assert!(def.sig.is_none());
+    }
+
+    #[test]
+    fn array_new_with_two_type_args_is_one_error() {
+        let (_, diags) = resolve_src("function main() { let a = Array.new::[u64, u64](3); a; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("exactly one type argument"));
     }
