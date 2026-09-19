@@ -18,6 +18,10 @@ pnpm build
 - `src/pages/cli/` — CLI reference
 - `src/pages/internals/` — compiler pipeline, crates, driver, and service reference
 - `src/components/Playground.svelte` — interactive compiler client (Svelte)
+- `src/grammars/vl.tmLanguage.json` — Shiki/TextMate grammar for VL;
+  registered as a custom `langs` entry in `astro.config.mjs`, so ` ```vl `
+  fences and `<Code lang={vlLang}>` blocks highlight. Dual `github-light` /
+  `github-dark` themes; dark-mode swap lives in `src/styles/global.css`.
 
 ## Deploy (`+devops/`)
 
