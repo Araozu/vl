@@ -20,6 +20,14 @@ Workspace crates (dependency order, lower first):
 - `examples/*.vl`: sample programs. `err_*.vl` must FAIL.
 - `tests/pipeline.rs` + `tests/golden/`: integration + golden tests.
 
+## Naravm target
+
+The target VM checkout is at `/root/projects/zig/naravm` (the user-facing
+project path is `projects/zig/naravm`). Inspect its ISA and file format when
+implementing the Naravm backend, but **never modify files in that checkout**.
+All VL-side integration belongs in this repository, including
+`crates/vl-codegen`, `vlc/`, and website deployment configuration.
+
 ## Hard rules
 
 1. **Errors via Ariadne only.** Produce `vl_common::Diagnostic`, print with
