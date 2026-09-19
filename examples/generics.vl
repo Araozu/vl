@@ -1,0 +1,28 @@
+// Generic functions over `Array[T]`.
+//
+// Type parameters are declared after the function name (`[T]`), inferred
+// from the value arguments at call sites (`first(b)`), or passed explicitly
+// with a turbofish (`first::[u64](b)`). `f[T](...)` without `::` is indexing,
+// not a generic call. Each concrete call monomorphizes (`first$u64`, ...).
+use std;
+
+function first[T](a: Array[T]): T {
+    return a[0u64];
+}
+
+function second[T](a: Array[T], fallback: T): T {
+    if (1u64 < 2u64) {
+        return a[1u64];
+    }
+    return fallback;
+}
+
+function main() {
+    let nums = [10u64, 20u64, 30u64];
+    std.print_u64(first(nums));
+    std.print_u64(first::[u64](nums));
+    std.print_u64(second(nums, 99u64));
+    let words = ["hi", "bye"];
+    std.print(first(words));
+    std.print(first::[string](words));
+}

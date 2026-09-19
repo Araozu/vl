@@ -93,7 +93,7 @@ fn run_frontend(
                     ret,
                     span,
                     ..
-                } if name == "main" => Some((params.len(), *ret, *span)),
+                } if name == "main" => Some((params.len(), ret.clone(), *span)),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -112,6 +112,7 @@ fn run_frontend(
             }
             // The entrypoint returns nothing; `void` keeps VL's type surface
             // total while the VM decides its own halt representation.
+            // (A generic `main` is rejected by typechecking with E401.)
             if mains[0].1 != Some(vl_common::VlType::Void) {
                 diags.push(
                     vl_common::Diagnostic::error("`main` must return `void`")

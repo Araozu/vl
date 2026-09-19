@@ -343,9 +343,9 @@ fn arrays_compile_through_frontend_to_naravm() {
 }
 
 #[test]
-fn u64array_new_needs_no_import() {
-    let lir = frontend("function main() { let a = U64Array.new(2u64); a[0u64] = 1u64; }")
-        .expect("U64Array.new must compile without imports");
+fn array_new_needs_no_import() {
+    let lir = frontend("function main() { let a = Array.new::[u64](2u64); a[0u64] = 1u64; }")
+        .expect("Array.new must compile without imports");
     assert!(lir.dump().contains("new_array"));
 }
 
@@ -355,7 +355,7 @@ fn array_element_mismatch_is_one_error() {
     assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
     assert!(
         err.iter()
-            .any(|d| d.message.contains("expects `u64` elements")),
+            .any(|d| d.message.contains("expects `i64` elements")),
         "{err:?}"
     );
 }
@@ -387,4 +387,51 @@ fn array_index_shapes_are_checked() {
 #[test]
 fn bare_return_in_void_function_compiles() {
     frontend("function main() { return; }").expect("bare return in void must compile");
+}
+
+#[test]
+fn generics_example_compiles_to_instances_and_runs_on_naravm() {
+    let src = std::fs::read_to_string("examples/generics.vl").unwrap();
+    let lir = frontend(&src).expect("generics.vl must compile");
+    let dump = lir.dump();
+    for name in ["first$u64", "first$string", "second$u64"] {
+        assert!(dump.contains(name), "{name} missing in {dump}");
+    }
+    assert!(!dump.contains("fn first:\n"), "{dump}");
+    assert!(!dump.contains("fn second:\n"), "{dump}");
+
+    use vl_codegen::Target;
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+}
+
+#[test]
+fn generic_inference_and_turbofish_agree() {
+    let lir = frontend(
+        "function first[T](a: Array[T]): T { return a[0u64]; } function main() { let a = first([7u64]); let b = first::[u64]([8u64]); a; b; }",
+    )
+    .expect("inferred and explicit calls must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("call first$u64"), "{dump}");
+    assert!(!dump.contains("call first("), "{dump}");
+}
+
+#[test]
+fn bracket_call_suggests_turbofish() {
+    let err = frontend("function main() { f[T](1u64); }").expect_err("must fail");
+    let rendered =
+        vl_common::diagnostic::render_all(&err, "bracket.vl", "function main() { f[T](1u64); }");
+    assert!(rendered.contains("f::[T]"), "{rendered}");
+}
+
+#[test]
+fn generic_main_is_rejected() {
+    let err = frontend("function main[T]() { return; }").expect_err("must fail");
+    assert!(
+        err.iter()
+            .any(|d| d.message.contains("must not declare type parameters")),
+        "{err:?}"
+    );
 }
