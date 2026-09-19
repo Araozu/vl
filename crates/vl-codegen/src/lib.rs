@@ -249,7 +249,8 @@ impl Target for StackVmTarget {
 /// `<entrypoint>` function plus one Nara function per other user function
 /// (see the internals book for the supported subset). Calls to
 /// `std.print` / `std.print_u64` and to user functions lower to `calli`;
-/// `U64Array` values lower to memory containers (`create`/`getvat`/`setvat`);
+/// `Array[T]` values lower to memory containers (`create`/`getvat`/`setvat`
+/// for value elements, `getrfat`/`setrfat` for reference elements);
 /// anything else is a diagnostic.
 pub struct NaraVmTarget;
 
@@ -288,7 +289,7 @@ enum NaraConstant {
     Function { module: usize, function: usize },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum NaraKind {
     U64,
     I64,
@@ -297,14 +298,17 @@ enum NaraKind {
     U8,
     String,
     File,
-    /// Fixed-length heap array of `u64` (a memory container of values).
-    U64Array,
+    /// Fixed-length heap array (a memory container). The payload is the
+    /// element kind: value elements use `vat` ops, reference elements
+    /// (`string`, `File`, nested arrays) use `rfat` ops.
+    Array(Box<NaraKind>),
 }
 
 impl NaraKind {
-    /// Map a VL-level type to its register file. `None` for `Void`/`Error`,
-    /// which never reach codegen through the driver (frontends reject them).
-    fn of_ty(ty: vl_typecheck::Ty) -> Option<Self> {
+    /// Map a VL-level type to its register file. `None` for `Void`/`Error`/
+    /// `Param`, which never reach codegen through the driver (frontends
+    /// reject them; instances are always concrete).
+    fn of_ty(ty: &vl_typecheck::Ty) -> Option<Self> {
         match ty {
             vl_typecheck::Ty::U64 => Some(NaraKind::U64),
             vl_typecheck::Ty::I64 => Some(NaraKind::I64),
@@ -313,14 +317,14 @@ impl NaraKind {
             vl_typecheck::Ty::U8 => Some(NaraKind::U8),
             vl_typecheck::Ty::String => Some(NaraKind::String),
             vl_typecheck::Ty::File => Some(NaraKind::File),
-            vl_typecheck::Ty::U64Array => Some(NaraKind::U64Array),
-            vl_typecheck::Ty::Void | vl_typecheck::Ty::Error => None,
+            vl_typecheck::Ty::Array(elem) => Some(NaraKind::Array(Box::new(Self::of_ty(elem)?))),
+            vl_typecheck::Ty::Param(_) | vl_typecheck::Ty::Void | vl_typecheck::Ty::Error => None,
         }
     }
 
     /// Reference kinds live in `rf`, everything else in `rv`.
-    fn is_ref(self) -> bool {
-        matches!(self, NaraKind::String | NaraKind::File | NaraKind::U64Array)
+    fn is_ref(&self) -> bool {
+        matches!(self, NaraKind::String | NaraKind::File | NaraKind::Array(_))
     }
 
     fn of_scalar(value: Scalar) -> Self {
@@ -343,7 +347,7 @@ impl NaraKind {
         }
     }
 
-    fn is_integer(self) -> bool {
+    fn is_integer(&self) -> bool {
         matches!(self, NaraKind::U64 | NaraKind::I64 | NaraKind::U8)
     }
 }
@@ -558,13 +562,14 @@ impl NaraEmit {
         None
     }
 
-    /// Resolve a `U64Array` operand to its reference register. Types were
-    /// enforced upstream, so anything unresolvable here is either poisoned
-    /// (quiet) or a compiler bug (loud E500).
-    fn array_reg(&mut self, reg: vl_lir::Reg, span: Span) -> Option<u8> {
-        if self.kinds.get(&reg).copied() == Some(NaraKind::U64Array) {
+    /// Resolve an `Array[T]` operand to its reference register plus the
+    /// element kind (which selects `vat` vs `rfat` ops). Types were enforced
+    /// upstream, so anything unresolvable here is either poisoned (quiet) or
+    /// a compiler bug (loud E500).
+    fn array_reg(&mut self, reg: vl_lir::Reg, span: Span) -> Option<(u8, NaraKind)> {
+        if let Some(NaraKind::Array(elem)) = self.kinds.get(&reg).cloned() {
             if let Some(rf) = self.rf_map.get(&reg).copied() {
-                return Some(rf);
+                return Some((rf, *elem));
             }
         } else if !self.invalid.contains(&reg) && self.kinds.contains_key(&reg) {
             self.diags.push(
@@ -1014,7 +1019,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 e.invalid.insert(*dst);
                 return;
             }
-            let Some(kind) = e.kinds.get(src).copied() else {
+            let Some(kind) = e.kinds.get(src).cloned() else {
                 e.invalid.insert(*dst);
                 return;
             };
@@ -1131,7 +1136,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                     e.invalid.insert(*dst);
                     return;
                 }
-                match e.kinds.get(&args[0]).copied() {
+                match e.kinds.get(&args[0]).cloned() {
                     Some(NaraKind::U64) | Some(NaraKind::U8) => {}
                     _ => {
                         e.diags.push(
@@ -1167,11 +1172,21 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 e.invalid.insert(*dst);
             }
         }
-        Instr::NewArray { dst, len, span } => {
+        Instr::NewArray {
+            dst,
+            len,
+            elem,
+            span,
+        } => {
+            let Some(elem_kind) = NaraKind::of_ty(elem) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let array_kind = NaraKind::Array(Box::new(elem_kind.clone()));
             if !e.last_use.contains_key(dst) {
                 // Dead allocation (e.g. an unused `let`): spend no machine
                 // register on it.
-                e.kinds.insert(*dst, NaraKind::U64Array);
+                e.kinds.insert(*dst, array_kind);
                 return;
             }
             if e.invalid.contains(len) {
@@ -1187,12 +1202,28 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 return;
             };
             e.rf_map.insert(*dst, rf);
-            e.kinds.insert(*dst, NaraKind::U64Array);
-            e.bytecode.extend_from_slice(&[0x26, rf, n, zero]); // create
+            e.kinds.insert(*dst, array_kind);
+            // `create rf n_vals n_refs`: value elements fill the value
+            // slots, reference elements the ref slots.
+            if elem_kind.is_ref() {
+                e.bytecode.extend_from_slice(&[0x26, rf, zero, n]); // create
+            } else {
+                e.bytecode.extend_from_slice(&[0x26, rf, n, zero]); // create
+            }
         }
-        Instr::ArrayLit { dst, elems, span } => {
+        Instr::ArrayLit {
+            dst,
+            elems,
+            elem,
+            span,
+        } => {
+            let Some(elem_kind) = NaraKind::of_ty(elem) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let array_kind = NaraKind::Array(Box::new(elem_kind.clone()));
             if !e.last_use.contains_key(dst) {
-                e.kinds.insert(*dst, NaraKind::U64Array);
+                e.kinds.insert(*dst, array_kind);
                 return;
             }
             for elem in elems {
@@ -1205,6 +1236,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 e.invalid.insert(*dst);
                 return;
             };
+            let is_ref = elem_kind.is_ref();
             // One scratch value register covers the dynamic length and every
             // dynamic index of oversized literals (> 255 elements); the
             // common path stays on the immediate `createi`/`setvati` forms.
@@ -1218,30 +1250,56 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                     return;
                 };
                 e.bytecode.extend_from_slice(&[0x02, s, len_idx as u8]); // lv
-                e.bytecode.extend_from_slice(&[0x26, rf, s, zero]); // create
+                if is_ref {
+                    e.bytecode.extend_from_slice(&[0x26, rf, zero, s]); // create
+                } else {
+                    e.bytecode.extend_from_slice(&[0x26, rf, s, zero]); // create
+                }
                 Some(s)
+            } else if is_ref {
+                e.bytecode
+                    .extend_from_slice(&[0x27, rf, 0, elems.len() as u8]); // createi
+                None
             } else {
                 e.bytecode
                     .extend_from_slice(&[0x27, rf, elems.len() as u8, 0]); // createi
                 None
             };
             e.rf_map.insert(*dst, rf);
-            e.kinds.insert(*dst, NaraKind::U64Array);
+            e.kinds.insert(*dst, array_kind);
             for (i, elem) in elems.iter().enumerate() {
-                let Some(v) = e.value_reg(*elem, *span) else {
-                    e.invalid.insert(*dst);
-                    return;
-                };
-                if i <= u8::MAX as usize {
-                    e.bytecode.extend_from_slice(&[0x2d, rf, i as u8, v]); // setvati
-                } else {
-                    let s = scratch.expect("scratch exists when a literal index exceeds u8");
-                    let Some(idx) = e.add_value(i as u64, *span) else {
+                if is_ref {
+                    let Some(v) = e.ref_reg(*elem, *span) else {
                         e.invalid.insert(*dst);
                         return;
                     };
-                    e.bytecode.extend_from_slice(&[0x02, s, idx as u8]); // lv
-                    e.bytecode.extend_from_slice(&[0x29, rf, s, v]); // setvat
+                    if i <= u8::MAX as usize {
+                        e.bytecode.extend_from_slice(&[0x2f, rf, i as u8, v]); // setrfati
+                    } else {
+                        let s = scratch.expect("scratch exists when a literal index exceeds u8");
+                        let Some(idx) = e.add_value(i as u64, *span) else {
+                            e.invalid.insert(*dst);
+                            return;
+                        };
+                        e.bytecode.extend_from_slice(&[0x02, s, idx as u8]); // lv
+                        e.bytecode.extend_from_slice(&[0x2b, rf, s, v]); // setrfat
+                    }
+                } else {
+                    let Some(v) = e.value_reg(*elem, *span) else {
+                        e.invalid.insert(*dst);
+                        return;
+                    };
+                    if i <= u8::MAX as usize {
+                        e.bytecode.extend_from_slice(&[0x2d, rf, i as u8, v]); // setvati
+                    } else {
+                        let s = scratch.expect("scratch exists when a literal index exceeds u8");
+                        let Some(idx) = e.add_value(i as u64, *span) else {
+                            e.invalid.insert(*dst);
+                            return;
+                        };
+                        e.bytecode.extend_from_slice(&[0x02, s, idx as u8]); // lv
+                        e.bytecode.extend_from_slice(&[0x29, rf, s, v]); // setvat
+                    }
                 }
             }
         }
@@ -1249,29 +1307,45 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             dst,
             array,
             index,
+            elem,
             span,
         } => {
+            let Some(elem_kind) = NaraKind::of_ty(elem) else {
+                e.invalid.insert(*dst);
+                return;
+            };
             if !e.last_use.contains_key(dst) {
-                e.kinds.insert(*dst, NaraKind::U64);
+                e.kinds.insert(*dst, elem_kind);
                 return;
             }
-            let (Some(a), Some(i)) = (e.array_reg(*array, *span), e.value_reg(*index, *span))
+            let (Some((a, _)), Some(i)) = (e.array_reg(*array, *span), e.value_reg(*index, *span))
             else {
                 e.invalid.insert(*dst);
                 return;
             };
-            let Some(d) = e.fresh_rv(*span) else {
-                e.invalid.insert(*dst);
-                return;
-            };
-            e.rv_map.insert(*dst, d);
-            e.kinds.insert(*dst, NaraKind::U64);
-            e.bytecode.extend_from_slice(&[0x28, d, a, i]); // getvat
+            if elem_kind.is_ref() {
+                let Some(d) = e.fresh_rf(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.rf_map.insert(*dst, d);
+                e.kinds.insert(*dst, elem_kind);
+                e.bytecode.extend_from_slice(&[0x2a, d, a, i]); // getrfat
+            } else {
+                let Some(d) = e.fresh_rv(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.rv_map.insert(*dst, d);
+                e.kinds.insert(*dst, elem_kind);
+                e.bytecode.extend_from_slice(&[0x28, d, a, i]); // getvat
+            }
         }
         Instr::ArraySet {
             array,
             index,
             value,
+            elem,
             span,
         } => {
             // Statement-only: no destination to poison. Poisoned sides stay
@@ -1279,14 +1353,24 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             if e.invalid.contains(array) || e.invalid.contains(index) || e.invalid.contains(value) {
                 return;
             }
-            let (Some(a), Some(i), Some(v)) = (
-                e.array_reg(*array, *span),
-                e.value_reg(*index, *span),
-                e.value_reg(*value, *span),
-            ) else {
+            let Some(elem_kind) = NaraKind::of_ty(elem) else {
                 return;
             };
-            e.bytecode.extend_from_slice(&[0x29, a, i, v]); // setvat
+            let (Some((a, _)), Some(i)) = (e.array_reg(*array, *span), e.value_reg(*index, *span))
+            else {
+                return;
+            };
+            if elem_kind.is_ref() {
+                let Some(v) = e.ref_reg(*value, *span) else {
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x2b, a, i, v]); // setrfat
+            } else {
+                let Some(v) = e.value_reg(*value, *span) else {
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x29, a, i, v]); // setvat
+            }
         }
         Instr::Ret { src, span } => nara_ret(e, ctx, *src, *span),
         Instr::BranchIfFalse { cond, target, span } => {
@@ -1340,9 +1424,9 @@ fn nara_param(e: &mut NaraEmit, ctx: &NaraFnCtx, dst: vl_lir::Reg, index: usize,
         .func
         .param_tys
         .get(index)
-        .copied()
+        .cloned()
         .unwrap_or(vl_typecheck::Ty::Error);
-    let Some(kind) = NaraKind::of_ty(ty) else {
+    let Some(kind) = NaraKind::of_ty(&ty) else {
         e.invalid.insert(dst);
         return;
     };
@@ -1455,7 +1539,7 @@ fn nara_user_call(
     let mut values = 0u8;
     let mut refs = 0u8;
     for arg in args {
-        match e.kinds.get(arg).copied() {
+        match e.kinds.get(arg).cloned() {
             Some(kind) if kind.is_ref() => {
                 let Some(src) = e.rf_map.get(arg).copied() else {
                     e.diags.push(
@@ -1512,8 +1596,8 @@ fn nara_user_call(
     }
     // Reserve the return register before spilling so it cannot alias a live
     // caller register. This emits no code, only reserves a register number.
-    let ret_kind = NaraKind::of_ty(callee_fn.ret);
-    let ret_rv = match ret_kind {
+    let ret_kind = NaraKind::of_ty(&callee_fn.ret);
+    let ret_rv = match &ret_kind {
         Some(kind) if !kind.is_ref() => match e.fresh_rv(span) {
             Some(rv) => Some(rv),
             None => {
@@ -1523,7 +1607,7 @@ fn nara_user_call(
         },
         _ => None,
     };
-    let ret_rf = match ret_kind {
+    let ret_rf = match &ret_kind {
         Some(kind) if kind.is_ref() => match e.fresh_rf(span) {
             Some(rf) => Some(rf),
             None => {
@@ -1618,7 +1702,7 @@ fn nara_ret(e: &mut NaraEmit, ctx: &NaraFnCtx, src: vl_lir::Reg, span: Span) {
         e.bytecode.push(0x00);
         return;
     }
-    let ret = match NaraKind::of_ty(ctx.func.ret) {
+    let ret = match NaraKind::of_ty(&ctx.func.ret) {
         None => {
             e.bytecode.push(0x00);
             return;
@@ -1680,8 +1764,8 @@ fn nara_binop(
     // Resolve operand kinds before machine registers: string operands live in
     // reference registers, so resolving value registers first would misreport
     // them as a compiler bug instead of clean E404 diagnostics.
-    let lkind = e.kinds.get(&lhs).copied();
-    let rkind = e.kinds.get(&rhs).copied();
+    let lkind = e.kinds.get(&lhs).cloned();
+    let rkind = e.kinds.get(&rhs).cloned();
     if lkind != rkind || lkind.is_none() {
         if e.invalid.contains(&lhs) || e.invalid.contains(&rhs) {
             fail(e);
@@ -1722,7 +1806,7 @@ fn nara_binop(
     };
     match op {
         LirOp::Add | LirOp::Sub | LirOp::Mul | LirOp::Div => {
-            let opcode = match (op, kind) {
+            let opcode = match (op, &kind) {
                 (LirOp::Add, NaraKind::U64) | (LirOp::Add, NaraKind::U8) => 0x30,
                 (LirOp::Add, NaraKind::I64) => 0x31,
                 (LirOp::Add, NaraKind::F64) => 0x32,
@@ -2026,7 +2110,7 @@ mod tests {
         // condition, but its machine register must survive the back edge.
         // Freeing it mid-loop used to let a temporary clobber it, hanging
         // `sum` forever.
-        let lir = lir_of("function sum(a: U64Array, n: u64): u64 { let t = 0u64; let i = 0u64; while (i < n) { t = t + a[i]; i = i + 1u64; } return t; } function main() {}");
+        let lir = lir_of("function sum(a: Array[u64], n: u64): u64 { let t = 0u64; let i = 0u64; while (i < n) { t = t + a[i]; i = i + 1u64; } return t; } function main() {}");
         let f = lir.functions.iter().find(|f| f.name == "sum").unwrap();
         let uses = nara_last_use(f);
         let n = match f.instrs[1] {
@@ -2049,13 +2133,13 @@ mod tests {
     #[test]
     fn naravm_emits_arrays_with_container_ops() {
         let lir = lir_of(
-            "use std; function get(a: U64Array): u64 { return a[0u64]; } function main() { let a = U64Array.new(2u64); a[0u64] = 1u64; a[1u64] = 2u64; let b = [3u64, 4u64]; std.print_u64(get(a) + b[1u64]); }",
+            "use std; function get(a: Array[u64]): u64 { return a[0u64]; } function main() { let a = Array.new::[u64](2u64); a[0u64] = 1u64; a[1u64] = 2u64; let b = [3u64, 4u64]; std.print_u64(get(a) + b[1u64]); }",
         );
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
         let bytes = artifact.unwrap().bytes.unwrap();
         assert_eq!(&bytes[..4], b"nara");
-        // create = 0x26 (U64Array.new), createi = 0x27 (literal),
+        // create = 0x26 (Array.new), createi = 0x27 (literal),
         // getvat = 0x28 (reads), setvat/setvati = 0x29/0x2D (writes).
         for op in [0x26u8, 0x27, 0x28, 0x2du8] {
             assert!(bytes.contains(&op), "no {op:#x} in {bytes:?}");
@@ -2065,8 +2149,41 @@ mod tests {
     #[test]
     fn naravm_passes_arrays_through_calls() {
         let lir = lir_of(
-            "function fill(a: U64Array): U64Array { a[0u64] = 7u64; return a; } function main() { let a = fill(U64Array.new(1u64)); }",
+            "function fill(a: Array[u64]): Array[u64] { a[0u64] = 7u64; return a; } function main() { let a = fill(Array.new::[u64](1u64)); }",
         );
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+    }
+
+    #[test]
+    fn naravm_emits_string_arrays_with_ref_ops() {
+        let lir = lir_of(
+            "function main() { let a = Array.new::[string](2u64); a[0u64] = \"hi\"; let x = a[0u64]; x; }",
+        );
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let bytes = artifact.unwrap().bytes.unwrap();
+        assert_eq!(&bytes[..4], b"nara");
+        // create = 0x26, setrfat = 0x2B (store), getrfat = 0x2A (load).
+        for op in [0x26u8, 0x2b, 0x2a] {
+            assert!(bytes.contains(&op), "no {op:#x} in {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn naravm_emits_monomorphized_instances() {
+        let lir = lir_of(
+            "function id[T](x: T): T { return x; } function main() { let a = id(1u64); let b = id::[string](\"s\"); a; b; }",
+        );
+        let names: Vec<&str> = lir.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"id$u64"), "{names:?}");
+        assert!(names.contains(&"id$string"), "{names:?}");
+        // The template itself never emits.
+        assert!(!names.contains(&"id"), "{names:?}");
+        let dump = lir.dump();
+        assert!(dump.contains("call id$u64"), "{dump}");
+        assert!(dump.contains("call id$string"), "{dump}");
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
         assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
