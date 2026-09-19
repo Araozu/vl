@@ -186,12 +186,32 @@ impl Resolver {
                 self.declare_local(name.clone(), *name_span);
             }
             Stmt::Expr(e) => self.resolve_expr(e),
+            Stmt::If {
+                condition,
+                then_body,
+                else_body,
+                ..
+            } => {
+                self.resolve_expr(condition);
+                self.scopes.push(HashMap::new());
+                for stmt in then_body {
+                    self.resolve_stmt(stmt);
+                }
+                self.scopes.pop();
+                if let Some(body) = else_body {
+                    self.scopes.push(HashMap::new());
+                    for stmt in body {
+                        self.resolve_stmt(stmt);
+                    }
+                    self.scopes.pop();
+                }
+            }
         }
     }
 
     fn resolve_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Int(_, _) | Expr::String(_, _) => {}
+            Expr::Literal(_, _) | Expr::String(_, _) => {}
             Expr::Var { path, span } => match self.lookup_path(path, *span) {
                 Some(id) => {
                     self.out.uses.insert((span.start, span.end), id);

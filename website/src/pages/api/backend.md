@@ -23,7 +23,7 @@ The desugared tree, with node ids and `DefId` links. Stub: the node catalogue.
 
 ### `vl-typecheck`
 
-Types and their rules. v0 has `int` and byte-string values. String literals
+Types and their rules. VL has `u64`, `i64`, `f64`, `bool`, `u8`, and byte-string values. String literals
 reach target-neutral LIR and the Naravm backend can emit them for `std.print`.
 Stub: the full judgments.
 

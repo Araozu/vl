@@ -8,7 +8,7 @@ availability: VL 0.1+
 
 # Documentation
 
-Start here. In v0, VL is integers, arithmetic, `let`, `function`, modules, and
+Start here. VL has typed scalar literals, arithmetic, `let`, `function`, modules, and
 `//` comments, carried through a strict staged pipeline to Naravm.
 
 ```text

@@ -5,7 +5,7 @@
 //! resolved by `vl-semantic` (or `None` when resolution failed, so later
 //! stages can skip rather than cascade errors).
 
-use vl_common::Span;
+use vl_common::{Scalar, Span};
 use vl_semantic::DefId;
 use vl_syntax::{
     BinOp as AstBinOp, Expr as AstExpr, Item as AstItem, Program as AstProgram, Stmt as AstStmt,
@@ -48,14 +48,20 @@ pub enum HirStmt {
         value: HirExpr,
         span: Span,
     },
+    If {
+        condition: HirExpr,
+        then_body: Vec<HirStmt>,
+        else_body: Option<Vec<HirStmt>>,
+        span: Span,
+    },
     Expr(HirExpr),
 }
 
 #[derive(Debug, Clone)]
 pub enum HirExpr {
-    Int {
+    Literal {
         id: HirId,
-        value: i64,
+        value: Scalar,
         span: Span,
     },
     String {
@@ -98,7 +104,7 @@ pub enum HirBinOp {
 impl HirExpr {
     pub fn id(&self) -> HirId {
         match self {
-            HirExpr::Int { id, .. }
+            HirExpr::Literal { id, .. }
             | HirExpr::String { id, .. }
             | HirExpr::Var { id, .. }
             | HirExpr::Call { id, .. }
@@ -108,7 +114,7 @@ impl HirExpr {
 
     pub fn span(&self) -> Span {
         match self {
-            HirExpr::Int { span, .. }
+            HirExpr::Literal { span, .. }
             | HirExpr::String { span, .. }
             | HirExpr::Var { span, .. }
             | HirExpr::Call { span, .. }
@@ -214,14 +220,27 @@ impl<'a> Lowerer<'a> {
                 }
             }
             AstStmt::Expr(e) => HirStmt::Expr(self.lower_expr(e)),
+            AstStmt::If {
+                condition,
+                then_body,
+                else_body,
+                span,
+            } => HirStmt::If {
+                condition: self.lower_expr(condition),
+                then_body: then_body.iter().map(|s| self.lower_stmt(s)).collect(),
+                else_body: else_body
+                    .as_ref()
+                    .map(|body| body.iter().map(|s| self.lower_stmt(s)).collect()),
+                span: *span,
+            },
         }
     }
 
     fn lower_expr(&mut self, expr: &AstExpr) -> HirExpr {
         match expr {
-            AstExpr::Int(v, s) => HirExpr::Int {
+            AstExpr::Literal(value, s) => HirExpr::Literal {
                 id: self.id(),
-                value: *v,
+                value: *value,
                 span: *s,
             },
             AstExpr::String(value, s) => HirExpr::String {
@@ -253,6 +272,10 @@ impl<'a> Lowerer<'a> {
             },
             AstExpr::Unary { op, rhs, span } => {
                 let rhs = self.lower_expr(rhs);
+                let zero = match &rhs {
+                    HirExpr::Literal { value, .. } => scalar_zero(*value),
+                    _ => Scalar::I64(0),
+                };
                 match op {
                     // Desugar `-x` into `0 - x`.
                     AstUnOp::Neg => {
@@ -260,9 +283,9 @@ impl<'a> Lowerer<'a> {
                         HirExpr::Binary {
                             id: self.id(),
                             op: HirBinOp::Sub,
-                            lhs: Box::new(HirExpr::Int {
+                            lhs: Box::new(HirExpr::Literal {
                                 id: self.id(),
-                                value: 0,
+                                value: zero,
                                 span: zero_span,
                             }),
                             rhs: Box::new(rhs),
@@ -287,6 +310,16 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
+    }
+}
+
+fn scalar_zero(value: Scalar) -> Scalar {
+    match value {
+        Scalar::U64(_) => Scalar::U64(0),
+        Scalar::I64(_) => Scalar::I64(0),
+        Scalar::F64(_) => Scalar::F64(0.0f64.to_bits()),
+        Scalar::Bool(_) => Scalar::Bool(false),
+        Scalar::U8(_) => Scalar::U8(0),
     }
 }
 

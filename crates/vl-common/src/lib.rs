@@ -10,6 +10,16 @@
 pub mod diagnostic;
 pub mod module;
 pub mod source;
+
+/// Scalar values shared by the frontend and target-neutral IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scalar {
+    U64(u64),
+    I64(i64),
+    F64(u64),
+    Bool(bool),
+    U8(u8),
+}
 pub mod span;
 
 pub use diagnostic::{Diagnostic, Label, Severity};

@@ -8,7 +8,7 @@ availability: VL 0.1+
 
 # Language tour
 
-A description of the v0 surface. Values can be integers or byte strings.
+A description of the VL surface. Values include typed scalars and byte strings.
 
 ```vl
 use std;
@@ -20,8 +20,10 @@ function main() {
 
 ## Overview
 
-Integers with `+ - * /`, unary minus, and parentheses, plus double-quoted
-strings. Strings are raw bytes for now, not UTF-8 text. `let` binds a name,
+Numeric literals are `i64` by default or can use `u64`, `i64`, `f64`, and `u8`
+suffixes. Boolean literals are `true` and `false`. Numeric values support
+`+ - * /`, unary minus, and parentheses, plus double-quoted strings. Strings
+are raw bytes for now, not UTF-8 text. `let` binds a name,
 `function` takes parameters, and calls use TypeScript-style `name(args)` syntax.
 Every program must define a zero-argument `function main()`; it becomes the
 runtime entrypoint.
@@ -48,6 +50,22 @@ values reach LIR as byte arrays. The Naravm backend can currently lower string
 literals passed to `std.print`.
 
 Scopes reject two things: names nobody defined, and names defined twice. After an error the compiler marks its nodes and stays quiet downstream, so you fix causes, not echoes.
+
+### Conditionals
+
+Conditionals are statements with brace-delimited branches. The condition must
+have type `bool`; `else` is optional.
+
+```vl
+function main() {
+    let ready = true;
+    if (ready) {
+        std.print("ready\n");
+    } else {
+        std.print("not ready\n");
+    }
+}
+```
 
 ## Topics
 
@@ -95,7 +113,7 @@ function main() {
 
 ### The grammar, with precedence
 
-Expressions include `int` and `string` literals. Arithmetic keeps its usual
+Expressions include typed scalar and `string` literals. Arithmetic keeps its usual
 precedence, and statements and bindings require `;`.
 
 ### Scoping rules, stated precisely
@@ -108,4 +126,4 @@ Stub. Per-item recovery and why `Ty::Error` passes through quietly.
 
 ### What comes next
 
-Bool values, richer function types, and a backend representation for strings.
+Richer function types and a backend representation for all scalar values.

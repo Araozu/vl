@@ -119,3 +119,24 @@ fn unknown_module_export_is_a_single_error() {
         .iter()
         .any(|d| d.message.contains("no export `missing`")));
 }
+
+#[test]
+fn scalar_literals_and_if_lower_to_typed_control_flow() {
+    let lir =
+        frontend("function main() { let x = 1u64; if (true) { x; } else { 255u8; } 1.5f64; }")
+            .expect("scalar literals and if must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("const 1u64"), "{dump}");
+    assert!(dump.contains("const 1.5f64"), "{dump}");
+    assert!(dump.contains("branch_if_false"), "{dump}");
+    assert!(dump.contains("L0:"), "{dump}");
+}
+
+#[test]
+fn if_requires_a_boolean_condition() {
+    let err = frontend("function main() { if (1) { 2; } }").expect_err("if condition must be bool");
+    assert!(
+        err.iter().any(|d| d.message.contains("must be bool")),
+        "{err:?}"
+    );
+}

@@ -10,10 +10,16 @@ use vl_common::{Diagnostic, Span};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenKind {
     Ident(String),
-    Int(i64),
+    I64(i64),
+    U64(u64),
+    F64(u64),
+    U8(u8),
+    Bool(bool),
     String(Vec<u8>),
     Let,
     Function,
+    If,
+    Else,
     Plus,
     Minus,
     Star,
@@ -115,12 +121,55 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
-                let lit = &src[start..i];
-                match lit.parse::<i64>() {
-                    Ok(v) => tokens.push(Token::new(TokenKind::Int(v), Span::new(start, i))),
-                    Err(_) => diags.push(
-                        Diagnostic::error("integer literal out of range")
-                            .with_label(Span::new(start, i), "does not fit in i64")
+                let is_float = bytes.get(i) == Some(&b'.')
+                    && bytes.get(i + 1).is_some_and(|b| b.is_ascii_digit());
+                if is_float {
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+                let suffix_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+                    i += 1;
+                }
+                let number = &src[start..suffix_start];
+                let suffix = &src[suffix_start..i];
+                let result = if is_float {
+                    if suffix != "f64" {
+                        Err("floating literals require the `f64` suffix")
+                    } else {
+                        number
+                            .parse::<f64>()
+                            .map(|v| TokenKind::F64(v.to_bits()))
+                            .map_err(|_| "invalid f64 literal")
+                    }
+                } else {
+                    match suffix {
+                        "" => number
+                            .parse::<i64>()
+                            .map(TokenKind::I64)
+                            .map_err(|_| "integer literal out of range"),
+                        "i64" => number
+                            .parse::<i64>()
+                            .map(TokenKind::I64)
+                            .map_err(|_| "i64 literal out of range"),
+                        "u64" => number
+                            .parse::<u64>()
+                            .map(TokenKind::U64)
+                            .map_err(|_| "u64 literal out of range"),
+                        "u8" => number
+                            .parse::<u8>()
+                            .map(TokenKind::U8)
+                            .map_err(|_| "u8 literal out of range"),
+                        _ => Err("unknown numeric literal suffix"),
+                    }
+                };
+                match result {
+                    Ok(kind) => tokens.push(Token::new(kind, Span::new(start, i))),
+                    Err(message) => diags.push(
+                        Diagnostic::error(message)
+                            .with_label(Span::new(start, i), "invalid numeric literal")
                             .with_code("E001"),
                     ),
                 }
@@ -200,6 +249,10 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 let kind = match word {
                     "let" => TokenKind::Let,
                     "function" => TokenKind::Function,
+                    "if" => TokenKind::If,
+                    "else" => TokenKind::Else,
+                    "true" => TokenKind::Bool(true),
+                    "false" => TokenKind::Bool(false),
                     _ => TokenKind::Ident(word.to_string()),
                 };
                 tokens.push(Token::new(kind, Span::new(start, i)));
@@ -272,5 +325,18 @@ mod tests {
             .iter()
             .any(|d| d.message.contains("unknown string escape")));
         assert!(!toks.iter().any(|t| matches!(t.kind, TokenKind::String(_))));
+    }
+
+    #[test]
+    fn lexes_scalar_suffixes_and_bools() {
+        let (toks, diags) = lex("1u64 -1i64 1.5f64 255u8 true false");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(matches!(toks[0].kind, TokenKind::U64(1)));
+        assert!(matches!(toks[1].kind, TokenKind::Minus));
+        assert!(matches!(toks[2].kind, TokenKind::I64(1)));
+        assert!(matches!(toks[3].kind, TokenKind::F64(_)));
+        assert!(matches!(toks[4].kind, TokenKind::U8(255)));
+        assert!(matches!(toks[5].kind, TokenKind::Bool(true)));
+        assert!(matches!(toks[6].kind, TokenKind::Bool(false)));
     }
 }

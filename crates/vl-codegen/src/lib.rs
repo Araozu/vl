@@ -11,6 +11,7 @@
 //! Rule: new targets = new types implementing [`Target`]. Never branch
 //! the LIR or the driver on target names.
 
+use vl_common::Scalar;
 use vl_common::{Diagnostic, Span};
 use vl_lir::{Instr, LirOp, LirProgram};
 
@@ -89,7 +90,7 @@ impl Target for DummyTarget {
 
 fn dummy_instr(ins: &Instr) -> String {
     match ins {
-        Instr::Const { dst, value, .. } => format!("mov %{}, {value}", dst.0),
+        Instr::Const { dst, value, .. } => format!("mov %{}, {}", dst.0, scalar_text(*value)),
         Instr::StringConst { dst, .. } => format!("string %{} (unsupported)", dst.0),
         Instr::Param { dst, index, .. } => format!("param %{}, {index}", dst.0),
         Instr::Copy { dst, src, .. } => format!("mov %{}, %{}", dst.0, src.0),
@@ -115,6 +116,21 @@ fn dummy_instr(ins: &Instr) -> String {
             format!("call %{}, {callee}({args})", dst.0)
         }
         Instr::Ret { src, .. } => format!("ret %{}", src.0),
+        Instr::BranchIfFalse { cond, target, .. } => {
+            format!("branch_if_false %{}, L{}", cond.0, target)
+        }
+        Instr::Jump { target, .. } => format!("jump L{}", target),
+        Instr::Label { id, .. } => format!("L{}:", id),
+    }
+}
+
+fn scalar_text(value: Scalar) -> String {
+    match value {
+        Scalar::U64(v) => format!("{v}u64"),
+        Scalar::I64(v) => format!("{v}i64"),
+        Scalar::F64(v) => format!("{}f64", f64::from_bits(v)),
+        Scalar::Bool(v) => v.to_string(),
+        Scalar::U8(v) => format!("{v}u8"),
     }
 }
 
@@ -254,7 +270,10 @@ fn nara_vmfile(
             Instr::Const { .. }
             | Instr::Copy { .. }
             | Instr::Param { .. }
-            | Instr::BinOp { .. } => {
+            | Instr::BinOp { .. }
+            | Instr::BranchIfFalse { .. }
+            | Instr::Jump { .. }
+            | Instr::Label { .. } => {
                 diags.push(
                     Diagnostic::error(
                         "Naravm backend only supports the hello-world subset currently",
@@ -346,7 +365,7 @@ fn pad4(out: &mut Vec<u8>) {
 
 fn stackvm_instr(ins: &Instr) -> String {
     match ins {
-        Instr::Const { value, .. } => format!("push {value}"),
+        Instr::Const { value, .. } => format!("push {}", scalar_text(*value)),
         Instr::StringConst { dst, .. } => format!("string %{} (unsupported)", dst.0),
         Instr::Param { index, .. } => format!("param {index}"),
         Instr::Copy { .. } => "dup".into(),
@@ -366,6 +385,11 @@ fn stackvm_instr(ins: &Instr) -> String {
             format!("call {callee}({args})")
         }
         Instr::Ret { .. } => "ret".into(),
+        Instr::BranchIfFalse { cond, target, .. } => {
+            format!("branch_if_false %{} -> L{}", cond.0, target)
+        }
+        Instr::Jump { target, .. } => format!("jump L{}", target),
+        Instr::Label { id, .. } => format!("L{}:", id),
     }
 }
 

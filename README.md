@@ -11,7 +11,7 @@ Ariadne error reporting, target platform TBD.
   ▼  vl-syntax     tokens -> AST (recursive descent, per-item recovery)
   │  vl-semantic   AST -> name resolution (scopes, undefined/duplicate defs)
   ▼  vl-hir        resolved AST -> HIR (desugared, node ids, DefId links)
-  │  vl-typecheck  HIR -> types (`int` and byte strings)
+  │  vl-typecheck  HIR -> types (`u64`, `i64`, `f64`, `bool`, `u8`, strings)
   ▼  vl-lir        typed HIR -> three-address code (target-agnostic)
   │  vl-codegen    LIR -> backend output via `Target` trait
   ▼
@@ -79,8 +79,11 @@ let x = 1 + 2 * 3;
 function main() { let d = x - 1; d; }
 ```
 
-Ints, double-quoted byte strings, `+ - * /`, unary `-`, parens, `let`,
-`function` with params and calls, `//` comments. String escapes are `\\0`,
+Numeric literals use `u64`, `i64`, `f64`, and `u8` suffixes; bare integers are
+`i64`. Boolean literals are `true` and `false`. The language also supports
+double-quoted byte strings, `+ - * /`, unary `-`, parens, `let`, `function`
+with params and calls, and brace-delimited `if`/`else` conditionals. `//` comments.
+String escapes are `\\0`,
 `\\n`, `\\r`, `\\t`, `\\\\`, and `\\"`; strings may not cross a newline.
 Semicolons are mandatory. Strings are carried as bytes through LIR; codegen
 support is not implemented yet. See crate docs for the grammar.
@@ -89,5 +92,5 @@ support is not implemented yet. See crate docs for the grammar.
 
 1. Decide target platform → harden/add a `vl-codegen` backend.
 2. Thread locals through LIR (vars currently materialise as consts).
-3. Grow types (`bool`, richer string/function types) in `vl-typecheck`.
+3. Grow richer string/function types in `vl-typecheck`.
 4. Bytecode/assembly emission + runner.

@@ -5,7 +5,7 @@
 //! program := item*
 //! item    := `let` ident `=` expr `;` | `function` ident `(` params? `)` block
 //! block   := `{` stmt* `}`
-//! stmt    := `let` ident `=` expr `;` | expr `;`
+//! stmt    := `let` ident `=` expr `;` | `if` `(` expr `)` block (`else` block)? | expr `;`
 //! expr    := term ((`+`|`-`) term)*
 //! term    := factor ((`*`|`/`) factor)*
 //! factor  := call | int | string | ident | `(` expr `)` | `-` factor
@@ -20,6 +20,7 @@
 //!
 //! The parser recovers per-item: one bad item doesn't kill the rest.
 
+pub use vl_common::Scalar;
 use vl_common::{Diagnostic, Span};
 use vl_lex::{Token, TokenKind};
 
@@ -61,12 +62,18 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    If {
+        condition: Expr,
+        then_body: Vec<Stmt>,
+        else_body: Option<Vec<Stmt>>,
+        span: Span,
+    },
     Expr(Expr),
 }
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    Int(i64, Span),
+    Literal(Scalar, Span),
     String(Vec<u8>, Span),
     Var {
         path: Vec<String>,
@@ -107,7 +114,7 @@ pub enum UnOp {
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
-            Expr::Int(_, s) => *s,
+            Expr::Literal(_, s) => *s,
             Expr::String(_, s) => *s,
             Expr::Var { span, .. } => *span,
             Expr::Call { span, .. } => *span,
@@ -299,6 +306,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stmt(&mut self) -> Option<Stmt> {
+        if matches!(self.peek().kind, TokenKind::If) {
+            return self.parse_if_stmt();
+        }
         if matches!(self.peek().kind, TokenKind::Let) {
             let let_tok = self.bump();
             let (name, name_span) = self.parse_ident()?;
@@ -316,6 +326,43 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::Semi, "`;`")?;
             Some(Stmt::Expr(value))
         }
+    }
+
+    fn parse_if_stmt(&mut self) -> Option<Stmt> {
+        let start = self.bump().span.start;
+        self.expect(&TokenKind::LParen, "`(` after `if`")?;
+        let condition = self.parse_expr()?;
+        self.expect(&TokenKind::RParen, "`)` after condition")?;
+        let then_body = self.parse_block()?;
+        let else_body = if matches!(self.peek().kind, TokenKind::Else) {
+            self.bump();
+            Some(self.parse_block()?)
+        } else {
+            None
+        };
+        let end = else_body
+            .as_ref()
+            .and_then(|_| self.toks.get(self.pos.saturating_sub(1)))
+            .map_or_else(|| condition.span().end, |t| t.span.end);
+        Some(Stmt::If {
+            condition,
+            then_body,
+            else_body,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_block(&mut self) -> Option<Vec<Stmt>> {
+        self.expect(&TokenKind::LBrace, "`{`")?;
+        let mut body = Vec::new();
+        while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
+            match self.parse_stmt() {
+                Some(stmt) => body.push(stmt),
+                None => self.recover_to_stmt_boundary(),
+            }
+        }
+        self.expect(&TokenKind::RBrace, "`}`")?;
+        Some(body)
     }
 
     fn recover_to_stmt_boundary(&mut self) {
@@ -418,9 +465,25 @@ impl<'a> Parser<'a> {
     fn parse_factor(&mut self) -> Option<Expr> {
         let t = self.peek().clone();
         match t.kind {
-            TokenKind::Int(v) => {
+            TokenKind::I64(v) => {
                 self.bump();
-                Some(Expr::Int(v, t.span))
+                Some(Expr::Literal(Scalar::I64(v), t.span))
+            }
+            TokenKind::U64(v) => {
+                self.bump();
+                Some(Expr::Literal(Scalar::U64(v), t.span))
+            }
+            TokenKind::F64(v) => {
+                self.bump();
+                Some(Expr::Literal(Scalar::F64(v), t.span))
+            }
+            TokenKind::U8(v) => {
+                self.bump();
+                Some(Expr::Literal(Scalar::U8(v), t.span))
+            }
+            TokenKind::Bool(v) => {
+                self.bump();
+                Some(Expr::Literal(Scalar::Bool(v), t.span))
             }
             TokenKind::String(value) => {
                 self.bump();
@@ -496,10 +559,16 @@ fn discriminant(k: &TokenKind) -> std::mem::Discriminant<TokenKind> {
 fn describe(k: &TokenKind) -> String {
     match k {
         TokenKind::Ident(n) => format!("identifier `{n}`"),
-        TokenKind::Int(v) => format!("integer `{v}`"),
+        TokenKind::I64(v) => format!("integer `{v}`"),
+        TokenKind::U64(v) => format!("u64 literal `{v}`"),
+        TokenKind::F64(v) => format!("f64 literal `{}`", f64::from_bits(*v)),
+        TokenKind::U8(v) => format!("u8 literal `{v}`"),
+        TokenKind::Bool(v) => format!("boolean `{v}`"),
         TokenKind::String(_) => "string literal".into(),
         TokenKind::Let => "`let`".into(),
         TokenKind::Function => "`function`".into(),
+        TokenKind::If => "`if`".into(),
+        TokenKind::Else => "`else`".into(),
         TokenKind::Plus => "`+`".into(),
         TokenKind::Minus => "`-`".into(),
         TokenKind::Star => "`*`".into(),

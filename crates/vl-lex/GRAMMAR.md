@@ -8,7 +8,7 @@ Signature: `lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>)`. Never panics.
 ```text
 source   := (trivia | token)* EOF
 trivia   := whitespace | comment
-token    := keyword | ident | int | string | punct
+token    := keyword | ident | number | bool | string | punct
 EOF      := synthetic, zero-width span at src.len()
 ```
 
@@ -28,9 +28,11 @@ The `\n` itself is then whitespace. Unterminated comment at EOF just stops.
 ## Tokens
 
 ```text
-keyword := "let" | "function"      ; exact match, else ident
+keyword := "let" | "function" | "if" | "else"; exact match, else ident
 ident   := [a-zA-Z_] [a-zA-Z0-9_]* ; stored as Ident(String)
-int     := [0-9]+                  ; stored as Int(i64), see errors
+number  := digits [ "." digits ] suffix?
+suffix  := "u64" | "i64" | "f64" | "u8"
+bool    := "true" | "false"
 string  := `"` string_char* `"`  ; stored as String(Vec<u8>)
 punct   := "+" | "-" | "*" | "/" | "=" | ";" | "(" | ")" | "{" | "}" | ","
 ```
@@ -43,8 +45,15 @@ bytes; no UTF-8 decoding is performed.
 |---|---|---|
 | `let` | `Let` | `start..end` of word |
 | `function` | `Function` | `start..end` of word |
+| `if` | `If` | `start..end` of word |
+| `else` | `Else` | `start..end` of word |
 | `[a-zA-Z_][a-zA-Z0-9_]*` | `Ident(String)` | `start..end` of word |
-| `[0-9]+` | `Int(i64)` | `start..end` of digits |
+| `[0-9]+` | `I64(i64)` | `start..end` of digits |
+| `[0-9]+u64` | `U64(u64)` | `start..end` |
+| `[0-9]+i64` | `I64(i64)` | `start..end` |
+| `[0-9]+u8` | `U8(u8)` | `start..end` |
+| `[0-9]+.[0-9]+f64` | `F64(u64)` | `start..end`, using `f64::to_bits` |
+| `true` / `false` | `Bool(bool)` | `start..end` of word |
 | `"..."` | `String(Vec<u8>)` | `start..end` including quotes |
 | `+` | `Plus` | `i..i+1` |
 | `-` | `Minus` | `i..i+1` |
@@ -62,7 +71,8 @@ Notes:
 
 * Maximal munch: `letx` → `Ident("letx")`, not `Let` + `Ident`. Same for `function1`, `letter`, `functional`.
 * Ident continuation in code is `(b as char).is_alphanumeric() || b == b'_'` — for ASCII input this equals `[0-9A-Za-z_]`. Non-ASCII bytes fall through to the error arm.
-* `int` is digit-run then `lit.parse::<i64>()`. `99999999999999999999` lexes as zero tokens + error.
+* Unsuffixed integer literals are `i64`; suffixed literals are checked against their declared type.
+  Floating literals require the `f64` suffix.
 * All spans are byte offsets, half-open `[start, end)` (`vl_common::Span`). Single-char punct is always length 1.
 * `Eof` is always appended, even when errors occurred: `Span::empty(src.len())`.
 
@@ -71,7 +81,7 @@ Notes:
 | Code | Message | Span | Recovery |
 |---|---|---|---|
 | `E000` | `unexpected character \`{c}\`` + note `identifiers use letters, digits and \`_\`; see \`let\`, \`function\`` | `i..i+1` | emit diag, `i += 1`, no token |
-| `E001` | `integer literal out of range` + label `does not fit in i64` | `start..i` of digit run | emit diag, no token, continue after run |
+| `E001` | invalid or out-of-range numeric literal | `start..i` of literal | emit diag, no token, continue after literal |
 | `E002` | `unterminated string literal` | opening quote through line end/EOF | emit diag, no token; continue lexing |
 | `E003` | `unknown string escape` | backslash and escaped byte | emit diag; no string token |
 
@@ -80,14 +90,15 @@ One diag per offending byte / per bad literal. Lexing never stops early.
 ## Examples
 
 ```text
-"let x = 1 + 2;"  → Let Ident("x") Eq Int(1) Plus Int(2) Semi Eof, no diags
-"// hi\nlet a=1;" → Let Ident("a") Eq Int(1) Semi Eof
+"let x = 1 + 2;"  → Let Ident("x") Eq I64(1) Plus I64(2) Semi Eof, no diags
+"// hi\nlet a=1;" → Let Ident("a") Eq I64(1) Semi Eof
 "let x = @;"      → Let Ident("x") Eq Semi Eof + E000 on `@` (0-width? no: 1-byte span)
-"99999999999999999999" → Eof only + E001 over the whole run
+"1u8" → U8(1), no diags
 "a\\n" → String([97, 10])
 ```
 
 ## Explicitly NOT lexed in v0
 
-No `== != <= >= ! && ||`, no chars, no floats, no hex/binary/octal ints,
-no block comments (`/* */`), no escapes, no `_`-separators in ints (`1_000` → `Int(1)` + `Ident("_000")` — wait, actually `_000` starts with `_` so it lexes as ident; beware).
+No `== != <= >= ! && ||`, no chars, no hex/binary/octal ints,
+no block comments (`/* */`), no `_`-separators in ints (`1_000` → `I64(1)` +
+`Ident("_000")` — `_000` starts with `_`, so it lexes as an identifier).

@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use vl_common::Scalar;
 use vl_common::Span;
 use vl_hir::{HirBinOp, HirExpr, HirItem, HirProgram, HirStmt};
 
@@ -20,7 +21,7 @@ pub struct Reg(pub u32);
 pub enum Instr {
     Const {
         dst: Reg,
-        value: i64,
+        value: Scalar,
         span: Span,
     },
     StringConst {
@@ -55,6 +56,19 @@ pub enum Instr {
     /// Tail value of a function body / global initializer.
     Ret {
         src: Reg,
+        span: Span,
+    },
+    BranchIfFalse {
+        cond: Reg,
+        target: u32,
+        span: Span,
+    },
+    Jump {
+        target: u32,
+        span: Span,
+    },
+    Label {
+        id: u32,
         span: Span,
     },
 }
@@ -106,7 +120,7 @@ impl LirProgram {
 
 fn fmt_instr(ins: &Instr) -> String {
     match ins {
-        Instr::Const { dst, value, .. } => format!("%{} = const {value}", dst.0),
+        Instr::Const { dst, value, .. } => format!("%{} = const {}", dst.0, fmt_scalar(*value)),
         Instr::StringConst { dst, value, .. } => {
             format!("%{} = string {value:?}", dst.0)
         }
@@ -128,6 +142,21 @@ fn fmt_instr(ins: &Instr) -> String {
             format!("%{} = call {callee}({args})", dst.0)
         }
         Instr::Ret { src, .. } => format!("ret %{}", src.0),
+        Instr::BranchIfFalse { cond, target, .. } => {
+            format!("branch_if_false %{} -> L{}", cond.0, target)
+        }
+        Instr::Jump { target, .. } => format!("jump -> L{}", target),
+        Instr::Label { id, .. } => format!("L{}:", id),
+    }
+}
+
+fn fmt_scalar(value: Scalar) -> String {
+    match value {
+        Scalar::U64(v) => format!("{v}u64"),
+        Scalar::I64(v) => format!("{v}i64"),
+        Scalar::F64(v) => format!("{}f64", f64::from_bits(v)),
+        Scalar::Bool(v) => v.to_string(),
+        Scalar::U8(v) => format!("{v}u8"),
     }
 }
 
@@ -137,6 +166,7 @@ struct Lowerer {
     /// Bindings for parameters are enough to make calls useful without
     /// changing the existing v0 treatment of locals and globals.
     params: HashMap<u32, Reg>,
+    next_label: u32,
 }
 
 impl Lowerer {
@@ -144,6 +174,12 @@ impl Lowerer {
         let r = Reg(self.next);
         self.next += 1;
         r
+    }
+
+    fn label(&mut self) -> u32 {
+        let label = self.next_label;
+        self.next_label += 1;
+        label
     }
 }
 
@@ -161,6 +197,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                     next: 0,
                     instrs: vec![],
                     params: HashMap::new(),
+                    next_label: 0,
                 };
                 if let Some(r) = l.lower_expr(value, typed) {
                     l.instrs.push(Instr::Ret {
@@ -180,6 +217,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                     next: 0,
                     instrs: vec![],
                     params: HashMap::new(),
+                    next_label: 0,
                 };
 
                 for (index, (_, def, span)) in params.iter().enumerate() {
@@ -203,6 +241,14 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                         HirStmt::Expr(e) => {
                             last = l.lower_expr(e, typed);
                         }
+                        HirStmt::If {
+                            condition,
+                            then_body,
+                            else_body,
+                            span,
+                        } => {
+                            l.lower_if(condition, then_body, else_body.as_deref(), typed, *span);
+                        }
                     }
                 }
                 // Bodies always return something; default to 0.
@@ -212,7 +258,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                         let r = l.reg();
                         l.instrs.push(Instr::Const {
                             dst: r,
-                            value: 0,
+                            value: Scalar::I64(0),
                             span: Span::empty(0),
                         });
                         r
@@ -238,7 +284,7 @@ impl Lowerer {
             return None;
         }
         match expr {
-            HirExpr::Int { value, span, .. } => {
+            HirExpr::Literal { value, span, .. } => {
                 let dst = self.reg();
                 self.instrs.push(Instr::Const {
                     dst,
@@ -267,7 +313,7 @@ impl Lowerer {
                 let dst = self.reg();
                 self.instrs.push(Instr::Const {
                     dst,
-                    value: 0,
+                    value: Scalar::I64(0),
                     span: *span,
                 });
                 Some(dst)
@@ -310,6 +356,62 @@ impl Lowerer {
                 Some(dst)
             }
         }
+    }
+
+    fn lower_stmt(&mut self, stmt: &HirStmt, typed: &vl_typecheck::TypedProgram) {
+        match stmt {
+            HirStmt::Let { value, .. } | HirStmt::Expr(value) => {
+                let _ = self.lower_expr(value, typed);
+            }
+            HirStmt::If {
+                condition,
+                then_body,
+                else_body,
+                span,
+            } => {
+                self.lower_if(condition, then_body, else_body.as_deref(), typed, *span);
+            }
+        }
+    }
+
+    fn lower_if(
+        &mut self,
+        condition: &HirExpr,
+        then_body: &[HirStmt],
+        else_body: Option<&[HirStmt]>,
+        typed: &vl_typecheck::TypedProgram,
+        span: Span,
+    ) {
+        let Some(cond) = self.lower_expr(condition, typed) else {
+            return;
+        };
+        let else_label = self.label();
+        let end_label = self.label();
+        self.instrs.push(Instr::BranchIfFalse {
+            cond,
+            target: else_label,
+            span,
+        });
+        for stmt in then_body {
+            self.lower_stmt(stmt, typed);
+        }
+        self.instrs.push(Instr::Jump {
+            target: end_label,
+            span,
+        });
+        self.instrs.push(Instr::Label {
+            id: else_label,
+            span,
+        });
+        if let Some(body) = else_body {
+            for stmt in body {
+                self.lower_stmt(stmt, typed);
+            }
+        }
+        self.instrs.push(Instr::Label {
+            id: end_label,
+            span,
+        });
     }
 }
 

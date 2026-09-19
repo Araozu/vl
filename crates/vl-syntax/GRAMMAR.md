@@ -15,19 +15,22 @@ let_item := "let" ident "=" expr ";"
 function_item := "function" ident "(" params? ")" block
 params   := ident ("," ident)*          ; no trailing comma
 block    := "{" stmt* "}"
-stmt     := let_stmt | expr_stmt
+stmt     := let_stmt | if_stmt | expr_stmt
 let_stmt := "let" ident "=" expr ";"
+if_stmt  := "if" "(" expr ")" block ("else" block)?
 expr_stmt := expr ";"                   ; mandatory, TS-style
 expr     := term (("+" | "-") term)*     ; left-assoc
 term     := factor (("*" | "/") factor)* ; left-assoc
-factor   := call | int | string | path | "(" expr ")" | "-" factor
+factor   := call | literal | string | path | "(" expr ")" | "-" factor
+literal  := i64 | u64 | f64 | u8 | bool
 path     := ident ("." ident)*
 call     := path "(" args? ")"
 args     := expr ("," expr)*
 ```
 
-Terminal names are `vl-lex` `TokenKind`s: `Let Function Eq Semi LParen RParen
-LBrace RBrace Comma Dot Plus Minus Star Slash Ident Int String Eof`.
+Terminal names are `vl-lex` `TokenKind`s: `Let Function If Else Eq Semi LParen
+RParen LBrace RBrace Comma Dot Plus Minus Star Slash Ident I64 U64 F64 U8 Bool
+String Eof`.
 
 ### Notes
 
@@ -36,8 +39,8 @@ LBrace RBrace Comma Dot Plus Minus Star Slash Ident Int String Eof`.
   (`{ let d = x; d; }`). A bare trailing `d` without `;` is `E100`.
 * Unary is `-` only, right-recursive: `- -5`, `--x` ok; `+x`, `!x` → `E103`.
 * Parens are transparent in the AST: `(e)` returns inner `Expr`, span drops parens.
-* Calls are identifier calls only: `foo(...)`; member calls, function-valued
-  calls, indexing, `.`, `return`, `if`, `else`, and `while` do not exist.
+Calls are identifier calls only: `foo(...)`; member calls, function-valued
+calls, indexing, `return`, and `while` do not exist.
 
 ## AST
 
@@ -46,8 +49,9 @@ Program { items: Vec<Item> }
 Item ::= Let { name, name_span, value: Expr, span }
        | Function { name, name_span, params: Vec<(String, Span)>, body: Vec<Stmt>, span }
 Stmt ::= Let { name, name_span, value: Expr, span }
-       | Expr(Expr)
-Expr ::= Int(i64, Span) | String(Vec<u8>, Span) | Var { path, span }
+        | If { condition, then_body, else_body, span }
+        | Expr(Expr)
+Expr ::= Literal(Scalar, Span) | String(Vec<u8>, Span) | Var { path, span }
          | Call { callee: path, callee_span, args, span }
         | Unary { op: Neg, rhs, span } | Binary { op, lhs, rhs, span }
 BinOp ::= Add | Sub | Mul | Div
@@ -94,9 +98,7 @@ Missing `;` (`let x = 1`) → `E100`; `@` never reaches here (lexer `E000`).
 
 ## Explicitly NOT syntax in v0
 
-No `return`, no `if`/`else`/`while`, no types/annotations
-(TS-like surface only: `let`, `function`, calls, braces, mandatory `;`),
-no trailing comma in params, no bool literals.
+No `return`, `while`, or type annotations; no trailing comma in params.
 
 ## Modules
 

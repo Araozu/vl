@@ -1,25 +1,29 @@
 //! vl-typecheck: type checking over HIR.
 //!
-//! The value types currently include `int` and byte strings. Arithmetic requires
-//! `int`; function boundaries remain unchecked in v0. That sounds
+//! The value types include `u64`, `i64`, `f64`, `bool`, `u8`, and byte strings.
+//! Arithmetic requires matching numeric types; function boundaries remain unchecked in v0. That sounds
 //! trivial, but the scaffolding is the point — [`check`] walks the HIR,
 //! annotates each node with [`Ty`], enforces call arity/callability, and
 //! quietly poisons nodes whose names failed resolution (already reported
 //! upstream, so no cascading second error).
 //!
-//! When the language grows (strings, bools, richer function types), only
+//! When the language grows (richer strings and function types), only
 //! [`Ty`] and `infer_expr` need to change; the driver and later stages keep
 //! working because they consume [`TypedProgram`].
 
 use std::collections::HashMap;
 
+use vl_common::Scalar;
 use vl_common::{Diagnostic, Span};
 use vl_hir::{HirBinOp, HirExpr, HirItem, HirProgram, HirStmt};
 
-/// v0 has one type. Future types get added here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ty {
-    Int,
+    U64,
+    I64,
+    F64,
+    Bool,
+    U8,
     String,
     /// Poison: an earlier error made this node's type unknowable.
     /// Poisoned nodes don't produce follow-on errors.
@@ -29,7 +33,11 @@ pub enum Ty {
 impl std::fmt::Display for Ty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Ty::Int => write!(f, "int"),
+            Ty::U64 => write!(f, "u64"),
+            Ty::I64 => write!(f, "i64"),
+            Ty::F64 => write!(f, "f64"),
+            Ty::Bool => write!(f, "bool"),
+            Ty::U8 => write!(f, "u8"),
             Ty::String => write!(f, "string"),
             Ty::Error => write!(f, "<error>"),
         }
@@ -106,10 +114,10 @@ impl Checker {
             HirItem::Fn {
                 id, params, body, ..
             } => {
-                self.record(*id, Ty::Int);
+                self.record(*id, Ty::I64);
                 for (_, def, _) in params {
                     if let Some(def) = def {
-                        self.bindings.insert(def.0, Ty::Int);
+                        self.bindings.insert(def.0, Ty::I64);
                     }
                 }
                 for stmt in body {
@@ -131,12 +139,35 @@ impl Checker {
             HirStmt::Expr(e) => {
                 self.infer_expr(e);
             }
+            HirStmt::If {
+                condition,
+                then_body,
+                else_body,
+                ..
+            } => {
+                let condition_ty = self.infer_expr(condition);
+                if condition_ty != Ty::Error && condition_ty != Ty::Bool {
+                    self.diags.push(
+                        Diagnostic::error(format!("if condition must be bool, got {condition_ty}"))
+                            .with_label(condition.span(), "expected bool")
+                            .with_code("E304"),
+                    );
+                }
+                for stmt in then_body {
+                    self.check_stmt(stmt);
+                }
+                if let Some(body) = else_body {
+                    for stmt in body {
+                        self.check_stmt(stmt);
+                    }
+                }
+            }
         }
     }
 
     fn infer_expr(&mut self, expr: &HirExpr) -> Ty {
         match expr {
-            HirExpr::Int { id, .. } => self.record(*id, Ty::Int),
+            HirExpr::Literal { id, value, .. } => self.record(*id, scalar_ty(*value)),
             HirExpr::String { id, .. } => self.record(*id, Ty::String),
             HirExpr::Var { id, def, .. } => {
                 // Unresolved names were already reported by `vl-semantic`;
@@ -147,7 +178,7 @@ impl Checker {
                     let ty = def
                         .as_ref()
                         .and_then(|def| self.bindings.get(&def.0).copied())
-                        .unwrap_or(Ty::Int);
+                        .unwrap_or(Ty::I64);
                     self.record(*id, ty)
                 }
             }
@@ -170,7 +201,7 @@ impl Checker {
                     return self.record(*id, Ty::Error);
                 };
                 if *external {
-                    return self.record(*id, Ty::Int);
+                    return self.record(*id, Ty::I64);
                 }
                 if !self.typed.func_defs.contains(&d.0) {
                     self.diags.push(
@@ -196,7 +227,7 @@ impl Checker {
                 if poisoned {
                     return self.record(*id, Ty::Error);
                 }
-                self.record(*id, Ty::Int)
+                self.record(*id, Ty::I64)
             }
             HirExpr::Binary {
                 id,
@@ -210,9 +241,7 @@ impl Checker {
                 if lt == Ty::Error || rt == Ty::Error {
                     return self.record(*id, Ty::Error);
                 }
-                // v0: both sides must be int; they always are, but keep the
-                // check explicit so future types slot in here.
-                if lt != Ty::Int || rt != Ty::Int {
+                if lt != rt || !is_numeric(lt) {
                     self.diags.push(mismatch(*span, lt, rt));
                     return self.record(*id, Ty::Error);
                 }
@@ -224,7 +253,7 @@ impl Checker {
                     );
                     return self.record(*id, Ty::Error);
                 }
-                self.record(*id, Ty::Int)
+                self.record(*id, lt)
             }
         }
     }
@@ -237,7 +266,27 @@ fn mismatch(span: Span, lt: Ty, rt: Ty) -> Diagnostic {
 }
 
 fn is_zero_literal(expr: &HirExpr) -> bool {
-    matches!(expr, HirExpr::Int { value: 0, .. })
+    matches!(
+        expr,
+        HirExpr::Literal {
+            value: Scalar::I64(0),
+            ..
+        }
+    )
+}
+
+fn scalar_ty(value: Scalar) -> Ty {
+    match value {
+        Scalar::U64(_) => Ty::U64,
+        Scalar::I64(_) => Ty::I64,
+        Scalar::F64(_) => Ty::F64,
+        Scalar::Bool(_) => Ty::Bool,
+        Scalar::U8(_) => Ty::U8,
+    }
+}
+
+fn is_numeric(ty: Ty) -> bool {
+    matches!(ty, Ty::U64 | Ty::I64 | Ty::F64 | Ty::U8)
 }
 
 #[cfg(test)]
