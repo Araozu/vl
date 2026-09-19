@@ -1,14 +1,15 @@
 ---
 layout: ../../layouts/Docs.astro
 title: Getting started
-description: Install Rust, check a program, build it, look inside.
+description: Check, build, and run a VL program on Naravm.
 eyebrow: Article
 availability: VL 0.1+
 ---
 
 # Getting started
 
-A sketch of the final guide. The commands below already work.
+The compiler currently targets Naravm. A VL executable has one required,
+zero-argument entrypoint: `function main()`.
 
 ```text
 vl check <file>
@@ -16,7 +17,8 @@ vl check <file>
 
 ## Overview
 
-You need Rust stable 1.80 or newer, plus Cargo. Nothing else. Clone the repository; the compiler lives at the workspace root.
+You need Rust stable 1.80 or newer, Cargo, and a checkout of Naravm. Clone
+both repositories; the compiler lives at the workspace root.
 
 Check a program:
 
@@ -24,13 +26,30 @@ Check a program:
 cargo run -- check examples/hello.vl
 ```
 
-A clean program exits 0 and stays silent. A broken one exits 1 with an Ariadne report pointing at the span.
+A clean program exits 0. A broken one exits 1 with an Ariadne report pointing
+at the span.
 
-Build it and look inside:
+The hello-world example imports the standard module and calls `std.print`:
+
+```vl
+use std;
+
+function main() {
+    std.print("Hello, world!\n");
+}
+```
+
+Build a Naravm vmfile:
 
 ```sh
-cargo run -- build examples/arith.vl --emit lir
-cargo run -- build examples/arith.vl --target stackvm
+cargo run -- build examples/hello.vl --out /tmp/hello.nara
+```
+
+Run it from the Naravm checkout:
+
+```sh
+zig build run -- /tmp/hello.nara
+# Hello, world!
 ```
 
 ## Topics
@@ -41,7 +60,9 @@ Stub. How to associate `.vl` files and where diagnostics surface.
 
 ### A first program, walked line by line
 
-Stub. `hello.vl` from the first `function` to the exit code.
+`hello.vl` demonstrates the required `main`, dotted VL namespaces, and the
+Naravm `std::print` native function. VL writes `std.print`; the backend maps
+that name to Naravm's double-colon namespace without changing the VM.
 
 ### How to read an Ariadne diagnostic
 

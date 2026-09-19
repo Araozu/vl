@@ -8,11 +8,14 @@ availability: VL 0.1+
 
 # Language tour
 
-A sketch of the v0 surface. Values can be integers or byte strings.
+A description of the v0 surface. Values can be integers or byte strings.
 
 ```vl
-let x = 1 + 2 * 3;
-function main() { let d = x - 1; d; }
+use std;
+
+function main() {
+    std.print("Hello, world!\n");
+}
 ```
 
 ## Overview
@@ -20,6 +23,8 @@ function main() { let d = x - 1; d; }
 Integers with `+ - * /`, unary minus, and parentheses, plus double-quoted
 strings. Strings are raw bytes for now, not UTF-8 text. `let` binds a name,
 `function` takes parameters, and calls use TypeScript-style `name(args)` syntax.
+Every program must define a zero-argument `function main()`; it becomes the
+runtime entrypoint.
 `//` starts a comment that runs to the line end. Every statement ends with `;`.
 
 ```vl
@@ -39,7 +44,8 @@ let quote = "say \\\"hi\\\"";
 ```
 
 An unterminated string is a lexical error at the line where it starts. String
-values reach LIR as byte arrays; code generation does not support them yet.
+values reach LIR as byte arrays. The Naravm backend can currently lower string
+literals passed to `std.print`.
 
 Scopes reject two things: names nobody defined, and names defined twice. After an error the compiler marks its nodes and stays quiet downstream, so you fix causes, not echoes.
 
@@ -49,7 +55,7 @@ Scopes reject two things: names nobody defined, and names defined twice. After a
 
 Every `.vl` file is its own module. Its module name is the filename without the
 extension, so `reader.vl` is module `reader`. Target backends publish modules
-such as `std.fs` and `std.string`.
+such as `std` and `std.fs`.
 
 Import a module with a dotted Rust-style `use`:
 
@@ -69,8 +75,23 @@ function main() { open(); read(); }
 ```
 
 Unknown modules and exports are reported during name resolution. Qualified
-calls reach LIR and backend output with their full path (`string.new` after the
-module import).
+calls reach LIR and backend output with their full dotted path (`string.new`
+after the module import). Dots are VL syntax; Naravm receives the corresponding
+`std::...` name at code generation time.
+
+### Standard output
+
+The Naravm standard module currently exposes `print` and `print_u64`:
+
+```vl
+use std;
+
+function main() {
+    std.print("hello\n");
+}
+```
+
+`std.print` takes one string and does not add an implicit newline.
 
 ### The grammar, with precedence
 

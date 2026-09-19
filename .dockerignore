@@ -1,0 +1,5 @@
+.git
+target
+website/node_modules
+website/dist
+vlc/.git

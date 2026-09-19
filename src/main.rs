@@ -32,7 +32,7 @@ enum Cmd {
     Build {
         file: PathBuf,
         /// Which backend to use (target platform TBD; see `vl-codegen`).
-        #[arg(long, default_value = "dummy")]
+        #[arg(long, default_value = "naravm")]
         target: String,
         /// Dump an intermediate instead of compiling.
         #[arg(long, value_enum)]
@@ -78,6 +78,30 @@ fn run_frontend(filename: &str, text: &str) -> Result<Frontend, Vec<vl_common::D
     diags.append(&mut d);
     let (res, mut d) = vl_semantic::resolve_with_modules(&ast, &vl_codegen::modules());
     diags.append(&mut d);
+    if !diags.iter().any(|d| d.is_error()) {
+        let mains = ast
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                vl_syntax::Item::Function {
+                    name, params, span, ..
+                } if name == "main" => Some((params.len(), *span)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if mains.is_empty() {
+            diags.push(
+                vl_common::Diagnostic::error("program must define `function main()`")
+                    .with_code("E400"),
+            );
+        } else if mains[0].0 != 0 {
+            diags.push(
+                vl_common::Diagnostic::error("`main` must not take parameters")
+                    .with_label(mains[0].1, "entrypoint declared here")
+                    .with_code("E401"),
+            );
+        }
+    }
     let hir = vl_hir::lower(&ast, &res);
     let (typed, mut d) = vl_typecheck::check(&hir);
     diags.append(&mut d);
@@ -199,11 +223,11 @@ fn main() -> ExitCode {
             let failed = emit_all(&backend_diags, &name, &text);
             match artifact {
                 Some(a) if !failed => {
-                    write_out(&out, &a.text);
+                    write_artifact(&out, &a);
                     ExitCode::SUCCESS
                 }
                 Some(a) => {
-                    write_out(&out, &a.text);
+                    write_artifact(&out, &a);
                     ExitCode::from(1)
                 }
                 None => ExitCode::from(1),
@@ -225,5 +249,25 @@ fn write_out(out: &Option<PathBuf>, text: &str) {
             std::process::exit(2);
         }),
         None => print!("{text}"),
+    }
+}
+
+fn write_artifact(out: &Option<PathBuf>, artifact: &vl_codegen::Artifact) {
+    if let Some(bytes) = &artifact.bytes {
+        match out {
+            Some(path) => fs::write(path, bytes).unwrap_or_else(|e| {
+                eprintln!("vl: cannot write {}: {e}", path.display());
+                std::process::exit(2);
+            }),
+            None => {
+                use std::io::Write;
+                std::io::stdout().write_all(bytes).unwrap_or_else(|e| {
+                    eprintln!("vl: cannot write stdout: {e}");
+                    std::process::exit(2);
+                });
+            }
+        }
+    } else {
+        write_out(out, &artifact.text);
     }
 }

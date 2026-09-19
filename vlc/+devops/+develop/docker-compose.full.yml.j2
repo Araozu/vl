@@ -1,0 +1,22 @@
+services:
+  {{ project_name }}-full-{{ project_stage }}:
+    image: ${{ (project_name + "_full") | upper | replace("-", "_") }}_REGISTRY_URL:${{ (project_name + "_full") | upper | replace("-", "_") }}_VERSION
+    container_name: {{ project_name }}-full-{{ project_stage }}
+    restart: unless-stopped
+    environment:
+      - TZ=America/Lima
+      - VLC_ADDR=:8080
+      - VL_COMPILER=/usr/local/bin/vl
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.vlc.rule=Host(`vlc.nara-lang.org`)"
+      - "traefik.http.routers.vlc.entrypoints=websecure"
+      - "traefik.http.routers.vlc.tls=true"
+      - "traefik.http.routers.vlc.tls.certresolver=http"
+      - "traefik.http.services.vlc.loadbalancer.server.port=8080"
+
+networks:
+  proxy:
+    external: true

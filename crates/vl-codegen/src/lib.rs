@@ -6,6 +6,7 @@
 //! - [`DummyTarget`]: human-readable pseudo-assembly, used by tests and
 //!   `--emit asm` until a real target lands.
 //! - [`StackVmTarget`]: stack-machine text format sketch (still TBD).
+//! - [`NaraVmTarget`]: executable Naravm 0.2 vmfiles.
 //!
 //! Rule: new targets = new types implementing [`Target`]. Never branch
 //! the LIR or the driver on target names.
@@ -18,6 +19,8 @@ use vl_lir::{Instr, LirOp, LirProgram};
 pub struct Artifact {
     pub target: String,
     pub text: String,
+    /// Binary payloads are used by targets whose output is not text.
+    pub bytes: Option<Vec<u8>>,
 }
 
 /// Every backend implements this. Keep it object-safe (`&self`, no generics).
@@ -30,6 +33,7 @@ pub trait Target {
 /// same catalog, so imports and emitted calls cannot drift apart.
 pub fn modules() -> Vec<vl_common::ModuleSpec> {
     vec![
+        vl_common::ModuleSpec::new(&["std"], &["print", "print_u64"]),
         vl_common::ModuleSpec::new(&["std", "fs"], &["open", "read"]),
         vl_common::ModuleSpec::new(&["std", "string"], &["new", "len"]),
     ]
@@ -37,12 +41,17 @@ pub fn modules() -> Vec<vl_common::ModuleSpec> {
 
 /// All backends the driver knows about.
 pub fn all_targets() -> Vec<&'static str> {
-    vec![DummyTarget.name(), StackVmTarget.name()]
+    vec![
+        NaraVmTarget.name(),
+        DummyTarget.name(),
+        StackVmTarget.name(),
+    ]
 }
 
 /// Look up a backend by `--target` flag value.
 pub fn lookup(name: &str) -> Option<Box<dyn Target>> {
     match name {
+        "naravm" => Some(Box::new(NaraVmTarget)),
         "dummy" => Some(Box::new(DummyTarget)),
         "stackvm" => Some(Box::new(StackVmTarget)),
         _ => None,
@@ -71,6 +80,7 @@ impl Target for DummyTarget {
             Some(Artifact {
                 target: self.name().into(),
                 text,
+                bytes: None,
             }),
             vec![],
         )
@@ -136,9 +146,201 @@ impl Target for StackVmTarget {
             Some(Artifact {
                 target: self.name().into(),
                 text,
+                bytes: None,
             }),
             diags,
         )
+    }
+}
+
+// --------------------------------------------------------- Naravm ---
+
+/// Naravm 0.2 executable vmfile backend.
+pub struct NaraVmTarget;
+
+impl Target for NaraVmTarget {
+    fn name(&self) -> &'static str {
+        "naravm"
+    }
+
+    fn emit(&self, prog: &LirProgram) -> (Option<Artifact>, Vec<Diagnostic>) {
+        let Some(main) = prog.functions.iter().find(|f| f.name == "main") else {
+            return (
+                None,
+                vec![Diagnostic::error("program must define `function main()`").with_code("E400")],
+            );
+        };
+        let mut diags = Vec::new();
+        let bytes = match nara_vmfile(prog, main, &mut diags) {
+            Some(bytes) if diags.iter().all(|d| !d.is_error()) => bytes,
+            _ => return (None, diags),
+        };
+        (
+            Some(Artifact {
+                target: self.name().into(),
+                text: String::new(),
+                bytes: Some(bytes),
+            }),
+            diags,
+        )
+    }
+}
+
+#[derive(Clone)]
+enum NaraConstant {
+    String { offset: usize, len: usize },
+    Function { module: usize, function: usize },
+}
+
+fn nara_vmfile(
+    prog: &LirProgram,
+    main: &vl_lir::Function,
+    diags: &mut Vec<Diagnostic>,
+) -> Option<Vec<u8>> {
+    let mut blob = Vec::new();
+    let mut constants = Vec::new();
+    let add_string = |blob: &mut Vec<u8>, constants: &mut Vec<NaraConstant>, value: &[u8]| {
+        let offset = blob.len();
+        blob.extend_from_slice(value);
+        let idx = constants.len();
+        constants.push(NaraConstant::String {
+            offset,
+            len: value.len(),
+        });
+        idx
+    };
+    add_string(&mut blob, &mut constants, prog.module.as_bytes());
+    let entry_name_idx = add_string(&mut blob, &mut constants, b"<entrypoint>");
+    let std_idx = add_string(&mut blob, &mut constants, b"std");
+    let print_idx = add_string(&mut blob, &mut constants, b"print");
+    let print_fn_idx = constants.len();
+    constants.push(NaraConstant::Function {
+        module: std_idx,
+        function: print_idx,
+    });
+    let mut bytecode = Vec::new();
+    let mut string_regs = std::collections::HashMap::new();
+    for ins in &main.instrs {
+        match ins {
+            Instr::StringConst { dst, value, .. } => {
+                let idx = add_string(&mut blob, &mut constants, value);
+                string_regs.insert(*dst, idx);
+                bytecode.extend_from_slice(&[0x03, 0x31, idx as u8]); // lrf rf31 #idx
+            }
+            Instr::Call {
+                callee, args, span, ..
+            } if callee == "std.print" => {
+                if args.len() != 1 {
+                    diags.push(
+                        Diagnostic::error("std.print expects one string argument")
+                            .with_label(*span, "invalid call")
+                            .with_code("E401"),
+                    );
+                } else if !string_regs.contains_key(&args[0]) {
+                    diags.push(
+                        Diagnostic::error("Naravm backend requires a string argument to std.print")
+                            .with_label(*span, "unsupported argument")
+                            .with_code("E402"),
+                    );
+                } else {
+                    bytecode.extend_from_slice(&[
+                        0x20,
+                        (print_fn_idx >> 8) as u8,
+                        print_fn_idx as u8,
+                    ]);
+                }
+            }
+            Instr::Ret { .. } => bytecode.push(0x00),
+            Instr::Const { .. }
+            | Instr::Copy { .. }
+            | Instr::Param { .. }
+            | Instr::BinOp { .. } => {
+                diags.push(
+                    Diagnostic::error(
+                        "Naravm backend only supports the hello-world subset currently",
+                    )
+                    .with_code("E403"),
+                );
+            }
+            Instr::Call { callee, span, .. } => {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "Naravm backend does not support call `{callee}` yet"
+                    ))
+                    .with_label(*span, "unsupported call")
+                    .with_code("E404"),
+                );
+            }
+        }
+    }
+    if diags.iter().any(|d| d.is_error()) {
+        return None;
+    }
+    // Keep the value section valid even though hello world uses only refs.
+    let functions = vec![(entry_name_idx, bytecode)];
+    Some(serialize_nara(
+        prog.module.as_bytes(),
+        &blob,
+        &constants,
+        &functions,
+    ))
+}
+
+fn serialize_nara(
+    module: &[u8],
+    blob: &[u8],
+    constants: &[NaraConstant],
+    functions: &[(usize, Vec<u8>)],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"nara");
+    put_u16(&mut out, 0);
+    put_u16(&mut out, 2);
+    let module_idx = constants.iter().position(|c| matches!(c, NaraConstant::String { offset, len } if &blob[*offset..*offset + *len] == module)).unwrap_or(0);
+    put_u32(&mut out, module_idx as u32);
+    put_u32(&mut out, 0);
+    put_u32(&mut out, blob.len() as u32);
+    out.extend_from_slice(blob);
+    pad4(&mut out);
+    put_u32(&mut out, constants.len() as u32);
+    for constant in constants {
+        out.push(match constant {
+            NaraConstant::String { .. } => 2,
+            NaraConstant::Function { .. } => 3,
+        });
+    }
+    pad4(&mut out);
+    for constant in constants {
+        match constant {
+            NaraConstant::String { offset, len } => {
+                put_u32(&mut out, *offset as u32);
+                put_u32(&mut out, *len as u32);
+            }
+            NaraConstant::Function { module, function } => {
+                put_u32(&mut out, *module as u32);
+                put_u32(&mut out, *function as u32);
+            }
+        }
+    }
+    put_u32(&mut out, functions.len() as u32);
+    for (name, code) in functions {
+        put_u32(&mut out, *name as u32);
+        put_u32(&mut out, code.len() as u32);
+        out.extend_from_slice(code);
+        pad4(&mut out);
+    }
+    out
+}
+
+fn put_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+fn put_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+fn pad4(out: &mut Vec<u8>) {
+    while !out.len().is_multiple_of(4) {
+        out.push(0xff);
     }
 }
 
@@ -191,7 +393,7 @@ mod tests {
 
     #[test]
     fn dummy_emits_text() {
-        let lir = lir_of("let x = 1 + 2;");
+        let lir = lir_of("function main() { 1 + 2; }");
         let (art, diags) = DummyTarget.emit(&lir);
         assert!(diags.is_empty());
         assert!(art.unwrap().text.contains("add"));

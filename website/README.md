@@ -11,12 +11,15 @@ pnpm dev      # http://localhost:4321
 pnpm build
 ```
 
-- `src/pages/index.astro` — landing + Svelte playground stub
+- `src/pages/index.astro` — landing + Svelte playground
 - `src/pages/docs/` — overview, getting-started, language, cli (markdown only)
-- `src/pages/api/` — overview, driver, frontend, backend (markdown only)
-- `src/components/Playground.svelte` — interactive stub (Svelte)
+- `src/pages/api/` — overview, compiler, driver, frontend, backend (markdown only)
+- `src/components/Playground.svelte` — interactive compiler client (Svelte)
 
 ## Deploy (`+devops/`)
+
+The playground calls the separate `vlc` service at `https://vlc.nara-lang.org`.
+Set `PUBLIC_VLC_URL` when building the site to use another compiler endpoint.
 
 Same shape as `nikki.nara-lang.org`: multi-stage Dockerfile (pnpm build →
 nginx serves `dist/`), Jenkins pipeline per stage, Ansible to the target host,

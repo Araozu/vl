@@ -31,6 +31,12 @@ Desugaring, checking, three-address code, and targets.
 
 [Backend crates](/api/backend)
 
+### Compiler service
+
+The HTTP endpoint used by the interactive playground.
+
+[Compiler service](/api/compiler)
+
 ## Overview
 
 Errors travel as `Vec<Diagnostic>` and only the driver renders them. Stages recover per item instead of panicking, and poisoned nodes (`Ty::Error`, no definition) pass through later stages silently.

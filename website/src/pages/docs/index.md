@@ -8,7 +8,8 @@ availability: VL 0.1+
 
 # Documentation
 
-Start here. In v0, VL is integers, arithmetic, `let`, `function`, modules, and `//` comments, carried through a strict staged pipeline.
+Start here. In v0, VL is integers, arithmetic, `let`, `function`, modules, and
+`//` comments, carried through a strict staged pipeline to Naravm.
 
 ```text
 .vl → vl-lex → vl-syntax → vl-semantic → vl-hir → vl-typecheck → vl-lir → vl-codegen
@@ -18,7 +19,7 @@ Start here. In v0, VL is integers, arithmetic, `let`, `function`, modules, and `
 
 ### Getting started
 
-Install nothing but Rust, then check and build your first `.vl` file.
+Install Rust and Naravm, then check, build, and run your first `.vl` file.
 
 [Getting started](/docs/getting-started)
 

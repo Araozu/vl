@@ -5,7 +5,7 @@ fn frontend(src: &str) -> Result<vl_lir::LirProgram, Vec<vl_common::Diagnostic>>
     let (toks, mut diags) = vl_lex::lex(src);
     let (ast, mut d) = vl_syntax::parse(&toks, src);
     diags.append(&mut d);
-    let (res, mut d) = vl_semantic::resolve(&ast);
+    let (res, mut d) = vl_semantic::resolve_with_modules(&ast, &vl_codegen::modules());
     diags.append(&mut d);
     let hir = vl_hir::lower(&ast, &res);
     let (typed, mut d) = vl_typecheck::check(&hir);
@@ -21,12 +21,19 @@ fn hello_compiles_to_lir() {
     let src = std::fs::read_to_string("examples/hello.vl").unwrap();
     let lir = frontend(&src).expect("hello.vl must compile");
     let dump = lir.dump();
-    assert!(
-        dump.contains("mul"),
-        "expected precedence: 2*3 first\n{dump}"
-    );
-    assert!(dump.contains("add"), "{dump}");
+    assert!(dump.contains("call std.print"), "{dump}");
     assert!(dump.contains("ret"), "{dump}");
+}
+
+#[test]
+fn naravm_emits_executable_vmfile() {
+    use vl_codegen::Target;
+    let src = std::fs::read_to_string("examples/hello.vl").unwrap();
+    let lir = frontend(&src).unwrap();
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty());
+    let artifact = artifact.unwrap();
+    assert_eq!(&artifact.bytes.as_ref().unwrap()[..4], b"nara");
 }
 
 #[test]
@@ -61,7 +68,7 @@ fn dummy_backend_emits_pseudo_asm() {
     let (art, diags) = vl_codegen::DummyTarget.emit(&lir);
     assert!(diags.is_empty());
     let text = art.unwrap().text;
-    assert!(text.contains("add") && text.contains("ret"), "{text}");
+    assert!(text.contains("std.print") && text.contains("ret"), "{text}");
 }
 
 #[test]

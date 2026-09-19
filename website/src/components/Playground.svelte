@@ -1,21 +1,57 @@
 <script lang="ts">
-  let source = $state('let x = 1 + 2 * 3;\nfunction main() { let d = x - 1; d; }');
-  let output = $state<string[]>(['// press Run — this sketch only pretends. The real pipeline lives in the Rust driver.']);
+  const compilerUrl = import.meta.env.PUBLIC_VLC_URL ?? 'https://vlc.nara-lang.org';
+  let source = $state('use std;\n\nfunction main() {\n    std.print("Hello, world!\\n");\n}');
+  let output = $state<string[]>(['// Naravm compiler ready — press Run']);
+  let compiling = $state(false);
+  let artifact = $state<Uint8Array | null>(null);
 
-  function run() {
-    // Stub: pretend to lex/check. Real playground will call into vl via WASM or server.
-    const lines = source.split('\n').filter((l) => l.trim().length > 0);
-    output = [
-      `ok — ${lines.length} line(s), 0 errors (sketch)`,
-      ...lines.map((l, i) => `  L${i + 1}: ${l.trim().slice(0, 60)}`),
-      'Tip: cargo run -- check examples/hello.vl runs the real thing.',
-    ];
+  async function run() {
+    compiling = true;
+    artifact = null;
+    output = ['// compiling on vlc.nara-lang.org…'];
+    try {
+      const response = await fetch(`${compilerUrl}/v1/compile`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source, filename: 'playground.vl' }),
+      });
+      const body = await response.json();
+      if (!response.ok || !body.ok) {
+        output = [
+          `build failed — ${body.error ?? `HTTP ${response.status}`}`,
+          ...(body.diagnostics ? body.diagnostics.split('\n') : []),
+        ];
+        return;
+      }
+      const bytes = Uint8Array.from(atob(body.bytecode_base64), (char) => char.charCodeAt(0));
+      artifact = bytes;
+      output = [
+        `build ok — ${body.target}, ${bytes.byteLength} byte vmfile`,
+        'The artifact is ready for Naravm.',
+        ...(body.diagnostics ? body.diagnostics.split('\n') : []),
+      ];
+    } catch (error) {
+      output = [`compiler unavailable — ${error instanceof Error ? error.message : 'request failed'}`];
+    } finally {
+      compiling = false;
+    }
+  }
+
+  function download() {
+    if (!artifact) return;
+    const url = URL.createObjectURL(new Blob([artifact], { type: 'application/octet-stream' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'playground.nara';
+    link.click();
+    URL.revokeObjectURL(url);
   }
 
   function loadSample(kind: 'hello' | 'arith' | 'error') {
-    if (kind === 'hello') source = 'function main() { 42; }';
-    if (kind === 'arith') source = 'let x = 1 + 2 * 3;\nfunction main() { let d = x - 1; d; }';
+    if (kind === 'hello') source = 'use std;\n\nfunction main() {\n    std.print("Hello, world!\\n");\n}';
+    if (kind === 'arith') source = 'use std;\n\nfunction main() {\n    std.print("2 + 3 = ");\n}';
     if (kind === 'error') source = 'function main() { undefined_var; }';
+    artifact = null;
     output = ['// sample loaded — press Run'];
   }
 </script>
@@ -27,11 +63,12 @@
       <button class="rounded-md px-2.5 py-1 text-muted transition hover:bg-pill hover:text-ink" onclick={() => loadSample('arith')}>arith.vl</button>
       <button class="rounded-md px-2.5 py-1 text-muted transition hover:bg-pill hover:text-ink" onclick={() => loadSample('error')}>err.vl</button>
     </div>
-    <button
-      class="rounded-full bg-accent px-4 py-1 text-[0.82rem] font-medium text-white transition hover:brightness-110"
+      <button
+      class="rounded-full bg-accent px-4 py-1 text-[0.82rem] font-medium text-white transition hover:brightness-110 disabled:cursor-wait disabled:opacity-60"
       onclick={run}
+      disabled={compiling}
     >
-      Run
+      {compiling ? 'Building…' : 'Run'}
     </button>
   </div>
   <div class="grid md:grid-cols-2">
@@ -43,8 +80,13 @@
     ></textarea>
     <div class="border-t border-rule p-4 font-mono text-[0.8rem] leading-[1.7] md:border-l md:border-t-0">
       {#each output as line}
-        <p class="text-muted">{line}</p>
+        <p class="whitespace-pre-wrap text-muted">{line}</p>
       {/each}
+      {#if artifact}
+        <button class="mt-3 rounded-md bg-pill px-2.5 py-1 text-[0.78rem] text-ink transition hover:bg-rule" onclick={download}>
+          Download .nara
+        </button>
+      {/if}
     </div>
   </div>
 </div>

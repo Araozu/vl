@@ -23,9 +23,9 @@ The desugared tree, with node ids and `DefId` links. Stub: the node catalogue.
 
 ### `vl-typecheck`
 
-Types and their rules. v0 has `int` and byte-string values. String codegen is
-not implemented yet; strings currently stop at target-neutral LIR. Stub: the
-full judgments.
+Types and their rules. v0 has `int` and byte-string values. String literals
+reach target-neutral LIR and the Naravm backend can emit them for `std.print`.
+Stub: the full judgments.
 
 ### `vl-lir`
 
@@ -33,9 +33,13 @@ Target-agnostic three-address code. Stub: the instruction set.
 
 ### `vl-codegen`
 
-Backends implement `Target` and register in `lookup` and `all_targets`. The placeholder backend stays until a real one takes its place as default. Stub: how to add a backend.
+Backends implement `Target` and register in `lookup` and `all_targets`.
+`NaraVmTarget` serializes Naravm 0.2 vmfiles and emits source `main` as the
+special `<entrypoint>` function required by the VM. `DummyTarget` and
+`StackVmTarget` remain inspection backends.
 
 Backends also publish the target module catalog. The current catalog includes
-`std.fs` (`open`, `read`) and `std.string` (`new`, `len`). Frontend imports are
-checked against this catalog, while LIR retains the source module name for
-backend placement.
+`std` (`print`, `print_u64`), `std.fs` (`open`, `read`), and `std.string`
+(`new`, `len`). Frontend imports are checked against this catalog, while LIR
+retains dotted source names for backend placement. Naravm uses double-colon
+names internally; the backend performs that target-specific mapping.

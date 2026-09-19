@@ -1,0 +1,4 @@
+ungrouped:
+  hosts:
+    REMOTE_IP:
+      ansible_user: REMOTE_USER
