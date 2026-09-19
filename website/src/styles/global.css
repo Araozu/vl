@@ -1,9 +1,10 @@
 @import '@fontsource-variable/inter';
+@import '@fontsource-variable/jetbrains-mono';
 @import "tailwindcss";
 
 @theme {
   --font-sans: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
-  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 
   --color-canvas: #000000;
   --color-header: #161617;
