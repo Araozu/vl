@@ -10,6 +10,9 @@ use std::str::FromStr;
 
 /// VL primitive + object types. No `Error` here: poisoning lives in
 /// `vl-typecheck::Ty::Error` so earlier stages stay quiet downstream.
+///
+/// `U64Array` is a fixed-length heap array of `u64` (a temporal,
+/// non-generic container backed by the target's memory object).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VlType {
     U64,
@@ -19,6 +22,7 @@ pub enum VlType {
     U8,
     String,
     File,
+    U64Array,
     Void,
 }
 
@@ -32,6 +36,7 @@ impl fmt::Display for VlType {
             VlType::U8 => write!(f, "u8"),
             VlType::String => write!(f, "string"),
             VlType::File => write!(f, "File"),
+            VlType::U64Array => write!(f, "U64Array"),
             VlType::Void => write!(f, "void"),
         }
     }
@@ -44,7 +49,7 @@ impl fmt::Display for ParseTyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "unknown type `{}` (have: u64, i64, f64, bool, u8, string, File, void)",
+            "unknown type `{}` (have: u64, i64, f64, bool, u8, string, File, U64Array, void)",
             self.0
         )
     }
@@ -63,6 +68,8 @@ impl FromStr for VlType {
             "string" | "String" => Ok(VlType::String),
             // Object types are capitalized (`File`); accept lowercase too.
             "File" | "file" => Ok(VlType::File),
+            // Temporal fixed-size array of `u64` (see `U64Array.new`).
+            "U64Array" => Ok(VlType::U64Array),
             "void" => Ok(VlType::Void),
             other => Err(ParseTyError(other.to_string())),
         }
