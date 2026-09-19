@@ -8,12 +8,13 @@
 use std::fmt;
 use std::str::FromStr;
 
-/// VL primitive + object types. No `Error` here: poisoning lives in
+/// VL primitive + object + generic types. No `Error` here: poisoning lives in
 /// `vl-typecheck::Ty::Error` so earlier stages stay quiet downstream.
 ///
-/// `U64Array` is a fixed-length heap array of `u64` (a temporal,
-/// non-generic container backed by the target's memory object).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// `Array[T]` is a fixed-length heap array of `T` (a reference type backed by
+/// the target's memory container). `Param(name)` is a use of an enclosing
+/// generic function's type parameter (e.g. `T` in `function id[T](x: T): T`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum VlType {
     U64,
     I64,
@@ -22,7 +23,8 @@ pub enum VlType {
     U8,
     String,
     File,
-    U64Array,
+    Array(Box<VlType>),
+    Param(String),
     Void,
 }
 
@@ -36,7 +38,8 @@ impl fmt::Display for VlType {
             VlType::U8 => write!(f, "u8"),
             VlType::String => write!(f, "string"),
             VlType::File => write!(f, "File"),
-            VlType::U64Array => write!(f, "U64Array"),
+            VlType::Array(elem) => write!(f, "Array[{elem}]"),
+            VlType::Param(name) => write!(f, "{name}"),
             VlType::Void => write!(f, "void"),
         }
     }
@@ -49,7 +52,7 @@ impl fmt::Display for ParseTyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "unknown type `{}` (have: u64, i64, f64, bool, u8, string, File, U64Array, void)",
+            "unknown type `{}` (have: u64, i64, f64, bool, u8, string, File, Array[T], void)",
             self.0
         )
     }
@@ -68,9 +71,10 @@ impl FromStr for VlType {
             "string" | "String" => Ok(VlType::String),
             // Object types are capitalized (`File`); accept lowercase too.
             "File" | "file" => Ok(VlType::File),
-            // Temporal fixed-size array of `u64` (see `U64Array.new`).
-            "U64Array" => Ok(VlType::U64Array),
             "void" => Ok(VlType::Void),
+            // `Array` needs an element type (`Array[T]`); `T` alone is a type
+            // parameter, which only the parser can resolve against an
+            // enclosing `function f[T]` scope.
             other => Err(ParseTyError(other.to_string())),
         }
     }
@@ -80,7 +84,15 @@ impl VlType {
     /// `void` is not a value: it cannot be a parameter, a `let` binding, a
     /// call argument, or an operand. It may only appear as a function return
     /// (value discarded) or as a bare expression statement.
-    pub fn is_void(self) -> bool {
+    pub fn is_void(&self) -> bool {
         matches!(self, VlType::Void)
+    }
+
+    /// Element type for `Array[T]`; `None` for everything else.
+    pub fn array_elem(&self) -> Option<&VlType> {
+        match self {
+            VlType::Array(elem) => Some(elem),
+            _ => None,
+        }
     }
 }

@@ -41,7 +41,7 @@ impl FuncSig {
                 .iter()
                 .map(|(n, t)| ParamSig {
                     name: (*n).into(),
-                    ty: *t,
+                    ty: t.clone(),
                 })
                 .collect(),
             ret,
@@ -73,7 +73,7 @@ impl ModuleSpec {
                 .iter()
                 .map(|(name, params, ret)| Export {
                     name: (*name).into(),
-                    sig: FuncSig::new(params, *ret),
+                    sig: FuncSig::new(params, ret.clone()),
                 })
                 .collect(),
         }
