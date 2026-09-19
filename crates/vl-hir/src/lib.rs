@@ -37,6 +37,8 @@ pub enum HirItem {
         id: HirId,
         def: Option<DefId>,
         name: String,
+        /// Declared type parameter names (`[]` when monomorphic).
+        type_params: Vec<String>,
         /// `(name, def, type, span)`. `ty` is `None` when the annotation was
         /// missing/unknown (already reported; typecheck poisons quietly).
         params: Vec<(String, Option<DefId>, Option<VlType>, Span)>,
@@ -134,6 +136,8 @@ pub enum HirExpr {
         /// `None` for locals, poisoned imports, or unresolved callees.
         extern_sig: Option<vl_common::FuncSig>,
         name: String,
+        /// Explicit type arguments (`f::[u64]`); empty means infer.
+        type_args: Vec<VlType>,
         args: Vec<HirExpr>,
         span: Span,
     },
@@ -263,6 +267,7 @@ impl<'a> Lowerer<'a> {
             AstItem::Function {
                 name,
                 name_span,
+                type_params,
                 params,
                 ret,
                 ret_span,
@@ -273,18 +278,19 @@ impl<'a> Lowerer<'a> {
                 id: self.id(),
                 def: self.def_at_site(*name_span),
                 name: name.clone(),
+                type_params: type_params.iter().map(|p| p.name.clone()).collect(),
                 params: params
                     .iter()
                     .map(|p| {
                         (
                             p.name.clone(),
                             self.def_at_site(p.name_span),
-                            p.ty,
+                            p.ty.clone(),
                             p.name_span,
                         )
                     })
                     .collect(),
-                ret: *ret,
+                ret: ret.clone(),
                 ret_span: *ret_span,
                 body: body.iter().map(|s| self.lower_stmt(s)).collect(),
                 span: *span,
@@ -400,8 +406,10 @@ impl<'a> Lowerer<'a> {
             AstExpr::Call {
                 callee,
                 callee_span,
+                type_args,
                 args,
                 span,
+                ..
             } => {
                 let def = self.def_at(*callee_span);
                 let resolved = def
@@ -420,6 +428,7 @@ impl<'a> Lowerer<'a> {
                     external,
                     extern_sig,
                     name: callee.join("."),
+                    type_args: type_args.clone(),
                     args: args.iter().map(|a| self.lower_expr(a)).collect(),
                     span: *span,
                 }
@@ -521,6 +530,47 @@ mod tests {
                 assert!(matches!(&body[0], HirStmt::Let { .. }));
                 assert!(matches!(&body[1], HirStmt::IndexAssign { .. }));
                 assert!(matches!(&body[2], HirStmt::Let { .. }));
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generics_plumb_type_params_and_args() {
+        let src = "function first[T](a: Array[T]): T { return a[0u64]; } function main() { first([1u64]); first::[u64]([2u64]); }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Fn {
+                type_params,
+                params,
+                ret,
+                ..
+            } => {
+                assert_eq!(type_params, &vec!["T".to_string()]);
+                assert!(matches!(params[0].2, Some(VlType::Array(_))));
+                assert!(matches!(ret, Some(VlType::Param(_))));
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+        match &hir.items[1] {
+            HirItem::Fn { body, .. } => {
+                match &body[0] {
+                    HirStmt::Expr(HirExpr::Call { type_args, .. }) => {
+                        assert!(type_args.is_empty());
+                    }
+                    other => panic!("expected inferred call, got {other:?}"),
+                }
+                match &body[1] {
+                    HirStmt::Expr(HirExpr::Call { type_args, .. }) => {
+                        assert_eq!(type_args.len(), 1);
+                    }
+                    other => panic!("expected turbofish call, got {other:?}"),
+                }
             }
             other => panic!("expected fn, got {other:?}"),
         }
