@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -8,6 +9,25 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestLimitedBufferDrainsAndCaps(t *testing.T) {
+	var b limitedBuffer
+	input := bytes.Repeat([]byte{'x'}, 300*1024)
+	n, err := b.Write(input)
+	if err != nil || n != len(input) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	if b.Len() != 256*1024 {
+		t.Fatalf("buffer length = %d", b.Len())
+	}
+}
+
+func TestStripANSI(t *testing.T) {
+	got := stripANSI("\x1b[31merror\x1b[0m: bad")
+	if got != "error: bad" {
+		t.Fatalf("stripANSI = %q", got)
+	}
+}
 
 func TestCompileSuccess(t *testing.T) {
 	s := server{compile: func(_ context.Context, source, filename string) ([]byte, string, error) {

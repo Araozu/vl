@@ -32,6 +32,9 @@ pub enum TokenKind {
     RBrace,
     Comma,
     Dot,
+    /// A token whose source span already has a lexer diagnostic. Parsers
+    /// consume it without inventing follow-on syntax errors.
+    Invalid,
     Eof,
 }
 
@@ -56,7 +59,10 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
     let mut i = 0;
 
     while i < bytes.len() {
-        let c = bytes[i] as char;
+        let c = src[i..]
+            .chars()
+            .next()
+            .expect("i always stays on a char boundary");
         match c {
             // Whitespace.
             ' ' | '\t' | '\r' | '\n' => {
@@ -167,11 +173,14 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 };
                 match result {
                     Ok(kind) => tokens.push(Token::new(kind, Span::new(start, i))),
-                    Err(message) => diags.push(
-                        Diagnostic::error(message)
-                            .with_label(Span::new(start, i), "invalid numeric literal")
-                            .with_code("E001"),
-                    ),
+                    Err(message) => {
+                        diags.push(
+                            Diagnostic::error(message)
+                                .with_label(Span::new(start, i), "invalid numeric literal")
+                                .with_code("E001"),
+                        );
+                        tokens.push(Token::new(TokenKind::Invalid, Span::new(start, i)));
+                    }
                 }
             }
             '"' => {
@@ -207,16 +216,21 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                             };
                             if let Some(byte) = escaped {
                                 value.push(byte);
+                                i += 1;
                             } else {
                                 valid = false;
+                                let escape_end = src[i..]
+                                    .chars()
+                                    .next()
+                                    .map_or(i + 1, |ch| i + ch.len_utf8());
                                 diags.push(
                                     Diagnostic::error("unknown string escape")
-                                        .with_label(Span::new(i - 1, i + 1), "unknown escape")
+                                        .with_label(Span::new(i - 1, escape_end), "unknown escape")
                                         .with_note("supported escapes are `\\0`, `\\n`, `\\r`, `\\t`, `\\\\`, and `\\\"`")
                                         .with_code("E003"),
                                 );
+                                i = escape_end;
                             }
-                            i += 1;
                         }
                         byte => {
                             value.push(byte);
@@ -234,15 +248,17 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                             )
                             .with_code("E002"),
                     );
+                    tokens.push(Token::new(TokenKind::Invalid, Span::new(start, end)));
                     // Leave the newline for the normal whitespace path.
                 } else if valid {
                     tokens.push(Token::new(TokenKind::String(value), Span::new(start, i)));
+                } else {
+                    tokens.push(Token::new(TokenKind::Invalid, Span::new(start, i)));
                 }
             }
             'a'..='z' | 'A'..='Z' | '_' => {
                 let start = i;
-                while i < bytes.len() && ((bytes[i] as char).is_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 let word = &src[start..i];
@@ -259,14 +275,17 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
             }
             _ => {
                 // Non-ASCII or punctuation we don't know: one error, keep going.
-                let end = (i + 1).min(bytes.len());
+                // Advance by the UTF-8 scalar width so a single character
+                // produces one diagnostic and a valid source span.
+                let end = i + c.len_utf8();
                 diags.push(
                     Diagnostic::error(format!("unexpected character `{c}`"))
                         .with_label(Span::new(i, end), "unexpected here")
                         .with_note("identifiers use letters, digits and `_`; see `let`, `function`")
                         .with_code("E000"),
                 );
-                i += 1;
+                tokens.push(Token::new(TokenKind::Invalid, Span::new(i, end)));
+                i = end;
             }
         }
     }
@@ -325,6 +344,34 @@ mod tests {
             .iter()
             .any(|d| d.message.contains("unknown string escape")));
         assert!(!toks.iter().any(|t| matches!(t.kind, TokenKind::String(_))));
+    }
+
+    #[test]
+    fn non_ascii_input_is_an_error_not_a_panic() {
+        let (_toks, diags) = lex("let café = 1;");
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn non_ascii_character_has_one_scalar_span() {
+        let (toks, diags) = lex("é");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].labels[0].span, Span::new(0, 2));
+        assert!(matches!(toks[0].kind, TokenKind::Invalid));
+    }
+
+    #[test]
+    fn invalid_numeric_literal_is_poisoned_for_parser_recovery() {
+        let (toks, diags) = lex("let x = 999999999999999999999999; let y = 2;");
+        assert_eq!(diags.len(), 1);
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Invalid)));
+    }
+
+    #[test]
+    fn unknown_unicode_escape_has_a_character_aligned_span() {
+        let (_toks, diags) = lex("\"\\é\"");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].labels[0].span, Span::new(1, 4));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! this to real targets; since the final target is still undecided, this
 //! crate must NOT grow target-specific hacks — add a new backend instead.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use vl_common::Scalar;
 use vl_common::Span;
@@ -163,10 +163,26 @@ fn fmt_scalar(value: Scalar) -> String {
 struct Lowerer {
     next: u32,
     instrs: Vec<Instr>,
-    /// Bindings for parameters are enough to make calls useful without
-    /// changing the existing v0 treatment of locals and globals.
-    params: HashMap<u32, Reg>,
+    /// Values currently available in this function. Locals are assigned when
+    /// declared; globals are materialized lazily from their initializer.
+    bindings: HashMap<u32, Reg>,
+    global_values: HashMap<u32, HirExpr>,
+    evaluating_globals: HashSet<u32>,
     next_label: u32,
+}
+
+fn globals(prog: &HirProgram) -> HashMap<u32, HirExpr> {
+    prog.items
+        .iter()
+        .filter_map(|item| match item {
+            HirItem::Let {
+                def: Some(def),
+                value,
+                ..
+            } => Some((def.0, value.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 impl Lowerer {
@@ -186,6 +202,7 @@ impl Lowerer {
 /// Lower typed HIR to LIR. Poisoned (`Error`-typed) nodes are skipped —
 /// errors were already reported, so no new diagnostics are produced here.
 pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgram {
+    let global_values = globals(prog);
     let mut out = LirProgram {
         module: prog.module.clone(),
         functions: Vec::new(),
@@ -196,10 +213,15 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                 let mut l = Lowerer {
                     next: 0,
                     instrs: vec![],
-                    params: HashMap::new(),
+                    bindings: HashMap::new(),
+                    global_values: global_values.clone(),
+                    evaluating_globals: HashSet::new(),
                     next_label: 0,
                 };
                 if let Some(r) = l.lower_expr(value, typed) {
+                    if let HirItem::Let { def: Some(def), .. } = item {
+                        l.bindings.insert(def.0, r);
+                    }
                     l.instrs.push(Instr::Ret {
                         src: r,
                         span: *span,
@@ -216,7 +238,9 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                 let mut l = Lowerer {
                     next: 0,
                     instrs: vec![],
-                    params: HashMap::new(),
+                    bindings: HashMap::new(),
+                    global_values: global_values.clone(),
+                    evaluating_globals: HashSet::new(),
                     next_label: 0,
                 };
 
@@ -228,15 +252,18 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                         span: *span,
                     });
                     if let Some(def) = def {
-                        l.params.insert(def.0, dst);
+                        l.bindings.insert(def.0, dst);
                     }
                 }
 
                 let mut last = None;
                 for stmt in body {
                     match stmt {
-                        HirStmt::Let { value, .. } => {
+                        HirStmt::Let { def, value, .. } => {
                             last = l.lower_expr(value, typed);
+                            if let (Some(def), Some(reg)) = (def, last) {
+                                l.bindings.insert(def.0, reg);
+                            }
                         }
                         HirStmt::Expr(e) => {
                             last = l.lower_expr(e, typed);
@@ -302,22 +329,22 @@ impl Lowerer {
                 });
                 Some(dst)
             }
-            HirExpr::Var { span, .. } => {
-                // Parameters have real registers. Other variables still use
-                // the v0 placeholder until full local/global storage lands.
-                if let HirExpr::Var { def: Some(def), .. } = expr {
-                    if let Some(reg) = self.params.get(&def.0) {
-                        return Some(*reg);
-                    }
+            HirExpr::Var { def: Some(def), .. } => {
+                if let Some(reg) = self.bindings.get(&def.0) {
+                    return Some(*reg);
                 }
-                let dst = self.reg();
-                self.instrs.push(Instr::Const {
-                    dst,
-                    value: Scalar::I64(0),
-                    span: *span,
-                });
-                Some(dst)
+                let value = self.global_values.get(&def.0)?.clone();
+                if !self.evaluating_globals.insert(def.0) {
+                    return None;
+                }
+                let reg = self.lower_expr(&value, typed);
+                self.evaluating_globals.remove(&def.0);
+                if let Some(reg) = reg {
+                    self.bindings.insert(def.0, reg);
+                }
+                reg
             }
+            HirExpr::Var { .. } => None,
             HirExpr::Call {
                 name, args, span, ..
             } => {
@@ -360,7 +387,14 @@ impl Lowerer {
 
     fn lower_stmt(&mut self, stmt: &HirStmt, typed: &vl_typecheck::TypedProgram) {
         match stmt {
-            HirStmt::Let { value, .. } | HirStmt::Expr(value) => {
+            HirStmt::Let { def, value, .. } => {
+                if let Some(reg) = self.lower_expr(value, typed) {
+                    if let Some(def) = def {
+                        self.bindings.insert(def.0, reg);
+                    }
+                }
+            }
+            HirStmt::Expr(value) => {
                 let _ = self.lower_expr(value, typed);
             }
             HirStmt::If {
@@ -385,6 +419,7 @@ impl Lowerer {
         let Some(cond) = self.lower_expr(condition, typed) else {
             return;
         };
+        let incoming = self.bindings.clone();
         let else_label = self.label();
         let end_label = self.label();
         self.instrs.push(Instr::BranchIfFalse {
@@ -403,11 +438,13 @@ impl Lowerer {
             id: else_label,
             span,
         });
+        self.bindings = incoming.clone();
         if let Some(body) = else_body {
             for stmt in body {
                 self.lower_stmt(stmt, typed);
             }
         }
+        self.bindings = incoming;
         self.instrs.push(Instr::Label {
             id: end_label,
             span,
@@ -447,5 +484,19 @@ mod tests {
         assert!(dump.contains("%0 = param 0"), "{dump}");
         assert!(dump.contains("%1 = param 1"), "{dump}");
         assert!(dump.contains("call add(%0, %1)"), "{dump}");
+    }
+
+    #[test]
+    fn local_reads_use_the_declared_value() {
+        let src = "function main() { let x = 7; x + 1; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty());
+        let dump = lower(&hir, &typed).dump();
+        assert!(dump.contains("const 7i64"), "{dump}");
+        assert!(!dump.contains("const 0i64"), "{dump}");
     }
 }

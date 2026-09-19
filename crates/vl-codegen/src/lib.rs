@@ -40,6 +40,16 @@ pub fn modules() -> Vec<vl_common::ModuleSpec> {
     ]
 }
 
+/// Module surface available to a concrete backend. The broad `modules`
+/// catalog remains useful to frontend/library tests; drivers should resolve
+/// against this target-specific view so accepted calls are actually emit-able.
+pub fn modules_for_target(target: &str) -> Vec<vl_common::ModuleSpec> {
+    match target {
+        "naravm" => vec![vl_common::ModuleSpec::new(&["std"], &["print"])],
+        _ => modules(),
+    }
+}
+
 /// All backends the driver knows about.
 pub fn all_targets() -> Vec<&'static str> {
     vec![
@@ -236,10 +246,20 @@ fn nara_vmfile(
     });
     let mut bytecode = Vec::new();
     let mut string_regs = std::collections::HashMap::new();
+    let mut invalid_string_regs = std::collections::HashSet::new();
     for ins in &main.instrs {
         match ins {
             Instr::StringConst { dst, value, .. } => {
                 let idx = add_string(&mut blob, &mut constants, value);
+                if idx > u8::MAX as usize {
+                    diags.push(
+                        Diagnostic::error("Naravm constant pool has more than 256 entries")
+                            .with_note("string references use an 8-bit constant index")
+                            .with_code("E405"),
+                    );
+                    invalid_string_regs.insert(*dst);
+                    continue;
+                }
                 string_regs.insert(*dst, idx);
                 bytecode.extend_from_slice(&[0x03, 0x31, idx as u8]); // lrf rf31 #idx
             }
@@ -252,6 +272,10 @@ fn nara_vmfile(
                             .with_label(*span, "invalid call")
                             .with_code("E401"),
                     );
+                } else if invalid_string_regs.contains(&args[0]) {
+                    // The defining string instruction already reported the
+                    // root cause; do not cascade an unsupported-argument
+                    // diagnostic from the poisoned register.
                 } else if !string_regs.contains_key(&args[0]) {
                     diags.push(
                         Diagnostic::error("Naravm backend requires a string argument to std.print")
@@ -358,7 +382,7 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 fn pad4(out: &mut Vec<u8>) {
-    while !out.len().is_multiple_of(4) {
+    while (out.len() & 3) != 0 {
         out.push(0xff);
     }
 }
@@ -440,5 +464,34 @@ mod tests {
         let (art, diags) = StackVmTarget.emit(&lir);
         assert_eq!(diags.len(), 1);
         assert!(art.unwrap().text.contains("call add(%0, %1)"));
+    }
+
+    #[test]
+    fn naravm_rejects_constant_pool_indices_that_do_not_fit() {
+        let mut src = String::from("function main() {");
+        for i in 0..252 {
+            src.push_str(&format!("let s{i} = \"s{i}\";"));
+        }
+        src.push_str("std.print(\"target\");}");
+        let lir = lir_of(&src);
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(artifact.is_none());
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E405")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn target_module_catalogs_are_specific() {
+        assert!(modules_for_target("naravm")
+            .iter()
+            .any(|m| m.path.as_string() == "std"));
+        assert!(!modules_for_target("naravm")
+            .iter()
+            .any(|m| m.path.as_string() == "std.fs"));
+        assert!(modules_for_target("dummy")
+            .iter()
+            .any(|m| m.path.as_string() == "std.fs"));
     }
 }

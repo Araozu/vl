@@ -146,7 +146,16 @@ pub fn parse_with_module(toks: &[Token], _src: &str, module: &str) -> (Program, 
     while !p.at_eof() {
         match p.parse_item() {
             Some(item) => items.push(item),
-            None => p.recover_to_item_boundary(),
+            None => {
+                let before = p.pos;
+                p.recover_to_item_boundary();
+                // A recovery boundary can itself be the token at which
+                // parsing failed (notably a nested `function`). Always make
+                // progress so malformed input cannot spin forever.
+                if p.pos == before && !p.at_eof() {
+                    p.bump();
+                }
+            }
         }
     }
     (
@@ -211,6 +220,10 @@ impl<'a> Parser<'a> {
             TokenKind::Function => self.parse_function_item(),
             TokenKind::Ident(name) if name == "use" => self.parse_use_item(),
             TokenKind::Eof => None,
+            TokenKind::Invalid => {
+                self.bump();
+                None
+            }
             _ => {
                 let t = self.peek().clone();
                 self.diags.push(
@@ -293,7 +306,13 @@ impl<'a> Parser<'a> {
         while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
             match self.parse_stmt() {
                 Some(s) => body.push(s),
-                None => self.recover_to_stmt_boundary(),
+                None => {
+                    let before = self.pos;
+                    self.recover_to_stmt_boundary();
+                    if self.pos == before && !self.at_eof() {
+                        self.bump();
+                    }
+                }
             }
         }
         let close = self.expect(&TokenKind::RBrace, "`}`")?;
@@ -359,7 +378,13 @@ impl<'a> Parser<'a> {
         while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
             match self.parse_stmt() {
                 Some(stmt) => body.push(stmt),
-                None => self.recover_to_stmt_boundary(),
+                None => {
+                    let before = self.pos;
+                    self.recover_to_stmt_boundary();
+                    if self.pos == before && !self.at_eof() {
+                        self.bump();
+                    }
+                }
             }
         }
         self.expect(&TokenKind::RBrace, "`}`")?;
@@ -546,6 +571,10 @@ impl<'a> Parser<'a> {
                     span,
                 })
             }
+            TokenKind::Invalid => {
+                self.bump();
+                None
+            }
             _ => {
                 self.diags.push(
                     Diagnostic::error(format!(
@@ -590,6 +619,7 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::RBrace => "`}`".into(),
         TokenKind::Comma => "`,`".into(),
         TokenKind::Dot => "`.`".into(),
+        TokenKind::Invalid => "invalid token".into(),
         TokenKind::Eof => "end of file".into(),
     }
 }
@@ -701,5 +731,28 @@ mod tests {
             Item::Function { body, .. } => assert!(matches!(body[0], Stmt::If { .. })),
             other => panic!("expected function, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn nested_function_recovery_makes_progress() {
+        let (toks, _) = vl_lex::lex("function main() { function nested() {} } function tail() {}");
+        let (prog, diags) = parse(&toks, "");
+        assert!(!diags.is_empty());
+        assert!(prog
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Function { name, .. } if name == "tail")));
+    }
+
+    #[test]
+    fn lexical_poison_does_not_hide_later_function() {
+        let (toks, lex_diags) = vl_lex::lex("let broken = @; function tail() {} ");
+        assert_eq!(lex_diags.len(), 1);
+        let (prog, parse_diags) = parse(&toks, "");
+        assert!(parse_diags.is_empty(), "{parse_diags:?}");
+        assert!(prog
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Function { name, .. } if name == "tail")));
     }
 }

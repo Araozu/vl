@@ -11,7 +11,7 @@
 //! [`Ty`] and `infer_expr` need to change; the driver and later stages keep
 //! working because they consume [`TypedProgram`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use vl_common::Scalar;
 use vl_common::{Diagnostic, Span};
@@ -67,6 +67,7 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
         typed: TypedProgram::default(),
         diags: vec![],
         bindings: HashMap::new(),
+        reported_unknown: HashSet::new(),
     };
     // Pass 1: collect function signatures so calls resolve arity
     // regardless of definition order (matches the resolver pre-pass).
@@ -91,6 +92,7 @@ struct Checker {
     typed: TypedProgram,
     diags: Vec<Diagnostic>,
     bindings: HashMap<u32, Ty>,
+    reported_unknown: HashSet<u32>,
 }
 
 impl Checker {
@@ -169,16 +171,29 @@ impl Checker {
         match expr {
             HirExpr::Literal { id, value, .. } => self.record(*id, scalar_ty(*value)),
             HirExpr::String { id, .. } => self.record(*id, Ty::String),
-            HirExpr::Var { id, def, .. } => {
+            HirExpr::Var { id, def, span, .. } => {
                 // Unresolved names were already reported by `vl-semantic`;
                 // poison quietly instead of cascading a second error.
                 if def.is_none() {
                     self.record(*id, Ty::Error)
                 } else {
+                    let def_id = def.as_ref().map(|d| d.0).expect("checked above");
                     let ty = def
                         .as_ref()
                         .and_then(|def| self.bindings.get(&def.0).copied())
-                        .unwrap_or(Ty::I64);
+                        .unwrap_or_else(|| {
+                            if self.reported_unknown.insert(def_id) {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        "cannot infer the type of this forward global reference",
+                                    )
+                                    .with_label(*span, "type is not known yet")
+                                    .with_note("define the global before using it")
+                                    .with_code("E305"),
+                                );
+                            }
+                            Ty::Error
+                        });
                     self.record(*id, ty)
                 }
             }
@@ -266,13 +281,17 @@ fn mismatch(span: Span, lt: Ty, rt: Ty) -> Diagnostic {
 }
 
 fn is_zero_literal(expr: &HirExpr) -> bool {
-    matches!(
-        expr,
-        HirExpr::Literal {
-            value: Scalar::I64(0),
-            ..
-        }
-    )
+    matches!(expr, HirExpr::Literal { value, .. } if scalar_is_zero(*value))
+}
+
+fn scalar_is_zero(value: Scalar) -> bool {
+    match value {
+        Scalar::I64(v) => v == 0,
+        Scalar::U64(v) => v == 0,
+        Scalar::U8(v) => v == 0,
+        Scalar::F64(v) => f64::from_bits(v) == 0.0,
+        Scalar::Bool(_) => false,
+    }
 }
 
 fn scalar_ty(value: Scalar) -> Ty {
@@ -356,5 +375,27 @@ mod tests {
         let hir = vl_hir::lower(&prog, &res);
         let (_, tdiags) = check(&hir);
         assert!(tdiags.is_empty());
+    }
+
+    #[test]
+    fn forward_global_type_is_not_invented() {
+        let (_, diags) = check_src("let x = later + 1; let later = \"s\";");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("forward global"));
+    }
+
+    #[test]
+    fn every_numeric_zero_divisor_is_rejected() {
+        for source in [
+            "let x = 1u64 / 0u64;",
+            "let x = 1u8 / 0u8;",
+            "let x = 1.0f64 / 0.0f64;",
+        ] {
+            let (_, diags) = check_src(source);
+            assert!(
+                diags.iter().any(|d| d.message.contains("division by zero")),
+                "{source}: {diags:?}"
+            );
+        }
     }
 }

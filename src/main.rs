@@ -65,7 +65,11 @@ struct Frontend {
     lir: vl_lir::LirProgram,
 }
 
-fn run_frontend(filename: &str, text: &str) -> Result<Frontend, Vec<vl_common::Diagnostic>> {
+fn run_frontend(
+    filename: &str,
+    text: &str,
+    modules: &[vl_common::ModuleSpec],
+) -> Result<Frontend, Vec<vl_common::Diagnostic>> {
     let mut diags = Vec::new();
 
     let (toks, mut d) = vl_lex::lex(text);
@@ -76,7 +80,7 @@ fn run_frontend(filename: &str, text: &str) -> Result<Frontend, Vec<vl_common::D
         .unwrap_or(filename);
     let (ast, mut d) = vl_syntax::parse_with_module(&toks, text, module);
     diags.append(&mut d);
-    let (res, mut d) = vl_semantic::resolve_with_modules(&ast, &vl_codegen::modules());
+    let (res, mut d) = vl_semantic::resolve_with_modules(&ast, modules);
     diags.append(&mut d);
     if !diags.iter().any(|d| d.is_error()) {
         let mains = ast
@@ -120,14 +124,16 @@ fn main() -> ExitCode {
             let (name, text) = match read_input(&file) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("vl: {e}");
+                    emit_driver_error(&e, "E600");
                     return ExitCode::from(2);
                 }
             };
             let (toks, diags) = vl_lex::lex(&text);
-            for t in &toks {
-                println!("{:?}\t{:?}", t.kind, t.span);
-            }
+            let token_dump = toks
+                .iter()
+                .map(|t| format!("{:?}\t{:?}\n", t.kind, t.span))
+                .collect::<String>();
+            write_out(&None, &token_dump);
             if emit_all(&diags, &name, &text) {
                 ExitCode::from(1)
             } else {
@@ -138,14 +144,14 @@ fn main() -> ExitCode {
             let (name, text) = match read_input(&file) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("vl: {e}");
+                    emit_driver_error(&e, "E600");
                     return ExitCode::from(2);
                 }
             };
             let (toks, mut diags) = vl_lex::lex(&text);
             let (ast, mut d) = vl_syntax::parse(&toks, &text);
             diags.append(&mut d);
-            println!("{ast:#?}");
+            write_out(&None, &format!("{ast:#?}\n"));
             if emit_all(&diags, &name, &text) {
                 ExitCode::from(1)
             } else {
@@ -156,13 +162,16 @@ fn main() -> ExitCode {
             let (name, text) = match read_input(&file) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("vl: {e}");
+                    emit_driver_error(&e, "E600");
                     return ExitCode::from(2);
                 }
             };
-            match run_frontend(&name, &text) {
+            // `check` validates frontend semantics independently of a codegen
+            // target; target capability checks belong to `build`.
+            let modules = vl_codegen::modules();
+            match run_frontend(&name, &text, &modules) {
                 Ok(_) => {
-                    println!("ok: {name} checks clean");
+                    write_out(&None, &format!("ok: {name} checks clean\n"));
                     ExitCode::SUCCESS
                 }
                 Err(diags) => {
@@ -180,43 +189,66 @@ fn main() -> ExitCode {
             let (name, text) = match read_input(&file) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("vl: {e}");
+                    emit_driver_error(&e, "E600");
                     return ExitCode::from(2);
                 }
             };
-            let fe = match run_frontend(&name, &text) {
+            // Lex/parse emits are intentionally shallow: they must remain
+            // useful for broken or incomplete files and do not require a
+            // `main` function or backend support.
+            if matches!(emit, Some(Emit::Tokens) | Some(Emit::Ast)) {
+                let (toks, mut diags) = vl_lex::lex(&text);
+                let dump = if matches!(emit, Some(Emit::Ast)) {
+                    let (ast, mut parse_diags) = vl_syntax::parse(&toks, &text);
+                    diags.append(&mut parse_diags);
+                    format!("{ast:#?}\n")
+                } else {
+                    format!("{toks:#?}\n")
+                };
+                write_out(&out, &dump);
+                return if emit_all(&diags, &name, &text) {
+                    ExitCode::from(1)
+                } else {
+                    ExitCode::SUCCESS
+                };
+            }
+            // LIR is target-neutral: it must be possible to dump it with an
+            // unknown target name and with modules only supported by another
+            // backend. Backend lookup/capabilities apply only to final asm.
+            let target_specific = matches!(emit, Some(Emit::Asm) | None);
+            let modules = if target_specific {
+                vl_codegen::modules_for_target(&target)
+            } else {
+                vl_codegen::modules()
+            };
+            let fe = match run_frontend(&name, &text, &modules) {
                 Ok(fe) => fe,
                 Err(diags) => {
                     emit_all(&diags, &name, &text);
                     return ExitCode::from(1);
                 }
             };
-            let backend = vl_codegen::lookup(&target).unwrap_or_else(|| {
-                eprintln!(
-                    "vl: unknown target `{target}` (have: {})",
-                    vl_codegen::all_targets().join(", ")
-                );
-                std::process::exit(2);
-            });
 
             // Intermediate dumps short-circuit codegen.
             let dumped = match emit {
-                Some(Emit::Tokens) => {
-                    let (toks, _) = vl_lex::lex(&text);
-                    Some(format!("{toks:#?}\n"))
-                }
-                Some(Emit::Ast) => {
-                    let (toks, _) = vl_lex::lex(&text);
-                    let (ast, _) = vl_syntax::parse(&toks, &text);
-                    Some(format!("{ast:#?}\n"))
-                }
                 Some(Emit::Lir) => Some(fe.lir.dump()),
+                Some(Emit::Tokens) | Some(Emit::Ast) => unreachable!("handled above"),
                 Some(Emit::Asm) | None => None,
             };
             if let Some(dump) = dumped {
                 write_out(&out, &dump);
                 return ExitCode::SUCCESS;
             }
+
+            let Some(backend) = vl_codegen::lookup(&target) else {
+                let d = vl_common::Diagnostic::error(format!(
+                    "unknown target `{target}` (have: {})",
+                    vl_codegen::all_targets().join(", ")
+                ))
+                .with_code("E501");
+                emit_all(&[d], &name, &text);
+                return ExitCode::from(2);
+            };
 
             let (artifact, backend_diags) = backend.emit(&fe.lir);
             // Backend warnings print but don't fail unless errors present.
@@ -234,9 +266,12 @@ fn main() -> ExitCode {
             }
         }
         Cmd::Targets => {
+            let mut output = String::new();
             for t in vl_codegen::all_targets() {
-                println!("{t}");
+                output.push_str(t);
+                output.push('\n');
             }
+            write_out(&None, &output);
             ExitCode::SUCCESS
         }
     }
@@ -245,10 +280,16 @@ fn main() -> ExitCode {
 fn write_out(out: &Option<PathBuf>, text: &str) {
     match out {
         Some(p) => fs::write(p, text).unwrap_or_else(|e| {
-            eprintln!("vl: cannot write {}: {e}", p.display());
+            emit_driver_error(&format!("cannot write {}: {e}", p.display()), "E601");
             std::process::exit(2);
         }),
-        None => print!("{text}"),
+        None => {
+            use std::io::Write;
+            if let Err(e) = std::io::stdout().write_all(text.as_bytes()) {
+                emit_driver_error(&format!("cannot write stdout: {e}"), "E601");
+                std::process::exit(2);
+            }
+        }
     }
 }
 
@@ -256,13 +297,13 @@ fn write_artifact(out: &Option<PathBuf>, artifact: &vl_codegen::Artifact) {
     if let Some(bytes) = &artifact.bytes {
         match out {
             Some(path) => fs::write(path, bytes).unwrap_or_else(|e| {
-                eprintln!("vl: cannot write {}: {e}", path.display());
+                emit_driver_error(&format!("cannot write {}: {e}", path.display()), "E601");
                 std::process::exit(2);
             }),
             None => {
                 use std::io::Write;
                 std::io::stdout().write_all(bytes).unwrap_or_else(|e| {
-                    eprintln!("vl: cannot write stdout: {e}");
+                    emit_driver_error(&format!("cannot write stdout: {e}"), "E601");
                     std::process::exit(2);
                 });
             }
@@ -270,4 +311,9 @@ fn write_artifact(out: &Option<PathBuf>, artifact: &vl_codegen::Artifact) {
     } else {
         write_out(out, &artifact.text);
     }
+}
+
+fn emit_driver_error(message: &str, code: &str) {
+    let diagnostic = vl_common::Diagnostic::error(message).with_code(code);
+    emit_all(&[diagnostic], "<driver>", "");
 }

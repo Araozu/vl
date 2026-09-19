@@ -31,7 +31,7 @@ target-agnostic — new targets mean new `Target` impls in `vl-codegen`.
 
 ```sh
 cargo run -- check examples/hello.vl        # frontend end-to-end
-cargo run -- build examples/arith.vl        # compile (dummy backend)
+cargo run -- build examples/hello.vl        # compile (Naravm backend)
 cargo run -- build examples/arith.vl --emit lir
 cargo run -- build examples/arith.vl --target stackvm
 cargo run -- lex examples/hello.vl
@@ -91,7 +91,6 @@ support is not implemented yet. See crate docs for the grammar.
 
 ## Roadmap
 
-1. Decide target platform → harden/add a `vl-codegen` backend.
-2. Thread locals through LIR (vars currently materialise as consts).
-3. Grow richer string/function types in `vl-typecheck`.
-4. Bytecode/assembly emission + runner.
+1. Harden/add more `vl-codegen` backends.
+2. Grow richer string/function types in `vl-typecheck`.
+3. Bytecode/assembly emission + runner.

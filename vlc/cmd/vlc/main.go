@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -59,19 +60,65 @@ func (c compiler) compile(ctx context.Context, source, filename string) ([]byte,
 	if err := cmd.Start(); err != nil {
 		return nil, "", fmt.Errorf("start compiler: %w", err)
 	}
-	diagnostics, readErr := io.ReadAll(io.LimitReader(stderr, 256*1024))
+	// Drain stderr concurrently so a chatty compiler cannot block on a full
+	// pipe while the parent waits. Keep only a bounded diagnostic prefix.
+	var diagnostics limitedBuffer
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(&diagnostics, stderr)
+		readDone <- err
+	}()
 	waitErr := cmd.Wait()
+	readErr := <-readDone
 	if readErr != nil {
-		return nil, string(diagnostics), fmt.Errorf("read compiler output: %w", readErr)
+		return nil, diagnostics.String(), fmt.Errorf("read compiler output: %w", readErr)
 	}
 	if waitErr != nil {
-		return nil, string(diagnostics), &buildError{err: waitErr}
+		return nil, diagnostics.String(), &buildError{err: waitErr}
 	}
 	bytecode, err := os.ReadFile(output)
 	if err != nil {
-		return nil, string(diagnostics), fmt.Errorf("read compiler output: %w", err)
+		return nil, diagnostics.String(), fmt.Errorf("read compiler output: %w", err)
 	}
-	return bytecode, string(diagnostics), nil
+	return bytecode, diagnostics.String(), nil
+}
+
+type limitedBuffer struct{ bytes.Buffer }
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if b.Len() < 256*1024 {
+		keep := p
+		if remaining := 256*1024 - b.Len(); len(keep) > remaining {
+			keep = keep[:remaining]
+		}
+		_, _ = b.Buffer.Write(keep)
+	}
+	// Report all bytes consumed: the pipe must be drained even after the
+	// response-size cap is reached.
+	return len(p), nil
+}
+
+func (b *limitedBuffer) String() string {
+	return stripANSI(b.Buffer.String())
+}
+
+func stripANSI(s string) string {
+	var out strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			i += 2
+			for i < len(s) && (s[i] < '@' || s[i] > '~') {
+				i++
+			}
+			if i < len(s) {
+				i++
+			}
+			continue
+		}
+		out.WriteByte(s[i])
+		i++
+	}
+	return out.String()
 }
 
 type buildError struct{ err error }

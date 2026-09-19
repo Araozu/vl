@@ -69,6 +69,7 @@ struct Resolver {
     diags: Vec<Diagnostic>,
     modules: Vec<ModuleSpec>,
     imports: HashMap<String, ModuleSpec>,
+    poisoned_imports: std::collections::HashSet<String>,
 }
 
 pub fn resolve(prog: &Program) -> (Resolution, Vec<Diagnostic>) {
@@ -85,6 +86,7 @@ pub fn resolve_with_modules(
         diags: vec![],
         modules: modules.to_vec(),
         imports: HashMap::new(),
+        poisoned_imports: std::collections::HashSet::new(),
     };
 
     for item in &prog.items {
@@ -120,6 +122,23 @@ pub fn resolve_with_modules(
             Item::Function { params, body, .. } => {
                 r.scopes.push(HashMap::new());
                 for (p, s) in params {
+                    if r.scopes.last().is_some_and(|scope| scope.contains_key(p)) {
+                        let previous = r
+                            .scopes
+                            .last()
+                            .and_then(|scope| scope.get(p))
+                            .and_then(|id| r.out.defs.iter().find(|d| d.id == *id))
+                            .map(|d| d.span);
+                        let mut diagnostic =
+                            Diagnostic::error(format!("duplicate parameter `{p}`"))
+                                .with_label(*s, "redefined here")
+                                .with_code("E200");
+                        if let Some(previous) = previous {
+                            diagnostic = diagnostic.with_bare_label(previous);
+                        }
+                        r.diags.push(diagnostic);
+                        continue;
+                    }
                     let id = r.out.intern_def(p.clone(), *s);
                     r.scopes.last_mut().unwrap().insert(p.clone(), id);
                 }
@@ -274,6 +293,10 @@ impl Resolver {
             .find(|m| m.path.as_string() == key)
             .cloned()
         else {
+            if let Some(name) = path.last() {
+                self.poisoned_imports.insert(name.clone());
+            }
+            self.poisoned_imports.insert(key.clone());
             self.diags.push(
                 Diagnostic::error(format!("cannot find module `{key}`"))
                     .with_label(span, "unknown module")
@@ -289,6 +312,8 @@ impl Resolver {
             Some(names) => {
                 for name in names {
                     if !module.exports.iter().any(|export| export == name) {
+                        self.poisoned_imports.insert(name.clone());
+                        self.poisoned_imports.insert(format!("{key}.{name}"));
                         self.diags.push(
                             Diagnostic::error(format!("module `{key}` has no export `{name}`"))
                                 .with_label(span, "unknown module export")
@@ -316,7 +341,19 @@ impl Resolver {
             if self.imports.contains_key(&path[0]) {
                 return Some(self.external_def(path[0].clone(), span));
             }
+            if self.poisoned_imports.contains(&path[0]) {
+                return Some(self.external_def(path[0].clone(), span));
+            }
             return None;
+        }
+        if self.poisoned_imports.contains(&path.join(".")) {
+            return Some(self.external_def(path.join("."), span));
+        }
+        // `use missing.module;` poisons the imported alias (`module`), not
+        // only the full source path. Treat qualified uses through that alias
+        // as poisoned too, so the E202 root cause does not cascade into E201.
+        if self.poisoned_imports.contains(&path[0]) {
+            return Some(self.external_def(path.join("."), span));
         }
         let module = self.imports.get(&path[0]).cloned()?;
         if path.len() != 2 || !module.exports.iter().any(|export| export == &path[1]) {
@@ -387,5 +424,19 @@ mod tests {
     fn forward_call_resolves_via_global_prepass() {
         let (_, diags) = resolve_src("function main() { helper(); } function helper() { 1; }");
         assert!(diags.iter().all(|d| !d.is_error()));
+    }
+
+    #[test]
+    fn duplicate_parameters_are_an_error() {
+        let (_, diags) = resolve_src("function f(x, x) { x; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("duplicate parameter"));
+    }
+
+    #[test]
+    fn poisoned_module_alias_suppresses_qualified_use_cascade() {
+        let (_, diags) = resolve_src("use missing.module; function main() { module.foo(); }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("cannot find module"));
     }
 }
