@@ -45,6 +45,14 @@ impl Resolution {
             .get(&(use_span.start, use_span.end))
             .and_then(|id| self.defs.iter().find(|d| d.id == *id))
     }
+
+    /// Definition-site lookup: which [`Def`] was declared *at* `span`.
+    /// (Use-sites go through [`def_of`](Self::def_of); def-sites are not uses.)
+    pub fn def_at(&self, def_span: Span) -> Option<&Def> {
+        self.defs
+            .iter()
+            .find(|d| d.span.start == def_span.start && d.span.end == def_span.end)
+    }
 }
 
 struct Resolver {

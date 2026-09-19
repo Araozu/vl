@@ -60,11 +60,11 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
     // Pass 1: collect function signatures so calls resolve arity
     // regardless of definition order (matches the resolver pre-pass).
     for item in &prog.items {
-        if let HirItem::Fn { def, params, .. } = item
-            && let Some(d) = def
-        {
-            cx.typed.func_defs.insert(d.0);
-            cx.typed.func_arity.insert(d.0, params.len());
+        if let HirItem::Fn { def, params, .. } = item {
+            if let Some(d) = def {
+                cx.typed.func_defs.insert(d.0);
+                cx.typed.func_arity.insert(d.0, params.len());
+            }
         }
     }
     for item in &prog.items {
@@ -131,6 +131,49 @@ impl Checker {
                     self.record(*id, Ty::Int)
                 }
             }
+            HirExpr::Call {
+                id,
+                def,
+                name,
+                args,
+                span,
+            } => {
+                let mut poisoned = false;
+                for arg in args {
+                    if self.infer_expr(arg) == Ty::Error {
+                        poisoned = true;
+                    }
+                }
+                let Some(d) = def else {
+                    // Unresolved callee already reported; stay quiet.
+                    return self.record(*id, Ty::Error);
+                };
+                if !self.typed.func_defs.contains(&d.0) {
+                    self.diags.push(
+                        Diagnostic::error(format!("`{name}` is not a function"))
+                            .with_label(*span, "cannot call a non-function value")
+                            .with_note("only `function` items are callable in v0")
+                            .with_code("E303"),
+                    );
+                    return self.record(*id, Ty::Error);
+                }
+                let arity = self.typed.func_arity.get(&d.0).copied().unwrap_or(0);
+                if args.len() != arity {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "`{name}` expects {arity} argument(s), got {}",
+                            args.len()
+                        ))
+                        .with_label(*span, "wrong number of arguments")
+                        .with_code("E303"),
+                    );
+                    return self.record(*id, Ty::Error);
+                }
+                if poisoned {
+                    return self.record(*id, Ty::Error);
+                }
+                self.record(*id, Ty::Int)
+            }
             HirExpr::Binary {
                 id,
                 op,
@@ -195,5 +238,38 @@ mod tests {
     fn const_div_by_zero_errors() {
         let (_, diags) = check_src("let x = 1 / 0;");
         assert!(diags.iter().any(|d| d.message.contains("division by zero")));
+    }
+
+    #[test]
+    fn call_with_correct_arity_checks_clean() {
+        let (_, diags) =
+            check_src("function add(a, b) { a + b; } function main() { add(1, 2); }");
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn call_with_wrong_arity_errors_once() {
+        let (_, diags) =
+            check_src("function add(a, b) { a + b; } function main() { add(1); }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("expects 2"));
+    }
+
+    #[test]
+    fn calling_a_let_binding_errors() {
+        let (_, diags) = check_src("let x = 1; function main() { x(); }");
+        assert!(diags.iter().any(|d| d.message.contains("not a function")));
+    }
+
+    #[test]
+    fn unresolved_callee_poisoned_quietly() {
+        // E201 comes from resolve; typecheck must not add a second error.
+        let (toks, _) = vl_lex::lex("function main() { nope(1); }");
+        let (prog, _) = vl_syntax::parse(&toks, "");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().any(|d| d.is_error()));
+        let hir = vl_hir::lower(&prog, &res);
+        let (_, tdiags) = check(&hir);
+        assert!(tdiags.is_empty());
     }
 }

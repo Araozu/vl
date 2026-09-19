@@ -120,8 +120,14 @@ impl<'a> Lowerer<'a> {
         id
     }
 
+    /// Use-site lookup (variable reads, callees).
     fn def_at(&self, span: Span) -> Option<DefId> {
         self.res.def_of(span).map(|d| d.id.clone())
+    }
+
+    /// Definition-site lookup (`let` names, `function` names, params).
+    fn def_at_site(&self, span: Span) -> Option<DefId> {
+        self.res.def_at(span).map(|d| d.id.clone())
     }
 }
 
@@ -142,7 +148,7 @@ impl<'a> Lowerer<'a> {
                 name_span,
                 ..
             } => {
-                let def = self.def_at(*name_span);
+                let def = self.def_at_site(*name_span);
                 HirItem::Let {
                     id: self.id(),
                     def,
@@ -159,11 +165,11 @@ impl<'a> Lowerer<'a> {
                 ..
             } => HirItem::Fn {
                 id: self.id(),
-                def: self.def_at(*name_span),
+                def: self.def_at_site(*name_span),
                 name: name.clone(),
                 params: params
                     .iter()
-                    .map(|(n, s)| (n.clone(), self.def_at(*s), *s))
+                    .map(|(n, s)| (n.clone(), self.def_at_site(*s), *s))
                     .collect(),
                 body: body.iter().map(|s| self.lower_stmt(s)).collect(),
                 span: *span,
