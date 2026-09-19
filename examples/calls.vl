@@ -1,0 +1,12 @@
+// Function declarations and nested calls.
+function add(a, b) {
+    a + b;
+}
+
+function twice(x) {
+    add(x, x);
+}
+
+function main() {
+    twice(add(1, 2));
+}

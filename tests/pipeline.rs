@@ -63,3 +63,18 @@ fn dummy_backend_emits_pseudo_asm() {
     let text = art.unwrap().text;
     assert!(text.contains("add") && text.contains("ret"), "{text}");
 }
+
+#[test]
+fn function_calls_lower_to_lir_and_asm() {
+    let src = std::fs::read_to_string("examples/calls.vl").unwrap();
+    let lir = frontend(&src).expect("calls.vl must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("%0 = param 0"), "{dump}");
+    assert!(dump.contains("call add(%0, %0)"), "{dump}");
+    assert!(dump.contains("call twice(%2)"), "{dump}");
+
+    use vl_codegen::Target;
+    let (artifact, diags) = vl_codegen::DummyTarget.emit(&lir);
+    assert!(diags.is_empty());
+    assert!(artifact.unwrap().text.contains("call"));
+}

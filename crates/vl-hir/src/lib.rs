@@ -285,7 +285,9 @@ mod tests {
         assert_eq!(hir.items.len(), 2);
         match &hir.items[1] {
             HirItem::Fn { body, .. } => match &body[0] {
-                HirStmt::Expr(HirExpr::Call { name, args, def, .. }) => {
+                HirStmt::Expr(HirExpr::Call {
+                    name, args, def, ..
+                }) => {
                     assert_eq!(name, "add");
                     assert_eq!(args.len(), 2);
                     assert!(def.is_some());

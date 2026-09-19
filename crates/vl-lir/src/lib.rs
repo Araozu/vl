@@ -5,6 +5,8 @@
 //! this to real targets; since the final target is still undecided, this
 //! crate must NOT grow target-specific hacks — add a new backend instead.
 
+use std::collections::HashMap;
+
 use vl_common::Span;
 use vl_hir::{HirBinOp, HirExpr, HirItem, HirProgram, HirStmt};
 
@@ -20,6 +22,12 @@ pub enum Instr {
         value: i64,
         span: Span,
     },
+    /// Function parameter copied into a virtual register at entry.
+    Param {
+        dst: Reg,
+        index: usize,
+        span: Span,
+    },
     Copy {
         dst: Reg,
         src: Reg,
@@ -30,6 +38,12 @@ pub enum Instr {
         op: LirOp,
         lhs: Reg,
         rhs: Reg,
+        span: Span,
+    },
+    Call {
+        dst: Reg,
+        callee: String,
+        args: Vec<Reg>,
         span: Span,
     },
     /// Tail value of a function body / global initializer.
@@ -86,11 +100,22 @@ impl LirProgram {
 fn fmt_instr(ins: &Instr) -> String {
     match ins {
         Instr::Const { dst, value, .. } => format!("%{} = const {value}", dst.0),
+        Instr::Param { dst, index, .. } => format!("%{} = param {index}", dst.0),
         Instr::Copy { dst, src, .. } => format!("%{} = copy %{}", dst.0, src.0),
         Instr::BinOp {
             dst, op, lhs, rhs, ..
         } => {
             format!("%{} = {op} %{} %{}", dst.0, lhs.0, rhs.0)
+        }
+        Instr::Call {
+            dst, callee, args, ..
+        } => {
+            let args = args
+                .iter()
+                .map(|arg| format!("%{}", arg.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("%{} = call {callee}({args})", dst.0)
         }
         Instr::Ret { src, .. } => format!("ret %{}", src.0),
     }
@@ -99,6 +124,9 @@ fn fmt_instr(ins: &Instr) -> String {
 struct Lowerer {
     next: u32,
     instrs: Vec<Instr>,
+    /// Bindings for parameters are enough to make calls useful without
+    /// changing the existing v0 treatment of locals and globals.
+    params: HashMap<u32, Reg>,
 }
 
 impl Lowerer {
@@ -119,6 +147,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                 let mut l = Lowerer {
                     next: 0,
                     instrs: vec![],
+                    params: HashMap::new(),
                 };
                 if let Some(r) = l.lower_expr(value, typed) {
                     l.instrs.push(Instr::Ret {
@@ -131,11 +160,27 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                     instrs: l.instrs,
                 });
             }
-            HirItem::Fn { name, body, .. } => {
+            HirItem::Fn {
+                name, params, body, ..
+            } => {
                 let mut l = Lowerer {
                     next: 0,
                     instrs: vec![],
+                    params: HashMap::new(),
                 };
+
+                for (index, (_, def, span)) in params.iter().enumerate() {
+                    let dst = l.reg();
+                    l.instrs.push(Instr::Param {
+                        dst,
+                        index,
+                        span: *span,
+                    });
+                    if let Some(def) = def {
+                        l.params.insert(def.0, dst);
+                    }
+                }
+
                 let mut last = None;
                 for stmt in body {
                     match stmt {
@@ -190,13 +235,33 @@ impl Lowerer {
                 Some(dst)
             }
             HirExpr::Var { span, .. } => {
-                // v0 has no env threading yet: materialise as 0 with a copy
-                // site so codegen stays total. Real locals arrive with scope
-                // lowering (see ROADMAP in README).
+                // Parameters have real registers. Other variables still use
+                // the v0 placeholder until full local/global storage lands.
+                if let HirExpr::Var { def: Some(def), .. } = expr {
+                    if let Some(reg) = self.params.get(&def.0) {
+                        return Some(*reg);
+                    }
+                }
                 let dst = self.reg();
                 self.instrs.push(Instr::Const {
                     dst,
                     value: 0,
+                    span: *span,
+                });
+                Some(dst)
+            }
+            HirExpr::Call {
+                name, args, span, ..
+            } => {
+                let mut arg_regs = Vec::with_capacity(args.len());
+                for arg in args {
+                    arg_regs.push(self.lower_expr(arg, typed)?);
+                }
+                let dst = self.reg();
+                self.instrs.push(Instr::Call {
+                    dst,
+                    callee: name.clone(),
+                    args: arg_regs,
                     span: *span,
                 });
                 Some(dst)
@@ -242,5 +307,21 @@ mod tests {
         let dump = lir.dump();
         assert!(dump.contains("add"));
         assert!(dump.contains("ret"));
+    }
+
+    #[test]
+    fn lowers_call_and_parameter_registers() {
+        let src = "function add(a, b) { a + b; } function main() { add(1, 2); }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty());
+        let lir = lower(&hir, &typed);
+        let dump = lir.dump();
+        assert!(dump.contains("%0 = param 0"), "{dump}");
+        assert!(dump.contains("%1 = param 1"), "{dump}");
+        assert!(dump.contains("call add(%0, %1)"), "{dump}");
     }
 }

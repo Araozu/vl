@@ -17,7 +17,14 @@ function main() { let d = x - 1; d; }
 
 ## Overview
 
-Integers with `+ - * /`, unary minus, and parentheses. `let` binds a name, `function` takes parameters, `//` starts a comment that runs to the line end. Every statement ends with `;`.
+Integers with `+ - * /`, unary minus, and parentheses. `let` binds a name,
+`function` takes parameters, and calls use TypeScript-style `name(args)` syntax.
+`//` starts a comment that runs to the line end. Every statement ends with `;`.
+
+```vl
+function add(a, b) { a + b; }
+function main() { add(1, 2); }
+```
 
 Scopes reject two things: names nobody defined, and names defined twice. After an error the compiler marks its nodes and stays quiet downstream, so you fix causes, not echoes.
 

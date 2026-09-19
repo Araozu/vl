@@ -370,10 +370,7 @@ impl<'a> Parser<'a> {
                     let mut args = Vec::new();
                     if !matches!(self.peek().kind, TokenKind::RParen) {
                         loop {
-                            match self.parse_expr() {
-                                Some(a) => args.push(a),
-                                None => return None,
-                            }
+                            args.push(self.parse_expr()?);
                             match &self.peek().kind {
                                 TokenKind::Comma => {
                                     self.bump();
@@ -382,10 +379,7 @@ impl<'a> Parser<'a> {
                             }
                         }
                     }
-                    let close = match self.expect(&TokenKind::RParen, "`)`") {
-                        Some(c) => c,
-                        None => return None,
-                    };
+                    let close = self.expect(&TokenKind::RParen, "`)`")?;
                     let span = Span::new(name_span.start, close.span.end);
                     Some(Expr::Call {
                         callee: name,

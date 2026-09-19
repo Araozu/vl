@@ -60,11 +60,14 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
     // Pass 1: collect function signatures so calls resolve arity
     // regardless of definition order (matches the resolver pre-pass).
     for item in &prog.items {
-        if let HirItem::Fn { def, params, .. } = item {
-            if let Some(d) = def {
-                cx.typed.func_defs.insert(d.0);
-                cx.typed.func_arity.insert(d.0, params.len());
-            }
+        if let HirItem::Fn {
+            def: Some(d),
+            params,
+            ..
+        } = item
+        {
+            cx.typed.func_defs.insert(d.0);
+            cx.typed.func_arity.insert(d.0, params.len());
         }
     }
     for item in &prog.items {
@@ -242,15 +245,13 @@ mod tests {
 
     #[test]
     fn call_with_correct_arity_checks_clean() {
-        let (_, diags) =
-            check_src("function add(a, b) { a + b; } function main() { add(1, 2); }");
+        let (_, diags) = check_src("function add(a, b) { a + b; } function main() { add(1, 2); }");
         assert!(diags.is_empty());
     }
 
     #[test]
     fn call_with_wrong_arity_errors_once() {
-        let (_, diags) =
-            check_src("function add(a, b) { a + b; } function main() { add(1); }");
+        let (_, diags) = check_src("function add(a, b) { a + b; } function main() { add(1); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("expects 2"));
     }

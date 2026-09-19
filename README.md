@@ -79,7 +79,8 @@ let x = 1 + 2 * 3;
 function main() { let d = x - 1; d; }
 ```
 
-Ints, `+ - * /`, unary `-`, parens, `let`, `function` with params, `//` comments.
+Ints, `+ - * /`, unary `-`, parens, `let`, `function` with params and calls,
+`//` comments.
 Semicolons are mandatory. Type system: everything is `int`. See crate docs for the grammar.
 
 ## Roadmap

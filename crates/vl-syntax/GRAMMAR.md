@@ -19,7 +19,9 @@ let_stmt := "let" ident "=" expr ";"
 expr_stmt := expr ";"                   ; mandatory, TS-style
 expr     := term (("+" | "-") term)*     ; left-assoc
 term     := factor (("*" | "/") factor)* ; left-assoc
-factor   := int | ident | "(" expr ")" | "-" factor
+factor   := call | int | ident | "(" expr ")" | "-" factor
+call     := ident "(" args? ")"
+args     := expr ("," expr)*
 ```
 
 Terminal names are `vl-lex` `TokenKind`s: `Let Function Eq Semi LParen RParen
@@ -32,8 +34,8 @@ LBrace RBrace Comma Plus Minus Star Slash Ident Int Eof`.
   (`{ let d = x; d; }`). A bare trailing `d` without `;` is `E100`.
 * Unary is `-` only, right-recursive: `- -5`, `--x` ok; `+x`, `!x` → `E103`.
 * Parens are transparent in the AST: `(e)` returns inner `Expr`, span drops parens.
-* Calls, indexing, `.`, `return`, `if`, `else`, `while` do not exist. `foo(...)`
-  as an expression is a parse error (`(` after ident has no rule).
+* Calls are identifier calls only: `foo(...)`; member calls, function-valued
+  calls, indexing, `.`, `return`, `if`, `else`, and `while` do not exist.
 
 ## AST
 
@@ -44,7 +46,8 @@ Item ::= Let { name, name_span, value: Expr, span }
 Stmt ::= Let { name, name_span, value: Expr, span }
        | Expr(Expr)
 Expr ::= Int(i64, Span) | Var(String, Span)
-       | Unary { op: Neg, rhs, span } | Binary { op, lhs, rhs, span }
+        | Call { callee, callee_span, args, span }
+        | Unary { op: Neg, rhs, span } | Binary { op, lhs, rhs, span }
 BinOp ::= Add | Sub | Mul | Div
 UnOp  ::= Neg
 ```
@@ -89,6 +92,6 @@ Missing `;` (`let x = 1`) → `E100`; `@` never reaches here (lexer `E000`).
 
 ## Explicitly NOT syntax in v0
 
-No calls, no `return`, no `if`/`else`/`while`, no types/annotations
-(TS-like surface only: `let`, `function`, braces, mandatory `;`),
+No `return`, no `if`/`else`/`while`, no types/annotations
+(TS-like surface only: `let`, `function`, calls, braces, mandatory `;`),
 no trailing comma in params, no string/bool literals.

@@ -71,6 +71,7 @@ impl Target for DummyTarget {
 fn dummy_instr(ins: &Instr) -> String {
     match ins {
         Instr::Const { dst, value, .. } => format!("mov %{}, {value}", dst.0),
+        Instr::Param { dst, index, .. } => format!("param %{}, {index}", dst.0),
         Instr::Copy { dst, src, .. } => format!("mov %{}, %{}", dst.0, src.0),
         Instr::BinOp {
             dst, op, lhs, rhs, ..
@@ -82,6 +83,16 @@ fn dummy_instr(ins: &Instr) -> String {
                 LirOp::Div => "div",
             };
             format!("{m} %{}, %{}, %{}", dst.0, lhs.0, rhs.0)
+        }
+        Instr::Call {
+            dst, callee, args, ..
+        } => {
+            let args = args
+                .iter()
+                .map(|arg| format!("%{}", arg.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("call %{}, {callee}({args})", dst.0)
         }
         Instr::Ret { src, .. } => format!("ret %{}", src.0),
     }
@@ -124,6 +135,7 @@ impl Target for StackVmTarget {
 fn stackvm_instr(ins: &Instr) -> String {
     match ins {
         Instr::Const { value, .. } => format!("push {value}"),
+        Instr::Param { index, .. } => format!("param {index}"),
         Instr::Copy { .. } => "dup".into(),
         Instr::BinOp { op, .. } => match op {
             LirOp::Add => "add",
@@ -132,6 +144,14 @@ fn stackvm_instr(ins: &Instr) -> String {
             LirOp::Div => "div",
         }
         .into(),
+        Instr::Call { callee, args, .. } => {
+            let args = args
+                .iter()
+                .map(|arg| format!("%{}", arg.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("call {callee}({args})")
+        }
         Instr::Ret { .. } => "ret".into(),
     }
 }
@@ -169,5 +189,19 @@ mod tests {
     #[test]
     fn unknown_target_is_none() {
         assert!(lookup("x86-64").is_none());
+    }
+
+    #[test]
+    fn backends_emit_calls_and_parameters() {
+        let lir = lir_of("function add(a, b) { a + b; } function main() { add(1, 2); }");
+        let (art, diags) = DummyTarget.emit(&lir);
+        assert!(diags.is_empty());
+        let text = art.unwrap().text;
+        assert!(text.contains("param %0, 0"), "{text}");
+        assert!(text.contains("call %2, add(%0, %1)"), "{text}");
+
+        let (art, diags) = StackVmTarget.emit(&lir);
+        assert_eq!(diags.len(), 1);
+        assert!(art.unwrap().text.contains("call add(%0, %1)"));
     }
 }

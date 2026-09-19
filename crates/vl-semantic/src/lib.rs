@@ -241,7 +241,8 @@ mod tests {
 
     #[test]
     fn call_callee_and_args_resolve() {
-        let (_, diags) = resolve_src("function add(a, b) { a + b; } function main() { add(1, 2); }");
+        let (_, diags) =
+            resolve_src("function add(a, b) { a + b; } function main() { add(1, 2); }");
         assert!(diags.iter().all(|d| !d.is_error()));
     }
 
