@@ -23,7 +23,12 @@
     }
   functions:
     - name: print
-      signature: std.print(value)
+      params:
+        - name: value
+          type: string
+          detail: Byte string to write. No implicit newline is added.
+      returns:
+        type: i64
       detail: |
         Writes one byte string to standard output. It does not add an implicit newline.
 
@@ -32,7 +37,12 @@
       example: |
         print("ready\n");
     - name: print_u64
-      signature: std.print_u64(value)
+      params:
+        - name: value
+          type: u64
+          detail: Unsigned integer to write.
+      returns:
+        type: i64
       detail: |
         The module catalog reserves `print_u64` for unsigned integer output. It is
         recognized during general module checking, but the current Naravm target does
@@ -53,12 +63,10 @@
     use std.fs.{open, read};
   functions:
     - name: open
-      signature: std.fs.open
       detail: |
         Opens a file. The callable surface is present in the module catalog; the
         current Naravm target does not emit file-system calls yet.
     - name: read
-      signature: std.fs.read
       detail: |
         Reads from an opened file. Like `open`, this function is currently a checked
         language surface rather than a runnable Naravm operation.
@@ -78,13 +86,11 @@
     use std.string.{new, len};
   functions:
     - name: new
-      signature: std.string.new
       detail: |
         Creates a string value. The function is present in the language module
         catalog; its target-specific argument and result behavior is still being
         defined.
     - name: len
-      signature: std.string.len
       detail: |
         Returns the length of a string. The function is present in the language module
         catalog; the current Naravm target does not emit it yet.

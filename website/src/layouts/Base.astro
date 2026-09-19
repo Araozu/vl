@@ -38,7 +38,7 @@ const navLink = (key: keyof typeof sectionMeta) =>
   <body class="min-h-screen bg-canvas font-sans text-body antialiased">
     <!-- Top developer bar, Swift-docs style -->
     <header class="sticky top-0 z-40 border-b border-rule bg-header/95 backdrop-blur">
-      <nav class="mx-auto flex h-12 max-w-[1400px] items-center justify-between gap-4 px-4 sm:px-6">
+      <nav class="mx-auto flex h-12 max-w-350 items-center justify-between gap-4 px-4 sm:px-6">
         <a href="/" class="flex items-baseline gap-1.5 text-[1.05rem] font-semibold tracking-tight text-ink">
           <span aria-hidden="true" class="text-[1rem]">◼</span> VL&nbsp;<span class="font-normal text-muted">Developer</span>
         </a>
@@ -52,13 +52,12 @@ const navLink = (key: keyof typeof sectionMeta) =>
           <a href="/docs" aria-label="Search" class="rounded-md p-1.5 text-body transition hover:text-ink">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/></svg>
           </a>
-          <a href="/docs" class="rounded-full bg-accent px-3.5 py-1 text-[0.8rem] font-medium text-white transition hover:brightness-110">Sign in</a>
         </div>
       </nav>
     </header>
     <!-- Documentation bar -->
     <div class="border-b border-rule bg-canvas">
-      <div class="mx-auto flex h-14 max-w-[1400px] items-center justify-between px-4 sm:px-6">
+      <div class="mx-auto flex h-14 max-w-350 items-center justify-between px-4 sm:px-6">
         <a href={current.href} class="flex items-center gap-2.5 text-[1.15rem] font-semibold tracking-tight text-ink">
           <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" class="text-muted" aria-hidden="true"><rect x="1.5" y="2.5" width="15" height="13" rx="2"/><path d="M6 2.5v13M1.5 6H6"/></svg>
           {current.label}
@@ -70,7 +69,7 @@ const navLink = (key: keyof typeof sectionMeta) =>
       <slot />
     </main>
     <footer class="border-t border-rule bg-canvas py-8">
-      <div class="mx-auto flex max-w-[1400px] flex-col gap-1 px-4 text-[0.8rem] text-faint sm:flex-row sm:items-baseline sm:justify-between sm:px-6">
+      <div class="mx-auto flex max-w-350 flex-col gap-1 px-4 text-[0.8rem] text-faint sm:flex-row sm:items-baseline sm:justify-between sm:px-6">
         <p>VL — a small language with a legible compiler.</p>
         <p>Set in Inter. Respects your system appearance.</p>
       </div>

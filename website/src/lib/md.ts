@@ -35,10 +35,12 @@ export function renderParagraphs(text: string): string {
     .join('\n');
 }
 
-/// GitHub-style slug used for heading anchors (`std.print(value)` → `stdprintvalue`).
+/// GitHub-style slug for heading anchors
+/// (`std.print(value: string) -> i64` → `stdprintvalue-string-returns-i64`).
 export function slug(text: string): string {
   return text
     .toLowerCase()
+    .replace(/->/g, ' returns ')
     .replace(/[^a-z0-9 _-]/g, '')
     .trim()
     .replace(/\s+/g, '-');

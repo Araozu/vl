@@ -1,8 +1,19 @@
 ---
 import { getCollection } from 'astro:content';
 import Docs from '../../layouts/Docs.astro';
-import { renderParagraphs, slug } from '../../lib/md';
+import { renderInline, renderParagraphs, slug } from '../../lib/md';
 import { highlightVl } from '../../lib/vl-code';
+
+function signature(module: string, fn: {
+  name: string;
+  params?: Array<{ name: string; type: string }>;
+  returns?: { type: string };
+}): string {
+  if (!fn.params) return `${module}.${fn.name}`;
+  const params = fn.params.map((p) => `${p.name}: ${p.type}`).join(', ');
+  const head = `${module}.${fn.name}(${params})`;
+  return fn.returns ? `${head} -> ${fn.returns.type}` : head;
+}
 
 export async function getStaticPaths() {
   const modules = await getCollection('stdlib');
@@ -31,15 +42,57 @@ for (const fn of mod.functions) {
   <Fragment set:html={renderParagraphs(mod.intro)} />
   <Fragment set:html={importHtml} />
   {
-    mod.functions.map((fn) => (
-      <Fragment>
-        <h2 id={slug(fn.signature)}>
-          <code>{fn.signature}</code>
-        </h2>
-        <Fragment set:html={renderParagraphs(fn.detail)} />
-        {fn.example && <Fragment set:html={exampleHtml.get(fn.name)} />}
-      </Fragment>
-    ))
+    mod.functions.map((fn) => {
+      const head = signature(mod.module, fn);
+      return (
+        <Fragment>
+          <h2 id={slug(head)}>
+            <code>{head}</code>
+          </h2>
+          {fn.params && (
+            <table>
+              <thead>
+                <tr>
+                  <th>Parameter</th>
+                  <th>Type</th>
+                  <th>Description</th>
+                </tr>
+              </thead>
+              <tbody>
+                {fn.params.map((p) => (
+                  <tr>
+                    <td>
+                      <code>{p.name}</code>
+                    </td>
+                    <td>
+                      <code>{p.type}</code>
+                    </td>
+                    <td>
+                      {p.detail ? <Fragment set:html={renderInline(p.detail)} /> : null}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {fn.returns && (
+            <p>
+              <strong>Returns</strong> <code>{fn.returns.type}</code>
+              {fn.returns.detail ? (
+                <>
+                  {' — '}
+                  <Fragment set:html={renderInline(fn.returns.detail)} />
+                </>
+              ) : (
+                '.'
+              )}
+            </p>
+          )}
+          <Fragment set:html={renderParagraphs(fn.detail)} />
+          {fn.example && <Fragment set:html={exampleHtml.get(fn.name)} />}
+        </Fragment>
+      );
+    })
   }
   {mod.outro && <Fragment set:html={renderParagraphs(mod.outro)} />}
 </Docs>
