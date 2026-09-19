@@ -323,6 +323,68 @@ fn value_return_in_void_function_is_an_error() {
 }
 
 #[test]
+fn arrays_compile_through_frontend_to_naravm() {
+    let src = std::fs::read_to_string("examples/arrays.vl").unwrap();
+    let lir = frontend(&src).expect("arrays.vl must compile");
+    let dump = lir.dump();
+    for op in ["new_array", "array_lit", "array_get", "array_set"] {
+        assert!(dump.contains(op), "{op} missing in {dump}");
+    }
+
+    use vl_codegen::Target;
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+    // create = 0x26, createi = 0x27, getvat = 0x28, setvat/setvati = 0x29/0x2D.
+    for op in [0x26u8, 0x27, 0x28, 0x2du8] {
+        assert!(bytes.contains(&op), "no {op:#x} in {bytes:?}");
+    }
+}
+
+#[test]
+fn u64array_new_needs_no_import() {
+    let lir = frontend("function main() { let a = U64Array.new(2u64); a[0u64] = 1u64; }")
+        .expect("U64Array.new must compile without imports");
+    assert!(lir.dump().contains("new_array"));
+}
+
+#[test]
+fn array_element_mismatch_is_one_error() {
+    let err = frontend("function main() { let a = [1, 2u64]; a; }").expect_err("must fail");
+    assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
+    assert!(
+        err.iter()
+            .any(|d| d.message.contains("expects `u64` elements")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn array_index_shapes_are_checked() {
+    let err = frontend(r#"function main() { let s = "hi"; let x = s[0u64]; x; }"#)
+        .expect_err("must fail");
+    assert!(
+        err.iter().any(|d| d.message.contains("cannot index")),
+        "{err:?}"
+    );
+
+    let err =
+        frontend("function main() { let a = [1u64]; let x = a[0]; x; }").expect_err("must fail");
+    assert!(
+        err.iter().any(|d| d.message.contains("must be `u64`")),
+        "{err:?}"
+    );
+
+    let err =
+        frontend(r#"function main() { let a = [1u64]; a[0u64] = "s"; }"#).expect_err("must fail");
+    assert!(
+        err.iter().any(|d| d.message.contains("cannot store")),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn bare_return_in_void_function_compiles() {
     frontend("function main() { return; }").expect("bare return in void must compile");
 }
