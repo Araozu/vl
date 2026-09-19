@@ -85,6 +85,16 @@ let visits = 1;
 let welcome = visits == 1;
 ```
 
+A type can also be written down explicitly with an annotation. The value must
+have that type (integer literals adapt, so `3` works where `u64` is written).
+An annotation is required to give `Array.new` its element type without a
+turbofish:
+
+```vl
+let retries: u64 = 3;
+let scores: Array[u64] = Array.new(3);
+```
+
 The name can be assigned a new value later, but the replacement must have the
 same type:
 

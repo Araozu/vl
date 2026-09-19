@@ -23,18 +23,25 @@ let words = ["one", "two"];
 ```
 
 For an array whose size is known but whose values will be filled in later, use
-the builtin `Array.new` constructor. The `::[u64]` part says that the elements
-are `u64` values.
+the builtin `Array.new` constructor. The preferred form annotates the `let`
+so the element type comes from the annotation:
 
 ```vl
-let scores = Array.new::[u64](3);
+let scores: Array[u64] = Array.new(3);
 scores[0] = 10;
 scores[1] = 20;
 scores[2] = 30;
 ```
 
+The explicit turbofish form says the element type at the call instead:
+
+```vl
+let scores = Array.new::[u64](3);
+```
+
 The new array is filled with zero values. An empty literal `[]` has no element
-type for VL to infer, so use `Array.new::[T](n)` when the array starts empty.
+type for VL to infer, so annotate it (`let e: Array[u64] = [];`) or use
+`Array.new::[T](n)` when the array starts empty.
 
 ## Reading and writing elements
 
