@@ -1,7 +1,7 @@
 //! vl-typecheck: type checking over HIR.
 //!
 //! Value types are the compiler-owned [`Ty`] (`u64`, `i64`, `f64`, `bool`,
-//! `u8`, `string`, `File`, `void`) converted from [`vl_common::VlType`].
+//! `u8`, `string`, `File`, `U64Array`, `void`) converted from [`vl_common::VlType`].
 //! These are VL language types enforced here — deliberately distinct from any
 //! VM representation, which backends map to separately.
 //!
@@ -28,6 +28,8 @@ pub enum Ty {
     U8,
     String,
     File,
+    /// Fixed-length heap array of `u64` (reference type, like `String`).
+    U64Array,
     Void,
     /// Poison: an earlier error made this node's type unknowable.
     /// Poisoned nodes don't produce follow-on errors.
@@ -44,6 +46,7 @@ impl std::fmt::Display for Ty {
             Ty::U8 => write!(f, "u8"),
             Ty::String => write!(f, "string"),
             Ty::File => write!(f, "File"),
+            Ty::U64Array => write!(f, "U64Array"),
             Ty::Void => write!(f, "void"),
             Ty::Error => write!(f, "<error>"),
         }
@@ -60,6 +63,7 @@ impl Ty {
             VlType::U8 => Ty::U8,
             VlType::String => Ty::String,
             VlType::File => Ty::File,
+            VlType::U64Array => Ty::U64Array,
             VlType::Void => Ty::Void,
         }
     }
@@ -384,6 +388,51 @@ impl Checker {
                     }
                 }
             }
+            HirStmt::IndexAssign {
+                id,
+                array,
+                index,
+                value,
+                ..
+            } => {
+                let at = self.infer_expr(array);
+                let it = self.infer_expr(index);
+                let vt = self.infer_expr(value);
+                if at == Ty::Error || it == Ty::Error || vt == Ty::Error {
+                    self.record(*id, Ty::Error);
+                    return;
+                }
+                if at != Ty::U64Array {
+                    self.diags.push(
+                        Diagnostic::error(format!("cannot index `{at}`"))
+                            .with_label(array.span(), "only `U64Array` supports indexing")
+                            .with_code("E302"),
+                    );
+                    self.record(*id, Ty::Error);
+                    return;
+                }
+                if it != Ty::U64 {
+                    self.diags.push(
+                        Diagnostic::error(format!("array index must be `u64`, got `{it}`"))
+                            .with_label(index.span(), "expected `u64` here")
+                            .with_code("E302"),
+                    );
+                    self.record(*id, Ty::Error);
+                    return;
+                }
+                if vt != Ty::U64 {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "cannot store `{vt}` in a `U64Array` (elements are `u64`)"
+                        ))
+                        .with_label(value.span(), "expected `u64` here")
+                        .with_code("E302"),
+                    );
+                    self.record(*id, Ty::Error);
+                    return;
+                }
+                self.record(*id, Ty::U64);
+            }
             HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
             HirStmt::While {
                 condition, body, ..
@@ -491,6 +540,56 @@ impl Checker {
         match expr {
             HirExpr::Literal { id, value, .. } => self.record(*id, scalar_ty(*value)),
             HirExpr::String { id, .. } => self.record(*id, Ty::String),
+            HirExpr::ArrayLiteral { id, elems, .. } => {
+                let mut poisoned = false;
+                for elem in elems {
+                    let t = self.infer_expr(elem);
+                    if t == Ty::Error {
+                        poisoned = true;
+                    } else if t != Ty::U64 {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "array literal expects `u64` elements, got `{t}`"
+                            ))
+                            .with_label(elem.span(), "expected `u64` here")
+                            .with_code("E302"),
+                        );
+                        poisoned = true;
+                    }
+                }
+                // Empty `[]` is the length-0 `U64Array`; one bad element
+                // poisons the whole literal (single root cause, no cascade).
+                if poisoned {
+                    return self.record(*id, Ty::Error);
+                }
+                self.record(*id, Ty::U64Array)
+            }
+            HirExpr::Index {
+                id, base, index, ..
+            } => {
+                let bt = self.infer_expr(base);
+                let it = self.infer_expr(index);
+                if bt == Ty::Error || it == Ty::Error {
+                    return self.record(*id, Ty::Error);
+                }
+                if bt != Ty::U64Array {
+                    self.diags.push(
+                        Diagnostic::error(format!("cannot index `{bt}`"))
+                            .with_label(base.span(), "only `U64Array` supports indexing")
+                            .with_code("E302"),
+                    );
+                    return self.record(*id, Ty::Error);
+                }
+                if it != Ty::U64 {
+                    self.diags.push(
+                        Diagnostic::error(format!("array index must be `u64`, got `{it}`"))
+                            .with_label(index.span(), "expected `u64` here")
+                            .with_code("E302"),
+                    );
+                    return self.record(*id, Ty::Error);
+                }
+                self.record(*id, Ty::U64)
+            }
             HirExpr::Var { id, def, span, .. } => {
                 // Unresolved names were already reported by `vl-semantic`;
                 // poison quietly instead of cascading a second error.
@@ -764,6 +863,68 @@ mod tests {
         let (res, _) = vl_semantic::resolve(&prog);
         let hir = vl_hir::lower(&prog, &res);
         check(&hir)
+    }
+
+    #[test]
+    fn arrays_check_clean() {
+        let (_, diags) = check_src(
+            "function sum(a: U64Array): u64 { return a[0u64]; } function main() { let a = U64Array.new(3u64); a[0u64] = 1u64; let b = [1u64, 2u64]; let e = []; sum(a); sum(b); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn array_literal_rejects_non_u64_elements() {
+        let (_, diags) = check_src("function main() { let a = [1, 2u64]; a; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("expects `u64` elements")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn index_requires_u64array_and_u64() {
+        let (_, diags) = check_src(r#"function main() { let s = "hi"; let x = s[0u64]; x; }"#);
+        assert!(
+            diags.iter().any(|d| d.message.contains("cannot index")),
+            "{diags:?}"
+        );
+        let (_, diags) = check_src("function main() { let a = [1u64]; let x = a[true]; x; }");
+        assert!(
+            diags.iter().any(|d| d.message.contains("must be `u64`")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn index_assign_checks_shapes() {
+        let (_, diags) = check_src(r#"function main() { let a = [1u64]; a[0u64] = "s"; }"#);
+        assert!(
+            diags.iter().any(|d| d.message.contains("cannot store")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn u64array_new_arg_is_checked() {
+        let (_, diags) = check_src("function main() { let a = U64Array.new(1); a; }");
+        assert!(
+            diags.iter().any(|d| d.message.contains("expects `u64`")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn arrays_are_not_numeric() {
+        let (_, diags) =
+            check_src("function main() { let a = [1u64]; let b = [2u64]; let c = a + b; c; }");
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E302")),
+            "{diags:?}"
+        );
     }
 
     #[test]
