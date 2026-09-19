@@ -6,12 +6,14 @@
 //! item    := `let` ident `=` expr `;` | `function` ident `(` params? `)` (`:` type)? block
 //! params  := param (`,` param)*
 //! param   := ident `:` type
-//! type    := `u64` | `i64` | `f64` | `bool` | `u8` | `string` | `File` | `void` (`void` only as return)
+//! type    := `u64` | `i64` | `f64` | `bool` | `u8` | `string` | `File` | `U64Array` | `void` (`void` only as return)
 //! block   := `{` stmt* `}`
-//! stmt    := `let` ident `=` expr `;` | ident `=` expr `;` | `if` `(` expr `)` branch (`else` branch)?
+//! stmt    := `let` ident `=` expr `;` | ident `=` expr `;` | index `=` expr `;`
+//!          | `if` `(` expr `)` branch (`else` branch)?
 //!          | `while` `(` expr `)` branch | `break` `;` | `continue` `;`
 //!          | `return` expr? `;` | expr `;`
 //! branch  := block | stmt
+//! index   := ident (`[` expr `]`)+
 //! expr    := or
 //! or      := and (`||` and)*
 //! and     := equality (`&&` equality)*
@@ -19,10 +21,19 @@
 //! comparison := term ((`<`|`<=`|`>`|`>=`) term)*
 //! term    := factor ((`+`|`-`) factor)*
 //! factor  := unary ((`*`|`/`) unary)*
-//! unary   := (`-`|`!`) unary | call
+//! unary   := (`-`|`!`) unary | postfix
+//! postfix := primary (`[` expr `]`)*
+//! primary := literal | array-literal | call | `(` expr `)`
+//! array-literal := `[` (expr (`,` expr)* `,`?)? `]`
 //! call    := ident `(` args? `)`
 //! args    := expr (`,` expr)*
 //! ```
+//!
+//! `U64Array` is a fixed-length heap array of `u64`: `U64Array.new(n)` creates
+//! a zero-filled array of `n` elements, `[1u64, 2u64]` is an array literal
+//! (empty `[]` is the length-0 array), `a[i]` reads element `i`, and
+//! `a[i] = v;` writes it. Indices and elements are always `u64`.
+//!
 //!
 //! Calls are callee-by-name (`ident(args)`), TypeScript-style. The callee
 //! is a plain variable use so forward references to `function` items work.
@@ -98,6 +109,14 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    /// Element write: `array[index] = value;` (only `ident`-led index chains
+    /// parse as statements; anything else is an expression-statement error).
+    IndexAssign {
+        array: Box<Expr>,
+        index: Box<Expr>,
+        value: Box<Expr>,
+        span: Span,
+    },
     If {
         condition: Expr,
         then_body: Vec<Stmt>,
@@ -126,6 +145,18 @@ pub enum Stmt {
 pub enum Expr {
     Literal(Scalar, Span),
     String(Vec<u8>, Span),
+    /// Array literal: `[1u64, 2u64]` (empty `[]` is the length-0 `U64Array`).
+    /// Element types are enforced later (`u64` only for now).
+    ArrayLiteral {
+        elems: Vec<Expr>,
+        span: Span,
+    },
+    /// Element read: `array[index]`.
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
     Var {
         path: Vec<String>,
         span: Span,
@@ -176,6 +207,8 @@ impl Expr {
         match self {
             Expr::Literal(_, s) => *s,
             Expr::String(_, s) => *s,
+            Expr::ArrayLiteral { span, .. } => *span,
+            Expr::Index { span, .. } => *span,
             Expr::Var { span, .. } => *span,
             Expr::Call { span, .. } => *span,
             Expr::Unary { span, .. } | Expr::Binary { span, .. } => *span,
@@ -361,7 +394,7 @@ impl<'a> Parser<'a> {
                     Diagnostic::error(format!("expected a type, found {}", describe(&t.kind)))
                         .with_label(
                             t.span,
-                            "expected one of u64, i64, f64, bool, u8, string, File, void",
+                            "expected one of u64, i64, f64, bool, u8, string, File, U64Array, void",
                         )
                         .with_code("E104"),
                 );
@@ -526,6 +559,47 @@ impl<'a> Parser<'a> {
                 value,
                 span: Span::new(let_tok.span.start, semi.span.end),
             })
+        } else if matches!(self.peek().kind, TokenKind::Ident(_))
+            && matches!(
+                self.toks.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::LBracket)
+            )
+        {
+            // Possible element write `a[i] = v;`. Parse only the postfix
+            // base (not a full expression, so `a[i] == 1;` still parses as a
+            // comparison statement): when no `=` follows, rewind and fall
+            // through to the expression-statement path.
+            let save = self.pos;
+            let base = self.parse_postfix()?;
+            if !matches!(self.peek().kind, TokenKind::Eq) {
+                self.pos = save;
+                let value = self.parse_expr()?;
+                self.expect(&TokenKind::Semi, "`;`")?;
+                Some(Stmt::Expr(value))
+            } else {
+                self.bump(); // `=`
+                let value = self.parse_expr()?;
+                let semi = self.expect(&TokenKind::Semi, "`;`")?;
+                match base {
+                    Expr::Index { base, index, span } => Some(Stmt::IndexAssign {
+                        array: base,
+                        index,
+                        value: Box::new(value),
+                        span: Span::new(span.start, semi.span.end),
+                    }),
+                    other => {
+                        self.diags.push(
+                            Diagnostic::error("cannot assign to this expression")
+                                .with_label(
+                                    other.span(),
+                                    "only variables and array elements are assignable",
+                                )
+                                .with_code("E103"),
+                        );
+                        None
+                    }
+                }
+            }
         } else if matches!(self.peek().kind, TokenKind::Ident(_))
             && matches!(
                 self.toks.get(self.pos + 1).map(|t| &t.kind),
@@ -828,6 +902,29 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_factor(&mut self) -> Option<Expr> {
+        self.parse_postfix()
+    }
+
+    /// Postfix indexing: `primary` followed by any number of `[expr]`.
+    /// Array literals consume their own brackets, so `[1u64][0]` reads
+    /// element 0 of a one-element literal.
+    fn parse_postfix(&mut self) -> Option<Expr> {
+        let mut base = self.parse_primary()?;
+        while matches!(self.peek().kind, TokenKind::LBracket) {
+            self.bump(); // `[`
+            let index = self.parse_expr()?;
+            let close = self.expect(&TokenKind::RBracket, "`]`")?;
+            let span = Span::new(base.span().start, close.span.end);
+            base = Expr::Index {
+                base: Box::new(base),
+                index: Box::new(index),
+                span,
+            };
+        }
+        Some(base)
+    }
+
+    fn parse_primary(&mut self) -> Option<Expr> {
         let t = self.peek().clone();
         match t.kind {
             TokenKind::I64(v) => {
@@ -892,6 +989,28 @@ impl<'a> Parser<'a> {
                 self.expect(&TokenKind::RParen, "`)`")?;
                 Some(inner)
             }
+            TokenKind::LBracket => {
+                let open = self.bump();
+                let mut elems = Vec::new();
+                if !matches!(self.peek().kind, TokenKind::RBracket) {
+                    loop {
+                        elems.push(self.parse_expr()?);
+                        if !matches!(self.peek().kind, TokenKind::Comma) {
+                            break;
+                        }
+                        self.bump();
+                        // Allow one trailing comma: `[1u64,]`.
+                        if matches!(self.peek().kind, TokenKind::RBracket) {
+                            break;
+                        }
+                    }
+                }
+                let close = self.expect(&TokenKind::RBracket, "`]`")?;
+                Some(Expr::ArrayLiteral {
+                    elems,
+                    span: Span::new(open.span.start, close.span.end),
+                })
+            }
             TokenKind::Invalid => {
                 self.bump();
                 None
@@ -951,6 +1070,8 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::RParen => "`)`".into(),
         TokenKind::LBrace => "`{`".into(),
         TokenKind::RBrace => "`}`".into(),
+        TokenKind::LBracket => "`[`".into(),
+        TokenKind::RBracket => "`]`".into(),
         TokenKind::Comma => "`,`".into(),
         TokenKind::Dot => "`.`".into(),
         TokenKind::Colon => "`:`".into(),
@@ -1175,6 +1296,53 @@ mod tests {
         let (prog, diags) = parse_src("function f(x: i64): i64 { return x; }");
         assert!(diags.is_empty(), "{diags:?}");
         assert_eq!(prog.items.len(), 1);
+    }
+
+    #[test]
+    fn parses_array_literal_index_and_index_assign() {
+        let (prog, diags) = parse_src(
+            "function get(a: U64Array): u64 { a[0u64] = 1u64; return a[0u64]; } function main() { let b = [1u64, 2u64,]; let e = []; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { params, body, .. } => {
+                assert_eq!(params[0].ty, Some(VlType::U64Array));
+                assert!(matches!(body[0], Stmt::IndexAssign { .. }));
+                assert!(matches!(
+                    body[1],
+                    Stmt::Return {
+                        value: Some(Expr::Index { .. }),
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+        match &prog.items[1] {
+            Item::Function { body, .. } => {
+                assert!(matches!(
+                    &body[0],
+                    Stmt::Let {
+                        value: Expr::ArrayLiteral { elems, .. },
+                        ..
+                    } if elems.len() == 2
+                ));
+                assert!(matches!(
+                    &body[1],
+                    Stmt::Let {
+                        value: Expr::ArrayLiteral { elems, .. },
+                        ..
+                    } if elems.is_empty()
+                ));
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unclosed_index_is_an_error() {
+        let (_prog, diags) = parse_src("function main() { a[0u64; }");
+        assert!(!diags.is_empty());
     }
 
     #[test]
