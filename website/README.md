@@ -13,7 +13,8 @@ pnpm build
 
 - `src/pages/index.astro` — landing + Svelte playground
 - `src/pages/docs/` — learning path, getting-started, and language guide (markdown only)
-- `src/pages/std/` — standard library overview and module references (markdown only)
+- `src/data/stdlib.yaml` + `src/content.config.ts` — stdlib catalog (Zod-validated content collection)
+- `src/pages/std/` — generated standard library pages (`[id].astro` per module, `index.astro` overview)
 - `src/pages/cli/` — CLI reference
 - `src/pages/internals/` — compiler pipeline, crates, driver, and service reference
 - `src/components/Playground.svelte` — interactive compiler client (Svelte)

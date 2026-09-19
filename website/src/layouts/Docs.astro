@@ -1,4 +1,5 @@
 ---
+import { getCollection } from 'astro:content';
 import Base from './Base.astro';
 
 interface Props {
@@ -25,6 +26,9 @@ const section = pathname.startsWith('/std')
     : pathname.startsWith('/internals')
       ? 'internals'
       : 'docs';
+// The std sidebar (and its pages) is generated from the stdlib catalog,
+// so adding a module to `src/data/stdlib.yaml` updates both at once.
+const stdModules = (await getCollection('stdlib')).sort((a, b) => a.data.order - b.data.order);
 const sectionSidebars = {
   docs: {
     root: '/docs',
@@ -45,10 +49,12 @@ const sectionSidebars = {
       {
         label: 'Standard library',
         items: [
-          { href: '/std', label: 'Overview', icon: 'doc' },
-          { href: '/std/std', label: 'std', icon: 'S' },
-          { href: '/std/fs', label: 'std.fs', icon: 'S' },
-          { href: '/std/string', label: 'std.string', icon: 'S' },
+          { href: '/std', label: 'Overview', icon: 'doc' as const },
+          ...stdModules.map((m) => ({
+            href: `/std/${m.id}`,
+            label: m.data.module,
+            icon: 'S' as const,
+          })),
         ],
       },
     ],

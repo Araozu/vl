@@ -1,0 +1,42 @@
+---
+import { getCollection } from 'astro:content';
+import Docs from '../../layouts/Docs.astro';
+import { renderInline, slug } from '../../lib/md';
+
+// Module cards come from the stdlib catalog; only the section framing
+// prose lives here.
+const modules = (await getCollection('stdlib')).sort((a, b) => a.data.order - b.data.order);
+---
+
+<Docs
+  title="std"
+  description="The modules and functions available to VL programs."
+  eyebrow="Reference"
+  availability="VL 0.1+"
+>
+  <h1 id="std">std</h1>
+  <p>
+    The standard library is the set of modules a VL program can import. Start with
+    the <a href="/docs">learning path</a> if you are new to the language, then use these pages
+    to look up a module or function.
+  </p>
+  <h2 id="modules">Modules</h2>
+  {
+    modules.map((entry) => (
+      <Fragment>
+        <h3 id={slug(entry.data.module)}>
+          <a href={`/std/${entry.id}`}>
+            <code>{entry.data.module}</code>
+          </a>
+        </h3>
+        <p><Fragment set:html={renderInline(entry.data.summary)} /></p>
+      </Fragment>
+    ))
+  }
+  <h2 id="availability">Availability</h2>
+  <p>
+    VL 0.1 is being implemented in stages. A function may be accepted by the
+    language checker before a runnable target supports it. Each module page calls
+    out the current status; <code>std.print</code> is the current Naravm example.
+  </p>
+</Docs>

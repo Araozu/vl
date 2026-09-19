@@ -1,0 +1,136 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "vl",
+  "displayName": "VL",
+  "scopeName": "source.vl",
+  "fileTypes": ["vl"],
+  "aliases": ["VL"],
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#function-definition" },
+    { "include": "#keyword" },
+    { "include": "#boolean" },
+    { "include": "#number" },
+    { "include": "#function-call" },
+    { "include": "#operator" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.double-slash.vl",
+      "match": "//.*$"
+    },
+    "string": {
+      "name": "string.quoted.double.vl",
+      "begin": "\"",
+      "end": "\"|$",
+      "patterns": [
+        {
+          "name": "constant.character.escape.vl",
+          "match": "\\\\(?:0|n|r|t|\\\\|\")"
+        },
+        {
+          "name": "invalid.illegal.unknown-escape.vl",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "function-definition": {
+      "name": "meta.function.definition.vl",
+      "begin": "\\b(function)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(\\()",
+      "beginCaptures": {
+        "1": { "name": "keyword.declaration.vl" },
+        "2": { "name": "entity.name.function.vl" },
+        "3": { "name": "punctuation.definition.parameters.begin.vl" }
+      },
+      "end": "\\)",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.parameters.end.vl" }
+      },
+      "patterns": [
+        { "include": "#comment" },
+        {
+          "name": "variable.parameter.vl",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b"
+        },
+        {
+          "name": "punctuation.separator.parameter.vl",
+          "match": ","
+        }
+      ]
+    },
+    "keyword": {
+      "patterns": [
+        {
+          "name": "keyword.declaration.vl",
+          "match": "\\b(?:let|function|use)\\b"
+        },
+        {
+          "name": "keyword.control.conditional.vl",
+          "match": "\\b(?:if|else)\\b"
+        }
+      ]
+    },
+    "boolean": {
+      "name": "constant.language.boolean.vl",
+      "match": "\\b(?:true|false)\\b"
+    },
+    "number": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.vl",
+          "match": "\\b\\d+\\.\\d+f64\\b"
+        },
+        {
+          "name": "constant.numeric.integer.vl",
+          "match": "\\b\\d+(?:i64|u64|u8)\\b"
+        },
+        {
+          "name": "invalid.illegal.numeric.vl",
+          "match": "\\b\\d+(?:\\.\\d+)?[A-Za-z_]\\w*|\\b\\d+\\.\\d+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.vl",
+          "match": "\\b\\d+\\b"
+        }
+      ]
+    },
+    "function-call": {
+      "name": "entity.name.function.call.vl",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?=\\s*\\()"
+    },
+    "operator": {
+      "patterns": [
+        {
+          "name": "keyword.operator.arithmetic.vl",
+          "match": "[+\\-*/]"
+        },
+        {
+          "name": "keyword.operator.assignment.vl",
+          "match": "="
+        },
+        {
+          "name": "punctuation.separator.vl",
+          "match": "[;,]"
+        },
+        {
+          "name": "punctuation.accessor.dot.vl",
+          "match": "\\."
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.bracket.round.vl",
+          "match": "[()]"
+        },
+        {
+          "name": "punctuation.bracket.curly.vl",
+          "match": "[{}]"
+        }
+      ]
+    }
+  }
+}

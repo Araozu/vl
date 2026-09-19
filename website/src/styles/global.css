@@ -68,6 +68,32 @@ body {
   border-radius: 4px;
 }
 
+/* ---------- Shiki syntax highlighting ---------- */
+
+/* Code plates stay on the site surface instead of the theme background. */
+pre.astro-code {
+  background-color: var(--color-plate) !important;
+}
+
+/* Shiki emits dual light/dark token colors; swap to the dark set in dark mode. */
+@media (prefers-color-scheme: dark) {
+  .astro-code,
+  .astro-code span {
+    color: var(--shiki-dark) !important;
+    /* Optional, if you also want font styles */
+    font-style: var(--shiki-dark-font-style) !important;
+    font-weight: var(--shiki-dark-font-weight) !important;
+    text-decoration: var(--shiki-dark-text-decoration) !important;
+  }
+}
+
+/* Homepage/landing code plates: the wrapper owns the background. */
+.code-plain pre.astro-code {
+  background-color: transparent !important;
+  margin: 0;
+  padding: 1rem 1.25rem;
+}
+
 /* ---------- docs prose: pure-markdown styling ---------- */
 
 .docs-prose {

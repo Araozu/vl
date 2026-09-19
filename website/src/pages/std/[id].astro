@@ -1,0 +1,45 @@
+---
+import { getCollection } from 'astro:content';
+import Docs from '../../layouts/Docs.astro';
+import { renderParagraphs, slug } from '../../lib/md';
+import { highlightVl } from '../../lib/vl-code';
+
+export async function getStaticPaths() {
+  const modules = await getCollection('stdlib');
+  return modules.map((entry) => ({
+    params: { id: entry.id },
+    props: { entry },
+  }));
+}
+
+const { entry } = Astro.props;
+const mod = entry.data;
+const importHtml = await highlightVl(mod.import_example);
+const exampleHtml = new Map<string, string>();
+for (const fn of mod.functions) {
+  if (fn.example) exampleHtml.set(fn.name, await highlightVl(fn.example));
+}
+---
+
+<Docs
+  title={mod.title}
+  description={mod.description}
+  eyebrow="Standard library"
+  availability="VL 0.1+"
+>
+  <h1 id={slug(mod.module)}><code>{mod.module}</code></h1>
+  <Fragment set:html={renderParagraphs(mod.intro)} />
+  <Fragment set:html={importHtml} />
+  {
+    mod.functions.map((fn) => (
+      <Fragment>
+        <h2 id={slug(fn.signature)}>
+          <code>{fn.signature}</code>
+        </h2>
+        <Fragment set:html={renderParagraphs(fn.detail)} />
+        {fn.example && <Fragment set:html={exampleHtml.get(fn.name)} />}
+      </Fragment>
+    ))
+  }
+  {mod.outro && <Fragment set:html={renderParagraphs(mod.outro)} />}
+</Docs>
