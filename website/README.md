@@ -3,9 +3,9 @@
 Astro + Tailwind v4 + Svelte. Docs & API sections are stubs for now.
 
 ```sh
-npm install
-npm run dev      # http://localhost:4321
-npm run build
+pnpm install
+pnpm dev      # http://localhost:4321
+pnpm build
 ```
 
 - `src/pages/index.astro` — landing + Svelte playground stub
