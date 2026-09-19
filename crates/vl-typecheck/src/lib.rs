@@ -1,9 +1,14 @@
 //! vl-typecheck: type checking over HIR.
 //!
 //! Value types are the compiler-owned [`Ty`] (`u64`, `i64`, `f64`, `bool`,
-//! `u8`, `string`, `File`, `U64Array`, `void`) converted from [`vl_common::VlType`].
+//! `u8`, `string`, `File`, `Array[T]`, `void`) converted from [`vl_common::VlType`].
 //! These are VL language types enforced here — deliberately distinct from any
 //! VM representation, which backends map to separately.
+//!
+//! Generics are purely a frontend concern: `Array[T]` checks element types,
+//! generic functions (`function first[T](a: Array[T]): T`) check once with
+//! their parameters opaque (`Ty::Param`) and monomorphize per concrete
+//! call (`first$u64`, ...). LIR and backends only ever see concrete types.
 //!
 //! [`check`] walks the HIR, annotates each node, enforces function boundaries
 //! (param types, arity, explicit `return` types, `void` misuse), checks extern
@@ -19,7 +24,7 @@ use vl_common::Scalar;
 use vl_common::{Diagnostic, Span, VlType};
 use vl_hir::{HirBinOp, HirExpr, HirItem, HirProgram, HirStmt, HirUnOp};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ty {
     U64,
     I64,
@@ -28,8 +33,10 @@ pub enum Ty {
     U8,
     String,
     File,
-    /// Fixed-length heap array of `u64` (reference type, like `String`).
-    U64Array,
+    /// Fixed-length heap array of `T` (reference type, like `String`).
+    Array(Box<Ty>),
+    /// Opaque use of an enclosing generic function's type parameter.
+    Param(String),
     Void,
     /// Poison: an earlier error made this node's type unknowable.
     /// Poisoned nodes don't produce follow-on errors.
@@ -46,7 +53,8 @@ impl std::fmt::Display for Ty {
             Ty::U8 => write!(f, "u8"),
             Ty::String => write!(f, "string"),
             Ty::File => write!(f, "File"),
-            Ty::U64Array => write!(f, "U64Array"),
+            Ty::Array(elem) => write!(f, "Array[{elem}]"),
+            Ty::Param(name) => write!(f, "{name}"),
             Ty::Void => write!(f, "void"),
             Ty::Error => write!(f, "<error>"),
         }
@@ -54,7 +62,14 @@ impl std::fmt::Display for Ty {
 }
 
 impl Ty {
-    pub fn from_vl(v: VlType) -> Self {
+    pub fn from_vl(v: &VlType) -> Self {
+        Self::from_vl_in(v, &HashMap::new())
+    }
+
+    /// Convert with a type-parameter environment: `Param(name)` looks up
+    /// `env`, and an unbound name becomes [`Ty::Error`] (the caller reports;
+    /// declaration positions are already validated by the parser).
+    pub fn from_vl_in(v: &VlType, env: &HashMap<String, Ty>) -> Self {
         match v {
             VlType::U64 => Ty::U64,
             VlType::I64 => Ty::I64,
@@ -63,9 +78,61 @@ impl Ty {
             VlType::U8 => Ty::U8,
             VlType::String => Ty::String,
             VlType::File => Ty::File,
-            VlType::U64Array => Ty::U64Array,
+            VlType::Array(elem) => Ty::Array(Box::new(Self::from_vl_in(elem, env))),
+            VlType::Param(name) => env.get(name).cloned().unwrap_or(Ty::Error),
             VlType::Void => Ty::Void,
         }
+    }
+
+    /// Fully concrete (no `Param` inside)? Only concrete types reach LIR.
+    pub fn is_concrete(&self) -> bool {
+        match self {
+            Ty::Array(elem) => elem.is_concrete(),
+            Ty::Param(_) | Ty::Error => false,
+            _ => true,
+        }
+    }
+
+    /// Element type for `Array[T]`; `None` for everything else.
+    pub fn array_elem(&self) -> Option<&Ty> {
+        match self {
+            Ty::Array(elem) => Some(elem),
+            _ => None,
+        }
+    }
+}
+
+/// Substitute type parameters via `env` (`Param(name)` -> mapped type).
+/// Names with no entry survive untouched (outer-scope parameters while
+/// checking a generic body).
+pub fn subst_ty(ty: &Ty, env: &HashMap<String, Ty>) -> Ty {
+    match ty {
+        Ty::Array(elem) => Ty::Array(Box::new(subst_ty(elem, env))),
+        Ty::Param(name) => env.get(name).cloned().unwrap_or(Ty::Param(name.clone())),
+        _ => ty.clone(),
+    }
+}
+
+/// Mangled instance name: `first$u64`, `get$Array_string`. `$` is not lexable
+/// in VL source, so instances can never collide with user-written names.
+pub fn mangle(name: &str, args: &[Ty]) -> String {
+    let parts: Vec<String> = args.iter().map(mangle_ty).collect();
+    format!("{name}${}", parts.join("_"))
+}
+
+fn mangle_ty(ty: &Ty) -> String {
+    match ty {
+        Ty::U64 => "u64".into(),
+        Ty::I64 => "i64".into(),
+        Ty::F64 => "f64".into(),
+        Ty::Bool => "bool".into(),
+        Ty::U8 => "u8".into(),
+        Ty::String => "string".into(),
+        Ty::File => "File".into(),
+        Ty::Array(elem) => format!("Array_{}", mangle_ty(elem)),
+        Ty::Param(name) => name.clone(),
+        Ty::Void => "void".into(),
+        Ty::Error => "error".into(),
     }
 }
 
@@ -75,6 +142,35 @@ pub struct FuncSigTy {
     pub param_names: Vec<String>,
     pub param_tys: Vec<Ty>,
     pub ret: Ty,
+    /// Declared type parameters (`[]` when monomorphic).
+    pub type_params: Vec<String>,
+}
+
+impl FuncSigTy {
+    /// Substitute concrete type arguments for the declared parameters.
+    pub fn instantiate(&self, args: &[Ty]) -> (Vec<Ty>, Ty) {
+        let env: HashMap<String, Ty> = self
+            .type_params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect();
+        (
+            self.param_tys.iter().map(|t| subst_ty(t, &env)).collect(),
+            subst_ty(&self.ret, &env),
+        )
+    }
+}
+
+/// One monomorphized instance of a generic function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Instance {
+    /// `DefId.0` of the generic template.
+    pub orig: u32,
+    /// Concrete type arguments.
+    pub args: Vec<Ty>,
+    /// Specialized signature (no `Param` inside).
+    pub sig: FuncSigTy,
 }
 
 /// HIR node id -> inferred type.
@@ -89,11 +185,21 @@ pub struct TypedProgram {
     pub func_defs: std::collections::HashSet<u32>,
     /// Function `DefId.0` -> declared signature (param + return types).
     pub func_sigs: HashMap<u32, FuncSigTy>,
+    /// Monomorphic call site (`HirId.0`) -> mangled instance name.
+    /// Only calls in non-generic code land here; calls inside generic
+    /// templates resolve per-instance in [`TypedProgram::inst_calls`].
+    pub root_calls: HashMap<u32, String>,
+    /// `(outer instance, call site)` -> mangled callee. Discovered by the
+    /// monomorphization worklist, which substitutes each outer instance's
+    /// arguments before resolving inner calls.
+    pub inst_calls: HashMap<(String, u32), String>,
+    /// Mangled name -> concrete instance (signature + template link).
+    pub instances: HashMap<String, Instance>,
 }
 
 impl TypedProgram {
     pub fn type_of_id(&self, id: vl_hir::HirId) -> Option<Ty> {
-        self.types.get(&id.0).copied()
+        self.types.get(&id.0).cloned()
     }
 
     pub fn sig_of(&self, def: u32) -> Option<&FuncSigTy> {
@@ -112,6 +218,9 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
         fn_ret_span: None,
         fn_span: Span::empty(0),
         saw_value_return: false,
+        type_env: HashMap::new(),
+        prog,
+        pending_instances: Vec::new(),
     };
     // Pass 1: collect function signatures so calls resolve arity + types
     // regardless of definition order (matches the resolver pre-pass).
@@ -119,6 +228,7 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
         if let HirItem::Fn {
             def: Some(d),
             params,
+            type_params,
             ret,
             ..
         } = item
@@ -127,11 +237,24 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
                 .iter()
                 .map(|(n, _, _, _)| n.clone())
                 .collect::<Vec<_>>();
+            // Signatures are stored generic (`Param` inside): each call site
+            // substitutes its own type arguments.
+            let env: HashMap<String, Ty> = type_params
+                .iter()
+                .map(|n| (n.clone(), Ty::Param(n.clone())))
+                .collect();
             let param_tys = params
                 .iter()
-                .map(|(_, _, t, _)| t.map(Ty::from_vl).unwrap_or(Ty::Error))
+                .map(|(_, _, t, _)| {
+                    t.as_ref()
+                        .map(|v| Ty::from_vl_in(v, &env))
+                        .unwrap_or(Ty::Error)
+                })
                 .collect::<Vec<_>>();
-            let ret_ty = ret.map(Ty::from_vl).unwrap_or(Ty::Error);
+            let ret_ty = ret
+                .as_ref()
+                .map(|v| Ty::from_vl_in(v, &env))
+                .unwrap_or(Ty::Error);
             cx.typed.func_defs.insert(d.0);
             cx.typed.func_arity.insert(d.0, params.len());
             cx.typed.func_sigs.insert(
@@ -140,6 +263,7 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
                     param_names,
                     param_tys,
                     ret: ret_ty,
+                    type_params: type_params.clone(),
                 },
             );
         }
@@ -147,10 +271,11 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
     for item in &prog.items {
         cx.check_item(item);
     }
+    cx.monomorphize();
     (cx.typed, cx.diags)
 }
 
-struct Checker {
+struct Checker<'a> {
     typed: TypedProgram,
     diags: Vec<Diagnostic>,
     bindings: HashMap<u32, Ty>,
@@ -160,11 +285,17 @@ struct Checker {
     fn_ret_span: Option<Span>,
     fn_span: Span,
     saw_value_return: bool,
+    /// Current function's type parameters mapped to opaque `Param` types
+    /// (empty while checking monomorphic code).
+    type_env: HashMap<String, Ty>,
+    prog: &'a HirProgram,
+    /// Concrete `(template DefId.0, args)` pairs awaiting worklist expansion.
+    pending_instances: Vec<(u32, Vec<Ty>)>,
 }
 
-impl Checker {
+impl<'a> Checker<'a> {
     fn record(&mut self, id: vl_hir::HirId, ty: Ty) -> Ty {
-        self.typed.types.insert(id.0, ty);
+        self.typed.types.insert(id.0, ty.clone());
         ty
     }
 
@@ -186,7 +317,7 @@ impl Checker {
                     }
                     return;
                 }
-                self.record(*id, ty);
+                self.record(*id, ty.clone());
                 if let Some(def) = def {
                     self.bindings.insert(def.0, ty);
                     self.typed.globals.push(format!("let#{}", id.0));
@@ -198,14 +329,34 @@ impl Checker {
                 id,
                 def,
                 name,
+                type_params,
                 params,
                 ret,
                 ret_span,
                 body,
                 span,
             } => {
-                let ret_ty = ret.map(Ty::from_vl).unwrap_or(Ty::Error);
-                self.record(*id, ret_ty);
+                if name == "main" && !type_params.is_empty() {
+                    // The entrypoint is concrete by definition; LIR never
+                    // emits uninstantiated templates, so a generic `main`
+                    // would silently drop the program entrypoint.
+                    self.diags.push(
+                        Diagnostic::error("`main` must not declare type parameters")
+                            .with_label(*span, "entrypoint declared here")
+                            .with_code("E401"),
+                    );
+                }
+                // Each type parameter checks opaquely as `Param(name)`; calls
+                // substitute their own arguments per site.
+                self.type_env = type_params
+                    .iter()
+                    .map(|n| (n.clone(), Ty::Param(n.clone())))
+                    .collect();
+                let ret_ty = ret
+                    .as_ref()
+                    .map(|v| Ty::from_vl_in(v, &self.type_env))
+                    .unwrap_or(Ty::Error);
+                self.record(*id, ret_ty.clone());
                 // Bad annotations were already reported by the parser
                 // (E104/E105); poison the scope quietly so no second error
                 // cascades. (An omitted return parses as `void`, never `None`.)
@@ -213,14 +364,17 @@ impl Checker {
                     ret_ty == Ty::Error || params.iter().any(|(_, _, t, _)| t.is_none());
                 for (_, def, ty, _) in params {
                     if let Some(def) = def {
-                        let t = ty.map(Ty::from_vl).unwrap_or(Ty::Error);
+                        let t = ty
+                            .as_ref()
+                            .map(|v| Ty::from_vl_in(v, &self.type_env))
+                            .unwrap_or(Ty::Error);
                         self.bindings.insert(def.0, t);
                     }
                 }
                 // Explicit returns only: the body's tail value is discarded.
                 // Track `return expr;` statements (including inside `if` /
                 // `while`) to enforce the declared return type.
-                self.fn_ret = ret_ty;
+                self.fn_ret = ret_ty.clone();
                 self.fn_name = name.clone();
                 self.fn_ret_span = *ret_span;
                 self.fn_span = *span;
@@ -228,6 +382,7 @@ impl Checker {
                 for stmt in body {
                     self.check_stmt(stmt);
                 }
+                self.type_env.clear();
                 if poisoned_sig {
                     return;
                 }
@@ -274,7 +429,7 @@ impl Checker {
                     }
                     return;
                 }
-                self.record(*id, ty);
+                self.record(*id, ty.clone());
                 if let Some(def) = def {
                     self.bindings.insert(def.0, ty);
                 }
@@ -350,7 +505,7 @@ impl Checker {
                     self.record(*id, Ty::Error);
                     return;
                 }
-                match self.bindings.get(&def.0).copied() {
+                match self.bindings.get(&def.0).cloned() {
                     None => {
                         self.diags.push(
                             Diagnostic::error("cannot assign before the binding type is known")
@@ -402,15 +557,15 @@ impl Checker {
                     self.record(*id, Ty::Error);
                     return;
                 }
-                if at != Ty::U64Array {
+                let Some(elem) = at.array_elem().cloned() else {
                     self.diags.push(
                         Diagnostic::error(format!("cannot index `{at}`"))
-                            .with_label(array.span(), "only `U64Array` supports indexing")
+                            .with_label(array.span(), "only `Array[T]` supports indexing")
                             .with_code("E302"),
                     );
                     self.record(*id, Ty::Error);
                     return;
-                }
+                };
                 if it != Ty::U64 {
                     self.diags.push(
                         Diagnostic::error(format!("array index must be `u64`, got `{it}`"))
@@ -420,18 +575,18 @@ impl Checker {
                     self.record(*id, Ty::Error);
                     return;
                 }
-                if vt != Ty::U64 {
+                if vt != elem {
                     self.diags.push(
                         Diagnostic::error(format!(
-                            "cannot store `{vt}` in a `U64Array` (elements are `u64`)"
+                            "cannot store `{vt}` in `{at}` (elements are `{elem}`)"
                         ))
-                        .with_label(value.span(), "expected `u64` here")
+                        .with_label(value.span(), format!("expected `{elem}` here"))
                         .with_code("E302"),
                     );
                     self.record(*id, Ty::Error);
                     return;
                 }
-                self.record(*id, Ty::U64);
+                self.record(*id, elem);
             }
             HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
             HirStmt::While {
@@ -485,10 +640,10 @@ impl Checker {
         args: &[HirExpr],
         arg_tys: &[Ty],
         params: &[vl_common::ParamSig],
-        ret_vl: VlType,
+        ret_vl: &VlType,
         id: vl_hir::HirId,
     ) -> Ty {
-        let ret = Ty::from_vl(ret_vl);
+        let ret = Ty::from_vl_in(ret_vl, &self.type_env);
         if args.len() != params.len() {
             self.diags.push(
                 Diagnostic::error(format!(
@@ -502,14 +657,18 @@ impl Checker {
             return self.record(id, Ty::Error);
         }
         // Poisoned annotations stay quiet (root cause already reported).
-        if params.iter().any(|p| Ty::from_vl(p.ty) == Ty::Error) || ret == Ty::Error {
+        if params
+            .iter()
+            .any(|p| Ty::from_vl_in(&p.ty, &self.type_env) == Ty::Error)
+            || ret == Ty::Error
+        {
             return self.record(id, Ty::Error);
         }
         for (i, (arg, got)) in args.iter().zip(arg_tys.iter()).enumerate() {
             if *got == Ty::Error {
                 continue;
             }
-            let want = Ty::from_vl(params[i].ty);
+            let want = Ty::from_vl_in(&params[i].ty, &self.type_env);
             if *got == Ty::Void || want == Ty::Void {
                 self.diags.push(
                     Diagnostic::error(format!(
@@ -536,33 +695,423 @@ impl Checker {
         self.record(id, ret)
     }
 
+    /// Convert one explicit type argument with unbound-name reporting.
+    /// (Declaration positions are parser-validated; turbofish arguments in
+    /// expression position parse permissively and land here.)
+    fn vl_to_ty_reported(&mut self, v: &VlType, span: Span) -> Ty {
+        let ty = Ty::from_vl_in(v, &self.type_env);
+        if ty == Ty::Error {
+            // from_vl_in only fails on unbound `Param` (void-in-Array is a
+            // parser error; everything else converts).
+            if let VlType::Param(name) = v {
+                self.diags.push(
+                    Diagnostic::error(format!("unknown type `{name}`"))
+                        .with_label(span, "no type parameter with this name is in scope")
+                        .with_note(
+                            "declare it on the function (`function f[T]`) or use a concrete type",
+                        )
+                        .with_code("E105"),
+                );
+            } else if let VlType::Array(_) = v {
+                // An unbound parameter nested inside `Array[...]`.
+                self.diags.push(
+                    Diagnostic::error(format!("unknown type `{v}`"))
+                        .with_label(span, "no type parameter with this name is in scope")
+                        .with_note(
+                            "declare it on the function (`function f[T]`) or use a concrete type",
+                        )
+                        .with_code("E105"),
+                );
+            }
+        }
+        ty
+    }
+
+    /// Resolve a call's type arguments to `Ty`s. Explicit (`::[T]`) converts
+    /// directly; omitted ones infer from the value arguments. Returns `None`
+    /// (after reporting) when resolution fails.
+    fn resolve_type_args(
+        &mut self,
+        name: &str,
+        span: Span,
+        sig: &FuncSigTy,
+        type_args: &[VlType],
+        arg_tys: &[Ty],
+    ) -> Option<Vec<Ty>> {
+        if sig.type_params.is_empty() {
+            if !type_args.is_empty() {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "`{name}` is not generic but got {} type argument(s)",
+                        type_args.len()
+                    ))
+                    .with_label(span, "remove the `::[...]`")
+                    .with_code("E303"),
+                );
+                return None;
+            }
+            return Some(Vec::new());
+        }
+        if !type_args.is_empty() {
+            if type_args.len() != sig.type_params.len() {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "`{name}` expects {} type argument(s), got {}",
+                        sig.type_params.len(),
+                        type_args.len()
+                    ))
+                    .with_label(span, "wrong number of type arguments")
+                    .with_code("E303"),
+                );
+                return None;
+            }
+            let mut out = Vec::with_capacity(type_args.len());
+            for v in type_args {
+                let t = self.vl_to_ty_reported(v, span);
+                if t == Ty::Error {
+                    return None;
+                }
+                if t == Ty::Void {
+                    self.diags.push(
+                        Diagnostic::error("type argument cannot be `void`")
+                            .with_label(span, "`void` is not a value type")
+                            .with_code("E308"),
+                    );
+                    return None;
+                }
+                out.push(t);
+            }
+            return Some(out);
+        }
+        self.infer_type_args(name, span, sig, arg_tys)
+    }
+
+    /// Infer omitted type arguments by unifying formal parameter types
+    /// against actual argument types.
+    fn infer_type_args(
+        &mut self,
+        name: &str,
+        span: Span,
+        sig: &FuncSigTy,
+        arg_tys: &[Ty],
+    ) -> Option<Vec<Ty>> {
+        let mut binds: HashMap<String, Ty> = HashMap::new();
+        for (formal, actual) in sig.param_tys.iter().zip(arg_tys.iter()) {
+            if *actual == Ty::Error {
+                continue;
+            }
+            if !Self::unify(formal, actual, &mut binds, name, span, &mut self.diags) {
+                return None;
+            }
+        }
+        let mut out = Vec::with_capacity(sig.type_params.len());
+        for p in &sig.type_params {
+            match binds.remove(p) {
+                Some(t) => out.push(t),
+                None => {
+                    self.diags.push(
+                        Diagnostic::error(format!("cannot infer type argument `{p}` for `{name}`"))
+                            .with_label(span, "pass it explicitly: `::[...]`")
+                            .with_note(format!("write `{name}::[{p}](...)` with a concrete type"))
+                            .with_code("E303"),
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Unify one formal parameter type against an actual argument type,
+    /// recording `Param` bindings. Reports exactly one diagnostic on
+    /// conflict and returns false.
+    fn unify(
+        formal: &Ty,
+        actual: &Ty,
+        binds: &mut HashMap<String, Ty>,
+        name: &str,
+        span: Span,
+        diags: &mut Vec<Diagnostic>,
+    ) -> bool {
+        match (formal, actual) {
+            (Ty::Param(p), t) => {
+                if let Some(bound) = binds.get(p) {
+                    if bound != t {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "`{name}` infers conflicting types for `{p}`: `{bound}` vs `{t}`"
+                            ))
+                            .with_label(span, "conflicting arguments here")
+                            .with_code("E306"),
+                        );
+                        return false;
+                    }
+                    true
+                } else {
+                    binds.insert(p.clone(), t.clone());
+                    true
+                }
+            }
+            (Ty::Array(f), Ty::Array(a)) => Self::unify(f, a, binds, name, span, diags),
+            (f, a) => {
+                if f != a {
+                    diags.push(
+                        Diagnostic::error(format!("`{name}` expects `{f}`, got `{a}`"))
+                            .with_label(span, format!("expected `{f}` here"))
+                            .with_code("E306"),
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+        }
+    }
+
+    /// `Array.new::[T](count)`: one `u64` argument, returns `Array[T]`.
+    /// (Arity of the type argument itself is enforced by `vl-semantic`.)
+    fn check_array_new(
+        &mut self,
+        name: &str,
+        span: Span,
+        type_args: &[VlType],
+        args: &[HirExpr],
+        arg_tys: &[Ty],
+        id: vl_hir::HirId,
+    ) -> Ty {
+        let [elem_vl] = type_args else {
+            // E303 already reported by vl-semantic; stay quiet.
+            return self.record(id, Ty::Error);
+        };
+        let elem = self.vl_to_ty_reported(elem_vl, span);
+        if elem == Ty::Error {
+            return self.record(id, Ty::Error);
+        }
+        if elem == Ty::Void {
+            self.diags.push(
+                Diagnostic::error("type argument cannot be `void`")
+                    .with_label(span, "`void` is not a value type")
+                    .with_code("E308"),
+            );
+            return self.record(id, Ty::Error);
+        }
+        if args.len() != 1 {
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "`{name}` expects 1 argument(s), got {}",
+                    args.len()
+                ))
+                .with_label(span, "wrong number of arguments")
+                .with_code("E303"),
+            );
+            return self.record(id, Ty::Error);
+        }
+        if arg_tys[0] != Ty::Error && arg_tys[0] != Ty::U64 {
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "`{name}` parameter `count` expects `u64`, got `{}`",
+                    arg_tys[0]
+                ))
+                .with_label(args[0].span(), "expected `u64` here")
+                .with_code("E306"),
+            );
+            return self.record(id, Ty::Error);
+        }
+        self.record(id, Ty::Array(Box::new(elem)))
+    }
+
+    /// Drain [`Checker::pending_instances`](Self::pending_instances):
+    /// for every concrete call discovered while checking, substitute the
+    /// template's type arguments and resolve the calls inside its body, so
+    /// generic-to-generic forwarding (`wrap[T]` calling `id::[T]`) lands on
+    /// concrete instances too. LIR emits one function per entry of
+    /// [`TypedProgram::instances`].
+    fn monomorphize(&mut self) {
+        let mut visited: HashSet<String> = HashSet::new();
+        while let Some((def, args)) = self.pending_instances.pop() {
+            let Some(sig) = self.typed.func_sigs.get(&def).cloned() else {
+                continue;
+            };
+            let Some(name) = self.instance_name(def) else {
+                continue;
+            };
+            let mangled = mangle(&name, &args);
+            if !visited.insert(mangled.clone()) {
+                continue;
+            }
+            let (param_tys, ret_ty) = sig.instantiate(&args);
+            self.typed.instances.insert(
+                mangled.clone(),
+                Instance {
+                    orig: def,
+                    args: args.clone(),
+                    sig: FuncSigTy {
+                        param_names: sig.param_names.clone(),
+                        param_tys,
+                        ret: ret_ty,
+                        type_params: Vec::new(),
+                    },
+                },
+            );
+            // Resolve the calls inside this instance's body under its
+            // substitution environment.
+            let env: HashMap<String, Ty> = sig
+                .type_params
+                .iter()
+                .cloned()
+                .zip(args.iter().cloned())
+                .collect();
+            let calls = calls_in_item(self.prog, &self.typed, def);
+            for (call_id, callee_def, type_args, actual_tys) in calls {
+                let Some(inner) = self.typed.func_sigs.get(&callee_def).cloned() else {
+                    continue;
+                };
+                if inner.type_params.is_empty() {
+                    continue;
+                }
+                // Substitute first: formals, explicit args, and the recorded
+                // (generic) actual types all live in template space.
+                let actuals: Vec<Ty> = actual_tys.iter().map(|t| subst_ty(t, &env)).collect();
+                if actuals.contains(&Ty::Error) {
+                    continue;
+                }
+                let resolved: Option<Vec<Ty>> = if type_args.is_empty() {
+                    Self::infer_quiet(&inner, &actuals)
+                } else {
+                    let mut out = Vec::with_capacity(type_args.len());
+                    let mut ok = true;
+                    for v in &type_args {
+                        // Explicit arguments name outer parameters (`T`
+                        // means the caller's `T`): substitute, and anything
+                        // still a `Param` afterwards is unbound (already
+                        // reported while checking the template).
+                        let t = Self::vl_in_instance(v, &env);
+                        if !t.is_concrete() {
+                            ok = false;
+                            break;
+                        }
+                        out.push(t);
+                    }
+                    ok.then_some(out)
+                };
+                let Some(resolved) = resolved else {
+                    continue;
+                };
+                if resolved.len() != inner.type_params.len()
+                    || !resolved.iter().all(|t| t.is_concrete())
+                {
+                    continue;
+                }
+                let Some(inner_name) = self.instance_name(callee_def) else {
+                    continue;
+                };
+                let inner_mangled = mangle(&inner_name, &resolved);
+                self.typed
+                    .inst_calls
+                    .insert((mangled.clone(), call_id), inner_mangled.clone());
+                if !self.typed.instances.contains_key(&inner_mangled)
+                    && !self
+                        .pending_instances
+                        .iter()
+                        .any(|(d, a)| *d == callee_def && *a == resolved)
+                {
+                    self.pending_instances.push((callee_def, resolved));
+                }
+            }
+        }
+    }
+
+    /// Convert an explicit type argument under an instance environment:
+    /// outer parameter names substitute, concrete types convert directly.
+    fn vl_in_instance(v: &VlType, env: &HashMap<String, Ty>) -> Ty {
+        match v {
+            VlType::Param(name) => env.get(name).cloned().unwrap_or(Ty::Param(name.clone())),
+            VlType::Array(elem) => Ty::Array(Box::new(Self::vl_in_instance(elem, env))),
+            _ => Ty::from_vl(v),
+        }
+    }
+
+    /// Quiet inference for worklist expansion (errors were already reported
+    /// while checking the template generically).
+    fn infer_quiet(sig: &FuncSigTy, actuals: &[Ty]) -> Option<Vec<Ty>> {
+        let mut binds: HashMap<String, Ty> = HashMap::new();
+        for (formal, actual) in sig.param_tys.iter().zip(actuals.iter()) {
+            if !Self::unify_quiet(formal, actual, &mut binds) {
+                return None;
+            }
+        }
+        sig.type_params
+            .iter()
+            .map(|p| binds.remove(p))
+            .collect::<Option<Vec<_>>>()
+    }
+
+    fn unify_quiet(formal: &Ty, actual: &Ty, binds: &mut HashMap<String, Ty>) -> bool {
+        match (formal, actual) {
+            (Ty::Param(p), t) => {
+                if let Some(bound) = binds.get(p) {
+                    bound == t
+                } else {
+                    binds.insert(p.clone(), t.clone());
+                    true
+                }
+            }
+            (Ty::Array(f), Ty::Array(a)) => Self::unify_quiet(f, a, binds),
+            (f, a) => f == a,
+        }
+    }
+
+    /// Template function name for a `DefId.0` (worklist helper).
+    fn instance_name(&self, def: u32) -> Option<String> {
+        self.prog.items.iter().find_map(|item| match item {
+            HirItem::Fn {
+                def: Some(d), name, ..
+            } if d.0 == def => Some(name.clone()),
+            _ => None,
+        })
+    }
+
     fn infer_expr(&mut self, expr: &HirExpr) -> Ty {
         match expr {
             HirExpr::Literal { id, value, .. } => self.record(*id, scalar_ty(*value)),
             HirExpr::String { id, .. } => self.record(*id, Ty::String),
             HirExpr::ArrayLiteral { id, elems, .. } => {
-                let mut poisoned = false;
-                for elem in elems {
+                if elems.is_empty() {
+                    // No element to infer from: point at the typed
+                    // constructor instead of guessing.
+                    self.diags.push(
+                        Diagnostic::error("cannot infer the element type of `[]`")
+                            .with_label(
+                                expr.span(),
+                                "empty array literal needs `Array.new::[T](n)`",
+                            )
+                            .with_code("E302"),
+                    );
+                    return self.record(*id, Ty::Error);
+                }
+                let first = self.infer_expr(&elems[0]);
+                let mut poisoned = first == Ty::Error;
+                for elem in &elems[1..] {
                     let t = self.infer_expr(elem);
                     if t == Ty::Error {
                         poisoned = true;
-                    } else if t != Ty::U64 {
+                    } else if !poisoned && t != first {
                         self.diags.push(
                             Diagnostic::error(format!(
-                                "array literal expects `u64` elements, got `{t}`"
+                                "array literal expects `{first}` elements, got `{t}`"
                             ))
-                            .with_label(elem.span(), "expected `u64` here")
+                            .with_label(elem.span(), format!("expected `{first}` here"))
                             .with_code("E302"),
                         );
                         poisoned = true;
                     }
                 }
-                // Empty `[]` is the length-0 `U64Array`; one bad element
-                // poisons the whole literal (single root cause, no cascade).
+                // One bad element poisons the whole literal (single root
+                // cause, no cascade).
                 if poisoned {
                     return self.record(*id, Ty::Error);
                 }
-                self.record(*id, Ty::U64Array)
+                self.record(*id, Ty::Array(Box::new(first)))
             }
             HirExpr::Index {
                 id, base, index, ..
@@ -572,14 +1121,14 @@ impl Checker {
                 if bt == Ty::Error || it == Ty::Error {
                     return self.record(*id, Ty::Error);
                 }
-                if bt != Ty::U64Array {
+                let Some(elem) = bt.array_elem().cloned() else {
                     self.diags.push(
                         Diagnostic::error(format!("cannot index `{bt}`"))
-                            .with_label(base.span(), "only `U64Array` supports indexing")
+                            .with_label(base.span(), "only `Array[T]` supports indexing")
                             .with_code("E302"),
                     );
                     return self.record(*id, Ty::Error);
-                }
+                };
                 if it != Ty::U64 {
                     self.diags.push(
                         Diagnostic::error(format!("array index must be `u64`, got `{it}`"))
@@ -588,7 +1137,7 @@ impl Checker {
                     );
                     return self.record(*id, Ty::Error);
                 }
-                self.record(*id, Ty::U64)
+                self.record(*id, elem)
             }
             HirExpr::Var { id, def, span, .. } => {
                 // Unresolved names were already reported by `vl-semantic`;
@@ -599,7 +1148,7 @@ impl Checker {
                     let def_id = def.as_ref().map(|d| d.0).expect("checked above");
                     let ty = def
                         .as_ref()
-                        .and_then(|def| self.bindings.get(&def.0).copied())
+                        .and_then(|def| self.bindings.get(&def.0).cloned())
                         .unwrap_or_else(|| {
                             if self.reported_unknown.insert(def_id) {
                                 self.diags.push(
@@ -622,6 +1171,7 @@ impl Checker {
                 external,
                 extern_sig,
                 name,
+                type_args,
                 args,
                 span,
             } => {
@@ -646,13 +1196,19 @@ impl Checker {
                     if poisoned {
                         return self.record(*id, Ty::Error);
                     }
+                    // `Array.new::[T]` carries its element type in the call,
+                    // not the catalog: resolve it here (reporting unbound
+                    // names) instead of trusting the prebuilt signature.
+                    if name == "Array.new" {
+                        return self.check_array_new(name, *span, type_args, args, &arg_tys, *id);
+                    }
                     return self.check_call_args(
                         name,
                         *span,
                         args,
                         &arg_tys,
                         &sig.params,
-                        sig.ret,
+                        &sig.ret,
                         *id,
                     );
                 }
@@ -672,11 +1228,18 @@ impl Checker {
                     // Definition already poisoned (missing annotations); quiet.
                     return self.record(*id, Ty::Error);
                 }
-                if args.len() != sig.param_tys.len() {
+                // Resolve type arguments: explicit (`::[T]`) converts with
+                // unbound-name reporting, omitted ones infer from the values.
+                let Some(resolved) = self.resolve_type_args(name, *span, &sig, type_args, &arg_tys)
+                else {
+                    return self.record(*id, Ty::Error);
+                };
+                let (param_tys, ret_ty) = sig.instantiate(&resolved);
+                if args.len() != param_tys.len() {
                     self.diags.push(
                         Diagnostic::error(format!(
                             "`{name}` expects {} argument(s), got {}",
-                            sig.param_tys.len(),
+                            param_tys.len(),
                             args.len()
                         ))
                         .with_label(*span, "wrong number of arguments")
@@ -691,8 +1254,8 @@ impl Checker {
                     if *got == Ty::Error {
                         continue;
                     }
-                    let want = sig.param_tys[i];
-                    if *got == Ty::Void || want == Ty::Void {
+                    let want = &param_tys[i];
+                    if *got == Ty::Void || *want == Ty::Void {
                         self.diags.push(
                             Diagnostic::error(format!(
                                 "`{name}` parameter `{}` cannot be `void`",
@@ -703,7 +1266,7 @@ impl Checker {
                         );
                         return self.record(*id, Ty::Error);
                     }
-                    if *got != want {
+                    if *got != *want {
                         self.diags.push(
                             Diagnostic::error(format!(
                                 "`{name}` parameter `{}` expects `{}`, got `{got}`",
@@ -715,7 +1278,20 @@ impl Checker {
                         return self.record(*id, Ty::Error);
                     }
                 }
-                self.record(*id, sig.ret)
+                // Concrete calls to generic functions monomorphize: record
+                // the instance for LIR (deferred calls inside generic bodies
+                // resolve per-instance in the worklist instead).
+                if !sig.type_params.is_empty()
+                    && resolved.iter().all(|t| t.is_concrete())
+                    && self.type_env.is_empty()
+                {
+                    let mangled = mangle(name, &resolved);
+                    self.typed.root_calls.insert(id.0, mangled.clone());
+                    if !self.typed.instances.contains_key(&mangled) {
+                        self.pending_instances.push((d.0, resolved.clone()));
+                    }
+                }
+                self.record(*id, ret_ty)
             }
             HirExpr::Unary {
                 id,
@@ -765,8 +1341,8 @@ impl Checker {
                 }
                 match op {
                     HirBinOp::Add | HirBinOp::Sub | HirBinOp::Mul | HirBinOp::Div => {
-                        if lt != rt || !is_numeric(lt) {
-                            self.diags.push(mismatch(*span, lt, rt));
+                        if lt != rt || !is_numeric(&lt) {
+                            self.diags.push(mismatch(*span, &lt, &rt));
                             return self.record(*id, Ty::Error);
                         }
                         if matches!(op, HirBinOp::Div) && is_zero_literal(rhs) {
@@ -780,15 +1356,15 @@ impl Checker {
                         self.record(*id, lt)
                     }
                     HirBinOp::Eq | HirBinOp::Ne => {
-                        if lt != rt || !is_comparable(lt) {
-                            self.diags.push(mismatch(*span, lt, rt));
+                        if lt != rt || !is_comparable(&lt) {
+                            self.diags.push(mismatch(*span, &lt, &rt));
                             return self.record(*id, Ty::Error);
                         }
                         self.record(*id, Ty::Bool)
                     }
                     HirBinOp::Lt | HirBinOp::Le | HirBinOp::Gt | HirBinOp::Ge => {
-                        if lt != rt || !is_numeric(lt) {
-                            self.diags.push(mismatch(*span, lt, rt));
+                        if lt != rt || !is_numeric(&lt) {
+                            self.diags.push(mismatch(*span, &lt, &rt));
                             return self.record(*id, Ty::Error);
                         }
                         self.record(*id, Ty::Bool)
@@ -812,10 +1388,129 @@ impl Checker {
     }
 }
 
-fn mismatch(span: Span, lt: Ty, rt: Ty) -> Diagnostic {
+fn mismatch(span: Span, lt: &Ty, rt: &Ty) -> Diagnostic {
     Diagnostic::error(format!("type mismatch: {lt} vs {rt}"))
         .with_label(span, format!("expected {lt} on both sides"))
         .with_code("E302")
+}
+
+/// Every `Call` inside one template function: `(call HirId.0, callee
+/// DefId.0, explicit type args, recorded generic actual types)`. Used by the
+/// monomorphization worklist to resolve inner calls per outer instance.
+fn calls_in_item(
+    prog: &HirProgram,
+    typed: &TypedProgram,
+    def: u32,
+) -> Vec<(u32, u32, Vec<VlType>, Vec<Ty>)> {
+    fn expr_ty(typed: &TypedProgram, e: &HirExpr) -> Ty {
+        typed.type_of_id(e.id()).unwrap_or(Ty::Error)
+    }
+    fn walk_expr(
+        typed: &TypedProgram,
+        e: &HirExpr,
+        out: &mut Vec<(u32, u32, Vec<VlType>, Vec<Ty>)>,
+    ) {
+        match e {
+            HirExpr::Call {
+                id,
+                def,
+                type_args,
+                args,
+                ..
+            } => {
+                for arg in args {
+                    walk_expr(typed, arg, out);
+                }
+                if let Some(d) = def {
+                    let actuals = args.iter().map(|a| expr_ty(typed, a)).collect();
+                    out.push((id.0, d.0, type_args.clone(), actuals));
+                }
+            }
+            HirExpr::ArrayLiteral { elems, .. } => {
+                for elem in elems {
+                    walk_expr(typed, elem, out);
+                }
+            }
+            HirExpr::Index { base, index, .. } => {
+                walk_expr(typed, base, out);
+                walk_expr(typed, index, out);
+            }
+            HirExpr::Binary { lhs, rhs, .. } => {
+                walk_expr(typed, lhs, out);
+                walk_expr(typed, rhs, out);
+            }
+            HirExpr::Unary { inner, .. } => walk_expr(typed, inner, out),
+            HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
+        }
+    }
+    fn walk_stmt(
+        typed: &TypedProgram,
+        s: &HirStmt,
+        out: &mut Vec<(u32, u32, Vec<VlType>, Vec<Ty>)>,
+    ) {
+        match s {
+            HirStmt::Let { value, .. } | HirStmt::Assign { value, .. } => {
+                walk_expr(typed, value, out)
+            }
+            HirStmt::Expr(e) => walk_expr(typed, e, out),
+            HirStmt::Return { value, .. } => {
+                if let Some(e) = value {
+                    walk_expr(typed, e, out);
+                }
+            }
+            HirStmt::IndexAssign {
+                array,
+                index,
+                value,
+                ..
+            } => {
+                walk_expr(typed, array, out);
+                walk_expr(typed, index, out);
+                walk_expr(typed, value, out);
+            }
+            HirStmt::If {
+                condition,
+                then_body,
+                else_body,
+                ..
+            } => {
+                walk_expr(typed, condition, out);
+                for s in then_body {
+                    walk_stmt(typed, s, out);
+                }
+                if let Some(body) = else_body {
+                    for s in body {
+                        walk_stmt(typed, s, out);
+                    }
+                }
+            }
+            HirStmt::While {
+                condition, body, ..
+            } => {
+                walk_expr(typed, condition, out);
+                for s in body {
+                    walk_stmt(typed, s, out);
+                }
+            }
+            HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
+        }
+    }
+    let mut out = Vec::new();
+    for item in &prog.items {
+        let HirItem::Fn {
+            def: Some(d), body, ..
+        } = item
+        else {
+            continue;
+        };
+        if d.0 != def {
+            continue;
+        }
+        for s in body {
+            walk_stmt(typed, s, &mut out);
+        }
+    }
+    out
 }
 
 fn is_zero_literal(expr: &HirExpr) -> bool {
@@ -842,11 +1537,11 @@ fn scalar_ty(value: Scalar) -> Ty {
     }
 }
 
-fn is_numeric(ty: Ty) -> bool {
+fn is_numeric(ty: &Ty) -> bool {
     matches!(ty, Ty::U64 | Ty::I64 | Ty::F64 | Ty::U8)
 }
 
-fn is_comparable(ty: Ty) -> bool {
+fn is_comparable(ty: &Ty) -> bool {
     matches!(
         ty,
         Ty::U64 | Ty::I64 | Ty::F64 | Ty::Bool | Ty::U8 | Ty::String
@@ -868,25 +1563,75 @@ mod tests {
     #[test]
     fn arrays_check_clean() {
         let (_, diags) = check_src(
-            "function sum(a: U64Array): u64 { return a[0u64]; } function main() { let a = U64Array.new(3u64); a[0u64] = 1u64; let b = [1u64, 2u64]; let e = []; sum(a); sum(b); }",
+            "function sum(a: Array[u64]): u64 { return a[0u64]; } function main() { let a = Array.new::[u64](3u64); a[0u64] = 1u64; let b = [1u64, 2u64]; sum(a); sum(b); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
-    fn array_literal_rejects_non_u64_elements() {
+    fn array_literal_requires_uniform_elements() {
         let (_, diags) = check_src("function main() { let a = [1, 2u64]; a; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("expects `u64` elements")),
+                .any(|d| d.message.contains("expects `i64` elements")),
             "{diags:?}"
         );
     }
 
     #[test]
-    fn index_requires_u64array_and_u64() {
+    fn empty_literal_needs_the_typed_constructor() {
+        let (_, diags) = check_src("function main() { let e = []; e; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("cannot infer the element type")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn array_new_without_type_arg_is_quietly_poisoned() {
+        // vl-semantic reports E303; typecheck must not cascade.
+        let (toks, _) = vl_lex::lex("function main() { let a = Array.new(1u64); a; }");
+        let (prog, _) = vl_syntax::parse(&toks, "");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().any(|d| d.is_error()));
+        let hir = vl_hir::lower(&prog, &res);
+        let (_, tdiags) = check(&hir);
+        assert!(tdiags.is_empty(), "{tdiags:?}");
+    }
+
+    #[test]
+    fn array_new_arg_is_checked() {
+        let (_, diags) = check_src("function main() { let a = Array.new::[u64](1); a; }");
+        assert!(
+            diags.iter().any(|d| d.message.contains("expects `u64`")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn array_new_rejects_void_element() {
+        let (_, diags) = check_src("function main() { let a = Array.new::[void](1u64); a; }");
+        assert!(
+            diags.iter().any(|d| d.message.contains("cannot be `void`")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn string_arrays_check_clean() {
+        let (_, diags) = check_src(
+            "function main() { let a = Array.new::[string](2u64); let b = [\"x\", \"y\"]; b[0u64]; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn index_requires_array_and_u64() {
         let (_, diags) = check_src(r#"function main() { let s = "hi"; let x = s[0u64]; x; }"#);
         assert!(
             diags.iter().any(|d| d.message.contains("cannot index")),
@@ -904,15 +1649,6 @@ mod tests {
         let (_, diags) = check_src(r#"function main() { let a = [1u64]; a[0u64] = "s"; }"#);
         assert!(
             diags.iter().any(|d| d.message.contains("cannot store")),
-            "{diags:?}"
-        );
-    }
-
-    #[test]
-    fn u64array_new_arg_is_checked() {
-        let (_, diags) = check_src("function main() { let a = U64Array.new(1); a; }");
-        assert!(
-            diags.iter().any(|d| d.message.contains("expects `u64`")),
             "{diags:?}"
         );
     }
@@ -1158,5 +1894,118 @@ mod tests {
                 "{source}: {diags:?}"
             );
         }
+    }
+
+    #[test]
+    fn generic_identity_infers_and_specializes() {
+        let (typed, diags) = check_src(
+            "function id[T](x: T): T { return x; } function main() { let a = id(1u64); let b = id::[string](\"s\"); a; b; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.instances.contains_key("id$u64"));
+        assert!(typed.instances.contains_key("id$string"));
+        assert_eq!(typed.root_calls.len(), 2);
+        let inst = &typed.instances["id$u64"];
+        assert_eq!(inst.sig.ret, Ty::U64);
+    }
+
+    #[test]
+    fn generic_array_first_checks() {
+        let (typed, diags) = check_src(
+            "function first[T](a: Array[T]): T { return a[0u64]; } function main() { let x = first([1u64, 2u64]); x; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.instances.contains_key("first$u64"));
+    }
+
+    #[test]
+    fn inference_failure_asks_for_turbofish() {
+        let (_, diags) = check_src(
+            "function never[T](): T { let a = Array.new::[T](1u64); return a[0u64]; } function main() { never(); }",
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("cannot infer")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn conflicting_inference_is_one_error() {
+        let (_, diags) = check_src(
+            "function same[T](a: T, b: T): T { return a; } function main() { same(1u64, 2i64); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("conflicting types"), "{diags:?}");
+    }
+
+    #[test]
+    fn explicit_arity_mismatch_is_one_error() {
+        let (_, diags) = check_src(
+            "function id[T](x: T): T { return x; } function main() { id::[u64, i64](1u64); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("type argument"), "{diags:?}");
+    }
+
+    #[test]
+    fn turbofish_on_monomorphic_fn_is_an_error() {
+        let (_, diags) = check_src(
+            "function add(a: i64, b: i64): i64 { return a + b; } function main() { add::[u64](1, 2); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("not generic"), "{diags:?}");
+    }
+
+    #[test]
+    fn unbound_type_argument_is_an_error() {
+        let (_, diags) = check_src(
+            "function id[T](x: T): T { return x; } function main() { id::[Bogus](1u64); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("unknown type"), "{diags:?}");
+    }
+
+    #[test]
+    fn generic_to_generic_forwarding_monomorphizes() {
+        let (typed, diags) = check_src(
+            "function id[T](x: T): T { return x; } function wrap[T](x: T): T { return id::[T](x); } function main() { wrap(1u64); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.instances.contains_key("wrap$u64"));
+        assert!(typed.instances.contains_key("id$u64"));
+        // The inner call inside `wrap` resolves per outer instance.
+        assert_eq!(typed.inst_calls.len(), 1);
+        let ((outer, _), inner) = typed.inst_calls.iter().next().unwrap();
+        assert_eq!(outer, "wrap$u64");
+        assert_eq!(inner, "id$u64");
+    }
+
+    #[test]
+    fn generic_recursion_terminates() {
+        let (typed, diags) = check_src(
+            "function count[T](a: Array[T], n: u64): u64 { if (n == 0u64) { return 0u64; } return count(a, n - 1u64); } function main() { count([1u64], 2u64); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.instances.contains_key("count$u64"));
+    }
+
+    #[test]
+    fn wrong_value_arg_in_instance_is_an_error() {
+        let (_, diags) = check_src(
+            "function first[T](a: Array[T]): T { return a[0u64]; } function main() { first::[u64]([\"s\"]); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(
+            diags[0].message.contains("expects `Array[u64]`"),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn uninstantiated_generic_emits_no_instance() {
+        let (typed, diags) =
+            check_src("function dead[T](x: T): T { return x; } function main() { 1u64; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.instances.is_empty());
     }
 }
