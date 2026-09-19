@@ -8,20 +8,42 @@ availability: VL 0.1+
 
 # Learn VL
 
-Follow these pages in order to go from your first file to a working VL program.
-You do not need to understand the compiler architecture to get started.
+Follow these pages in order. Each one introduces a small idea, explains why it
+is useful, and gives you a complete example to change and run. You do not need
+to understand compiler architecture to get started.
 
 ## 1. Get a program running
 
 Start with [Getting started](/docs/getting-started) to set up the toolchain,
 write `hello.vl`, check it, build it, and run the result on Naravm.
 
-## 2. Learn the language
+## 2. Learn the basics
 
-The [Language guide](/docs/language) covers values, expressions, functions,
-conditionals, modules, strings, and the rules that affect everyday programs.
+Start with [Basics](/docs/basics) to learn the shape of a VL program, values,
+types, variables, operators, and comments.
 
-## 3. Use the command line
+## 3. Make decisions and repeat work
+
+[Conditions and loops](/docs/control-flow) explains `if`, `else`, `while`,
+`break`, and `continue`. These are the tools that let a program react and do
+the same work more than once.
+
+## 4. Reuse your code
+
+[Functions](/docs/functions) shows how to name work, accept inputs, return
+results, and call one function from another.
+
+## 5. Work with groups of values
+
+[Arrays and generics](/docs/arrays) introduces fixed-length arrays and the
+type parameters that let one function work with several element types.
+
+## 6. Organize a program
+
+[Modules and strings](/docs/modules) covers imports, source files, text values,
+and the standard library.
+
+## 7. Use the command line
 
 When you are ready to work with your own files, use the [CLI reference](/cli)
 to check, build, inspect, and select a target from the `vl` driver.

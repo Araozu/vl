@@ -97,7 +97,7 @@
       example: |
         let s = read(f);
   outro: |
-    `File` is a VL object type mapping to the VM `ObjectFile`. See the [language guide](/docs/language) for the type list.
+    `File` is a VL object type mapping to the VM `ObjectFile`. See [Basics](/docs/basics) for the core type list.
 
 - id: string
   order: 3
@@ -128,5 +128,5 @@
       example: |
         let n = len("hi");
   outro: |
-    VL strings are byte strings for now. See the [language guide](/docs/language)
+    VL strings are byte strings for now. See [Modules and strings](/docs/modules)
     for literal syntax and supported escapes.

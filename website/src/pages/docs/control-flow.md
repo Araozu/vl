@@ -1,0 +1,120 @@
+---
+layout: ../../layouts/Docs.astro
+title: Conditions and loops
+description: Use if statements, while loops, break, and continue to control a VL program.
+eyebrow: Learn the language
+availability: VL 0.1+
+---
+
+# Conditions and loops
+
+Programs become useful when they can make a choice or repeat a task. VL uses
+`if` for choices and `while` for repetition. Both take a boolean condition in
+parentheses.
+
+## Choosing with `if`
+
+The code in the first branch runs when the condition is `true`. An optional
+`else` branch runs when it is `false`.
+
+```vl
+use std;
+
+function main() {
+    let temperature = 25;
+
+    if (temperature > 30) {
+        std.print("hot\n");
+    } else {
+        std.print("comfortable\n");
+    }
+}
+```
+
+The condition must be a boolean expression. Comparisons such as `count < 10`
+and boolean names such as `ready` produce the values that `if` needs.
+
+You can omit braces when a branch contains one statement, but braces are often
+clearer and make it easier to add another statement later:
+
+```vl
+if (ready) std.print("go\n");
+```
+
+Several choices can be chained with `else if`:
+
+```vl
+if (score >= 90) {
+    std.print("A\n");
+} else if (score >= 80) {
+    std.print("B\n");
+} else {
+    std.print("keep practicing\n");
+}
+```
+
+The example is intentionally just the decision-making part; place it inside a
+function and define `score` before using it.
+
+## Repeating with `while`
+
+`while` runs its body, checks the condition again, and repeats while the
+condition remains true. Change something inside the loop so that it eventually
+stops.
+
+```vl
+use std;
+
+function main() {
+    let i = 1;
+    while (i <= 3) {
+        std.print_u64(i);
+        i = i + 1;
+    }
+}
+```
+
+This prints the numbers 1, 2, and 3. The assignment is important: without
+`i = i + 1`, the condition would stay true forever.
+
+## `break` and `continue`
+
+`break` leaves the nearest loop immediately. `continue` skips the rest of the
+current iteration and checks the loop condition again.
+
+```vl
+use std;
+
+function main() {
+    let i = 0;
+    while (true) {
+        i = i + 1;
+        if (i == 3) {
+            break;
+        }
+        if (i == 2) {
+            continue;
+        }
+        std.print_u64(i);
+    }
+}
+```
+
+Both keywords only make sense inside a loop. VL reports an error if they are
+used in a function that is not currently looping.
+
+## Combining conditions
+
+Use parentheses to make a complicated condition easy to read. `&&` requires
+both sides to be true; `||` requires at least one side to be true.
+
+```vl
+if (logged_in && has_permission) {
+    open_settings();
+}
+```
+
+The left side of `&&` and `||` is evaluated first. This is useful when the
+second part should only run after a first check succeeds.
+
+Continue with [functions](/docs/functions).
