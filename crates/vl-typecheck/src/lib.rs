@@ -221,7 +221,6 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
         fn_name: String::new(),
         fn_ret_span: None,
         fn_span: Span::empty(0),
-        saw_value_return: false,
         type_env: HashMap::new(),
         prog,
         pending_instances: Vec::new(),
@@ -288,7 +287,6 @@ struct Checker<'a> {
     fn_name: String,
     fn_ret_span: Option<Span>,
     fn_span: Span,
-    saw_value_return: bool,
     /// Current function's type parameters mapped to opaque `Param` types
     /// (empty while checking monomorphic code).
     type_env: HashMap<String, Ty>,
@@ -358,7 +356,7 @@ impl<'a> Checker<'a> {
                 // (E104/E105); poison the scope quietly so no second error
                 // cascades. (An omitted return parses as `void`, never `None`.)
                 let poisoned_sig =
-                    ret_ty == Ty::Error || params.iter().any(|(_, _, t, _)| t.is_none());
+                    ty_has_error(&ret_ty) || params.iter().any(|(_, _, t, _)| t.is_none());
                 for (_, def, ty, _) in params {
                     if let Some(def) = def {
                         let t = ty
@@ -369,13 +367,12 @@ impl<'a> Checker<'a> {
                     }
                 }
                 // Explicit returns only: the body's tail value is discarded.
-                // Track `return expr;` statements (including inside `if` /
-                // `while`) to enforce the declared return type.
+                // Every reachable path must return (definite-return analysis
+                // below); a bare tail value never satisfies the return type.
                 self.fn_ret = ret_ty.clone();
                 self.fn_name = name.clone();
                 self.fn_ret_span = *ret_span;
                 self.fn_span = *span;
-                self.saw_value_return = false;
                 for stmt in body {
                     self.check_stmt(stmt);
                 }
@@ -388,17 +385,22 @@ impl<'a> Checker<'a> {
                     // discarded. Any body is accepted.
                     return;
                 }
-                if !self.saw_value_return {
-                    // No `return expr;` anywhere (poisoned returns still set
-                    // the flag so a single root cause stays single).
+                if !stmts_always_return(body) {
+                    // Any `return` (even a mistyped or bare one, already
+                    // reported) counts as diverging, so this fires only when
+                    // some reachable path falls through — one root cause.
                     let anchor = ret_span.unwrap_or(*span);
+                    let mut diag = Diagnostic::error(format!(
+                        "function `{name}` declares return `{ret_ty}` but not all paths return a value"
+                    ))
+                    .with_label(anchor, "declared here");
+                    if let Some(fallthrough) = fallthrough_span(body) {
+                        diag = diag
+                            .with_label(fallthrough, "this path can fall through without `return`");
+                    }
                     self.diags.push(
-                        Diagnostic::error(format!(
-                            "function `{name}` declares return `{ret_ty}` but has no `return` statement"
-                        ))
-                        .with_label(anchor, "declared here")
-                        .with_note("add `return <expr>;` of the return type (`return;` is only for `void`)")
-                        .with_code("E307"),
+                        diag.with_note("add `return <expr>;` of the return type (`return;` is only for `void`)")
+                            .with_code("E307"),
                     );
                 }
                 let _ = def;
@@ -435,7 +437,7 @@ impl<'a> Checker<'a> {
                 let mut poisoned = false;
                 for arg in args {
                     let t = self.infer_expr(arg);
-                    if t == Ty::Error {
+                    if ty_has_error(&t) {
                         poisoned = true;
                     }
                     arg_tys.push(t);
@@ -454,10 +456,16 @@ impl<'a> Checker<'a> {
             }
         }
         let inferred = match &ann {
-            Some(a) => self.infer_expr_expected(value, a),
+            Some(a) => {
+                if ty_has_error(a) {
+                    let _ = self.infer_expr(value);
+                    return Ty::Error;
+                }
+                self.infer_expr_expected(value, a)
+            }
             None => self.infer_expr(value),
         };
-        if inferred == Ty::Error {
+        if ty_has_error(&inferred) {
             return Ty::Error;
         }
         if inferred == Ty::Void {
@@ -480,6 +488,21 @@ impl<'a> Checker<'a> {
                 );
                 return Ty::Error;
             }
+            return inferred;
+        }
+        // Unannotated `int` bindings resolve to the target's default unsigned
+        // lane (`u64`): an `int` variable must not stay compatible with every
+        // integer type, or `let v = 300; take_u8(v);` would pass.
+        if inferred == Ty::Int {
+            self.coerce_expr_literals(value, &Ty::U64);
+            let resolved = self.infer_expr(value);
+            if ty_has_error(&resolved) {
+                return Ty::Error;
+            }
+            if resolved == Ty::Int {
+                return Ty::U64;
+            }
+            return resolved;
         }
         inferred
     }
@@ -511,7 +534,9 @@ impl<'a> Checker<'a> {
                 match value {
                     None => {
                         // Bare `return;`: only valid for `void` (or poisoned).
-                        if self.fn_ret == Ty::Void || self.fn_ret == Ty::Error {
+                        // Any `return` diverges, so the missing-return check
+                        // (definite-return analysis) stays quiet — one error.
+                        if ty_has_error(&self.fn_ret) || self.fn_ret == Ty::Void {
                             return;
                         }
                         self.diags.push(
@@ -526,10 +551,9 @@ impl<'a> Checker<'a> {
                     }
                     Some(e) => {
                         let got = self.infer_expr_expected(e, &self.fn_ret.clone());
-                        // Poisoned values already reported; mark seen so the
-                        // missing-`return` check does not cascade.
-                        if got == Ty::Error || self.fn_ret == Ty::Error {
-                            self.saw_value_return = true;
+                        // Poisoned values already reported; the statement still
+                        // diverges, so the missing-`return` check stays quiet.
+                        if ty_has_error(&got) || ty_has_error(&self.fn_ret) {
                             return;
                         }
                         if self.fn_ret == Ty::Void {
@@ -555,11 +579,7 @@ impl<'a> Checker<'a> {
                                 .with_label(*span, "mismatched `return`")
                                 .with_code("E307"),
                             );
-                            // Count as seen: the mismatch is the single error.
-                            self.saw_value_return = true;
-                            return;
                         }
-                        self.saw_value_return = true;
                     }
                 }
             }
@@ -570,12 +590,19 @@ impl<'a> Checker<'a> {
                     return;
                 };
                 let expected = self.bindings.get(&def.0).cloned();
+                if let Some(ty) = expected.as_ref() {
+                    if ty_has_error(ty) {
+                        let _ = self.infer_expr(value);
+                        self.record(*id, Ty::Error);
+                        return;
+                    }
+                }
                 let got = if let Some(ty) = expected.as_ref() {
                     self.infer_expr_expected(value, ty)
                 } else {
                     self.infer_expr(value)
                 };
-                if got == Ty::Error {
+                if ty_has_error(&got) {
                     self.record(*id, Ty::Error);
                     return;
                 }
@@ -589,7 +616,7 @@ impl<'a> Checker<'a> {
                         );
                         self.record(*id, Ty::Error);
                     }
-                    Some(Ty::Error) => {
+                    Some(want) if ty_has_error(&want) => {
                         self.record(*id, Ty::Error);
                     }
                     Some(want) => {
@@ -626,7 +653,7 @@ impl<'a> Checker<'a> {
             } => {
                 let at = self.infer_expr(array);
                 let it = self.infer_expr_expected(index, &Ty::U64);
-                if at == Ty::Error || it == Ty::Error {
+                if ty_has_error(&at) || ty_has_error(&it) {
                     self.record(*id, Ty::Error);
                     return;
                 }
@@ -640,7 +667,7 @@ impl<'a> Checker<'a> {
                     return;
                 };
                 let vt = self.infer_expr_expected(value, &elem);
-                if vt == Ty::Error {
+                if ty_has_error(&vt) || ty_has_error(&elem) {
                     self.record(*id, Ty::Error);
                     return;
                 }
@@ -671,7 +698,7 @@ impl<'a> Checker<'a> {
                 condition, body, ..
             } => {
                 let condition_ty = self.infer_expr(condition);
-                if condition_ty != Ty::Error && condition_ty != Ty::Bool {
+                if !ty_has_error(&condition_ty) && condition_ty != Ty::Bool {
                     self.diags.push(
                         Diagnostic::error(format!(
                             "while condition must be bool, got {condition_ty}"
@@ -691,7 +718,7 @@ impl<'a> Checker<'a> {
                 ..
             } => {
                 let condition_ty = self.infer_expr(condition);
-                if condition_ty != Ty::Error && condition_ty != Ty::Bool {
+                if !ty_has_error(&condition_ty) && condition_ty != Ty::Bool {
                     self.diags.push(
                         Diagnostic::error(format!("if condition must be bool, got {condition_ty}"))
                             .with_label(condition.span(), "expected bool")
@@ -737,18 +764,24 @@ impl<'a> Checker<'a> {
         // Poisoned annotations stay quiet (root cause already reported).
         if params
             .iter()
-            .any(|p| Ty::from_vl_in(&p.ty, &self.type_env) == Ty::Error)
-            || ret == Ty::Error
+            .any(|p| ty_has_error(&Ty::from_vl_in(&p.ty, &self.type_env)))
+            || ty_has_error(&ret)
         {
             return self.record(id, Ty::Error);
         }
         for (i, (arg, got)) in args.iter().zip(arg_tys.iter()).enumerate() {
-            if *got == Ty::Error {
+            if ty_has_error(got) {
                 continue;
             }
             let want = Ty::from_vl_in(&params[i].ty, &self.type_env);
+            if ty_has_error(&want) {
+                continue;
+            }
             self.coerce_expr_literals(arg, &want);
             let got = self.infer_expr(arg);
+            if ty_has_error(&got) {
+                continue;
+            }
             if got == Ty::Void || want == Ty::Void {
                 self.diags.push(
                     Diagnostic::error(format!(
@@ -780,7 +813,7 @@ impl<'a> Checker<'a> {
     /// expression position parse permissively and land here.)
     fn vl_to_ty_reported(&mut self, v: &VlType, span: Span) -> Ty {
         let ty = Ty::from_vl_in(v, &self.type_env);
-        if ty == Ty::Error {
+        if ty_has_error(&ty) {
             // from_vl_in only fails on unbound `Param` (void-in-Array is a
             // parser error; everything else converts).
             if let VlType::Param(name) = v {
@@ -848,7 +881,7 @@ impl<'a> Checker<'a> {
             let mut out = Vec::with_capacity(type_args.len());
             for v in type_args {
                 let t = self.vl_to_ty_reported(v, span);
-                if t == Ty::Error {
+                if ty_has_error(&t) {
                     return None;
                 }
                 if t == Ty::Void {
@@ -877,7 +910,7 @@ impl<'a> Checker<'a> {
     ) -> Option<Vec<Ty>> {
         let mut binds: HashMap<String, Ty> = HashMap::new();
         for (formal, actual) in sig.param_tys.iter().zip(arg_tys.iter()) {
-            if *actual == Ty::Error {
+            if ty_has_error(actual) || ty_has_error(formal) {
                 continue;
             }
             if !Self::unify(formal, actual, &mut binds, name, span, &mut self.diags) {
@@ -887,7 +920,12 @@ impl<'a> Checker<'a> {
         let mut out = Vec::with_capacity(sig.type_params.len());
         for p in &sig.type_params {
             match binds.remove(p) {
-                Some(t) => out.push(t),
+                // Unconstrained `int` literals default to the target's
+                // unsigned lane: `id(300)` infers `T = u64`, so a generic
+                // result crossing a concrete integer boundary (`return
+                // id(300);` in a `u8` function) mismatches instead of
+                // silently truncating.
+                Some(t) => out.push(default_inferred_ty(t)),
                 None => {
                     self.diags.push(
                         Diagnostic::error(format!("cannot infer type argument `{p}` for `{name}`"))
@@ -915,8 +953,18 @@ impl<'a> Checker<'a> {
     ) -> bool {
         match (formal, actual) {
             (Ty::Param(p), t) => {
-                if let Some(bound) = binds.get(p) {
-                    if !types_compatible(t, bound) {
+                if let Some(bound) = binds.get(p).cloned() {
+                    // Integer literals (`int`) defer to concrete constraints
+                    // so argument order is unobservable: `same(1u64, 2)` and
+                    // `same(1, 2u64)` both infer `T = u64`.
+                    if bound == Ty::Int && is_integer(t) && *t != Ty::Int {
+                        binds.insert(p.clone(), t.clone());
+                        return true;
+                    }
+                    if *t == Ty::Int && is_integer(&bound) {
+                        return true;
+                    }
+                    if !types_compatible(t, &bound) {
                         diags.push(
                             Diagnostic::error(format!(
                                 "`{name}` infers conflicting types for `{p}`: `{bound}` vs `{t}`"
@@ -973,7 +1021,7 @@ impl<'a> Checker<'a> {
             return self.record(id, Ty::Error);
         };
         let elem = self.vl_to_ty_reported(elem_vl, span);
-        if elem == Ty::Error {
+        if ty_has_error(&elem) {
             return self.record(id, Ty::Error);
         }
         self.check_array_new_elem(name, span, elem, args, arg_tys, id)
@@ -991,7 +1039,7 @@ impl<'a> Checker<'a> {
         id: vl_hir::HirId,
     ) -> Ty {
         // Poisoned arguments stay quiet (root cause already reported).
-        if arg_tys.contains(&Ty::Error) {
+        if arg_tys.iter().any(ty_has_error) || ty_has_error(&elem) {
             return self.record(id, Ty::Error);
         }
         if elem == Ty::Void {
@@ -1013,12 +1061,12 @@ impl<'a> Checker<'a> {
             );
             return self.record(id, Ty::Error);
         }
-        if arg_tys.contains(&Ty::Error) {
+        if arg_tys.iter().any(ty_has_error) {
             return self.record(id, Ty::Error);
         }
         self.coerce_expr_literals(&args[0], &Ty::U64);
         let ct = self.typed.type_of_id(args[0].id()).unwrap_or(Ty::Error);
-        if ct == Ty::Error {
+        if ty_has_error(&ct) {
             return self.record(id, Ty::Error);
         }
         if !types_compatible(&ct, &Ty::U64) {
@@ -1050,9 +1098,29 @@ impl<'a> Checker<'a> {
                 continue;
             };
             let mangled = mangle(&name, &args);
-            if !visited.insert(mangled.clone()) {
+            // Skip duplicates before enforcing the budget: a repeated call
+            // at the valid boundary must not consume the instance allowance.
+            if visited.contains(&mangled) {
                 continue;
             }
+            // Type-expanding recursion (`grow[T]` calling `grow[[T]]>`)
+            // would otherwise create infinitely many instances. Cap the
+            // worklist with a diagnostic instead of hanging the compiler.
+            if visited.len() >= MAX_INSTANCES {
+                let span = self.fn_span_for(def);
+                self.diags.push(
+                    Diagnostic::error(
+                        "generic instantiation limit exceeded (possible polymorphic recursion)",
+                    )
+                    .with_label(span, "recursive instantiations keep growing here")
+                    .with_note(
+                        "avoid calls that wrap a type parameter in a larger type (`grow([x])`)",
+                    )
+                    .with_code("E303"),
+                );
+                break;
+            }
+            visited.insert(mangled.clone());
             let (param_tys, ret_ty) = sig.instantiate(&args);
             self.typed.instances.insert(
                 mangled.clone(),
@@ -1086,7 +1154,7 @@ impl<'a> Checker<'a> {
                 // Substitute first: formals, explicit args, and the recorded
                 // (generic) actual types all live in template space.
                 let actuals: Vec<Ty> = actual_tys.iter().map(|t| subst_ty(t, &env)).collect();
-                if actuals.contains(&Ty::Error) {
+                if actuals.iter().any(ty_has_error) {
                     continue;
                 }
                 let resolved: Option<Vec<Ty>> = if type_args.is_empty() {
@@ -1156,15 +1224,22 @@ impl<'a> Checker<'a> {
         }
         sig.type_params
             .iter()
-            .map(|p| binds.remove(p))
+            .map(|p| binds.remove(p).map(default_inferred_ty))
             .collect::<Option<Vec<_>>>()
     }
 
     fn unify_quiet(formal: &Ty, actual: &Ty, binds: &mut HashMap<String, Ty>) -> bool {
         match (formal, actual) {
             (Ty::Param(p), t) => {
-                if let Some(bound) = binds.get(p) {
-                    bound == t
+                if let Some(bound) = binds.get(p).cloned() {
+                    if bound == Ty::Int && is_integer(t) && *t != Ty::Int {
+                        binds.insert(p.clone(), t.clone());
+                        return true;
+                    }
+                    if *t == Ty::Int && is_integer(&bound) {
+                        return true;
+                    }
+                    bound == *t
                 } else {
                     binds.insert(p.clone(), t.clone());
                     true
@@ -1182,13 +1257,31 @@ impl<'a> Checker<'a> {
 
     /// Give untyped integer literals the concrete type required by a use site.
     /// Updating the recorded types here also lets LIR select the right integer
-    /// register class without adding conversion instructions.
+    /// register class without adding conversion instructions. Literals are
+    /// range-checked before recording: `let x: u8 = 300;` is an error rather
+    /// than a silent truncation.
     fn coerce_expr_literals(&mut self, expr: &HirExpr, expected: &Ty) {
         match expr {
-            HirExpr::Literal { id, value, .. }
+            HirExpr::Literal { id, value, span }
                 if matches!(value, Scalar::Int(_)) && is_integer(expected) =>
             {
-                self.record(*id, expected.clone());
+                if let Scalar::Int(v) = value {
+                    if !int_fits_in(*v, expected) {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "integer literal `{v}` out of range for `{expected}`"
+                            ))
+                            .with_label(*span, format!("expected `{expected}` here"))
+                            .with_code("E302"),
+                        );
+                        self.record(*id, Ty::Error);
+                        return;
+                    }
+                }
+                // Don't overwrite a previous range error with a good type.
+                if !matches!(self.typed.type_of_id(*id), Some(Ty::Error)) {
+                    self.record(*id, expected.clone());
+                }
             }
             HirExpr::ArrayLiteral { id, elems, .. } => {
                 if let Ty::Array(elem) = expected {
@@ -1216,9 +1309,27 @@ impl<'a> Checker<'a> {
         })
     }
 
+    /// Template function span for diagnostics (falls back to empty).
+    fn fn_span_for(&self, def: u32) -> Span {
+        self.prog
+            .items
+            .iter()
+            .find_map(|item| match item {
+                HirItem::Fn {
+                    def: Some(d), span, ..
+                } if d.0 == def => Some(*span),
+                _ => None,
+            })
+            .unwrap_or(Span::empty(0))
+    }
+
     fn infer_expr(&mut self, expr: &HirExpr) -> Ty {
         match expr {
             HirExpr::Literal { id, value, .. } => {
+                // A range error recorded by coercion stays poisoned.
+                if matches!(self.typed.type_of_id(*id), Some(Ty::Error)) {
+                    return self.record(*id, Ty::Error);
+                }
                 let ty = if matches!(value, Scalar::Int(_)) {
                     self.typed
                         .type_of_id(*id)
@@ -1236,8 +1347,8 @@ impl<'a> Checker<'a> {
                     // annotation (`let e: Array[u64] = [];`); honor it.
                     // A repeat visit after an error stays quiet.
                     match self.typed.type_of_id(*id) {
+                        Some(t) if ty_has_error(&t) => return self.record(*id, Ty::Error),
                         Some(t @ Ty::Array(_)) => return self.record(*id, t),
-                        Some(Ty::Error) => return self.record(*id, Ty::Error),
                         _ => {}
                     }
                     // No element to infer from: point at the typed
@@ -1253,10 +1364,10 @@ impl<'a> Checker<'a> {
                     return self.record(*id, Ty::Error);
                 }
                 let mut first = self.infer_expr(&elems[0]);
-                let mut poisoned = first == Ty::Error;
+                let mut poisoned = ty_has_error(&first);
                 for elem in &elems[1..] {
                     let t = self.infer_expr(elem);
-                    if t == Ty::Error {
+                    if ty_has_error(&t) {
                         poisoned = true;
                     } else if !poisoned && first == Ty::Int && is_integer(&t) {
                         self.coerce_expr_literals(&elems[0], &t);
@@ -1296,7 +1407,7 @@ impl<'a> Checker<'a> {
             } => {
                 let bt = self.infer_expr(base);
                 let it = self.infer_expr_expected(index, &Ty::U64);
-                if bt == Ty::Error || it == Ty::Error {
+                if ty_has_error(&bt) || ty_has_error(&it) {
                     return self.record(*id, Ty::Error);
                 }
                 let Some(elem) = bt.array_elem().cloned() else {
@@ -1357,7 +1468,7 @@ impl<'a> Checker<'a> {
                 let mut poisoned = false;
                 for arg in args {
                     let t = self.infer_expr(arg);
-                    if t == Ty::Error {
+                    if ty_has_error(&t) {
                         poisoned = true;
                     }
                     arg_tys.push(t);
@@ -1373,6 +1484,18 @@ impl<'a> Checker<'a> {
                     // has no prebuilt signature by design).
                     if name == "Array.new" {
                         return self.check_array_new(name, *span, type_args, args, &arg_tys, *id);
+                    }
+                    // Externs are never generic: `print::[u64]` is an error.
+                    if !type_args.is_empty() {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "`{name}` is not generic but got {} type argument(s)",
+                                type_args.len()
+                            ))
+                            .with_label(*span, "remove the `::[...]`")
+                            .with_code("E303"),
+                        );
+                        return self.record(*id, Ty::Error);
                     }
                     let Some(sig) = extern_sig else {
                         // Poisoned import (E202/E203 already reported).
@@ -1403,7 +1526,7 @@ impl<'a> Checker<'a> {
                 let Some(sig) = self.typed.func_sigs.get(&d.0).cloned() else {
                     return self.record(*id, Ty::Error);
                 };
-                if sig.ret == Ty::Error || sig.param_tys.contains(&Ty::Error) {
+                if ty_has_error(&sig.ret) || sig.param_tys.iter().any(ty_has_error) {
                     // Definition already poisoned (missing annotations); quiet.
                     return self.record(*id, Ty::Error);
                 }
@@ -1430,12 +1553,18 @@ impl<'a> Checker<'a> {
                     return self.record(*id, Ty::Error);
                 }
                 for (i, original_got) in arg_tys.iter().enumerate() {
-                    if *original_got == Ty::Error {
+                    if ty_has_error(original_got) {
                         continue;
                     }
                     let want = &param_tys[i];
+                    if ty_has_error(want) {
+                        continue;
+                    }
                     self.coerce_expr_literals(&args[i], want);
                     let got = self.infer_expr(&args[i]);
+                    if ty_has_error(&got) {
+                        continue;
+                    }
                     if got == Ty::Void || *want == Ty::Void {
                         self.diags.push(
                             Diagnostic::error(format!(
@@ -1481,7 +1610,7 @@ impl<'a> Checker<'a> {
                 span,
             } => {
                 let inner_ty = self.infer_expr(inner);
-                if inner_ty == Ty::Error {
+                if ty_has_error(&inner_ty) {
                     return self.record(*id, Ty::Error);
                 }
                 match op {
@@ -1509,7 +1638,7 @@ impl<'a> Checker<'a> {
             } => {
                 let lt = self.infer_expr(lhs);
                 let rt = self.infer_expr(rhs);
-                if lt == Ty::Error || rt == Ty::Error {
+                if ty_has_error(&lt) || ty_has_error(&rt) {
                     return self.record(*id, Ty::Error);
                 }
                 if lt == Ty::Void || rt == Ty::Void {
@@ -1529,6 +1658,9 @@ impl<'a> Checker<'a> {
                         }
                         let lt = self.infer_expr(lhs);
                         let rt = self.infer_expr(rhs);
+                        if ty_has_error(&lt) || ty_has_error(&rt) {
+                            return self.record(*id, Ty::Error);
+                        }
                         if !types_compatible(&lt, &rt) || !is_numeric(&lt) {
                             self.diags.push(mismatch(*span, &lt, &rt));
                             return self.record(*id, Ty::Error);
@@ -1551,6 +1683,9 @@ impl<'a> Checker<'a> {
                         }
                         let lt = self.infer_expr(lhs);
                         let rt = self.infer_expr(rhs);
+                        if ty_has_error(&lt) || ty_has_error(&rt) {
+                            return self.record(*id, Ty::Error);
+                        }
                         if !types_compatible(&lt, &rt) || !is_comparable(&lt) {
                             self.diags.push(mismatch(*span, &lt, &rt));
                             return self.record(*id, Ty::Error);
@@ -1565,6 +1700,9 @@ impl<'a> Checker<'a> {
                         }
                         let lt = self.infer_expr(lhs);
                         let rt = self.infer_expr(rhs);
+                        if ty_has_error(&lt) || ty_has_error(&rt) {
+                            return self.record(*id, Ty::Error);
+                        }
                         if !types_compatible(&lt, &rt) || !is_numeric(&lt) {
                             self.diags.push(mismatch(*span, &lt, &rt));
                             return self.record(*id, Ty::Error);
@@ -1743,6 +1881,100 @@ fn scalar_ty(value: Scalar) -> Ty {
 
 fn is_integer(ty: &Ty) -> bool {
     matches!(ty, Ty::Int | Ty::U64 | Ty::I64 | Ty::U8)
+}
+
+/// Recursive poison check: `Array[Error]` is just as poisoned as `Error.
+/// Direct `== Ty::Error` comparisons miss nested poison and cascade.
+fn ty_has_error(ty: &Ty) -> bool {
+    match ty {
+        Ty::Error => true,
+        Ty::Array(elem) => ty_has_error(elem),
+        _ => false,
+    }
+}
+
+/// Budget for monomorphization: type-expanding recursion creates a fresh
+/// instance per nesting level (`T`, `Array[T]`, `Array[Array[T]]`, ...).
+const MAX_INSTANCES: usize = 64;
+
+/// Does an untyped `int` literal value fit in the target integer type?
+fn int_fits_in(v: i64, expected: &Ty) -> bool {
+    match expected {
+        Ty::Int | Ty::I64 => true,
+        Ty::U64 => v >= 0,
+        Ty::U8 => (0..=255).contains(&v),
+        _ => true,
+    }
+}
+
+/// Default for inferred type arguments left as untyped `int`: the target's
+/// unsigned lane (`u64`). Keeps non-literal `Int` expressions (generic call
+/// results) from staying compatible with every integer type.
+fn default_inferred_ty(ty: Ty) -> Ty {
+    match ty {
+        Ty::Int => Ty::U64,
+        Ty::Array(elem) => Ty::Array(Box::new(default_inferred_ty(*elem))),
+        _ => ty,
+    }
+}
+
+/// Definite-return analysis: does this statement diverge (exit the function
+/// via `return`, value or bare)? `while` never counts (the body may not run);
+/// `if` counts only when both branches diverge.
+fn stmt_always_returns(stmt: &HirStmt) -> bool {
+    match stmt {
+        HirStmt::Return { .. } => true,
+        HirStmt::If {
+            then_body,
+            else_body: Some(else_body),
+            ..
+        } => stmts_always_return(then_body) && stmts_always_return(else_body),
+        _ => false,
+    }
+}
+
+fn stmts_always_return(stmts: &[HirStmt]) -> bool {
+    stmts.iter().any(stmt_always_returns)
+}
+
+/// Span of one statement (for labelling the fallthrough path).
+fn stmt_span(stmt: &HirStmt) -> Span {
+    match stmt {
+        HirStmt::Let { span, .. }
+        | HirStmt::Assign { span, .. }
+        | HirStmt::IndexAssign { span, .. }
+        | HirStmt::If { span, .. }
+        | HirStmt::While { span, .. }
+        | HirStmt::Break { span }
+        | HirStmt::Continue { span }
+        | HirStmt::Return { span, .. } => *span,
+        HirStmt::Expr(e) => e.span(),
+    }
+}
+
+/// Span of the construct that lets execution fall through: an `if` whose
+/// taken branch returns while the other path falls through, else the last
+/// statement (`None` for an empty body).
+fn fallthrough_span(body: &[HirStmt]) -> Option<Span> {
+    for stmt in body {
+        if let HirStmt::If {
+            then_body,
+            else_body,
+            span,
+            ..
+        } = stmt
+        {
+            let then_returns = stmts_always_return(then_body);
+            let else_returns = else_body
+                .as_ref()
+                .map(|body| stmts_always_return(body))
+                .unwrap_or(false);
+            if then_returns != else_returns {
+                return Some(*span);
+            }
+        }
+    }
+    body.last().map(stmt_span)
 }
 
 fn types_compatible(got: &Ty, want: &Ty) -> bool {
@@ -2066,7 +2298,9 @@ mod tests {
         // No implicit returns: a bare tail value does not satisfy `: i64`.
         let (_, diags) = check_src(r#"function f(): i64 { "s"; }"#);
         assert!(
-            diags.iter().any(|d| d.message.contains("has no `return`")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("not all paths return")),
             "{diags:?}"
         );
     }
@@ -2283,5 +2517,172 @@ mod tests {
             check_src("function dead[T](x: T): T { return x; } function main() { 1u64; }");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.is_empty());
+    }
+
+    #[test]
+    fn partial_return_path_is_an_error() {
+        // Every reachable path must return: a single `if` branch is not
+        // enough, even though a value `return` is present.
+        let (_, diags) = check_src(
+            "function f(x: bool): u64 { if (x) { return 1u64; } } function main() { f(true); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("not all paths return")),
+            "{diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| d.labels.iter().any(|l| l
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("fall through")))),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn while_body_return_does_not_satisfy() {
+        // A `while` body may never run, so its `return` never counts.
+        let (_, diags) = check_src(
+            "function f(x: bool): u64 { while (x) { return 1u64; } } function main() { f(true); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E307")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn bare_return_in_value_function_is_one_error() {
+        // The invalid bare `return` is the single error: no second
+        // missing-return diagnostic follows it.
+        let (_, diags) = check_src("function f(): i64 { return; } function main() { }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("returns nothing"), "{diags:?}");
+    }
+
+    #[test]
+    fn expanding_recursion_hits_the_instance_budget() {
+        // Type-expanding recursion must terminate with a single diagnostic,
+        // not hang the compiler. The void body keeps the return check quiet
+        // so the budget error is the one root cause.
+        let (_, diags) =
+            check_src("function grow[T](x: T) { grow([x]); } function main() { grow(1u64); }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("instantiation limit exceeded")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn nested_unknown_type_argument_is_an_error() {
+        // `Array(Error)` is poisoned: one `unknown type` error, no cascade.
+        let (_, diags) = check_src("function main() { let a = Array.new::[Array[Bogus]](1u64); }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("unknown type"), "{diags:?}");
+    }
+
+    #[test]
+    fn u8_literal_range_is_checked() {
+        let (_, diags) = check_src("function main() { let x: u8 = 300; x; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("out of range"), "{diags:?}");
+        let (_, diags) = check_src("function main() { let x: u8 = 255; x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn int_binding_does_not_escape_to_u8_param() {
+        // `let v = 300` resolves to `u64`, which must not pass a `u8`
+        // parameter even though the literal would fit neither.
+        let (_, diags) = check_src(
+            "function take(x: u8): u8 { return x; } function main() { let v = 300; take(v); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("expects `u8`"), "{diags:?}");
+    }
+
+    #[test]
+    fn generic_result_does_not_escape_to_u8() {
+        // All-literal inference defaults to `u64`, so a generic result
+        // crossing a narrower boundary mismatches instead of truncating.
+        let (typed, diags) = check_src(
+            "function id[T](x: T): T { return x; } function f(): u64 { return id(300); } function main() { f(); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.instances.contains_key("id$u64"));
+        let (_, diags) = check_src(
+            "function id[T](x: T): T { return x; } function f(): u8 { return id(300); } function main() { f(); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("declares return"), "{diags:?}");
+    }
+
+    #[test]
+    fn generic_inference_ignores_argument_order() {
+        // A literal constraint defers to a concrete one regardless of
+        // position: both orders infer `T = u64`.
+        for call in ["same(1u64, 2)", "same(1, 2u64)"] {
+            let (typed, diags) = check_src(&format!(
+                "function same[T](a: T, b: T): T {{ return a; }} function main() {{ {call}; }}"
+            ));
+            assert!(diags.is_empty(), "{call}: {diags:?}");
+            assert!(typed.instances.contains_key("same$u64"), "{call}");
+        }
+    }
+
+    #[test]
+    fn turbofish_on_extern_is_an_error() {
+        let (_, diags) = check_src("use std.print; function main() { print::[u64](\"hi\"); }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("not generic"), "{diags:?}");
+    }
+
+    /// Build a `main` calling `id` once per nesting depth `0..count`
+    /// (`1u64`, `[1u64]`, `[[1u64]]`, ...), each a distinct instance.
+    fn nested_id_calls(count: usize) -> String {
+        let mut src = String::from("function id[T](x: T): T { return x; } function main() { ");
+        for depth in 0..count {
+            src.push_str("id(");
+            for _ in 0..depth {
+                src.push('[');
+            }
+            src.push_str("1u64");
+            for _ in 0..depth {
+                src.push(']');
+            }
+            src.push_str("); ");
+        }
+        src.push('}');
+        src
+    }
+
+    #[test]
+    fn instance_limit_allows_repeated_call_at_boundary() {
+        // 64 distinct instances fill the budget; a repeated call after that
+        // is a duplicate and must not trip the limit.
+        let mut src = nested_id_calls(64);
+        src.pop();
+        src.push_str(" id(1u64); }");
+        let (typed, diags) = check_src(&src);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(typed.instances.len(), 64);
+    }
+
+    #[test]
+    fn instance_limit_rejects_the_65th_distinct_instance() {
+        let (_, diags) = check_src(&nested_id_calls(65));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("instantiation limit exceeded")),
+            "{diags:?}"
+        );
     }
 }

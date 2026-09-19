@@ -23,3 +23,57 @@ Reviewed: 2026-09-19 18:21:41 UTC-05:00 (America/Lima)
 ## Validation
 
 All 57 existing `vl-typecheck` tests passed. The findings were reproduced separately through `vl check` and LIR emission.
+
+## Fix audit — 2026-09-19 18:34:29 UTC-05:00
+
+### Original finding status
+
+1. **Verified fixed:** non-void functions now require every reachable path to return.
+2. **Core hang fixed; follow-up remains:** type-expanding recursion now stops with E303, but the limit check can reject a duplicate instance at the valid boundary.
+3. **Verified fixed:** nested `Array[Error]` poison is detected recursively and reported.
+4. **Verified fixed:** contextual integer literals are range-checked; `let x: u8 = 300;` now reports E302.
+5. **Still open:** `Ty::Int` can escape through an inferred generic call result and cross a concrete integer boundary without conversion.
+6. **Verified fixed:** mixed `int`/concrete generic constraints infer independently of argument order.
+7. **Verified fixed:** turbofish arguments on non-generic externs are rejected.
+8. **Verified fixed:** bare `return;` in a value function now emits one E307 diagnostic.
+
+### Remaining findings for handoff
+
+1. [`crates/vl-typecheck/src/lib.rs:919`](../crates/vl-typecheck/src/lib.rs#L919) — 🔴 **Bug:** All-literal generic inference still returns `Ty::Int`; `function f(): u8 { return id(300); }` checks clean and lowers a `300int` result from `id$int` as `u8`. Default unresolved inferred `Int` arguments to `u64`, or stop treating non-literal `Int` expressions as compatible with every integer type.
+
+2. [`crates/vl-typecheck/src/lib.rs:1088`](../crates/vl-typecheck/src/lib.rs#L1088) — 🔴 **Bug:** `MAX_INSTANCES` is checked before duplicate detection, so 64 distinct valid instances followed by a repeated call incorrectly emit the polymorphic-recursion error. Compute the mangled key and skip visited instances before enforcing the budget.
+
+3. [`crates/vl-typecheck/src/lib.rs:395`](../crates/vl-typecheck/src/lib.rs#L395) — 🟡 **Risk:** The new path analysis reports that a function “has no `return` statement” even when one branch visibly returns. Report that not all reachable paths return and label the fallthrough construct.
+
+4. [`crates/vl-typecheck/src/lib.rs:1934`](../crates/vl-typecheck/src/lib.rs#L1934) — 🟡 **Risk:** The 247-line fix adds no regression tests; the typechecker suite remains at 57 tests and does not catch the remaining generic-result bug or instance-limit boundary. Add focused unit tests for every original repro and both follow-up cases.
+
+### Fix-audit validation
+
+- `cargo test --workspace`: 219 passed.
+- `cargo test -p vl-typecheck`: 57 passed.
+- `cargo test -p vl-lir`: 12 passed.
+- `cargo test --test pipeline`: 44 passed.
+- All eight original repros were rerun through the rebuilt driver; seven now behave correctly, while finding 5 still accepts the invalid generic-result program.
+- Type-expanding recursion terminates with E303 within the five-second probe timeout.
+
+## Second fix audit — 2026-09-19 18:42:43 UTC-05:00
+
+### Status
+
+All eight original findings and all four findings from the first fix audit are verified fixed:
+
+- `id(300)` now infers `id$u64`; returning it from `u8` reports E307, while returning it from `u64` emits `300u64` in LIR.
+- A duplicate generic call at the 64-instance boundary checks clean; the 65th distinct instance still reports E303.
+- Partial-return diagnostics now say that not all paths return and label the fallthrough construct.
+- Twelve focused typechecker regression tests were added, bringing that suite from 57 to 69 tests.
+
+### Remaining finding for handoff
+
+1. [`crates/vl-typecheck/src/lib.rs:2572`](../crates/vl-typecheck/src/lib.rs#L2572) — 🟡 **Risk:** `expanding_recursion_hits_the_instance_budget` uses a value-returning `grow[T]` whose body already violates its declared return type, so the test emits both E307 and E303 and does not enforce the repository's single-root-error rule. Use the original void-function repro (`function grow[T](x: T) { grow([x]); }`) and assert exactly one E303 diagnostic.
+
+### Second-audit validation
+
+- `cargo test --workspace`: 231 passed.
+- `cargo test -p vl-typecheck` (as part of the workspace run): 69 passed.
+- Direct driver probes verified the generic-result rejection, `id$u64` LIR, corrected fallthrough diagnostic, and 64-instance duplicate boundary.
+- The original void expanding-recursion repro emits exactly one E303 diagnostic.

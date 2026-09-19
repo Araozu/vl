@@ -323,7 +323,8 @@ fn missing_return_is_an_error() {
 fn trailing_expr_is_not_an_implicit_return() {
     let err = frontend(r#"function f(): i64 { 1; }"#).expect_err("must fail");
     assert!(
-        err.iter().any(|d| d.message.contains("has no `return`")),
+        err.iter()
+            .any(|d| d.message.contains("not all paths return")),
         "{err:?}"
     );
 }

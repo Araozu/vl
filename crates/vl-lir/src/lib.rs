@@ -1346,15 +1346,15 @@ mod tests {
 
     #[test]
     fn local_reads_use_the_declared_value() {
-        let src = "function f(): i64 { let x = 7; return x + 1; }";
+        let src = "function f(): u64 { let x = 7; return x + 1; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
         let hir = vl_hir::lower(&prog, &res);
         let (typed, diags) = vl_typecheck::check(&hir);
-        assert!(diags.is_empty());
+        assert!(diags.is_empty(), "{diags:?}");
         let dump = lower(&hir, &typed).dump();
-        assert!(dump.contains("const 7int"), "{dump}");
+        assert!(dump.contains("const 7u64"), "{dump}");
         // Explicit `return` is the tail: no default-zero fallthrough.
         assert!(!dump.contains("const 0int"), "{dump}");
     }
@@ -1371,7 +1371,7 @@ mod tests {
         let dump = lower(&hir, &typed).dump();
         // Discarded tail still lowers, but the function epilogue is the
         // default zero (void fallthrough), not the tail value.
-        assert!(dump.contains("const 7int"), "{dump}");
+        assert!(dump.contains("const 7u64"), "{dump}");
         assert!(dump.contains("const 0int"), "{dump}");
     }
 
