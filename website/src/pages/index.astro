@@ -57,19 +57,17 @@ import Playground from '../components/Playground.svelte';
       <p class="mt-3"><a href="/docs" class="text-link hover:underline">Documentation</a></p>
       <p class="ml-6 mt-1 text-muted">Three short chapters, front to back.</p>
       <p class="mt-3"><a href="/api" class="text-link hover:underline">API reference</a></p>
-      <p class="ml-6 mt-1 text-muted">One page per crate layer, in dependency order.</p>
-      <p class="mt-3"><a href="/docs/cli" class="text-link hover:underline">CLI reference</a></p>
+      <p class="ml-6 mt-1 text-muted">The modules and functions available to VL programs.</p>
+      <p class="mt-3"><a href="/cli" class="text-link hover:underline">CLI reference</a></p>
       <p class="ml-6 mt-1 text-muted">Every subcommand of the <code class="rounded-md bg-pill px-1.5 py-0.5 font-mono text-[0.85em] text-ink">vl</code> driver.</p>
+      <p class="mt-3"><a href="/internals" class="text-link hover:underline">Compiler internals</a></p>
+      <p class="ml-6 mt-1 text-muted">The staged pipeline and the rules that keep diagnostics predictable.</p>
     </div>
 
-    <h3 class="mt-8 text-[1.15rem] font-bold text-ink">How a program travels</h3>
+    <h3 class="mt-8 text-[1.15rem] font-bold text-ink">For contributors</h3>
     <div class="mt-2">
-      <p class="mt-3 font-mono text-[0.85rem] text-ink">vl-lex, vl-syntax, vl-semantic</p>
-      <p class="ml-6 mt-1 text-muted">Text becomes tokens, tokens become a tree, names resolve. Nothing here panics on your input.</p>
-      <p class="mt-3 font-mono text-[0.85rem] text-ink">vl-hir, vl-typecheck, vl-lir</p>
-      <p class="ml-6 mt-1 text-muted">The tree is desugared, checked, and lowered to three-address code.</p>
-      <p class="mt-3 font-mono text-[0.85rem] text-ink">vl-codegen, vl driver</p>
-      <p class="ml-6 mt-1 text-muted">Backends implement one <code class="rounded-md bg-pill px-1.5 py-0.5 font-mono text-[0.85em] text-ink">Target</code> trait. The driver prints every diagnostic.</p>
+      <p class="mt-3"><a href="/internals" class="text-link hover:underline">Compiler internals</a></p>
+      <p class="ml-6 mt-1 text-muted">The staged pipeline, diagnostics, recovery rules, and target boundary.</p>
     </div>
   </section>
 </Base>

@@ -1,40 +1,36 @@
 ---
 layout: ../../layouts/Docs.astro
 title: Documentation
-description: Start here. Three short chapters cover VL v0 end to end.
-eyebrow: Collection
+description: A short, practical learning path for writing and running VL programs.
+eyebrow: Learning path
 availability: VL 0.1+
 ---
 
-# Documentation
+# Learn VL
 
-Start here. VL has typed scalar literals, arithmetic, `let`, `function`, modules, and
-`//` comments, carried through a strict staged pipeline to Naravm.
+Follow these pages in order to go from your first file to a working VL program.
+You do not need to understand the compiler architecture to get started.
 
-```text
-.vl → vl-lex → vl-syntax → vl-semantic → vl-hir → vl-typecheck → vl-lir → vl-codegen
-```
+## 1. Get a program running
 
-## Topics
+Start with [Getting started](/docs/getting-started) to set up the toolchain,
+write `hello.vl`, check it, build it, and run the result on Naravm.
 
-### Getting started
+## 2. Learn the language
 
-Install Rust and Naravm, then check, build, and run your first `.vl` file.
+The [Language guide](/docs/language) covers values, expressions, functions,
+conditionals, modules, strings, and the rules that affect everyday programs.
 
-[Getting started](/docs/getting-started)
+## 3. Use the command line
 
-### Language tour
+When you are ready to work with your own files, use the [CLI reference](/cli)
+to check, build, inspect, and select a target from the `vl` driver.
 
-The v0 surface, scoping, and why one root cause stays one error.
+## Where to go next
 
-[Language tour](/docs/language)
+- Need module and function details? See the [standard library API](/api).
+- Building an integration? See the [compiler service](/internals/compiler-service).
+- Contributing to the compiler? Read [Compiler internals](/internals).
 
-### CLI reference
-
-Every subcommand of the `vl` driver, with examples.
-
-[CLI reference](/docs/cli)
-
-## Overview
-
-Each stage gets its own chapter once the language surface settles. For the crate view, see the [API reference](/api).
+VL is currently a small, evolving language. The examples in this guide match
+the `0.1` compiler and the Naravm target.

@@ -1,14 +1,15 @@
 ---
 layout: ../../layouts/Docs.astro
-title: Language tour
-description: The v0 surface, scoping, and error promises.
+title: Language guide
+description: The values, expressions, functions, and modules in VL 0.1.
 eyebrow: Article
 availability: VL 0.1+
 ---
 
-# Language tour
+# Language guide
 
-A description of the VL surface. Values include typed scalars and byte strings.
+VL uses a small, TypeScript-like surface: declarations use `let` and
+`function`, blocks use braces, and statements end with semicolons.
 
 ```vl
 use std;
@@ -18,44 +19,61 @@ function main() {
 }
 ```
 
-## Overview
+## Values and expressions
 
-Numeric literals are `i64` by default or can use `u64`, `i64`, `f64`, and `u8`
-suffixes. Boolean literals are `true` and `false`. Numeric values support
-`+ - * /`, unary minus, and parentheses, plus double-quoted strings. Strings
-are raw bytes for now, not UTF-8 text. `let` binds a name,
-`function` takes parameters, and calls use TypeScript-style `name(args)` syntax.
-Every program must define a zero-argument `function main()`; it becomes the
-runtime entrypoint.
-`//` starts a comment that runs to the line end. Every statement ends with `;`.
+Numeric literals are `i64` by default. Add a suffix when you need `u64`, `f64`,
+or `u8`; boolean literals are `true` and `false`. Numeric values support `+`,
+`-`, `*`, `/`, unary minus, and parentheses. Calls use the familiar `name(args)`
+form.
 
 ```vl
-function add(a, b) { a + b; }
-function main() { add(1, 2); }
+let count = 255u8;
+let total = 1u64;
+let ratio = 1.5f64;
+let result = (total + 2u64) * 3u64;
 ```
 
-### Strings
+## Bindings and functions
+
+Use `let` to bind a value and `function` to name reusable work:
+
+```vl
+let greeting = "hello";
+
+function add(a, b) {
+    a + b;
+}
+
+function main() {
+    add(1, 2);
+}
+```
+
+Names must be defined before they are used, and a scope cannot define the same
+name twice. The compiler reports those problems at the source location.
+
+Every program must define a zero-argument `function main()`; it becomes the
+runtime entrypoint.
+
+## Strings
 
 Strings use double quotes only. They may contain any byte except an unescaped
-quote or a newline. The supported escapes are `\\0`, `\\n`, `\\r`, `\\t`, `\\\\`,
+quote or a newline. Supported escapes are `\\0`, `\\n`, `\\r`, `\\t`, `\\\\`,
 and `\\"`.
 
 ```vl
 let greeting = "hello\\nworld";
-let quote = "say \\\"hi\\\"";
+let quote = "say \\"hi\\"";
 ```
 
-An unterminated string is a lexical error at the line where it starts. String
-values reach LIR as byte arrays. The Naravm backend can currently lower string
-literals passed to `std.print`.
+Strings are byte strings for now rather than a full text type. See the
+[standard library API](/api) for the functions that work with them.
 
-Scopes reject two things: names nobody defined, and names defined twice. After an error the compiler marks its nodes and stays quiet downstream, so you fix causes, not echoes.
+## Conditionals
 
-### Conditionals
-
-Conditionals require parenthesized boolean conditions. Branch braces are
-optional: each branch can be one statement or a brace-delimited block. `else`
-is optional.
+Conditionals require parenthesized boolean conditions. Branch braces
+are optional: each branch can be one statement or a brace-delimited block, and
+`else` is optional.
 
 ```vl
 function main() {
@@ -74,39 +92,9 @@ For a single statement, omit the braces:
 if (ready) std.print("ready\n"); else std.print("not ready\n");
 ```
 
-## Topics
+## Modules and imports
 
-### Modules and namespaces
-
-Every `.vl` file is its own module. Its module name is the filename without the
-extension, so `reader.vl` is module `reader`. Target backends publish modules
-such as `std` and `std.fs`.
-
-Import a module with a dotted Rust-style `use`:
-
-```vl
-use std.string;
-
-function main() { string.new(); }
-```
-
-The import introduces only the final module name, not its descendants or
-exports. Use grouped imports when individual exports should be direct names:
-
-```vl
-use std.fs.{open, read};
-
-function main() { open(); read(); }
-```
-
-Unknown modules and exports are reported during name resolution. Qualified
-calls reach LIR and backend output with their full dotted path (`string.new`
-after the module import). Dots are VL syntax; Naravm receives the corresponding
-`std::...` name at code generation time.
-
-### Standard output
-
-The Naravm standard module currently exposes `print` and `print_u64`:
+Each `.vl` file can import a module with a dotted `use` path:
 
 ```vl
 use std;
@@ -116,21 +104,23 @@ function main() {
 }
 ```
 
-`std.print` takes one string and does not add an implicit newline.
+Grouped imports can bring selected exports into the current file:
 
-### The grammar, with precedence
+```vl
+use std.string.{new, len};
 
-Expressions include typed scalar and `string` literals. Arithmetic keeps its usual
-precedence, and statements and bindings require `;`.
+function main() {
+    new();
+    len();
+}
+```
 
-### Scoping rules, stated precisely
+Unknown modules and exports are reported when the file is checked. The
+available modules and functions are listed in the [standard library API](/api).
 
-Stub. Undefined names, duplicate definitions, and shadowing.
+## Current limits
 
-### Recovery and poisoning, with examples
-
-Stub. Per-item recovery and why `Ty::Error` passes through quietly.
-
-### What comes next
-
-Richer function types and a backend representation for all scalar values.
+VL 0.1 is intentionally small: strings are byte strings, the standard modules
+are limited, and Naravm is the only runnable target. Use the [CLI reference](/cli)
+for inspection commands or [Compiler internals](/internals) for implementation
+details.

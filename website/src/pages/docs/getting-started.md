@@ -1,35 +1,26 @@
 ---
 layout: ../../layouts/Docs.astro
 title: Getting started
-description: Check, build, and run a VL program on Naravm.
+description: Write, check, build, and run your first VL program.
 eyebrow: Article
 availability: VL 0.1+
 ---
 
 # Getting started
 
-The compiler currently targets Naravm. A VL executable has one required,
-zero-argument entrypoint: `function main()`.
+This guide takes you from a checkout to a running VL program. VL currently
+builds for Naravm, and every executable starts at one required, zero-argument
+entrypoint: `function main()`.
 
-```text
-vl check <file>
-```
+## Before you begin
 
-## Overview
+You need Rust stable 1.80 or newer, Cargo, and a Naravm checkout. For now, VL
+is run from the repository with Cargo rather than from a separately installed
+binary.
 
-You need Rust stable 1.80 or newer, Cargo, and a checkout of Naravm. Clone
-both repositories; the compiler lives at the workspace root.
+## Write a first program
 
-Check a program:
-
-```sh
-cargo run -- check examples/hello.vl
-```
-
-A clean program exits 0. A broken one exits 1 with an Ariadne report pointing
-at the span.
-
-The hello-world example imports the standard module and calls `std.print`:
+Create `hello.vl` with one import and one entrypoint:
 
 ```vl
 use std;
@@ -39,7 +30,23 @@ function main() {
 }
 ```
 
-Build a Naravm vmfile:
+The `std.print` call writes the string without adding another newline.
+
+## Check the source
+
+From the VL repository root, ask the compiler to validate the file:
+
+```sh
+cargo run -- check examples/hello.vl
+```
+
+A clean program exits with status 0. If the source is invalid, the command
+returns status 1 and prints an Ariadne diagnostic pointing at the relevant
+span.
+
+## Build and run it
+
+Build a Naravm vmfile with `--out`:
 
 ```sh
 cargo run -- build examples/hello.vl --out /tmp/hello.nara
@@ -52,18 +59,15 @@ zig build run -- /tmp/hello.nara
 # Hello, world!
 ```
 
-## Topics
+## If something goes wrong
 
-### Editor setup and file association
+Try `check` before `build` when you are editing a file. The diagnostic shows
+the source span and the first problem the compiler found. Fix that problem and
+run the command again; VL keeps later stages quiet when an earlier stage has
+already reported the cause.
 
-Stub. How to associate `.vl` files and where diagnostics surface.
+## Continue learning
 
-### A first program, walked line by line
-
-`hello.vl` demonstrates the required `main`, dotted VL namespaces, and the
-Naravm `std::print` native function. VL writes `std.print`; the backend maps
-that name to Naravm's double-colon namespace without changing the VM.
-
-### How to read an Ariadne diagnostic
-
-Stub. Spans, labels, and why one root cause stays one error.
+- Learn the syntax and values in the [Language guide](/docs/language).
+- See every command and inspection option in the [CLI reference](/cli).
+- Look up modules and functions in the [standard library API](/api).

@@ -1,42 +1,35 @@
 ---
 layout: ../../layouts/Docs.astro
-title: API reference
-description: One page per layer, in dependency order.
-eyebrow: Collection
+title: Standard library API
+description: The modules and functions available to VL programs.
+eyebrow: Reference
 availability: VL 0.1+
-section: api
 ---
 
-# API reference
+# Standard library API
 
-Crates depend only on the stages below them, and everything may depend on `vl-common`. Nothing depends on the driver.
+The standard library is the set of modules a VL program can import. Start with
+the [learning path](/docs) if you are new to the language, then use these pages
+to look up a module or function.
 
-## Topics
+## Modules
 
-### The driver
+### [`std`](/api/std)
 
-CLI wiring, and the only place that prints a diagnostic.
+Output functions for small command-line programs.
 
-[The driver](/api/driver)
+### [`std.fs`](/api/fs)
 
-### Frontend crates
+File-system functions recognized by the language module catalog. Target support
+is still in progress.
 
-Spans and reports, tokens, trees, and scopes.
+### [`std.string`](/api/string)
 
-[Frontend crates](/api/frontend)
+String helpers recognized by the language module catalog. Target support is
+still in progress.
 
-### Backend crates
+## Availability
 
-Desugaring, checking, three-address code, and targets.
-
-[Backend crates](/api/backend)
-
-### Compiler service
-
-The HTTP endpoint used by the interactive playground.
-
-[Compiler service](/api/compiler)
-
-## Overview
-
-Errors travel as `Vec<Diagnostic>` and only the driver renders them. Stages recover per item instead of panicking, and poisoned nodes (`Ty::Error`, no definition) pass through later stages silently.
+VL 0.1 is being implemented in stages. A function may be accepted by the
+language checker before a runnable target supports it. Each module page calls
+out the current status; `std.print` is the current Naravm example.

@@ -17,30 +17,31 @@ const availability = (fm.availability as string | undefined) ?? (Astro.props as 
 // section labels, icon rows, one selected pill, filter box pinned bottom.
 const groups = [
   {
-    label: 'Essentials',
+    label: 'Learn VL',
     items: [
-      { href: '/docs', label: 'VL updates', icon: 'doc' },
+      { href: '/docs', label: 'Learning path', icon: 'doc' },
       { href: '/docs/getting-started', label: 'Getting started', icon: 'doc' },
-      { href: '/docs/language', label: 'Adopting VL in v0 apps', icon: 'doc' },
+      { href: '/docs/language', label: 'Language guide', icon: 'doc' },
     ],
   },
   {
-    label: 'Standard Library',
+    label: 'Reference',
     items: [
-      { href: '/docs/language', label: 'Int', icon: 'S', stub: true },
-      { href: '/docs/language', label: 'Double', icon: 'S', stub: true },
-      { href: '/docs/cli', label: 'String', icon: 'S', stub: true },
-      { href: '/docs', label: 'Array', icon: 'S', stub: true },
+      { href: '/cli', label: 'CLI reference', icon: 'M' },
+      { href: '/api', label: 'Standard library', icon: 'doc' },
+      { href: '/api/std', label: 'std', icon: 'S' },
+      { href: '/api/fs', label: 'std.fs', icon: 'S' },
+      { href: '/api/string', label: 'std.string', icon: 'S' },
     ],
   },
   {
-    label: 'Compiler Reference',
+    label: 'For contributors',
     items: [
-      { href: '/api', label: 'Overview', icon: 'doc' },
-      { href: '/api/driver', label: 'The driver', icon: 'S' },
-      { href: '/api/frontend', label: 'Frontend crates', icon: 'S' },
-      { href: '/api/backend', label: 'Backend crates', icon: 'S' },
-      { href: '/docs/cli', label: 'CLI reference', icon: 'M' },
+      { href: '/internals', label: 'Compiler internals', icon: 'doc' },
+      { href: '/internals/driver', label: 'Driver', icon: 'S' },
+      { href: '/internals/frontend', label: 'Frontend crates', icon: 'S' },
+      { href: '/internals/backend', label: 'Backend crates', icon: 'S' },
+      { href: '/internals/compiler-service', label: 'Compiler service', icon: 'S' },
     ],
   },
 ];
@@ -106,8 +107,9 @@ const pathname = Astro.url.pathname;
         <a href="/docs" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">Docs</a>
         <a href="/docs/getting-started" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">Getting started</a>
         <a href="/docs/language" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">Language</a>
-        <a href="/docs/cli" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">CLI</a>
+        <a href="/cli" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">CLI</a>
         <a href="/api" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">API</a>
+        <a href="/internals" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">Internals</a>
       </nav>
 
       <!-- Content -->

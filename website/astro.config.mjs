@@ -6,6 +6,13 @@ import tailwindcss from '@tailwindcss/vite';
 // https://astro.build/config
 export default defineConfig({
   integrations: [mdx(), svelte()],
+  redirects: {
+    '/docs/cli': '/cli',
+    '/api/compiler': '/internals/compiler-service',
+    '/api/driver': '/internals/driver',
+    '/api/frontend': '/internals/frontend',
+    '/api/backend': '/internals/backend',
+  },
   vite: {
     plugins: [tailwindcss()],
   },
