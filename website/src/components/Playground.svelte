@@ -1,5 +1,5 @@
 <script lang="ts">
-  const compilerUrl = import.meta.env.PUBLIC_VLC_URL ?? 'https://vlc.nara-lang.org';
+  import { compileVl, formatCompileLines } from '../lib/vl-compile';
   let source = $state('use std.print;\n\nfunction main() {\n    print("Hello, world!\\n");\n}');
   let output = $state<string[]>(['// Naravm compiler ready — press Run']);
   let compiling = $state(false);
@@ -10,26 +10,13 @@
     artifact = null;
     output = ['// compiling on vlc.nara-lang.org…'];
     try {
-      const response = await fetch(`${compilerUrl}/v1/compile`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ source, filename: 'playground.vl' }),
-      });
-      const body = await response.json();
-      if (!response.ok || !body.ok) {
-        output = [
-          `build failed — ${body.error ?? `HTTP ${response.status}`}`,
-          ...(body.diagnostics ? body.diagnostics.split('\n') : []),
-        ];
+      const result = await compileVl(source, 'playground.vl');
+      if (!result.ok) {
+        output = formatCompileLines(result);
         return;
       }
-      const bytes = Uint8Array.from(atob(body.bytecode_base64), (char) => char.charCodeAt(0));
-      artifact = bytes;
-      output = [
-        `build ok — ${body.target}, ${bytes.byteLength} byte vmfile`,
-        'The artifact is ready for Naravm.',
-        ...(body.diagnostics ? body.diagnostics.split('\n') : []),
-      ];
+      artifact = result.bytes;
+      output = formatCompileLines(result);
     } catch (error) {
       output = [`compiler unavailable — ${error instanceof Error ? error.message : 'request failed'}`];
     } finally {

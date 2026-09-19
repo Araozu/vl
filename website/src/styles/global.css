@@ -283,6 +283,69 @@ pre.astro-code {
   color: var(--color-ink);
 }
 
+/* ---------- runnable VL snippets ---------- */
+
+/* Wrapper added client-side around every `pre[data-language="vl"]` plate.
+   The <pre> keeps its own plate styling; this only positions the button. */
+.vl-snippet {
+  position: relative;
+}
+
+/* Homepage plates own the background on the outer .code-plain div; keep the
+   snippet output inside that plate visually attached. */
+.code-plain .vl-snippet > pre.astro-code {
+  margin: 0;
+}
+
+.code-plain .vl-run-output {
+  margin: 0 1rem 1rem;
+}
+
+.vl-run-btn {
+  position: absolute;
+  top: 0.55rem;
+  right: 0.55rem;
+  font-family: var(--font-sans);
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1;
+  padding: 0.35rem 0.7rem;
+  border-radius: 999px;
+  border: 1px solid var(--color-rule);
+  background: var(--color-pill);
+  color: var(--color-ink);
+  cursor: pointer;
+  opacity: 0.85;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.vl-run-btn:hover {
+  opacity: 1;
+  background: var(--color-rule);
+}
+
+.vl-run-btn:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.vl-run-output {
+  margin-top: 0.5rem;
+  border-radius: 0.85rem;
+  background: var(--color-panel);
+  border: 1px solid var(--color-rule);
+  padding: 0.7rem 1rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.65;
+  color: var(--color-muted);
+}
+
+.vl-run-output p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* Brand mark: source art is black fill; invert on the dark surface. */
 .logo-mark {
   height: 1.35rem;
