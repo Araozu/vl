@@ -62,6 +62,14 @@ pub enum HirStmt {
         value: HirExpr,
         span: Span,
     },
+    /// Element write: `array[index] = value;`.
+    IndexAssign {
+        id: HirId,
+        array: Box<HirExpr>,
+        index: Box<HirExpr>,
+        value: Box<HirExpr>,
+        span: Span,
+    },
     If {
         condition: HirExpr,
         then_body: Vec<HirStmt>,
@@ -96,6 +104,19 @@ pub enum HirExpr {
     String {
         id: HirId,
         value: Vec<u8>,
+        span: Span,
+    },
+    /// Array literal: `[1u64, 2u64]`.
+    ArrayLiteral {
+        id: HirId,
+        elems: Vec<HirExpr>,
+        span: Span,
+    },
+    /// Element read: `array[index]`.
+    Index {
+        id: HirId,
+        base: Box<HirExpr>,
+        index: Box<HirExpr>,
         span: Span,
     },
     Var {
@@ -157,6 +178,8 @@ impl HirExpr {
         match self {
             HirExpr::Literal { id, .. }
             | HirExpr::String { id, .. }
+            | HirExpr::ArrayLiteral { id, .. }
+            | HirExpr::Index { id, .. }
             | HirExpr::Var { id, .. }
             | HirExpr::Call { id, .. }
             | HirExpr::Binary { id, .. }
@@ -168,6 +191,8 @@ impl HirExpr {
         match self {
             HirExpr::Literal { span, .. }
             | HirExpr::String { span, .. }
+            | HirExpr::ArrayLiteral { span, .. }
+            | HirExpr::Index { span, .. }
             | HirExpr::Var { span, .. }
             | HirExpr::Call { span, .. }
             | HirExpr::Binary { span, .. }
@@ -299,6 +324,18 @@ impl<'a> Lowerer<'a> {
                     span: *span,
                 }
             }
+            AstStmt::IndexAssign {
+                array,
+                index,
+                value,
+                span,
+            } => HirStmt::IndexAssign {
+                id: self.id(),
+                array: Box::new(self.lower_expr(array)),
+                index: Box::new(self.lower_expr(index)),
+                value: Box::new(self.lower_expr(value)),
+                span: *span,
+            },
             AstStmt::Expr(e) => HirStmt::Expr(self.lower_expr(e)),
             AstStmt::Return { value, span } => HirStmt::Return {
                 value: value.as_ref().map(|e| self.lower_expr(e)),
@@ -342,6 +379,17 @@ impl<'a> Lowerer<'a> {
                 id: self.id(),
                 value: value.clone(),
                 span: *s,
+            },
+            AstExpr::ArrayLiteral { elems, span } => HirExpr::ArrayLiteral {
+                id: self.id(),
+                elems: elems.iter().map(|e| self.lower_expr(e)).collect(),
+                span: *span,
+            },
+            AstExpr::Index { base, index, span } => HirExpr::Index {
+                id: self.id(),
+                base: Box::new(self.lower_expr(base)),
+                index: Box::new(self.lower_expr(index)),
+                span: *span,
             },
             AstExpr::Var { path, span: s } => HirExpr::Var {
                 id: self.id(),
@@ -454,6 +502,25 @@ mod tests {
         match &hir.items[0] {
             HirItem::Fn { body, .. } => {
                 assert!(matches!(&body[0], HirStmt::Expr(HirExpr::Unary { .. })))
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arrays_lower() {
+        let src = "function main() { let a = [1u64, 2u64]; a[0u64] = 3u64; let x = a[1u64]; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Fn { body, .. } => {
+                assert!(matches!(&body[0], HirStmt::Let { .. }));
+                assert!(matches!(&body[1], HirStmt::IndexAssign { .. }));
+                assert!(matches!(&body[2], HirStmt::Let { .. }));
             }
             other => panic!("expected fn, got {other:?}"),
         }
