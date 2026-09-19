@@ -4,6 +4,9 @@
 //! each holding [`Instr`]s over virtual [`Reg`]isters. `vl-codegen` lowers
 //! this to real targets; since the final target is still undecided, this
 //! crate must NOT grow target-specific hacks — add a new backend instead.
+//! Returns are explicit: only `return expr;` / `return;` emits [`Instr::Ret`]
+//! for a function; trailing expression values are discarded and the
+//! fallthrough epilogue returns a dummy zero (`void` backends ignore it).
 
 use std::collections::{HashMap, HashSet};
 
@@ -59,7 +62,7 @@ pub enum Instr {
         args: Vec<Reg>,
         span: Span,
     },
-    /// Tail value of a function body / global initializer.
+    /// Explicit `return` (or fallthrough / global initializer value).
     Ret {
         src: Reg,
         span: Span,
@@ -309,17 +312,25 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                     }
                 }
 
-                let mut last = None;
+                let mut topped_return = false;
                 for stmt in body {
                     match stmt {
                         HirStmt::Let { def, value, .. } => {
-                            last = l.lower_expr(value, typed);
-                            if let (Some(def), Some(reg)) = (def, last) {
-                                l.bindings.insert(def.0, reg);
+                            if let Some(reg) = l.lower_expr(value, typed) {
+                                if let Some(def) = def {
+                                    l.bindings.insert(def.0, reg);
+                                }
                             }
+                            topped_return = false;
                         }
                         HirStmt::Expr(e) => {
-                            last = l.lower_expr(e, typed);
+                            // Discarded value: no implicit return.
+                            let _ = l.lower_expr(e, typed);
+                            topped_return = false;
+                        }
+                        HirStmt::Return { value, span } => {
+                            l.lower_return(value.as_ref(), typed, *span);
+                            topped_return = true;
                         }
                         HirStmt::If {
                             condition,
@@ -328,11 +339,13 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                             span,
                         } => {
                             l.lower_if(condition, then_body, else_body.as_deref(), typed, *span);
+                            topped_return = false;
                         }
                         HirStmt::Assign {
                             def, value, span, ..
                         } => {
                             l.lower_assign(def.as_ref(), value, typed, *span);
+                            topped_return = false;
                         }
                         HirStmt::While {
                             condition,
@@ -340,32 +353,38 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                             span,
                         } => {
                             l.lower_while(condition, body, typed, *span);
+                            topped_return = false;
                         }
                         HirStmt::Break { span } => {
                             l.lower_break(*span);
+                            topped_return = false;
                         }
                         HirStmt::Continue { span } => {
                             l.lower_continue(*span);
+                            topped_return = false;
                         }
                     }
                 }
-                // Bodies always return something; default to 0.
-                let ret = match last {
-                    Some(r) => r,
-                    None => {
-                        let r = l.reg();
-                        l.instrs.push(Instr::Const {
-                            dst: r,
-                            value: Scalar::I64(0),
-                            span: Span::empty(0),
-                        });
-                        r
-                    }
-                };
-                l.instrs.push(Instr::Ret {
-                    src: ret,
-                    span: Span::empty(0),
-                });
+                // Every function ends with a `Ret` so backends always see a
+                // well-formed epilogue. Explicit `return` emits its own `Ret`
+                // inline (VM `ret` transfers control immediately, so later
+                // instructions are unreachable fallthrough); only emit the
+                // default fallthrough when the top level does not end with
+                // an unconditional `return`.
+                let ends_with_ret =
+                    topped_return && matches!(l.instrs.last(), Some(Instr::Ret { .. }));
+                if !ends_with_ret {
+                    let r = l.reg();
+                    l.instrs.push(Instr::Const {
+                        dst: r,
+                        value: Scalar::I64(0),
+                        span: Span::empty(0),
+                    });
+                    l.instrs.push(Instr::Ret {
+                        src: r,
+                        span: Span::empty(0),
+                    });
+                }
                 out.functions.push(Function {
                     name: name.clone(),
                     param_tys,
@@ -495,6 +514,9 @@ impl Lowerer {
             HirStmt::Expr(value) => {
                 let _ = self.lower_expr(value, typed);
             }
+            HirStmt::Return { value, span } => {
+                self.lower_return(value.as_ref(), typed, *span);
+            }
             HirStmt::If {
                 condition,
                 then_body,
@@ -520,6 +542,35 @@ impl Lowerer {
             }
             HirStmt::Continue { span } => {
                 self.lower_continue(*span);
+            }
+        }
+    }
+
+    /// Explicit `return`: `return expr;` moves the value into `Ret`;
+    /// bare `return;` (for `void`) returns a dummy zero — backends ignore
+    /// the payload for `void`/`main`. Poisoned values emit nothing (the
+    /// error was already reported; the fallthrough default keeps LIR
+    /// well-formed).
+    fn lower_return(
+        &mut self,
+        value: Option<&HirExpr>,
+        typed: &vl_typecheck::TypedProgram,
+        span: Span,
+    ) {
+        match value {
+            Some(e) => {
+                if let Some(r) = self.lower_expr(e, typed) {
+                    self.instrs.push(Instr::Ret { src: r, span });
+                }
+            }
+            None => {
+                let r = self.reg();
+                self.instrs.push(Instr::Const {
+                    dst: r,
+                    value: Scalar::I64(0),
+                    span,
+                });
+                self.instrs.push(Instr::Ret { src: r, span });
             }
         }
     }
@@ -898,7 +949,8 @@ mod tests {
 
     #[test]
     fn lowers_call_and_parameter_registers() {
-        let src = "function add(a: i64, b: i64): i64 { a + b; } function main() { add(1, 2); }";
+        let src =
+            "function add(a: i64, b: i64): i64 { return a + b; } function main() { add(1, 2); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -914,7 +966,7 @@ mod tests {
 
     #[test]
     fn function_signatures_carry_param_and_return_types() {
-        let src = r#"function greet(name: string, n: u64): string { name; } function main() { greet("hi", 1u64); }"#;
+        let src = r#"function greet(name: string, n: u64): string { return name; } function main() { greet("hi", 1u64); }"#;
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -947,7 +999,7 @@ mod tests {
 
     #[test]
     fn local_reads_use_the_declared_value() {
-        let src = "function main() { let x = 7; x + 1; }";
+        let src = "function f(): i64 { let x = 7; return x + 1; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -956,6 +1008,47 @@ mod tests {
         assert!(diags.is_empty());
         let dump = lower(&hir, &typed).dump();
         assert!(dump.contains("const 7i64"), "{dump}");
+        // Explicit `return` is the tail: no default-zero fallthrough.
         assert!(!dump.contains("const 0i64"), "{dump}");
+    }
+
+    #[test]
+    fn bare_tail_values_are_discarded_without_implicit_return() {
+        let src = "function main() { let x = 7; x + 1; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let dump = lower(&hir, &typed).dump();
+        // Discarded tail still lowers, but the function epilogue is the
+        // default zero (void fallthrough), not the tail value.
+        assert!(dump.contains("const 7i64"), "{dump}");
+        assert!(dump.contains("const 0i64"), "{dump}");
+    }
+
+    #[test]
+    fn explicit_return_emits_ret_and_skips_default() {
+        let src = "function f(): i64 { return 1; } function m() { return; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let lir = lower(&hir, &typed);
+        let dump = lir.dump();
+        assert!(dump.contains("ret"), "{dump}");
+        // `f` ends with its explicit return: exactly one `ret`.
+        let f = lir.functions.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(
+            f.instrs
+                .iter()
+                .filter(|i| matches!(i, Instr::Ret { .. }))
+                .count(),
+            1
+        );
     }
 }

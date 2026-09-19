@@ -3,7 +3,9 @@
 //! Differences from the AST: unary negation is lowered to `0 - x`,
 //! every node carries a [`HirId`], and variable uses carry the [`DefId`]
 //! resolved by `vl-semantic` (or `None` when resolution failed, so later
-//! stages can skip rather than cascade errors).
+//! stages can skip rather than cascade errors). Returns are explicit:
+//! only `return expr;` / `return;` yields a value; trailing expression
+//! statements are discarded values, never implicit returns.
 
 use vl_common::{Scalar, Span, VlType};
 
@@ -75,6 +77,10 @@ pub enum HirStmt {
         span: Span,
     },
     Continue {
+        span: Span,
+    },
+    Return {
+        value: Option<HirExpr>,
         span: Span,
     },
     Expr(HirExpr),
@@ -294,6 +300,10 @@ impl<'a> Lowerer<'a> {
                 }
             }
             AstStmt::Expr(e) => HirStmt::Expr(self.lower_expr(e)),
+            AstStmt::Return { value, span } => HirStmt::Return {
+                value: value.as_ref().map(|e| self.lower_expr(e)),
+                span: *span,
+            },
             AstStmt::Break { span } => HirStmt::Break { span: *span },
             AstStmt::Continue { span } => HirStmt::Continue { span: *span },
             AstStmt::While {
@@ -496,7 +506,8 @@ mod tests {
 
     #[test]
     fn call_links_callee_def() {
-        let src = "function add(a: i64, b: i64): i64 { a + b; } function main() { add(1, 2); }";
+        let src =
+            "function add(a: i64, b: i64): i64 { return a + b; } function main() { add(1, 2); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -513,6 +524,29 @@ mod tests {
                 }
                 other => panic!("expected call, got {other:?}"),
             },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn return_lowers_with_value() {
+        let src = "function f(): i64 { return 1; } function m() { return; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Fn { body, .. } => {
+                assert!(matches!(&body[0], HirStmt::Return { value: Some(_), .. }))
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+        match &hir.items[1] {
+            HirItem::Fn { body, .. } => {
+                assert!(matches!(&body[0], HirStmt::Return { value: None, .. }))
+            }
             other => panic!("expected fn, got {other:?}"),
         }
     }

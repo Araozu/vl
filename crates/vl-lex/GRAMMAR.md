@@ -28,7 +28,7 @@ The `\n` itself is then whitespace. Unterminated comment at EOF just stops.
 ## Tokens
 
 ```text
-keyword := "let" | "function" | "if" | "else"; exact match, else ident
+keyword := "let" | "function" | "if" | "else" | "while" | "break" | "continue" | "return"; exact match, else ident
 ident   := [a-zA-Z_] [a-zA-Z0-9_]* ; stored as Ident(String)
 number  := digits [ "." digits ] suffix?
 suffix  := "u64" | "i64" | "f64" | "u8"
@@ -47,6 +47,10 @@ bytes; no UTF-8 decoding is performed.
 | `function` | `Function` | `start..end` of word |
 | `if` | `If` | `start..end` of word |
 | `else` | `Else` | `start..end` of word |
+| `while` | `While` | `start..end` of word |
+| `break` | `Break` | `start..end` of word |
+| `continue` | `Continue` | `start..end` of word |
+| `return` | `Return` | `start..end` of word |
 | `[a-zA-Z_][a-zA-Z0-9_]*` | `Ident(String)` | `start..end` of word |
 | `[0-9]+` | `I64(i64)` | `start..end` of digits |
 | `[0-9]+u64` | `U64(u64)` | `start..end` |

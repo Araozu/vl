@@ -6,10 +6,12 @@
 //! VM representation, which backends map to separately.
 //!
 //! [`check`] walks the HIR, annotates each node, enforces function boundaries
-//! (param types, arity, return types, `void` misuse), checks extern calls
-//! against their catalog signatures (carried in HIR from `vl-semantic`), and
-//! quietly poisons nodes whose names failed resolution (already reported
-//! upstream, so no cascading second error).
+//! (param types, arity, explicit `return` types, `void` misuse), checks extern
+//! calls against their catalog signatures (carried in HIR from `vl-semantic`),
+//! and quietly poisons nodes whose names failed resolution (already reported
+//! upstream, so no cascading second error). There are no implicit returns:
+//! only `return expr;` satisfies a value return; bare trailing expressions
+//! are discarded.
 
 use std::collections::{HashMap, HashSet};
 
@@ -101,6 +103,11 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
         diags: vec![],
         bindings: HashMap::new(),
         reported_unknown: HashSet::new(),
+        fn_ret: Ty::Void,
+        fn_name: String::new(),
+        fn_ret_span: None,
+        fn_span: Span::empty(0),
+        saw_value_return: false,
     };
     // Pass 1: collect function signatures so calls resolve arity + types
     // regardless of definition order (matches the resolver pre-pass).
@@ -144,6 +151,11 @@ struct Checker {
     diags: Vec<Diagnostic>,
     bindings: HashMap<u32, Ty>,
     reported_unknown: HashSet<u32>,
+    fn_ret: Ty,
+    fn_name: String,
+    fn_ret_span: Option<Span>,
+    fn_span: Span,
+    saw_value_return: bool,
 }
 
 impl Checker {
@@ -201,56 +213,47 @@ impl Checker {
                         self.bindings.insert(def.0, t);
                     }
                 }
-                let mut last_ty: Option<Ty> = None;
+                // Explicit returns only: the body's tail value is discarded.
+                // Track `return expr;` statements (including inside `if` /
+                // `while`) to enforce the declared return type.
+                self.fn_ret = ret_ty;
+                self.fn_name = name.clone();
+                self.fn_ret_span = *ret_span;
+                self.fn_span = *span;
+                self.saw_value_return = false;
                 for stmt in body {
-                    if let Some(t) = self.check_stmt(stmt) {
-                        last_ty = Some(t);
-                    }
+                    self.check_stmt(stmt);
                 }
                 if poisoned_sig {
                     return;
                 }
                 if ret_ty == Ty::Void {
-                    // Value discarded; any body is accepted.
+                    // `return;` is optional; bare expression values are
+                    // discarded. Any body is accepted.
                     return;
                 }
-                match last_ty {
-                    Some(t) if t == ret_ty => {}
-                    Some(Ty::Error) => {}
-                    Some(t) => {
-                        self.diags.push(
-                            Diagnostic::error(format!(
-                                "function `{name}` declares return `{ret_ty}` but body yields `{t}`"
-                            ))
-                            .with_label(*span, "mismatched return")
-                            .with_code("E307"),
-                        );
-                    }
-                    None => {
-                        // Empty body or body ending in `if` with no tail value.
-                        // LIR defaults such bodies to `0`; require explicit `void`.
-                        let anchor = ret_span.unwrap_or(*span);
-                        self.diags.push(
-                            Diagnostic::error(format!(
-                                "function `{name}` declares return `{ret_ty}` but has no tail value"
-                            ))
-                            .with_label(anchor, "declared here")
-                            .with_note("end the body with an expression of the return type, or declare `: void`")
-                            .with_code("E307"),
-                        );
-                    }
+                if !self.saw_value_return {
+                    // No `return expr;` anywhere (poisoned returns still set
+                    // the flag so a single root cause stays single).
+                    let anchor = ret_span.unwrap_or(*span);
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "function `{name}` declares return `{ret_ty}` but has no `return` statement"
+                        ))
+                        .with_label(anchor, "declared here")
+                        .with_note("add `return <expr>;` of the return type (`return;` is only for `void`)")
+                        .with_code("E307"),
+                    );
                 }
                 let _ = def;
             }
         }
     }
 
-    /// Check a statement. Returns the tail-value type when the statement
-    /// produces one (`let` initializer / expression value); control-flow
-    /// statements (`if`, `while`, `break`, `continue`, assignment)
-    /// preserve the incoming tail (matches LIR, which leaves `last`
-    /// untouched).
-    fn check_stmt(&mut self, stmt: &HirStmt) -> Option<Ty> {
+    /// Check a statement. There are no implicit returns: `let` initializers
+    /// and bare expression values are discarded and never satisfy a declared
+    /// return type — only an explicit `return expr;` does.
+    fn check_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::Let { id, def, value, .. } => {
                 let ty = self.infer_expr(value);
@@ -265,25 +268,83 @@ impl Checker {
                     if let Some(def) = def {
                         self.bindings.insert(def.0, Ty::Error);
                     }
-                    return Some(Ty::Error);
+                    return;
                 }
                 self.record(*id, ty);
                 if let Some(def) = def {
                     self.bindings.insert(def.0, ty);
                 }
-                Some(ty)
             }
-            HirStmt::Expr(e) => Some(self.infer_expr(e)),
+            HirStmt::Expr(e) => {
+                // Value discarded; still infer for inner errors.
+                let _ = self.infer_expr(e);
+            }
+            HirStmt::Return { value, span } => {
+                match value {
+                    None => {
+                        // Bare `return;`: only valid for `void` (or poisoned).
+                        if self.fn_ret == Ty::Void || self.fn_ret == Ty::Error {
+                            return;
+                        }
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "function `{}` declares return `{}` but returns nothing",
+                                self.fn_name, self.fn_ret
+                            ))
+                            .with_label(*span, "bare `return` here")
+                            .with_note("use `return <expr>;` with a value of the return type")
+                            .with_code("E307"),
+                        );
+                    }
+                    Some(e) => {
+                        let got = self.infer_expr(e);
+                        // Poisoned values already reported; mark seen so the
+                        // missing-`return` check does not cascade.
+                        if got == Ty::Error || self.fn_ret == Ty::Error {
+                            self.saw_value_return = true;
+                            return;
+                        }
+                        if self.fn_ret == Ty::Void {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "function `{}` returns `void` but returns a value",
+                                    self.fn_name
+                                ))
+                                .with_label(*span, format!("unexpected `{got}` here"))
+                                .with_note(
+                                    "declare a return type (`: <type>`) or use bare `return;`",
+                                )
+                                .with_code("E307"),
+                            );
+                            return;
+                        }
+                        if got != self.fn_ret {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "function `{}` declares return `{}` but returns `{got}`",
+                                    self.fn_name, self.fn_ret
+                                ))
+                                .with_label(*span, "mismatched `return`")
+                                .with_code("E307"),
+                            );
+                            // Count as seen: the mismatch is the single error.
+                            self.saw_value_return = true;
+                            return;
+                        }
+                        self.saw_value_return = true;
+                    }
+                }
+            }
             HirStmt::Assign { id, def, value, .. } => {
                 let got = self.infer_expr(value);
                 let Some(def) = def else {
                     // Unresolved target already reported (E201); stay quiet.
                     self.record(*id, Ty::Error);
-                    return None;
+                    return;
                 };
                 if got == Ty::Error {
                     self.record(*id, Ty::Error);
-                    return None;
+                    return;
                 }
                 match self.bindings.get(&def.0).copied() {
                     None => {
@@ -294,11 +355,9 @@ impl Checker {
                                 .with_code("E305"),
                         );
                         self.record(*id, Ty::Error);
-                        None
                     }
                     Some(Ty::Error) => {
                         self.record(*id, Ty::Error);
-                        None
                     }
                     Some(want) => {
                         if got == Ty::Void || want == Ty::Void {
@@ -308,7 +367,7 @@ impl Checker {
                                     .with_code("E308"),
                             );
                             self.record(*id, Ty::Error);
-                            return None;
+                            return;
                         }
                         if got != want {
                             self.diags.push(
@@ -319,14 +378,13 @@ impl Checker {
                                 .with_code("E309"),
                             );
                             self.record(*id, Ty::Error);
-                            return None;
+                            return;
                         }
                         self.record(*id, want);
-                        None
                     }
                 }
             }
-            HirStmt::Break { .. } | HirStmt::Continue { .. } => None,
+            HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
             HirStmt::While {
                 condition, body, ..
             } => {
@@ -343,7 +401,6 @@ impl Checker {
                 for stmt in body {
                     self.check_stmt(stmt);
                 }
-                None
             }
             HirStmt::If {
                 condition,
@@ -367,7 +424,6 @@ impl Checker {
                         self.check_stmt(stmt);
                     }
                 }
-                None
             }
         }
     }
@@ -800,15 +856,16 @@ mod tests {
     #[test]
     fn call_with_correct_types_checks_clean() {
         let (_, diags) = check_src(
-            "function add(a: i64, b: i64): i64 { a + b; } function main() { add(1, 2); }",
+            "function add(a: i64, b: i64): i64 { return a + b; } function main() { add(1, 2); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn call_with_wrong_arity_errors_once() {
-        let (_, diags) =
-            check_src("function add(a: i64, b: i64): i64 { a + b; } function main() { add(1); }");
+        let (_, diags) = check_src(
+            "function add(a: i64, b: i64): i64 { return a + b; } function main() { add(1); }",
+        );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("expects 2"));
     }
@@ -816,7 +873,7 @@ mod tests {
     #[test]
     fn call_with_wrong_param_type_errors() {
         let (_, diags) = check_src(
-            r#"function add(a: i64, b: i64): i64 { a + b; } function main() { add(1, "s"); }"#,
+            r#"function add(a: i64, b: i64): i64 { return a + b; } function main() { add(1, "s"); }"#,
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("expects `i64`"), "{diags:?}");
@@ -824,11 +881,67 @@ mod tests {
 
     #[test]
     fn return_mismatch_errors() {
-        let (_, diags) = check_src(r#"function f(): i64 { "s"; }"#);
+        let (_, diags) = check_src(r#"function f(): i64 { return "s"; }"#);
         assert!(
             diags.iter().any(|d| d.message.contains("declares return")),
             "{diags:?}"
         );
+    }
+
+    #[test]
+    fn trailing_expr_is_not_a_return() {
+        // No implicit returns: a bare tail value does not satisfy `: i64`.
+        let (_, diags) = check_src(r#"function f(): i64 { "s"; }"#);
+        assert!(
+            diags.iter().any(|d| d.message.contains("has no `return`")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_return_satisfies_declared_type() {
+        let (_, diags) = check_src(r#"function f(): i64 { return 1; }"#);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn missing_return_is_an_error() {
+        let (_, diags) = check_src(r#"function f(): i64 { let x = 1; }"#);
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E307")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn bare_return_in_value_function_errors() {
+        let (_, diags) = check_src(r#"function f(): i64 { return; }"#);
+        assert!(
+            diags.iter().any(|d| d.message.contains("returns nothing")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn value_return_in_void_function_errors() {
+        let (_, diags) = check_src(r#"function main() { return 1; }"#);
+        assert!(
+            diags.iter().any(|d| d.message.contains("returns `void`")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn bare_return_in_void_function_checks() {
+        let (_, diags) = check_src(r#"function main() { return; }"#);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn return_inside_branch_satisfies_declared_type() {
+        let (_, diags) =
+            check_src(r#"function f(x: bool): i64 { if (x) { return 1; } else { return 2; } }"#);
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]

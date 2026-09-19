@@ -76,7 +76,7 @@ colours) and sets the exit code. Never add another reporting library.
 
 ```text
 let x = 1 + 2 * 3;
-function main() { let d = x - 1; d; }
+function main() { let d = x - 1; }
 ```
 
 Numeric literals use `u64`, `i64`, `f64`, and `u8` suffixes; bare integers are
@@ -85,7 +85,10 @@ Numeric literals use `u64`, `i64`, `f64`, and `u8` suffixes; bare integers are
 The language also supports double-quoted byte strings, `+ - * /`, unary `-`
 and `!`, comparisons (`== != < <= > >=`), short-circuit `&&` / `||`, parens,
 `let` plus `=` reassignment, user-defined functions with typed boundaries
-(`function add(a: i64, b: i64): i64`; an omitted return type means `void`),
+(`function add(a: i64, b: i64): i64 { return a + b; }`; an omitted return
+type means `void`), explicit `return` (`return <expr>;` for values,
+`return;` for `void`; there are no implicit returns — a trailing expression
+is discarded, never returned),
 calls between user functions (nestable, order-independent, recursive;
 arity and argument types are checked, `void` results only as bare statements),
 `if`/`else` conditionals with mandatory parentheses, and `while` loops

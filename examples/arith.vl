@@ -5,5 +5,4 @@ let c = -a + b;
 
 function main() {
     let d = a + b * c;
-    d;
 }

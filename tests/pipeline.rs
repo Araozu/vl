@@ -105,12 +105,12 @@ fn naravm_emits_mixed_params_string_return_and_recursion() {
     let lir = frontend(
         r#"
 use std;
-function add(a: u64, b: u64): u64 { a + b; }
-function greet(name: string): string { name; }
+function add(a: u64, b: u64): u64 { return a + b; }
+function greet(name: string): string { return name; }
 function fact(n: u64): u64 {
     let r = 1u64;
     if (n == 0u64) { r; } else { r = n * fact(n - 1u64); }
-    r;
+    return r;
 }
 function main() {
     std.print(greet("hi\n"));
@@ -268,9 +268,61 @@ fn while_condition_must_be_bool() {
 
 #[test]
 fn missing_annotations_are_an_error() {
-    let err = frontend("function add(a, b) { a + b; }").expect_err("must fail");
+    let err = frontend("function add(a, b) { return a + b; }").expect_err("must fail");
     assert!(
         err.iter().any(|d| d.code.as_deref() == Some("E104")),
         "{err:?}"
     );
+}
+
+#[test]
+fn explicit_return_compiles_and_lowers_to_ret() {
+    let lir = frontend(
+        "function add(a: i64, b: i64): i64 { return a + b; } function main() { add(1, 2); }",
+    )
+    .expect("explicit return must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("add"), "{dump}");
+    assert!(dump.contains("ret"), "{dump}");
+}
+
+#[test]
+fn missing_return_is_an_error() {
+    let err = frontend("function f(): i64 { let x = 1; }").expect_err("must fail");
+    assert!(
+        err.iter().any(|d| d.code.as_deref() == Some("E307")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn trailing_expr_is_not_an_implicit_return() {
+    let err = frontend(r#"function f(): i64 { 1; }"#).expect_err("must fail");
+    assert!(
+        err.iter().any(|d| d.message.contains("has no `return`")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn bare_return_in_value_function_is_an_error() {
+    let err = frontend("function f(): i64 { return; }").expect_err("must fail");
+    assert!(
+        err.iter().any(|d| d.message.contains("returns nothing")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn value_return_in_void_function_is_an_error() {
+    let err = frontend("function main() { return 1; }").expect_err("must fail");
+    assert!(
+        err.iter().any(|d| d.message.contains("returns `void`")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn bare_return_in_void_function_compiles() {
+    frontend("function main() { return; }").expect("bare return in void must compile");
 }

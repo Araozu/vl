@@ -6,5 +6,4 @@ function main() {
     let f = open("data.txt");
     let s = read(f);
     let n = string.len(s);
-    n;
 }

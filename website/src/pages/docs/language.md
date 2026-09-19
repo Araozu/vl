@@ -50,7 +50,7 @@ typed, and the return type follows the parameter list:
 let greeting = "hello";
 
 function add(a: i64, b: i64): i64 {
-    a + b;
+    return a + b;
 }
 
 function main() {
@@ -59,9 +59,12 @@ function main() {
 ```
 
 A missing return type means `void`, so `function main()` is
-`function main(): void`. Calls check arity and argument types, and the declared
-return must match the body's tail value; `void` results may only appear as bare
-statements.
+`function main(): void`. There are no implicit returns: only an explicit
+`return <expr>;` yields a value (`return;` with no value is for `void`
+functions). A trailing expression statement is discarded, never returned —
+`function add(a: i64, b: i64): i64 { a + b; }` is an error (`E307`), not a
+shorthand. The declared return must match every `return <expr>;` value;
+`void` results may only appear as bare statements.
 
 User functions are first-class callees: any `function` item can be called from
 any other function body (or from itself, recursively), regardless of definition
@@ -69,11 +72,11 @@ order. Calls nest freely, and argument values are evaluated left to right:
 
 ```vl
 function add(a: i64, b: i64): i64 {
-    a + b;
+    return a + b;
 }
 
 function twice(x: i64): i64 {
-    add(x, x);
+    return add(x, x);
 }
 
 function main() {
@@ -198,7 +201,6 @@ use std.string.{len};
 
 function main() {
     let n = len("hello");
-    n;
 }
 ```
 

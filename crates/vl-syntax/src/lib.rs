@@ -9,7 +9,8 @@
 //! type    := `u64` | `i64` | `f64` | `bool` | `u8` | `string` | `File` | `void` (`void` only as return)
 //! block   := `{` stmt* `}`
 //! stmt    := `let` ident `=` expr `;` | ident `=` expr `;` | `if` `(` expr `)` branch (`else` branch)?
-//!          | `while` `(` expr `)` branch | `break` `;` | `continue` `;` | expr `;`
+//!          | `while` `(` expr `)` branch | `break` `;` | `continue` `;`
+//!          | `return` expr? `;` | expr `;`
 //! branch  := block | stmt
 //! expr    := or
 //! or      := and (`||` and)*
@@ -25,8 +26,10 @@
 //!
 //! Calls are callee-by-name (`ident(args)`), TypeScript-style. The callee
 //! is a plain variable use so forward references to `function` items work.
-//! Semicolons are mandatory: every `let` and every expression statement
-//! ends with `;` (no bare trailing value like Rust).
+//! Semicolons are mandatory: every `let`, every `return`, and every
+//! expression statement ends with `;` (no bare trailing value like Rust).
+//! There are no implicit returns: a function yields a value only through an
+//! explicit `return expr;` (`return;` for `void`).
 //! Function boundaries are typed: every param needs `: type`; the return
 //! type may be omitted and defaults to `void`.
 //!
@@ -110,6 +113,10 @@ pub enum Stmt {
         span: Span,
     },
     Continue {
+        span: Span,
+    },
+    Return {
+        value: Option<Expr>,
         span: Span,
     },
     Expr(Expr),
@@ -492,6 +499,21 @@ impl<'a> Parser<'a> {
                 span: Span::new(t.span.start, semi.span.end),
             });
         }
+        if matches!(self.peek().kind, TokenKind::Return) {
+            let t = self.bump();
+            // Bare `return;` yields no value (for `void` functions);
+            // `return expr;` yields `expr`. The `;` is mandatory either way.
+            let value = if matches!(self.peek().kind, TokenKind::Semi) {
+                None
+            } else {
+                Some(self.parse_expr()?)
+            };
+            let semi = self.expect(&TokenKind::Semi, "`;`")?;
+            return Some(Stmt::Return {
+                value,
+                span: Span::new(t.span.start, semi.span.end),
+            });
+        }
         if matches!(self.peek().kind, TokenKind::Let) {
             let let_tok = self.bump();
             let (name, name_span) = self.parse_ident()?;
@@ -608,7 +630,8 @@ impl<'a> Parser<'a> {
                 | TokenKind::If
                 | TokenKind::While
                 | TokenKind::Break
-                | TokenKind::Continue => return,
+                | TokenKind::Continue
+                | TokenKind::Return => return,
                 _ => {
                     self.bump();
                 }
@@ -908,6 +931,7 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::While => "`while`".into(),
         TokenKind::Break => "`break`".into(),
         TokenKind::Continue => "`continue`".into(),
+        TokenKind::Return => "`return`".into(),
         TokenKind::Plus => "`+`".into(),
         TokenKind::Minus => "`-`".into(),
         TokenKind::Star => "`*`".into(),
@@ -973,7 +997,7 @@ mod tests {
 
     #[test]
     fn typed_params_and_void_return_parse() {
-        let (prog, diags) = parse_src("function add(a: i64, b: i64): i64 { a + b; }");
+        let (prog, diags) = parse_src("function add(a: i64, b: i64): i64 { return a + b; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { params, ret, .. } => {
@@ -987,7 +1011,7 @@ mod tests {
 
     #[test]
     fn missing_param_type_is_an_error() {
-        let (_prog, diags) = parse_src("function add(a): i64 { a; }");
+        let (_prog, diags) = parse_src("function add(a): i64 { return a; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E104")));
     }
 
@@ -1003,13 +1027,13 @@ mod tests {
 
     #[test]
     fn void_param_is_an_error() {
-        let (_prog, diags) = parse_src("function f(x: void): void { 1; }");
+        let (_prog, diags) = parse_src("function f(x: void): void { return; }");
         assert!(diags.iter().any(|d| d.message.contains("cannot be `void`")));
     }
 
     #[test]
     fn unknown_type_is_an_error() {
-        let (_prog, diags) = parse_src("function f(x: bogus): void { 1; }");
+        let (_prog, diags) = parse_src("function f(x: bogus): void { return; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E105")));
     }
 
@@ -1143,6 +1167,38 @@ mod tests {
             .items
             .iter()
             .any(|item| matches!(item, Item::Function { name, .. } if name == "tail")));
+    }
+
+    #[test]
+    fn shadowing_is_a_warning_only_placeholder() {
+        // (resolver test covers shadowing; parser just needs a valid body)
+        let (prog, diags) = parse_src("function f(x: i64): i64 { return x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(prog.items.len(), 1);
+    }
+
+    #[test]
+    fn return_with_value_and_bare_return_parse() {
+        let (prog, diags) = parse_src("function f(): i64 { return 1; } function g() { return; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { body, .. } => {
+                assert!(matches!(body[0], Stmt::Return { value: Some(_), .. }))
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+        match &prog.items[1] {
+            Item::Function { body, .. } => {
+                assert!(matches!(body[0], Stmt::Return { value: None, .. }))
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn return_requires_semi() {
+        let (_prog, diags) = parse_src("function f(): i64 { return 1 }");
+        assert!(!diags.is_empty());
     }
 
     #[test]

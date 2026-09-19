@@ -23,6 +23,7 @@ pub enum TokenKind {
     While,
     Break,
     Continue,
+    Return,
     Plus,
     Minus,
     Star,
@@ -347,6 +348,7 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                     "while" => TokenKind::While,
                     "break" => TokenKind::Break,
                     "continue" => TokenKind::Continue,
+                    "return" => TokenKind::Return,
                     "true" => TokenKind::Bool(true),
                     "false" => TokenKind::Bool(false),
                     _ => TokenKind::Ident(word.to_string()),
@@ -456,7 +458,8 @@ mod tests {
 
     #[test]
     fn lexes_loop_keywords_and_operators() {
-        let (toks, diags) = lex("while (a == 1 && b != 2 || !c) { a = a + 1; break; continue; }");
+        let (toks, diags) =
+            lex("while (a == 1 && b != 2 || !c) { a = a + 1; break; continue; return a; }");
         assert!(diags.is_empty(), "{diags:?}");
         let kinds: Vec<&TokenKind> = toks.iter().map(|t| &t.kind).collect();
         assert!(matches!(kinds[0], TokenKind::While));
@@ -467,6 +470,7 @@ mod tests {
         assert!(kinds.iter().any(|k| matches!(k, TokenKind::Bang)));
         assert!(kinds.iter().any(|k| matches!(k, TokenKind::Break)));
         assert!(kinds.iter().any(|k| matches!(k, TokenKind::Continue)));
+        assert!(kinds.iter().any(|k| matches!(k, TokenKind::Return)));
     }
 
     #[test]

@@ -72,7 +72,7 @@
         },
         {
           "name": "keyword.control.loop.vl",
-          "match": "\\b(?:while|break|continue)\\b"
+          "match": "\\b(?:while|break|continue|return)\\b"
         }
       ]
     },

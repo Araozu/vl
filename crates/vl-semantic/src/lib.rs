@@ -235,6 +235,11 @@ impl Resolver {
                 }
             }
             Stmt::Expr(e) => self.resolve_expr(e),
+            Stmt::Return { value, .. } => {
+                if let Some(e) = value {
+                    self.resolve_expr(e);
+                }
+            }
             Stmt::Break { span } => {
                 if self.loop_depth == 0 {
                     self.diags.push(

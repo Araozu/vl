@@ -1337,9 +1337,9 @@ fn nara_user_call(
     }
 }
 
-/// Function epilogue: move the tail value into the return slot (`rv11` /
-/// `rf31` per the declared return kind), then `ret`. `main` and `void`
-/// functions emit a bare `ret` as before.
+/// Function epilogue: move the explicit `return` value into the return slot
+/// (`rv11` / `rf31` per the declared return kind), then `ret`. `main` and
+/// `void` functions emit a bare `ret` as before.
 fn nara_ret(e: &mut NaraEmit, ctx: &NaraFnCtx, src: vl_lir::Reg, span: Span) {
     if ctx.is_main {
         e.bytecode.push(0x00);
@@ -1769,12 +1769,12 @@ mod tests {
         let lir = lir_of(
             r#"
 use std;
-function add(a: u64, b: u64): u64 { a + b; }
-function greet(name: string, n: u64): string { name; }
+function add(a: u64, b: u64): u64 { return a + b; }
+function greet(name: string, n: u64): string { return name; }
 function fact(n: u64): u64 {
     let r = 1u64;
     if (n == 0u64) { r; } else { r = n * fact(n - 1u64); }
-    r;
+    return r;
 }
 function main() {
     std.print(greet("hi\n", 1u64));
@@ -1851,8 +1851,9 @@ function main() {
 
     #[test]
     fn backends_emit_calls_and_parameters() {
-        let lir =
-            lir_of("function add(a: i64, b: i64): i64 { a + b; } function main() { add(1, 2); }");
+        let lir = lir_of(
+            "function add(a: i64, b: i64): i64 { return a + b; } function main() { add(1, 2); }",
+        );
         let (art, diags) = DummyTarget.emit(&lir);
         assert!(diags.is_empty());
         let text = art.unwrap().text;
