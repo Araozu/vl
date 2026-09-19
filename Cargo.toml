@@ -1,6 +1,36 @@
 [package]
 name = "vl"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "VL — vibecoded programming language (driver binary)"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "vl"
+path = "src/main.rs"
+
+[workspace]
+members = [
+    ".",
+    "crates/vl-common",
+    "crates/vl-lex",
+    "crates/vl-syntax",
+    "crates/vl-semantic",
+    "crates/vl-hir",
+    "crates/vl-typecheck",
+    "crates/vl-lir",
+    "crates/vl-codegen",
+]
+resolver = "2"
 
 [dependencies]
+vl-common = { path = "crates/vl-common" }
+vl-lex = { path = "crates/vl-lex" }
+vl-syntax = { path = "crates/vl-syntax" }
+vl-semantic = { path = "crates/vl-semantic" }
+vl-hir = { path = "crates/vl-hir" }
+vl-typecheck = { path = "crates/vl-typecheck" }
+vl-lir = { path = "crates/vl-lir" }
+vl-codegen = { path = "crates/vl-codegen" }
+clap = { version = "4", features = ["derive"] }
+ariadne = "0.4"

@@ -1,0 +1,2 @@
+// Error demo: missing `;` and bad character.
+let x = 1 + @

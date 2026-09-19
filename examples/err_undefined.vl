@@ -1,0 +1,2 @@
+// Error demo: `y` is never bound.
+let x = y + 1;

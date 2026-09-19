@@ -1,0 +1,15 @@
+[package]
+name = "vl-typecheck"
+version = "0.1.0"
+edition = "2021"
+description = "VL type checker: HIR -> typed HIR"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+vl-common = { path = "../vl-common" }
+vl-hir = { path = "../vl-hir" }
+
+[dev-dependencies]
+vl-lex = { path = "../vl-lex" }
+vl-syntax = { path = "../vl-syntax" }
+vl-semantic = { path = "../vl-semantic" }

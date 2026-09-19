@@ -1,0 +1,9 @@
+[package]
+name = "vl-common"
+version = "0.1.0"
+edition = "2021"
+description = "VL common primitives: spans, sources, Ariadne-backed diagnostics"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+ariadne = "0.4"

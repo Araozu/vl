@@ -1,0 +1,9 @@
+// Arithmetic, precedence, unary minus, and a function body.
+let a = 1 + 2 * 3;
+let b = (1 + 2) * 3;
+let c = -a + b;
+
+fn main() {
+    let d = a + b * c;
+    d
+}

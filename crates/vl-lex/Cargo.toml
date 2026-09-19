@@ -1,0 +1,9 @@
+[package]
+name = "vl-lex"
+version = "0.1.0"
+edition = "2021"
+description = "VL lexer: source text -> tokens"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+vl-common = { path = "../vl-common" }
