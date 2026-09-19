@@ -6,7 +6,8 @@
 //! stages can skip rather than cascade errors).
 
 use vl_common::{Scalar, Span, VlType};
-use vl_semantic::DefId;
+
+pub use vl_semantic::DefId;
 use vl_syntax::{
     BinOp as AstBinOp, Expr as AstExpr, Item as AstItem, Program as AstProgram, Stmt as AstStmt,
     UnOp as AstUnOp,
@@ -53,10 +54,27 @@ pub enum HirStmt {
         value: HirExpr,
         span: Span,
     },
+    Assign {
+        id: HirId,
+        def: Option<DefId>,
+        value: HirExpr,
+        span: Span,
+    },
     If {
         condition: HirExpr,
         then_body: Vec<HirStmt>,
         else_body: Option<Vec<HirStmt>>,
+        span: Span,
+    },
+    While {
+        condition: HirExpr,
+        body: Vec<HirStmt>,
+        span: Span,
+    },
+    Break {
+        span: Span,
+    },
+    Continue {
         span: Span,
     },
     Expr(HirExpr),
@@ -99,6 +117,17 @@ pub enum HirExpr {
         rhs: Box<HirExpr>,
         span: Span,
     },
+    Unary {
+        id: HirId,
+        op: HirUnOp,
+        inner: Box<HirExpr>,
+        span: Span,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HirUnOp {
+    Not,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +136,14 @@ pub enum HirBinOp {
     Sub,
     Mul,
     Div,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
 }
 
 impl HirExpr {
@@ -116,7 +153,8 @@ impl HirExpr {
             | HirExpr::String { id, .. }
             | HirExpr::Var { id, .. }
             | HirExpr::Call { id, .. }
-            | HirExpr::Binary { id, .. } => *id,
+            | HirExpr::Binary { id, .. }
+            | HirExpr::Unary { id, .. } => *id,
         }
     }
 
@@ -126,7 +164,8 @@ impl HirExpr {
             | HirExpr::String { span, .. }
             | HirExpr::Var { span, .. }
             | HirExpr::Call { span, .. }
-            | HirExpr::Binary { span, .. } => *span,
+            | HirExpr::Binary { span, .. }
+            | HirExpr::Unary { span, .. } => *span,
         }
     }
 }
@@ -238,7 +277,34 @@ impl<'a> Lowerer<'a> {
                     span: *span,
                 }
             }
+            AstStmt::Assign {
+                name_span,
+                value,
+                span,
+                ..
+            } => {
+                // Assignment writes through the resolved binding; the LHS is
+                // a use-site (recorded by the resolver), not a new def-site.
+                let def = self.def_at(*name_span);
+                HirStmt::Assign {
+                    id: self.id(),
+                    def,
+                    value: self.lower_expr(value),
+                    span: *span,
+                }
+            }
             AstStmt::Expr(e) => HirStmt::Expr(self.lower_expr(e)),
+            AstStmt::Break { span } => HirStmt::Break { span: *span },
+            AstStmt::Continue { span } => HirStmt::Continue { span: *span },
+            AstStmt::While {
+                condition,
+                body,
+                span,
+            } => HirStmt::While {
+                condition: self.lower_expr(condition),
+                body: body.iter().map(|s| self.lower_stmt(s)).collect(),
+                span: *span,
+            },
             AstStmt::If {
                 condition,
                 then_body,
@@ -300,36 +366,48 @@ impl<'a> Lowerer<'a> {
                     span: *span,
                 }
             }
-            AstExpr::Unary { op, rhs, span } => {
-                let rhs = self.lower_expr(rhs);
-                let zero = match &rhs {
-                    HirExpr::Literal { value, .. } => scalar_zero(*value),
-                    _ => Scalar::I64(0),
-                };
-                match op {
-                    // Desugar `-x` into `0 - x`.
-                    AstUnOp::Neg => {
-                        let zero_span = Span::empty(span.start);
-                        HirExpr::Binary {
+            AstExpr::Unary { op, rhs, span } => match op {
+                // Desugar `-x` into `0 - x`.
+                AstUnOp::Neg => {
+                    let rhs = self.lower_expr(rhs);
+                    let zero = match &rhs {
+                        HirExpr::Literal { value, .. } => scalar_zero(*value),
+                        _ => Scalar::I64(0),
+                    };
+                    let zero_span = Span::empty(span.start);
+                    HirExpr::Binary {
+                        id: self.id(),
+                        op: HirBinOp::Sub,
+                        lhs: Box::new(HirExpr::Literal {
                             id: self.id(),
-                            op: HirBinOp::Sub,
-                            lhs: Box::new(HirExpr::Literal {
-                                id: self.id(),
-                                value: zero,
-                                span: zero_span,
-                            }),
-                            rhs: Box::new(rhs),
-                            span: *span,
-                        }
+                            value: zero,
+                            span: zero_span,
+                        }),
+                        rhs: Box::new(rhs),
+                        span: *span,
                     }
                 }
-            }
+                AstUnOp::Not => HirExpr::Unary {
+                    id: self.id(),
+                    op: HirUnOp::Not,
+                    inner: Box::new(self.lower_expr(rhs)),
+                    span: *span,
+                },
+            },
             AstExpr::Binary { op, lhs, rhs, span } => {
                 let op = match op {
                     AstBinOp::Add => HirBinOp::Add,
                     AstBinOp::Sub => HirBinOp::Sub,
                     AstBinOp::Mul => HirBinOp::Mul,
                     AstBinOp::Div => HirBinOp::Div,
+                    AstBinOp::Eq => HirBinOp::Eq,
+                    AstBinOp::Ne => HirBinOp::Ne,
+                    AstBinOp::Lt => HirBinOp::Lt,
+                    AstBinOp::Le => HirBinOp::Le,
+                    AstBinOp::Gt => HirBinOp::Gt,
+                    AstBinOp::Ge => HirBinOp::Ge,
+                    AstBinOp::And => HirBinOp::And,
+                    AstBinOp::Or => HirBinOp::Or,
                 };
                 HirExpr::Binary {
                     id: self.id(),
@@ -356,6 +434,55 @@ fn scalar_zero(value: Scalar) -> Scalar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn not_lowers_to_explicit_unary() {
+        let (toks, _) = vl_lex::lex("function main() { !true; }");
+        let (prog, _) = vl_syntax::parse(&toks, "");
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Fn { body, .. } => {
+                assert!(matches!(&body[0], HirStmt::Expr(HirExpr::Unary { .. })))
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_links_the_resolved_binding() {
+        let src = "function main() { let x = 1; x = 2; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Fn { body, .. } => {
+                assert!(matches!(&body[1], HirStmt::Assign { def: Some(_), .. }))
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn while_and_break_lower() {
+        let src = "function main() { while (true) { break; } }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Fn { body, .. } => match &body[0] {
+                HirStmt::While { body, .. } => {
+                    assert!(matches!(body[0], HirStmt::Break { .. }))
+                }
+                other => panic!("expected while, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
 
     #[test]
     fn neg_desugars_to_sub() {

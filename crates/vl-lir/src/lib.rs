@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use vl_common::Scalar;
 use vl_common::Span;
-use vl_hir::{HirBinOp, HirExpr, HirItem, HirProgram, HirStmt};
+use vl_hir::{HirBinOp, HirExpr, HirItem, HirProgram, HirStmt, HirUnOp};
 
 /// Virtual register.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,6 +36,11 @@ pub enum Instr {
         span: Span,
     },
     Copy {
+        dst: Reg,
+        src: Reg,
+        span: Span,
+    },
+    Not {
         dst: Reg,
         src: Reg,
         span: Span,
@@ -79,6 +84,12 @@ pub enum LirOp {
     Sub,
     Mul,
     Div,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 impl std::fmt::Display for LirOp {
@@ -88,6 +99,12 @@ impl std::fmt::Display for LirOp {
             LirOp::Sub => write!(f, "sub"),
             LirOp::Mul => write!(f, "mul"),
             LirOp::Div => write!(f, "div"),
+            LirOp::Eq => write!(f, "eq"),
+            LirOp::Ne => write!(f, "ne"),
+            LirOp::Lt => write!(f, "lt"),
+            LirOp::Le => write!(f, "le"),
+            LirOp::Gt => write!(f, "gt"),
+            LirOp::Ge => write!(f, "ge"),
         }
     }
 }
@@ -126,6 +143,7 @@ fn fmt_instr(ins: &Instr) -> String {
         }
         Instr::Param { dst, index, .. } => format!("%{} = param {index}", dst.0),
         Instr::Copy { dst, src, .. } => format!("%{} = copy %{}", dst.0, src.0),
+        Instr::Not { dst, src, .. } => format!("%{} = not %{}", dst.0, src.0),
         Instr::BinOp {
             dst, op, lhs, rhs, ..
         } => {
@@ -160,15 +178,23 @@ fn fmt_scalar(value: Scalar) -> String {
     }
 }
 
+struct LoopTargets {
+    break_target: u32,
+    continue_target: u32,
+}
+
 struct Lowerer {
     next: u32,
     instrs: Vec<Instr>,
     /// Values currently available in this function. Locals are assigned when
     /// declared; globals are materialized lazily from their initializer.
+    /// Assignment writes in place (`Copy` into the bound register) so values
+    /// stay correct across branches and loop iterations without phi nodes.
     bindings: HashMap<u32, Reg>,
     global_values: HashMap<u32, HirExpr>,
     evaluating_globals: HashSet<u32>,
     next_label: u32,
+    loop_stack: Vec<LoopTargets>,
 }
 
 fn globals(prog: &HirProgram) -> HashMap<u32, HirExpr> {
@@ -217,6 +243,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                     global_values: global_values.clone(),
                     evaluating_globals: HashSet::new(),
                     next_label: 0,
+                    loop_stack: Vec::new(),
                 };
                 if let Some(r) = l.lower_expr(value, typed) {
                     if let HirItem::Let { def: Some(def), .. } = item {
@@ -242,6 +269,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                     global_values: global_values.clone(),
                     evaluating_globals: HashSet::new(),
                     next_label: 0,
+                    loop_stack: Vec::new(),
                 };
 
                 for (index, (_, def, _, span)) in params.iter().enumerate() {
@@ -275,6 +303,24 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                             span,
                         } => {
                             l.lower_if(condition, then_body, else_body.as_deref(), typed, *span);
+                        }
+                        HirStmt::Assign {
+                            def, value, span, ..
+                        } => {
+                            l.lower_assign(def.as_ref(), value, typed, *span);
+                        }
+                        HirStmt::While {
+                            condition,
+                            body,
+                            span,
+                        } => {
+                            l.lower_while(condition, body, typed, *span);
+                        }
+                        HirStmt::Break { span } => {
+                            l.lower_break(*span);
+                        }
+                        HirStmt::Continue { span } => {
+                            l.lower_continue(*span);
                         }
                     }
                 }
@@ -363,25 +409,50 @@ impl Lowerer {
             }
             HirExpr::Binary {
                 op, lhs, rhs, span, ..
-            } => {
-                let l = self.lower_expr(lhs, typed)?;
-                let r = self.lower_expr(rhs, typed)?;
-                let dst = self.reg();
-                let op = match op {
-                    HirBinOp::Add => LirOp::Add,
-                    HirBinOp::Sub => LirOp::Sub,
-                    HirBinOp::Mul => LirOp::Mul,
-                    HirBinOp::Div => LirOp::Div,
-                };
-                self.instrs.push(Instr::BinOp {
-                    dst,
-                    op,
-                    lhs: l,
-                    rhs: r,
-                    span: *span,
-                });
-                Some(dst)
-            }
+            } => match op {
+                HirBinOp::And => self.lower_and(lhs, rhs, typed, *span),
+                HirBinOp::Or => self.lower_or(lhs, rhs, typed, *span),
+                _ => {
+                    let l = self.lower_expr(lhs, typed)?;
+                    let r = self.lower_expr(rhs, typed)?;
+                    let dst = self.reg();
+                    let op = match op {
+                        HirBinOp::Add => LirOp::Add,
+                        HirBinOp::Sub => LirOp::Sub,
+                        HirBinOp::Mul => LirOp::Mul,
+                        HirBinOp::Div => LirOp::Div,
+                        HirBinOp::Eq => LirOp::Eq,
+                        HirBinOp::Ne => LirOp::Ne,
+                        HirBinOp::Lt => LirOp::Lt,
+                        HirBinOp::Le => LirOp::Le,
+                        HirBinOp::Gt => LirOp::Gt,
+                        HirBinOp::Ge => LirOp::Ge,
+                        HirBinOp::And | HirBinOp::Or => unreachable!("handled above"),
+                    };
+                    self.instrs.push(Instr::BinOp {
+                        dst,
+                        op,
+                        lhs: l,
+                        rhs: r,
+                        span: *span,
+                    });
+                    Some(dst)
+                }
+            },
+            HirExpr::Unary {
+                op, inner, span, ..
+            } => match op {
+                HirUnOp::Not => {
+                    let src = self.lower_expr(inner, typed)?;
+                    let dst = self.reg();
+                    self.instrs.push(Instr::Not {
+                        dst,
+                        src,
+                        span: *span,
+                    });
+                    Some(dst)
+                }
+            },
         }
     }
 
@@ -405,6 +476,290 @@ impl Lowerer {
             } => {
                 self.lower_if(condition, then_body, else_body.as_deref(), typed, *span);
             }
+            HirStmt::Assign {
+                def, value, span, ..
+            } => {
+                self.lower_assign(def.as_ref(), value, typed, *span);
+            }
+            HirStmt::While {
+                condition,
+                body,
+                span,
+            } => {
+                self.lower_while(condition, body, typed, *span);
+            }
+            HirStmt::Break { span } => {
+                self.lower_break(*span);
+            }
+            HirStmt::Continue { span } => {
+                self.lower_continue(*span);
+            }
+        }
+    }
+
+    /// Assignment writes in place: evaluate the RHS then `Copy` it into the
+    /// already-bound register. The bindings map is unchanged, so branches and
+    /// loops that assign keep working without phi nodes; branch-local `let`s
+    /// are still pruned by the caller restoring the incoming map.
+    fn lower_assign(
+        &mut self,
+        def: Option<&vl_hir::DefId>,
+        value: &HirExpr,
+        typed: &vl_typecheck::TypedProgram,
+        span: Span,
+    ) {
+        let Some(src) = self.lower_expr(value, typed) else {
+            return;
+        };
+        let Some(def) = def else {
+            return;
+        };
+        if let Some(dst) = self.bindings.get(&def.0).copied() {
+            self.instrs.push(Instr::Copy { dst, src, span });
+            return;
+        }
+        // Assignment to a not-yet-materialized global: materialize first.
+        if let Some(init) = self.global_values.get(&def.0).cloned() {
+            if !self.evaluating_globals.insert(def.0) {
+                return;
+            }
+            let base = self.lower_expr(&init, typed);
+            self.evaluating_globals.remove(&def.0);
+            if let Some(base) = base {
+                self.bindings.insert(def.0, base);
+                self.instrs.push(Instr::Copy {
+                    dst: base,
+                    src,
+                    span,
+                });
+            }
+        }
+    }
+
+    /// Short-circuit `&&`: sides evaluate at most once, left to right.
+    fn lower_and(
+        &mut self,
+        lhs: &HirExpr,
+        rhs: &HirExpr,
+        typed: &vl_typecheck::TypedProgram,
+        span: Span,
+    ) -> Option<Reg> {
+        let l = self.lower_expr(lhs, typed)?;
+        let dst = self.reg();
+        let false_label = self.label();
+        let end_label = self.label();
+        self.instrs.push(Instr::BranchIfFalse {
+            cond: l,
+            target: false_label,
+            span,
+        });
+        let Some(r) = self.lower_expr(rhs, typed) else {
+            self.instrs.push(Instr::Label {
+                id: false_label,
+                span,
+            });
+            self.instrs.push(Instr::Label {
+                id: end_label,
+                span,
+            });
+            return None;
+        };
+        self.instrs.push(Instr::BranchIfFalse {
+            cond: r,
+            target: false_label,
+            span,
+        });
+        let true_tmp = self.reg();
+        self.instrs.push(Instr::Const {
+            dst: true_tmp,
+            value: Scalar::Bool(true),
+            span,
+        });
+        self.instrs.push(Instr::Copy {
+            dst,
+            src: true_tmp,
+            span,
+        });
+        self.instrs.push(Instr::Jump {
+            target: end_label,
+            span,
+        });
+        self.instrs.push(Instr::Label {
+            id: false_label,
+            span,
+        });
+        let false_tmp = self.reg();
+        self.instrs.push(Instr::Const {
+            dst: false_tmp,
+            value: Scalar::Bool(false),
+            span,
+        });
+        self.instrs.push(Instr::Copy {
+            dst,
+            src: false_tmp,
+            span,
+        });
+        self.instrs.push(Instr::Label {
+            id: end_label,
+            span,
+        });
+        Some(dst)
+    }
+
+    /// Short-circuit `||`: sides evaluate at most once, left to right.
+    fn lower_or(
+        &mut self,
+        lhs: &HirExpr,
+        rhs: &HirExpr,
+        typed: &vl_typecheck::TypedProgram,
+        span: Span,
+    ) -> Option<Reg> {
+        let l = self.lower_expr(lhs, typed)?;
+        let dst = self.reg();
+        let rhs_label = self.label();
+        let false_label = self.label();
+        let end_label = self.label();
+        self.instrs.push(Instr::BranchIfFalse {
+            cond: l,
+            target: rhs_label,
+            span,
+        });
+        let lhs_true_tmp = self.reg();
+        self.instrs.push(Instr::Const {
+            dst: lhs_true_tmp,
+            value: Scalar::Bool(true),
+            span,
+        });
+        self.instrs.push(Instr::Copy {
+            dst,
+            src: lhs_true_tmp,
+            span,
+        });
+        self.instrs.push(Instr::Jump {
+            target: end_label,
+            span,
+        });
+        self.instrs.push(Instr::Label {
+            id: rhs_label,
+            span,
+        });
+        let Some(r) = self.lower_expr(rhs, typed) else {
+            self.instrs.push(Instr::Label {
+                id: false_label,
+                span,
+            });
+            self.instrs.push(Instr::Label {
+                id: end_label,
+                span,
+            });
+            return None;
+        };
+        self.instrs.push(Instr::BranchIfFalse {
+            cond: r,
+            target: false_label,
+            span,
+        });
+        let true_tmp = self.reg();
+        self.instrs.push(Instr::Const {
+            dst: true_tmp,
+            value: Scalar::Bool(true),
+            span,
+        });
+        self.instrs.push(Instr::Copy {
+            dst,
+            src: true_tmp,
+            span,
+        });
+        self.instrs.push(Instr::Jump {
+            target: end_label,
+            span,
+        });
+        self.instrs.push(Instr::Label {
+            id: false_label,
+            span,
+        });
+        let false_tmp = self.reg();
+        self.instrs.push(Instr::Const {
+            dst: false_tmp,
+            value: Scalar::Bool(false),
+            span,
+        });
+        self.instrs.push(Instr::Copy {
+            dst,
+            src: false_tmp,
+            span,
+        });
+        self.instrs.push(Instr::Label {
+            id: end_label,
+            span,
+        });
+        Some(dst)
+    }
+
+    fn lower_while(
+        &mut self,
+        condition: &HirExpr,
+        body: &[HirStmt],
+        typed: &vl_typecheck::TypedProgram,
+        span: Span,
+    ) {
+        let start_label = self.label();
+        let end_label = self.label();
+        self.loop_stack.push(LoopTargets {
+            break_target: end_label,
+            continue_target: start_label,
+        });
+        let incoming = self.bindings.clone();
+        self.instrs.push(Instr::Label {
+            id: start_label,
+            span,
+        });
+        let Some(cond) = self.lower_expr(condition, typed) else {
+            self.instrs.push(Instr::Label {
+                id: end_label,
+                span,
+            });
+            self.loop_stack.pop();
+            return;
+        };
+        self.instrs.push(Instr::BranchIfFalse {
+            cond,
+            target: end_label,
+            span,
+        });
+        for stmt in body {
+            self.lower_stmt(stmt, typed);
+        }
+        self.instrs.push(Instr::Jump {
+            target: start_label,
+            span,
+        });
+        self.instrs.push(Instr::Label {
+            id: end_label,
+            span,
+        });
+        // Drop loop-local `let`s; in-place `Copy` writes to shared registers
+        // stay visible, so assignments inside the loop persist.
+        self.bindings.retain(|k, _| incoming.contains_key(k));
+        self.loop_stack.pop();
+    }
+
+    fn lower_break(&mut self, span: Span) {
+        // Outside a loop the resolver already reported E204; stay quiet.
+        if let Some(targets) = self.loop_stack.last() {
+            self.instrs.push(Instr::Jump {
+                target: targets.break_target,
+                span,
+            });
+        }
+    }
+
+    fn lower_continue(&mut self, span: Span) {
+        if let Some(targets) = self.loop_stack.last() {
+            self.instrs.push(Instr::Jump {
+                target: targets.continue_target,
+                span,
+            });
         }
     }
 
@@ -455,6 +810,50 @@ impl Lowerer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn while_emits_labels_and_back_edge() {
+        let src = "function main() { let i = 0; while (i < 10) { i = i + 1; } }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let dump = lower(&hir, &typed).dump();
+        assert!(dump.contains("branch_if_false"), "{dump}");
+        assert!(dump.contains("jump"), "{dump}");
+        assert!(dump.contains("copy"), "{dump}");
+        assert!(dump.contains("lt"), "{dump}");
+    }
+
+    #[test]
+    fn logical_and_short_circuits_without_an_and_instr() {
+        let src = "function main() { let x = true && false; x; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let dump = lower(&hir, &typed).dump();
+        assert!(!dump.contains("= and"), "{dump}");
+        assert!(dump.contains("branch_if_false"), "{dump}");
+        assert!(!dump.contains("not"), "{dump}");
+    }
+
+    #[test]
+    fn not_emits_a_not_instr() {
+        let src = "function main() { !true; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let dump = lower(&hir, &typed).dump();
+        assert!(dump.contains("not"), "{dump}");
+    }
 
     #[test]
     fn lowers_add_chain() {

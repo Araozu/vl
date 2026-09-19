@@ -74,6 +74,7 @@ struct Resolver {
     modules: Vec<ModuleSpec>,
     imports: HashMap<String, ModuleSpec>,
     poisoned_imports: std::collections::HashSet<String>,
+    loop_depth: usize,
 }
 
 pub fn resolve(prog: &Program) -> (Resolution, Vec<Diagnostic>) {
@@ -91,6 +92,7 @@ pub fn resolve_with_modules(
         modules: modules.to_vec(),
         imports: HashMap::new(),
         poisoned_imports: std::collections::HashSet::new(),
+        loop_depth: 0,
     };
 
     for item in &prog.items {
@@ -211,7 +213,58 @@ impl Resolver {
                 self.resolve_expr(value);
                 self.declare_local(name.clone(), *name_span);
             }
+            Stmt::Assign {
+                name,
+                name_span,
+                value,
+                ..
+            } => {
+                self.resolve_expr(value);
+                match self.lookup(name) {
+                    Some(id) => {
+                        self.out.uses.insert((name_span.start, name_span.end), id);
+                    }
+                    None => {
+                        self.diags.push(
+                            Diagnostic::error(format!("cannot find `{name}` in this scope"))
+                                .with_label(*name_span, "undefined variable")
+                                .with_note("did you mean to `let`-bind it first?")
+                                .with_code("E201"),
+                        );
+                    }
+                }
+            }
             Stmt::Expr(e) => self.resolve_expr(e),
+            Stmt::Break { span } => {
+                if self.loop_depth == 0 {
+                    self.diags.push(
+                        Diagnostic::error("`break` outside of a loop")
+                            .with_label(*span, "no enclosing `while`")
+                            .with_code("E204"),
+                    );
+                }
+            }
+            Stmt::Continue { span } => {
+                if self.loop_depth == 0 {
+                    self.diags.push(
+                        Diagnostic::error("`continue` outside of a loop")
+                            .with_label(*span, "no enclosing `while`")
+                            .with_code("E204"),
+                    );
+                }
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                self.resolve_expr(condition);
+                self.loop_depth += 1;
+                self.scopes.push(HashMap::new());
+                for stmt in body {
+                    self.resolve_stmt(stmt);
+                }
+                self.scopes.pop();
+                self.loop_depth -= 1;
+            }
             Stmt::If {
                 condition,
                 then_body,
@@ -471,6 +524,31 @@ mod tests {
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         resolve(&prog)
+    }
+
+    #[test]
+    fn break_outside_a_loop_is_an_error() {
+        let (_, diags) = resolve_src("function main() { break; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("outside of a loop"));
+    }
+
+    #[test]
+    fn break_inside_while_resolves() {
+        let (_, diags) = resolve_src("function main() { while (true) { break; } }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+    }
+
+    #[test]
+    fn assignment_to_an_undefined_name_errors() {
+        let (_, diags) = resolve_src("function main() { x = 1; }");
+        assert!(diags.iter().any(|d| d.code.as_deref() == Some("E201")));
+    }
+
+    #[test]
+    fn assignment_to_a_bound_local_resolves() {
+        let (_, diags) = resolve_src("function main() { let x = 1; x = 2; }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
     }
 
     #[test]

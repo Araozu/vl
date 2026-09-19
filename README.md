@@ -82,10 +82,12 @@ function main() { let d = x - 1; d; }
 Numeric literals use `u64`, `i64`, `f64`, and `u8` suffixes; bare integers are
 `i64`. Boolean literals are `true` and `false`. Value types are `u64`, `i64`,
 `f64`, `bool`, `u8`, `string`, `File`, and `void` (`void` only as a return).
-The language also supports double-quoted byte strings, `+ - * /`, unary `-`,
-parens, `let`, typed `function` boundaries (`function add(a: i64, b: i64): i64`;
-an omitted return type means `void`),
-calls, and `if`/`else` conditionals with mandatory parentheses.
+The language also supports double-quoted byte strings, `+ - * /`, unary `-`
+and `!`, comparisons (`== != < <= > >=`), short-circuit `&&` / `||`, parens,
+`let` plus `=` reassignment, typed `function` boundaries
+(`function add(a: i64, b: i64): i64`; an omitted return type means `void`),
+calls, `if`/`else` conditionals with mandatory parentheses, and `while` loops
+with `break` / `continue`.
 Branches may be single statements or brace-delimited blocks. `//` comments.
 String escapes are `\\0`,
 `\\n`, `\\r`, `\\t`, `\\\\`, and `\\"`; strings may not cross a newline.

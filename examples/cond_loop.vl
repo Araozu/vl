@@ -1,0 +1,22 @@
+// Conditionals, comparisons, and `while` loops end to end.
+// Run it: `cargo run -- build examples/cond_loop.vl --out cond.nara`
+use std;
+
+function main() {
+    let i = 5u64;
+    while (i > 0u64) {
+        if (i == 3u64) {
+            std.print("three\n");
+        } else {
+            std.print_u64(i);
+        }
+        i = i - 1u64;
+    }
+    let ready = true;
+    if (ready && i == 0u64) {
+        std.print("done\n");
+    }
+    while (!ready) {
+        break;
+    }
+}

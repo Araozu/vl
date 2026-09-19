@@ -8,11 +8,17 @@
 //! param   := ident `:` type
 //! type    := `u64` | `i64` | `f64` | `bool` | `u8` | `string` | `File` | `void` (`void` only as return)
 //! block   := `{` stmt* `}`
-//! stmt    := `let` ident `=` expr `;` | `if` `(` expr `)` branch (`else` branch)? | expr `;`
+//! stmt    := `let` ident `=` expr `;` | ident `=` expr `;` | `if` `(` expr `)` branch (`else` branch)?
+//!          | `while` `(` expr `)` branch | `break` `;` | `continue` `;` | expr `;`
 //! branch  := block | stmt
-//! expr    := term ((`+`|`-`) term)*
-//! term    := factor ((`*`|`/`) factor)*
-//! factor  := call | int | string | ident | `(` expr `)` | `-` factor
+//! expr    := or
+//! or      := and (`||` and)*
+//! and     := equality (`&&` equality)*
+//! equality:= comparison ((`==`|`!=`) comparison)*
+//! comparison := term ((`<`|`<=`|`>`|`>=`) term)*
+//! term    := factor ((`+`|`-`) factor)*
+//! factor  := unary ((`*`|`/`) unary)*
+//! unary   := (`-`|`!`) unary | call
 //! call    := ident `(` args? `)`
 //! args    := expr (`,` expr)*
 //! ```
@@ -83,10 +89,27 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    Assign {
+        name: String,
+        name_span: Span,
+        value: Expr,
+        span: Span,
+    },
     If {
         condition: Expr,
         then_body: Vec<Stmt>,
         else_body: Option<Vec<Stmt>>,
+        span: Span,
+    },
+    While {
+        condition: Expr,
+        body: Vec<Stmt>,
+        span: Span,
+    },
+    Break {
+        span: Span,
+    },
+    Continue {
         span: Span,
     },
     Expr(Expr),
@@ -125,11 +148,20 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
     Neg,
+    Not,
 }
 
 impl Expr {
@@ -443,6 +475,23 @@ impl<'a> Parser<'a> {
         if matches!(self.peek().kind, TokenKind::If) {
             return self.parse_if_stmt();
         }
+        if matches!(self.peek().kind, TokenKind::While) {
+            return self.parse_while_stmt();
+        }
+        if matches!(self.peek().kind, TokenKind::Break) {
+            let t = self.bump();
+            let semi = self.expect(&TokenKind::Semi, "`;`")?;
+            return Some(Stmt::Break {
+                span: Span::new(t.span.start, semi.span.end),
+            });
+        }
+        if matches!(self.peek().kind, TokenKind::Continue) {
+            let t = self.bump();
+            let semi = self.expect(&TokenKind::Semi, "`;`")?;
+            return Some(Stmt::Continue {
+                span: Span::new(t.span.start, semi.span.end),
+            });
+        }
         if matches!(self.peek().kind, TokenKind::Let) {
             let let_tok = self.bump();
             let (name, name_span) = self.parse_ident()?;
@@ -454,6 +503,22 @@ impl<'a> Parser<'a> {
                 name_span,
                 value,
                 span: Span::new(let_tok.span.start, semi.span.end),
+            })
+        } else if matches!(self.peek().kind, TokenKind::Ident(_))
+            && matches!(
+                self.toks.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Eq)
+            )
+        {
+            let (name, name_span) = self.parse_ident_opt().expect("checked above");
+            self.bump(); // `=`
+            let value = self.parse_expr()?;
+            let semi = self.expect(&TokenKind::Semi, "`;`")?;
+            Some(Stmt::Assign {
+                name,
+                name_span,
+                value,
+                span: Span::new(name_span.start, semi.span.end),
             })
         } else {
             let value = self.parse_expr()?;
@@ -482,6 +547,23 @@ impl<'a> Parser<'a> {
             condition,
             then_body,
             else_body,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_while_stmt(&mut self) -> Option<Stmt> {
+        let start = self.bump().span.start; // `while`
+        self.expect(&TokenKind::LParen, "`(` after `while`")?;
+        let condition = self.parse_expr()?;
+        self.expect(&TokenKind::RParen, "`)` after condition")?;
+        let body = self.parse_branch()?;
+        let end = self
+            .toks
+            .get(self.pos.saturating_sub(1))
+            .map_or_else(|| condition.span().end, |t| t.span.end);
+        Some(Stmt::While {
+            condition,
+            body,
             span: Span::new(start, end),
         })
     }
@@ -520,7 +602,13 @@ impl<'a> Parser<'a> {
                     self.bump();
                     return;
                 }
-                TokenKind::RBrace | TokenKind::Let | TokenKind::Function => return,
+                TokenKind::RBrace
+                | TokenKind::Let
+                | TokenKind::Function
+                | TokenKind::If
+                | TokenKind::While
+                | TokenKind::Break
+                | TokenKind::Continue => return,
                 _ => {
                     self.bump();
                 }
@@ -569,6 +657,86 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self) -> Option<Expr> {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Option<Expr> {
+        let mut lhs = self.parse_and()?;
+        while matches!(self.peek().kind, TokenKind::PipePipe) {
+            self.bump();
+            let rhs = self.parse_and()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Binary {
+                op: BinOp::Or,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Some(lhs)
+    }
+
+    fn parse_and(&mut self) -> Option<Expr> {
+        let mut lhs = self.parse_equality()?;
+        while matches!(self.peek().kind, TokenKind::AmpAmp) {
+            self.bump();
+            let rhs = self.parse_equality()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Binary {
+                op: BinOp::And,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Some(lhs)
+    }
+
+    fn parse_equality(&mut self) -> Option<Expr> {
+        let mut lhs = self.parse_comparison()?;
+        loop {
+            let op = match &self.peek().kind {
+                TokenKind::EqEq => BinOp::Eq,
+                TokenKind::BangEq => BinOp::Ne,
+                _ => break,
+            };
+            self.bump();
+            let rhs = self.parse_comparison()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Some(lhs)
+    }
+
+    fn parse_comparison(&mut self) -> Option<Expr> {
+        let mut lhs = self.parse_add()?;
+        loop {
+            let op = match &self.peek().kind {
+                TokenKind::Lt => BinOp::Lt,
+                TokenKind::LtEq => BinOp::Le,
+                TokenKind::Gt => BinOp::Gt,
+                TokenKind::GtEq => BinOp::Ge,
+                _ => break,
+            };
+            self.bump();
+            let rhs = self.parse_add()?;
+            let span = lhs.span().merge(rhs.span());
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Some(lhs)
+    }
+
+    fn parse_add(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_term()?;
         loop {
             let op = match &self.peek().kind {
@@ -590,7 +758,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_term(&mut self) -> Option<Expr> {
-        let mut lhs = self.parse_factor()?;
+        let mut lhs = self.parse_unary()?;
         loop {
             let op = match &self.peek().kind {
                 TokenKind::Star => BinOp::Mul,
@@ -598,7 +766,7 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             self.bump();
-            let rhs = self.parse_factor()?;
+            let rhs = self.parse_unary()?;
             let span = lhs.span().merge(rhs.span());
             lhs = Expr::Binary {
                 op,
@@ -608,6 +776,32 @@ impl<'a> Parser<'a> {
             };
         }
         Some(lhs)
+    }
+
+    fn parse_unary(&mut self) -> Option<Expr> {
+        match &self.peek().kind {
+            TokenKind::Minus => {
+                let t = self.bump();
+                let rhs = self.parse_unary()?;
+                let span = Span::new(t.span.start, rhs.span().end);
+                Some(Expr::Unary {
+                    op: UnOp::Neg,
+                    rhs: Box::new(rhs),
+                    span,
+                })
+            }
+            TokenKind::Bang => {
+                let t = self.bump();
+                let rhs = self.parse_unary()?;
+                let span = Span::new(t.span.start, rhs.span().end);
+                Some(Expr::Unary {
+                    op: UnOp::Not,
+                    rhs: Box::new(rhs),
+                    span,
+                })
+            }
+            _ => self.parse_factor(),
+        }
     }
 
     fn parse_factor(&mut self) -> Option<Expr> {
@@ -675,16 +869,6 @@ impl<'a> Parser<'a> {
                 self.expect(&TokenKind::RParen, "`)`")?;
                 Some(inner)
             }
-            TokenKind::Minus => {
-                self.bump();
-                let rhs = self.parse_factor()?;
-                let span = Span::new(t.span.start, rhs.span().end);
-                Some(Expr::Unary {
-                    op: UnOp::Neg,
-                    rhs: Box::new(rhs),
-                    span,
-                })
-            }
             TokenKind::Invalid => {
                 self.bump();
                 None
@@ -721,11 +905,23 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::Function => "`function`".into(),
         TokenKind::If => "`if`".into(),
         TokenKind::Else => "`else`".into(),
+        TokenKind::While => "`while`".into(),
+        TokenKind::Break => "`break`".into(),
+        TokenKind::Continue => "`continue`".into(),
         TokenKind::Plus => "`+`".into(),
         TokenKind::Minus => "`-`".into(),
         TokenKind::Star => "`*`".into(),
         TokenKind::Slash => "`/`".into(),
         TokenKind::Eq => "`=`".into(),
+        TokenKind::EqEq => "`==`".into(),
+        TokenKind::Bang => "`!`".into(),
+        TokenKind::BangEq => "`!=`".into(),
+        TokenKind::Lt => "`<`".into(),
+        TokenKind::LtEq => "`<=`".into(),
+        TokenKind::Gt => "`>`".into(),
+        TokenKind::GtEq => "`>=`".into(),
+        TokenKind::AmpAmp => "`&&`".into(),
+        TokenKind::PipePipe => "`||`".into(),
         TokenKind::Semi => "`;`".into(),
         TokenKind::LParen => "`(`".into(),
         TokenKind::RParen => "`)`".into(),
@@ -878,6 +1074,54 @@ mod tests {
         assert!(
             matches!(&prog.items[0], Item::Use { path, names: Some(names), .. } if path == &vec![String::from("std"), String::from("string")] && names.len() == 1)
         );
+    }
+
+    #[test]
+    fn parses_while_break_continue_and_assign() {
+        let (prog, diags) = parse_src(
+            "function main() { let i = 0; while (i < 10) { i = i + 1; if (i == 2) { continue; } break; } }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { body, .. } => {
+                assert!(matches!(body[1], Stmt::While { .. }));
+                match &body[1] {
+                    Stmt::While { body, .. } => {
+                        assert!(matches!(body[0], Stmt::Assign { .. }));
+                        match &body[1] {
+                            Stmt::If { then_body, .. } => {
+                                assert!(matches!(then_body[0], Stmt::Continue { .. }))
+                            }
+                            other => panic!("expected if, got {other:?}"),
+                        }
+                        assert!(matches!(body[2], Stmt::Break { .. }));
+                    }
+                    other => panic!("expected while, got {other:?}"),
+                }
+            }
+            other => panic!("expected function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logical_operators_bind_looser_than_comparison() {
+        let (prog, diags) = parse_src("function main() { let x = 1; x + 1 == 2 && !x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { body, .. } => match &body[1] {
+                Stmt::Expr(Expr::Binary {
+                    op: BinOp::And,
+                    lhs,
+                    rhs,
+                    ..
+                }) => {
+                    assert!(matches!(**lhs, Expr::Binary { op: BinOp::Eq, .. }));
+                    assert!(matches!(**rhs, Expr::Unary { op: UnOp::Not, .. }));
+                }
+                other => panic!("expected &&, got {other:?}"),
+            },
+            other => panic!("expected function, got {other:?}"),
+        }
     }
 
     #[test]

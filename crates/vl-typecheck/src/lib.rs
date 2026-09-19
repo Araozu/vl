@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use vl_common::Scalar;
 use vl_common::{Diagnostic, Span, VlType};
-use vl_hir::{HirBinOp, HirExpr, HirItem, HirProgram, HirStmt};
+use vl_hir::{HirBinOp, HirExpr, HirItem, HirProgram, HirStmt, HirUnOp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ty {
@@ -246,8 +246,10 @@ impl Checker {
     }
 
     /// Check a statement. Returns the tail-value type when the statement
-    /// produces one (`let` initializer / expression value); `if` preserves
-    /// the incoming tail (matches LIR, which leaves `last` untouched).
+    /// produces one (`let` initializer / expression value); control-flow
+    /// statements (`if`, `while`, `break`, `continue`, assignment)
+    /// preserve the incoming tail (matches LIR, which leaves `last`
+    /// untouched).
     fn check_stmt(&mut self, stmt: &HirStmt) -> Option<Ty> {
         match stmt {
             HirStmt::Let { id, def, value, .. } => {
@@ -272,6 +274,77 @@ impl Checker {
                 Some(ty)
             }
             HirStmt::Expr(e) => Some(self.infer_expr(e)),
+            HirStmt::Assign { id, def, value, .. } => {
+                let got = self.infer_expr(value);
+                let Some(def) = def else {
+                    // Unresolved target already reported (E201); stay quiet.
+                    self.record(*id, Ty::Error);
+                    return None;
+                };
+                if got == Ty::Error {
+                    self.record(*id, Ty::Error);
+                    return None;
+                }
+                match self.bindings.get(&def.0).copied() {
+                    None => {
+                        self.diags.push(
+                            Diagnostic::error("cannot assign before the binding type is known")
+                                .with_label(value.span(), "type is not known yet")
+                                .with_note("define the binding before assigning to it")
+                                .with_code("E305"),
+                        );
+                        self.record(*id, Ty::Error);
+                        None
+                    }
+                    Some(Ty::Error) => {
+                        self.record(*id, Ty::Error);
+                        None
+                    }
+                    Some(want) => {
+                        if got == Ty::Void || want == Ty::Void {
+                            self.diags.push(
+                                Diagnostic::error("cannot assign a `void` value")
+                                    .with_label(value.span(), "`void` is not a value")
+                                    .with_code("E308"),
+                            );
+                            self.record(*id, Ty::Error);
+                            return None;
+                        }
+                        if got != want {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "cannot assign `{got}` to `{want}` binding"
+                                ))
+                                .with_label(value.span(), format!("expected `{want}` here"))
+                                .with_code("E309"),
+                            );
+                            self.record(*id, Ty::Error);
+                            return None;
+                        }
+                        self.record(*id, want);
+                        None
+                    }
+                }
+            }
+            HirStmt::Break { .. } | HirStmt::Continue { .. } => None,
+            HirStmt::While {
+                condition, body, ..
+            } => {
+                let condition_ty = self.infer_expr(condition);
+                if condition_ty != Ty::Error && condition_ty != Ty::Bool {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "while condition must be bool, got {condition_ty}"
+                        ))
+                        .with_label(condition.span(), "expected bool")
+                        .with_code("E304"),
+                    );
+                }
+                for stmt in body {
+                    self.check_stmt(stmt);
+                }
+                None
+            }
             HirStmt::If {
                 condition,
                 then_body,
@@ -489,6 +562,32 @@ impl Checker {
                 }
                 self.record(*id, sig.ret)
             }
+            HirExpr::Unary {
+                id,
+                op,
+                inner,
+                span,
+            } => {
+                let inner_ty = self.infer_expr(inner);
+                if inner_ty == Ty::Error {
+                    return self.record(*id, Ty::Error);
+                }
+                match op {
+                    HirUnOp::Not => {
+                        if inner_ty != Ty::Bool {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "not operator requires bool, got {inner_ty}"
+                                ))
+                                .with_label(*span, "expected bool here")
+                                .with_code("E304"),
+                            );
+                            return self.record(*id, Ty::Error);
+                        }
+                        self.record(*id, Ty::Bool)
+                    }
+                }
+            }
             HirExpr::Binary {
                 id,
                 op,
@@ -509,19 +608,50 @@ impl Checker {
                     );
                     return self.record(*id, Ty::Error);
                 }
-                if lt != rt || !is_numeric(lt) {
-                    self.diags.push(mismatch(*span, lt, rt));
-                    return self.record(*id, Ty::Error);
+                match op {
+                    HirBinOp::Add | HirBinOp::Sub | HirBinOp::Mul | HirBinOp::Div => {
+                        if lt != rt || !is_numeric(lt) {
+                            self.diags.push(mismatch(*span, lt, rt));
+                            return self.record(*id, Ty::Error);
+                        }
+                        if matches!(op, HirBinOp::Div) && is_zero_literal(rhs) {
+                            self.diags.push(
+                                Diagnostic::error("division by zero")
+                                    .with_label(rhs.span(), "denominator is a constant zero")
+                                    .with_code("E301"),
+                            );
+                            return self.record(*id, Ty::Error);
+                        }
+                        self.record(*id, lt)
+                    }
+                    HirBinOp::Eq | HirBinOp::Ne => {
+                        if lt != rt || !is_comparable(lt) {
+                            self.diags.push(mismatch(*span, lt, rt));
+                            return self.record(*id, Ty::Error);
+                        }
+                        self.record(*id, Ty::Bool)
+                    }
+                    HirBinOp::Lt | HirBinOp::Le | HirBinOp::Gt | HirBinOp::Ge => {
+                        if lt != rt || !is_numeric(lt) {
+                            self.diags.push(mismatch(*span, lt, rt));
+                            return self.record(*id, Ty::Error);
+                        }
+                        self.record(*id, Ty::Bool)
+                    }
+                    HirBinOp::And | HirBinOp::Or => {
+                        if lt != Ty::Bool || rt != Ty::Bool {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "logical operator requires bool on both sides, got {lt} and {rt}"
+                                ))
+                                .with_label(*span, "expected bool here")
+                                .with_code("E304"),
+                            );
+                            return self.record(*id, Ty::Error);
+                        }
+                        self.record(*id, Ty::Bool)
+                    }
                 }
-                if matches!(op, HirBinOp::Div) && is_zero_literal(rhs) {
-                    self.diags.push(
-                        Diagnostic::error("division by zero")
-                            .with_label(rhs.span(), "denominator is a constant zero")
-                            .with_code("E301"),
-                    );
-                    return self.record(*id, Ty::Error);
-                }
-                self.record(*id, lt)
             }
         }
     }
@@ -561,6 +691,13 @@ fn is_numeric(ty: Ty) -> bool {
     matches!(ty, Ty::U64 | Ty::I64 | Ty::F64 | Ty::U8)
 }
 
+fn is_comparable(ty: Ty) -> bool {
+    matches!(
+        ty,
+        Ty::U64 | Ty::I64 | Ty::F64 | Ty::Bool | Ty::U8 | Ty::String
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,6 +708,67 @@ mod tests {
         let (res, _) = vl_semantic::resolve(&prog);
         let hir = vl_hir::lower(&prog, &res);
         check(&hir)
+    }
+
+    #[test]
+    fn comparisons_and_logic_yield_bool() {
+        let (typed, diags) =
+            check_src("function main() { let a = 1; let ok = a < 2 && a == 1 || !false; ok; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.types.values().any(|t| *t == Ty::Bool));
+    }
+
+    #[test]
+    fn mixed_numeric_comparison_errors() {
+        let (_, diags) = check_src("function main() { let x = 1 < 2u64; x; }");
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E302")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn logical_operators_require_bool() {
+        let (_, diags) = check_src("function main() { let x = 1 && true; x; }");
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E304")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn not_requires_bool() {
+        let (_, diags) = check_src("function main() { !1; }");
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E304")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn while_condition_must_be_bool() {
+        let (_, diags) = check_src("function main() { while (1) { 2; } }");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("while condition must be bool")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn assignment_type_mismatch_errors() {
+        let (_, diags) = check_src(r#"function main() { let x = 1; x = "s"; }"#);
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E309")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn assignment_with_matching_type_checks() {
+        let (_, diags) = check_src("function main() { let x = 1; x = 2; }");
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]

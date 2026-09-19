@@ -35,3 +35,13 @@ backend will consume the program.
 Defines the `Target` trait and registers `naravm`, `dummy`, and `stackvm`.
 `naravm` serializes Naravm 0.2 vmfiles; the other targets are inspection
 backends.
+
+The Naravm backend compiles `function main()` (which takes no parameters) to
+a single entrypoint function: integer (`u64`/`i64`/`u8`) and `f64` arithmetic,
+integer equality and ordering (`i64` ordering is emulated by flipping the
+sign bit before the unsigned `ltu`), boolean logic, branches, and `while`
+loops lower to `lv`/`lrf`, typed arithmetic, `eq`/`ltu`/`xor`, `jz`/`jmp`,
+and `calli` for `std.print` / `std.print_u64`. Registers are recycled past
+their last textual use so idiomatic programs fit the 32 value and 32
+reference registers. Float ordering, string equality, and calls to other user
+functions are rejected with diagnostics rather than miscompiled.

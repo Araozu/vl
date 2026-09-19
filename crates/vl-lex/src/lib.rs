@@ -20,11 +20,23 @@ pub enum TokenKind {
     Function,
     If,
     Else,
+    While,
+    Break,
+    Continue,
     Plus,
     Minus,
     Star,
     Slash,
     Eq,
+    EqEq,
+    Bang,
+    BangEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    AmpAmp,
+    PipePipe,
     Semi,
     LParen,
     RParen,
@@ -92,8 +104,68 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 i += 1;
             }
             '=' => {
-                tokens.push(Token::new(TokenKind::Eq, Span::new(i, i + 1)));
-                i += 1;
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token::new(TokenKind::EqEq, Span::new(i, i + 2)));
+                    i += 2;
+                } else {
+                    tokens.push(Token::new(TokenKind::Eq, Span::new(i, i + 1)));
+                    i += 1;
+                }
+            }
+            '!' => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token::new(TokenKind::BangEq, Span::new(i, i + 2)));
+                    i += 2;
+                } else {
+                    tokens.push(Token::new(TokenKind::Bang, Span::new(i, i + 1)));
+                    i += 1;
+                }
+            }
+            '<' => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token::new(TokenKind::LtEq, Span::new(i, i + 2)));
+                    i += 2;
+                } else {
+                    tokens.push(Token::new(TokenKind::Lt, Span::new(i, i + 1)));
+                    i += 1;
+                }
+            }
+            '>' => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token::new(TokenKind::GtEq, Span::new(i, i + 2)));
+                    i += 2;
+                } else {
+                    tokens.push(Token::new(TokenKind::Gt, Span::new(i, i + 1)));
+                    i += 1;
+                }
+            }
+            '&' => {
+                if bytes.get(i + 1) == Some(&b'&') {
+                    tokens.push(Token::new(TokenKind::AmpAmp, Span::new(i, i + 2)));
+                    i += 2;
+                } else {
+                    diags.push(
+                        Diagnostic::error("unexpected character `&`")
+                            .with_label(Span::new(i, i + 1), "did you mean `&&`?")
+                            .with_code("E000"),
+                    );
+                    tokens.push(Token::new(TokenKind::Invalid, Span::new(i, i + 1)));
+                    i += 1;
+                }
+            }
+            '|' => {
+                if bytes.get(i + 1) == Some(&b'|') {
+                    tokens.push(Token::new(TokenKind::PipePipe, Span::new(i, i + 2)));
+                    i += 2;
+                } else {
+                    diags.push(
+                        Diagnostic::error("unexpected character `|`")
+                            .with_label(Span::new(i, i + 1), "did you mean `||`?")
+                            .with_code("E000"),
+                    );
+                    tokens.push(Token::new(TokenKind::Invalid, Span::new(i, i + 1)));
+                    i += 1;
+                }
             }
             ';' => {
                 tokens.push(Token::new(TokenKind::Semi, Span::new(i, i + 1)));
@@ -272,6 +344,9 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                     "function" => TokenKind::Function,
                     "if" => TokenKind::If,
                     "else" => TokenKind::Else,
+                    "while" => TokenKind::While,
+                    "break" => TokenKind::Break,
+                    "continue" => TokenKind::Continue,
                     "true" => TokenKind::Bool(true),
                     "false" => TokenKind::Bool(false),
                     _ => TokenKind::Ident(word.to_string()),
@@ -377,6 +452,38 @@ mod tests {
         let (_toks, diags) = lex("\"\\é\"");
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].labels[0].span, Span::new(1, 4));
+    }
+
+    #[test]
+    fn lexes_loop_keywords_and_operators() {
+        let (toks, diags) = lex("while (a == 1 && b != 2 || !c) { a = a + 1; break; continue; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        let kinds: Vec<&TokenKind> = toks.iter().map(|t| &t.kind).collect();
+        assert!(matches!(kinds[0], TokenKind::While));
+        assert!(kinds.iter().any(|k| matches!(k, TokenKind::EqEq)));
+        assert!(kinds.iter().any(|k| matches!(k, TokenKind::AmpAmp)));
+        assert!(kinds.iter().any(|k| matches!(k, TokenKind::BangEq)));
+        assert!(kinds.iter().any(|k| matches!(k, TokenKind::PipePipe)));
+        assert!(kinds.iter().any(|k| matches!(k, TokenKind::Bang)));
+        assert!(kinds.iter().any(|k| matches!(k, TokenKind::Break)));
+        assert!(kinds.iter().any(|k| matches!(k, TokenKind::Continue)));
+    }
+
+    #[test]
+    fn lexes_ordering_operators() {
+        let (toks, diags) = lex("a < b <= c > d >= e");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Lt)));
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::LtEq)));
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Gt)));
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::GtEq)));
+    }
+
+    #[test]
+    fn single_ampersand_is_an_error() {
+        let (_toks, diags) = lex("a & b");
+        assert!(diags.iter().any(|d| d.message.contains('`')));
+        assert_eq!(diags.len(), 1);
     }
 
     #[test]

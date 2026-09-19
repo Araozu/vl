@@ -23,8 +23,16 @@ function main() {
 
 Numeric literals are `i64` by default. Add a suffix when you need `u64`, `f64`,
 or `u8`; boolean literals are `true` and `false`. Numeric values support `+`,
-`-`, `*`, `/`, unary minus, and parentheses. Calls use the familiar `name(args)`
+`-`, `*`, `/`, unary minus, and parentheses. Comparisons use `==`, `!=`, `<`,
+`<=`, `>`, `>=`; boolean values combine with `&&`, `||`, and prefix `!`.
+`&&` and `||` short-circuit left to right. Calls use the familiar `name(args)`
 form.
+
+```vl
+let ready = true;
+let big = total >= 10u64;
+let ok = ready && big || !ready;
+```
 
 ```vl
 let count = 255u8;
@@ -100,6 +108,52 @@ For a single statement, omit the braces:
 if (ready) print("ready\n"); else print("not ready\n");
 ```
 
+## Assignment
+
+Bindings created with `let` can be reassigned with `=`. The new value must
+have the same type as the binding:
+
+```vl
+function main() {
+    let count = 0;
+    count = count + 1;
+}
+```
+
+Assigning to an undefined name, or with a mismatched type, is an error.
+
+## Loops
+
+`while` repeats a branch while its parenthesized boolean condition holds.
+Branch braces are optional, as with `if`. `break` exits the innermost loop
+and `continue` jumps to its next iteration check:
+
+```vl
+use std.print_u64;
+
+function main() {
+    let i = 3u64;
+    while (i > 0u64) {
+        print_u64(i);
+        i = i - 1u64;
+    }
+}
+```
+
+```vl
+while (true) {
+    if (done) {
+        break;
+    }
+    tick();
+    if (skip) {
+        continue;
+    }
+}
+```
+
+`break` and `continue` outside a loop are errors.
+
 ## Modules and imports
 
 Each `.vl` file can import a module with a dotted `use` path:
@@ -131,6 +185,9 @@ available modules and functions are listed in the [standard library](/std).
 ## Current limits
 
 VL 0.1 is intentionally small: strings are byte strings, the standard modules
-are limited, and Naravm is the only runnable target. Use the [CLI reference](/cli)
+are limited, and Naravm is the only runnable target. The Naravm backend runs
+`function main()` with integer arithmetic, comparisons, and control flow plus
+`std.print` / `std.print_u64`; float ordering, string equality, and calls to
+other user functions are rejected with a diagnostic. Use the [CLI reference](/cli)
 for inspection commands or [Compiler internals](/internals) for implementation
 details.

@@ -170,6 +170,63 @@ fn extern_call_arity_is_checked() {
 }
 
 #[test]
+fn while_countdown_lowers_to_jumps_copies_and_runs_on_naravm() {
+    let src = std::fs::read_to_string("examples/cond_loop.vl").unwrap();
+    let lir = frontend(&src).expect("cond_loop.vl must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("branch_if_false"), "{dump}");
+    assert!(dump.contains("jump"), "{dump}");
+    assert!(dump.contains("copy"), "{dump}");
+
+    use vl_codegen::Target;
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+}
+
+#[test]
+fn comparisons_and_short_circuit_logic_lower() {
+    let lir = frontend(
+        "function main() { let a = 1; if (a <= 2 && a != 3 || !(a > 9)) { a; } while (a >= 1) { a = a - 1; } }",
+    )
+    .expect("comparisons must compile");
+    let dump = lir.dump();
+    for op in ["le", "ne", "gt", "ge", "not", "copy"] {
+        assert!(dump.contains(op), "{op} missing in {dump}");
+    }
+    assert!(!dump.contains("= and"), "{dump}");
+    assert!(!dump.contains("= or"), "{dump}");
+}
+
+#[test]
+fn break_outside_a_loop_is_one_error() {
+    let err = frontend("function main() { break; }").expect_err("must fail");
+    assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
+    assert!(err[0].message.contains("outside of a loop"));
+}
+
+#[test]
+fn continue_outside_a_loop_is_one_error() {
+    let err = frontend("function main() { continue; }").expect_err("must fail");
+    assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
+}
+
+#[test]
+fn assignment_type_mismatch_is_one_error() {
+    let err = frontend(r#"function main() { let x = 1; x = "s"; }"#).expect_err("must fail");
+    assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
+    assert!(err.iter().any(|d| d.code.as_deref() == Some("E309")));
+}
+
+#[test]
+fn while_condition_must_be_bool() {
+    let err = frontend("function main() { while (1) { 2; } }").expect_err("must fail");
+    assert!(err
+        .iter()
+        .any(|d| d.message.contains("while condition must be bool")));
+}
+
+#[test]
 fn missing_annotations_are_an_error() {
     let err = frontend("function add(a, b) { a + b; }").expect_err("must fail");
     assert!(
