@@ -265,7 +265,7 @@ fn nara_vmfile(
             }
             Instr::Call {
                 callee, args, span, ..
-            } if callee == "std.print" => {
+            } if callee == "std.print" || callee == "print" => {
                 if args.len() != 1 {
                     diags.push(
                         Diagnostic::error("std.print expects one string argument")
@@ -480,6 +480,23 @@ mod tests {
             diags.iter().any(|d| d.code.as_deref() == Some("E405")),
             "{diags:?}"
         );
+    }
+
+    #[test]
+    fn naravm_accepts_bare_print_from_single_export_use() {
+        let src = "use std.print; function main() { print(\"hi\\n\"); }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, rdiags) = vl_semantic::resolve_with_modules(&prog, &modules());
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, tdiags) = vl_typecheck::check(&hir);
+        assert!(tdiags.is_empty(), "{tdiags:?}");
+        let lir = vl_lir::lower(&hir, &typed);
+        assert!(lir.dump().contains("call print"), "{}", lir.dump());
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
     }
 
     #[test]

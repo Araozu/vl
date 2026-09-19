@@ -1,6 +1,6 @@
 <script lang="ts">
   const compilerUrl = import.meta.env.PUBLIC_VLC_URL ?? 'https://vlc.nara-lang.org';
-  let source = $state('use std;\n\nfunction main() {\n    std.print("Hello, world!\\n");\n}');
+  let source = $state('use std.print;\n\nfunction main() {\n    print("Hello, world!\\n");\n}');
   let output = $state<string[]>(['// Naravm compiler ready — press Run']);
   let compiling = $state(false);
   let artifact = $state<Uint8Array | null>(null);
@@ -48,8 +48,8 @@
   }
 
   function loadSample(kind: 'hello' | 'arith' | 'error') {
-    if (kind === 'hello') source = 'use std;\n\nfunction main() {\n    std.print("Hello, world!\\n");\n}';
-    if (kind === 'arith') source = 'use std;\n\nfunction main() {\n    std.print("2 + 3 = ");\n}';
+    if (kind === 'hello') source = 'use std.print;\n\nfunction main() {\n    print("Hello, world!\\n");\n}';
+    if (kind === 'arith') source = 'use std.print;\n\nfunction main() {\n    print("2 + 3 = ");\n}';
     if (kind === 'error') source = 'function main() { undefined_var; }';
     artifact = null;
     output = ['// sample loaded — press Run'];

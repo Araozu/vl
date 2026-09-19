@@ -12,10 +12,10 @@ VL uses a small, TypeScript-like surface: declarations use `let` and
 `function`, blocks use braces, and statements end with semicolons.
 
 ```vl
-use std;
+use std.print;
 
 function main() {
-    std.print("Hello, world!\n");
+    print("Hello, world!\n");
 }
 ```
 
@@ -79,9 +79,9 @@ are optional: each branch can be one statement or a brace-delimited block, and
 function main() {
     let ready = true;
     if (ready) {
-        std.print("ready\n");
+        print("ready\n");
     } else {
-        std.print("not ready\n");
+        print("not ready\n");
     }
 }
 ```
@@ -89,7 +89,7 @@ function main() {
 For a single statement, omit the braces:
 
 ```vl
-if (ready) std.print("ready\n"); else std.print("not ready\n");
+if (ready) print("ready\n"); else print("not ready\n");
 ```
 
 ## Modules and imports
@@ -97,14 +97,16 @@ if (ready) std.print("ready\n"); else std.print("not ready\n");
 Each `.vl` file can import a module with a dotted `use` path:
 
 ```vl
-use std;
+use std.print;
 
 function main() {
-    std.print("hello\n");
+    print("hello\n");
 }
 ```
 
-Grouped imports can bring selected exports into the current file:
+A trailing export can be imported directly (`use std.print;` behaves like
+`use std.{print};` and brings `print` into scope), and grouped imports can
+bring selected exports into the current file:
 
 ```vl
 use std.string.{new, len};

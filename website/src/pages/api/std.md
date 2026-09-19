@@ -14,10 +14,10 @@ example.
 Import the module before calling it:
 
 ```vl
-use std;
+use std.print;
 
 function main() {
-    std.print("Hello, world!\n");
+    print("Hello, world!\n");
 }
 ```
 
@@ -26,7 +26,7 @@ function main() {
 Writes one byte string to standard output. It does not add an implicit newline.
 
 ```vl
-std.print("ready\n");
+print("ready\n");
 ```
 
 `std.print` is supported by the Naravm target and currently expects exactly one

@@ -293,6 +293,38 @@ impl Resolver {
             .find(|m| m.path.as_string() == key)
             .cloned()
         else {
+            // `use std.print;` is a single-export import: the parent path is
+            // a known module and the leaf is one of its exports. It behaves
+            // like `use std.{print};` and brings `print` into scope.
+            if names.is_none() && path.len() >= 2 {
+                let parent_key = path[..path.len() - 1].join(".");
+                let leaf = path[path.len() - 1].clone();
+                if let Some(parent) = self
+                    .modules
+                    .iter()
+                    .find(|m| m.path.as_string() == parent_key)
+                    .cloned()
+                {
+                    if parent.exports.iter().any(|export| export == &leaf) {
+                        self.imports.insert(
+                            leaf.clone(),
+                            ModuleSpec {
+                                path: vl_common::ModulePath::new(vec![parent_key, leaf]),
+                                exports: vec![],
+                            },
+                        );
+                        return;
+                    }
+                    self.poisoned_imports.insert(leaf.clone());
+                    self.poisoned_imports.insert(key.clone());
+                    self.diags.push(
+                        Diagnostic::error(format!("module `{parent_key}` has no export `{leaf}`"))
+                            .with_label(span, "unknown module export")
+                            .with_code("E203"),
+                    );
+                    return;
+                }
+            }
             if let Some(name) = path.last() {
                 self.poisoned_imports.insert(name.clone());
             }
@@ -438,5 +470,34 @@ mod tests {
         let (_, diags) = resolve_src("use missing.module; function main() { module.foo(); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("cannot find module"));
+    }
+
+    #[test]
+    fn single_export_use_brings_bare_name_into_scope() {
+        let (_, diags) = resolve_src("use std.string.new; function main() { new(); }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+    }
+
+    #[test]
+    fn single_export_use_of_std_print_resolves() {
+        let (toks, _) = vl_lex::lex("use std.print; function main() { print(); }");
+        let (prog, _) = vl_syntax::parse(&toks, "");
+        let (_, diags) = resolve_with_modules(&prog, &vl_codegen_modules());
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+    }
+
+    #[test]
+    fn single_export_use_with_unknown_export_is_one_error() {
+        let (_, diags) = resolve_src("use std.string.bogus; function main() { bogus(); }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("no export `bogus`"));
+    }
+
+    fn vl_codegen_modules() -> Vec<ModuleSpec> {
+        vec![
+            ModuleSpec::new(&["std"], &["print", "print_u64"]),
+            ModuleSpec::new(&["std", "fs"], &["open", "read"]),
+            ModuleSpec::new(&["std", "string"], &["new", "len"]),
+        ]
     }
 }

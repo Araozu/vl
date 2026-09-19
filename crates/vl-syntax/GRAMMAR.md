@@ -106,4 +106,6 @@ No `return`, `while`, or type annotations; no trailing comma in params.
 Each source file is a module named after its filename without the `.vl`
 extension. `use std.string;` brings the `string` module name into scope, but
 not its exports, so members are written `string.new()`. Grouped imports bring
-only listed exports into scope: `use std.fs.{open, read};`.
+only listed exports into scope: `use std.fs.{open, read};`. A trailing export
+can be imported directly: `use std.print;` behaves like `use std.{print};` and
+brings `print` into scope.

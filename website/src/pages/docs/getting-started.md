@@ -23,14 +23,14 @@ binary.
 Create `hello.vl` with one import and one entrypoint:
 
 ```vl
-use std;
+use std.print;
 
 function main() {
-    std.print("Hello, world!\n");
+    print("Hello, world!\n");
 }
 ```
 
-The `std.print` call writes the string without adding another newline.
+The `print` call writes the string without adding another newline.
 
 ## Check the source
 
