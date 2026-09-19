@@ -5,7 +5,8 @@
 //! program := item*
 //! item    := `let` ident `=` expr `;` | `function` ident `(` params? `)` block
 //! block   := `{` stmt* `}`
-//! stmt    := `let` ident `=` expr `;` | `if` `(` expr `)` block (`else` block)? | expr `;`
+//! stmt    := `let` ident `=` expr `;` | `if` `(` expr `)` branch (`else` branch)? | expr `;`
+//! branch  := block | stmt
 //! expr    := term ((`+`|`-`) term)*
 //! term    := factor ((`*`|`/`) factor)*
 //! factor  := call | int | string | ident | `(` expr `)` | `-` factor
@@ -333,10 +334,10 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::LParen, "`(` after `if`")?;
         let condition = self.parse_expr()?;
         self.expect(&TokenKind::RParen, "`)` after condition")?;
-        let then_body = self.parse_block()?;
+        let then_body = self.parse_branch()?;
         let else_body = if matches!(self.peek().kind, TokenKind::Else) {
             self.bump();
-            Some(self.parse_block()?)
+            Some(self.parse_branch()?)
         } else {
             None
         };
@@ -363,6 +364,14 @@ impl<'a> Parser<'a> {
         }
         self.expect(&TokenKind::RBrace, "`}`")?;
         Some(body)
+    }
+
+    fn parse_branch(&mut self) -> Option<Vec<Stmt>> {
+        if matches!(self.peek().kind, TokenKind::LBrace) {
+            self.parse_block()
+        } else {
+            Some(vec![self.parse_stmt()?])
+        }
     }
 
     fn recover_to_stmt_boundary(&mut self) {
@@ -682,5 +691,15 @@ mod tests {
         assert!(
             matches!(&prog.items[0], Item::Use { path, names: Some(names), .. } if path == &vec![String::from("std"), String::from("string")] && names.len() == 2)
         );
+    }
+
+    #[test]
+    fn parses_unbraced_conditional_branches() {
+        let (prog, diags) = parse_src("function main() { if (true) 1; else 2; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { body, .. } => assert!(matches!(body[0], Stmt::If { .. })),
+            other => panic!("expected function, got {other:?}"),
+        }
     }
 }

@@ -53,8 +53,9 @@ Scopes reject two things: names nobody defined, and names defined twice. After a
 
 ### Conditionals
 
-Conditionals are statements with brace-delimited branches. The condition must
-have type `bool`; `else` is optional.
+Conditionals require parenthesized boolean conditions. Branch braces are
+optional: each branch can be one statement or a brace-delimited block. `else`
+is optional.
 
 ```vl
 function main() {
@@ -65,6 +66,12 @@ function main() {
         std.print("not ready\n");
     }
 }
+```
+
+For a single statement, omit the braces:
+
+```vl
+if (ready) std.print("ready\n"); else std.print("not ready\n");
 ```
 
 ## Topics

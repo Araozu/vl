@@ -82,7 +82,8 @@ function main() { let d = x - 1; d; }
 Numeric literals use `u64`, `i64`, `f64`, and `u8` suffixes; bare integers are
 `i64`. Boolean literals are `true` and `false`. The language also supports
 double-quoted byte strings, `+ - * /`, unary `-`, parens, `let`, `function`
-with params and calls, and brace-delimited `if`/`else` conditionals. `//` comments.
+with params and calls, and `if`/`else` conditionals with mandatory parentheses.
+Branches may be single statements or brace-delimited blocks. `//` comments.
 String escapes are `\\0`,
 `\\n`, `\\r`, `\\t`, `\\\\`, and `\\"`; strings may not cross a newline.
 Semicolons are mandatory. Strings are carried as bytes through LIR; codegen

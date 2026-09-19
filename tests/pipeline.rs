@@ -140,3 +140,10 @@ fn if_requires_a_boolean_condition() {
         "{err:?}"
     );
 }
+
+#[test]
+fn unbraced_conditional_branches_compile() {
+    let lir = frontend("function main() { if (true) 1u64; else 2u64; }")
+        .expect("unbraced branches must compile");
+    assert!(lir.dump().contains("branch_if_false"));
+}

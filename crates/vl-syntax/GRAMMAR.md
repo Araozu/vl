@@ -17,7 +17,8 @@ params   := ident ("," ident)*          ; no trailing comma
 block    := "{" stmt* "}"
 stmt     := let_stmt | if_stmt | expr_stmt
 let_stmt := "let" ident "=" expr ";"
-if_stmt  := "if" "(" expr ")" block ("else" block)?
+if_stmt  := "if" "(" expr ")" branch ("else" branch)?
+branch   := block | stmt
 expr_stmt := expr ";"                   ; mandatory, TS-style
 expr     := term (("+" | "-") term)*     ; left-assoc
 term     := factor (("*" | "/") factor)* ; left-assoc
