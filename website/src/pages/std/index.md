@@ -1,12 +1,12 @@
 ---
 layout: ../../layouts/Docs.astro
-title: Standard library API
+title: std
 description: The modules and functions available to VL programs.
 eyebrow: Reference
 availability: VL 0.1+
 ---
 
-# Standard library API
+# std
 
 The standard library is the set of modules a VL program can import. Start with
 the [learning path](/docs) if you are new to the language, then use these pages
@@ -14,16 +14,16 @@ to look up a module or function.
 
 ## Modules
 
-### [`std`](/api/std)
+### [`std`](/std/std)
 
 Output functions for small command-line programs.
 
-### [`std.fs`](/api/fs)
+### [`std.fs`](/std/fs)
 
 File-system functions recognized by the language module catalog. Target support
 is still in progress.
 
-### [`std.string`](/api/string)
+### [`std.string`](/std/string)
 
 String helpers recognized by the language module catalog. Target support is
 still in progress.

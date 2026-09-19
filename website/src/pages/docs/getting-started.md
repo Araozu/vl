@@ -70,4 +70,4 @@ already reported the cause.
 
 - Learn the syntax and values in the [Language guide](/docs/language).
 - See every command and inspection option in the [CLI reference](/cli).
-- Look up modules and functions in the [standard library API](/api).
+- Look up modules and functions in the [standard library](/std).

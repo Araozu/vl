@@ -1,5 +1,5 @@
 ---
-layout: ../layouts/Docs.astro
+layout: ../../layouts/Docs.astro
 title: CLI reference
 description: Check, build, and inspect VL programs from the command line.
 eyebrow: Reference
@@ -84,4 +84,4 @@ cargo run -- build examples/hello.vl --target naravm --out /tmp/hello.nara
 ```
 
 For the language itself, continue with the [learning path](/docs). For module
-and function details, see the [standard library API](/api).
+and function details, see the [standard library](/std).

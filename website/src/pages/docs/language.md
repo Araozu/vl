@@ -67,7 +67,7 @@ let quote = "say \\"hi\\"";
 ```
 
 Strings are byte strings for now rather than a full text type. See the
-[standard library API](/api) for the functions that work with them.
+[standard library](/std) for the functions that work with them.
 
 ## Conditionals
 
@@ -118,7 +118,7 @@ function main() {
 ```
 
 Unknown modules and exports are reported when the file is checked. The
-available modules and functions are listed in the [standard library API](/api).
+available modules and functions are listed in the [standard library](/std).
 
 ## Current limits
 

@@ -11,7 +11,7 @@ availability: VL 0.1+
 This section is for contributors and tools authors who need to understand how a
 VL program moves through the compiler. If you are learning VL, start with the
 [learning path](/docs). For modules and functions used by programs, see the
-[standard library API](/api).
+[standard library](/std).
 
 ## The pipeline
 

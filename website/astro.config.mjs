@@ -8,6 +8,10 @@ export default defineConfig({
   integrations: [mdx(), svelte()],
   redirects: {
     '/docs/cli': '/cli',
+    '/api': '/std',
+    '/api/std': '/std/std',
+    '/api/fs': '/std/fs',
+    '/api/string': '/std/string',
     '/api/compiler': '/internals/compiler-service',
     '/api/driver': '/internals/driver',
     '/api/frontend': '/internals/frontend',

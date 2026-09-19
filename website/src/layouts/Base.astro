@@ -5,6 +5,25 @@ interface Props {
 }
 const { title = 'VL Documentation', description = 'Documentation for the VL programming language.' } = Astro.props;
 import '../styles/global.css';
+
+// Top-level sections. Each one is its own group with its own sidebar.
+const pathname = Astro.url.pathname;
+const section = pathname.startsWith('/std')
+  ? 'std'
+  : pathname.startsWith('/cli')
+    ? 'cli'
+    : pathname.startsWith('/internals')
+      ? 'internals'
+      : 'docs';
+const sectionMeta = {
+  docs: { href: '/docs', label: 'Documentation' },
+  std: { href: '/std', label: 'std' },
+  cli: { href: '/cli', label: 'CLI' },
+  internals: { href: '/internals', label: 'Internals' },
+} as const;
+const current = sectionMeta[section];
+const navLink = (key: keyof typeof sectionMeta) =>
+  key === section ? 'text-ink' : 'transition hover:text-ink';
 ---
 
 <!doctype html>
@@ -24,12 +43,10 @@ import '../styles/global.css';
           <span aria-hidden="true" class="text-[1rem]">◼</span> VL&nbsp;<span class="font-normal text-muted">Developer</span>
         </a>
         <div class="hidden items-center gap-6 text-[0.82rem] text-body lg:flex">
-          <a href="/docs/getting-started" class="transition hover:text-ink">Get Started</a>
-          <a href="/docs/language" class="transition hover:text-ink">Language</a>
-          <a href="/api" class="transition hover:text-ink">API</a>
-          <a href="/docs" class="text-ink">Documentation</a>
-          <a href="/cli" class="transition hover:text-ink">CLI</a>
-          <a href="/internals" class="transition hover:text-ink">Internals</a>
+          <a href="/docs" class={navLink('docs')}>Documentation</a>
+          <a href="/std" class={navLink('std')}>std</a>
+          <a href="/cli" class={navLink('cli')}>CLI</a>
+          <a href="/internals" class={navLink('internals')}>Internals</a>
         </div>
         <div class="flex items-center gap-3">
           <a href="/docs" aria-label="Search" class="rounded-md p-1.5 text-body transition hover:text-ink">
@@ -42,9 +59,9 @@ import '../styles/global.css';
     <!-- Documentation bar -->
     <div class="border-b border-rule bg-canvas">
       <div class="mx-auto flex h-14 max-w-[1400px] items-center justify-between px-4 sm:px-6">
-        <a href="/docs" class="flex items-center gap-2.5 text-[1.15rem] font-semibold tracking-tight text-ink">
+        <a href={current.href} class="flex items-center gap-2.5 text-[1.15rem] font-semibold tracking-tight text-ink">
           <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" class="text-muted" aria-hidden="true"><rect x="1.5" y="2.5" width="15" height="13" rx="2"/><path d="M6 2.5v13M1.5 6H6"/></svg>
-          Documentation
+          {current.label}
         </a>
         <p class="text-[0.82rem] text-muted">Language: <span class="text-body">VL</span></p>
       </div>

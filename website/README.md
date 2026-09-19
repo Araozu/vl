@@ -13,8 +13,8 @@ pnpm build
 
 - `src/pages/index.astro` — landing + Svelte playground
 - `src/pages/docs/` — learning path, getting-started, and language guide (markdown only)
-- `src/pages/cli.md` — CLI reference
-- `src/pages/api/` — standard library overview and module references (markdown only)
+- `src/pages/std/` — standard library overview and module references (markdown only)
+- `src/pages/cli/` — CLI reference
 - `src/pages/internals/` — compiler pipeline, crates, driver, and service reference
 - `src/components/Playground.svelte` — interactive compiler client (Svelte)
 

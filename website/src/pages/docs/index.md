@@ -28,7 +28,7 @@ to check, build, inspect, and select a target from the `vl` driver.
 
 ## Where to go next
 
-- Need module and function details? See the [standard library API](/api).
+- Need module and function details? See the [standard library](/std).
 - Building an integration? See the [compiler service](/internals/compiler-service).
 - Contributing to the compiler? Read [Compiler internals](/internals).
 

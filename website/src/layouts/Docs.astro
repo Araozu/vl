@@ -15,40 +15,73 @@ const availability = (fm.availability as string | undefined) ?? (Astro.props as 
 
 // Sidebar mirrors the Swift reference: back link, product title, grey
 // section labels, icon rows, one selected pill, filter box pinned bottom.
-const groups = [
-  {
-    label: 'Learn VL',
-    items: [
-      { href: '/docs', label: 'Learning path', icon: 'doc' },
-      { href: '/docs/getting-started', label: 'Getting started', icon: 'doc' },
-      { href: '/docs/language', label: 'Language guide', icon: 'doc' },
+// Each top-level section (docs, std, cli, internals) is its own group with
+// its own sidebar; the navbar switches sections, the sidebar never mixes them.
+const pathname = Astro.url.pathname;
+const section = pathname.startsWith('/std')
+  ? 'std'
+  : pathname.startsWith('/cli')
+    ? 'cli'
+    : pathname.startsWith('/internals')
+      ? 'internals'
+      : 'docs';
+const sectionSidebars = {
+  docs: {
+    root: '/docs',
+    groups: [
+      {
+        label: 'Learn VL',
+        items: [
+          { href: '/docs', label: 'Learning path', icon: 'doc' },
+          { href: '/docs/getting-started', label: 'Getting started', icon: 'doc' },
+          { href: '/docs/language', label: 'Language guide', icon: 'doc' },
+        ],
+      },
     ],
   },
-  {
-    label: 'Reference',
-    items: [
-      { href: '/cli', label: 'CLI reference', icon: 'M' },
-      { href: '/api', label: 'Standard library', icon: 'doc' },
-      { href: '/api/std', label: 'std', icon: 'S' },
-      { href: '/api/fs', label: 'std.fs', icon: 'S' },
-      { href: '/api/string', label: 'std.string', icon: 'S' },
+  std: {
+    root: '/std',
+    groups: [
+      {
+        label: 'Standard library',
+        items: [
+          { href: '/std', label: 'Overview', icon: 'doc' },
+          { href: '/std/std', label: 'std', icon: 'S' },
+          { href: '/std/fs', label: 'std.fs', icon: 'S' },
+          { href: '/std/string', label: 'std.string', icon: 'S' },
+        ],
+      },
     ],
   },
-  {
-    label: 'For contributors',
-    items: [
-      { href: '/internals', label: 'Compiler internals', icon: 'doc' },
-      { href: '/internals/driver', label: 'Driver', icon: 'S' },
-      { href: '/internals/frontend', label: 'Frontend crates', icon: 'S' },
-      { href: '/internals/backend', label: 'Backend crates', icon: 'S' },
-      { href: '/internals/compiler-service', label: 'Compiler service', icon: 'S' },
+  cli: {
+    root: '/cli',
+    groups: [
+      {
+        label: 'Command line',
+        items: [{ href: '/cli', label: 'CLI reference', icon: 'M' }],
+      },
     ],
   },
-];
+  internals: {
+    root: '/internals',
+    groups: [
+      {
+        label: 'For contributors',
+        items: [
+          { href: '/internals', label: 'Compiler internals', icon: 'doc' },
+          { href: '/internals/driver', label: 'Driver', icon: 'S' },
+          { href: '/internals/frontend', label: 'Frontend crates', icon: 'S' },
+          { href: '/internals/backend', label: 'Backend crates', icon: 'S' },
+          { href: '/internals/compiler-service', label: 'Compiler service', icon: 'S' },
+        ],
+      },
+    ],
+  },
+} as const;
+const { root: sectionRoot, groups } = sectionSidebars[section];
 
 // Breadcrumb: "VL / <page>"
 const shortTitle = String(title).split('·')[0].split('|')[0].trim();
-const pathname = Astro.url.pathname;
 ---
 
 <Base title={title} description={description}>
@@ -57,7 +90,7 @@ const pathname = Astro.url.pathname;
       <!-- Sidebar -->
       <aside class="hidden border-r border-rule lg:flex lg:min-h-[calc(100vh-6.5rem)] lg:flex-col">
         <nav class="flex-1 px-3 py-4" aria-label="Documentation">
-          <a href="/docs" class="flex items-center gap-1.5 px-2 py-1.5 text-[0.83rem] font-medium text-body transition hover:text-ink">
+          <a href="/" class="flex items-center gap-1.5 px-2 py-1.5 text-[0.83rem] font-medium text-body transition hover:text-ink">
             <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M7.5 2 4 6l3.5 4"/></svg>
             All Technologies
           </a>
@@ -102,19 +135,25 @@ const pathname = Astro.url.pathname;
         </div>
       </aside>
 
-      <!-- Mobile nav: horizontal strip -->
+      <!-- Mobile nav: horizontal strip for the current section -->
       <nav class="flex gap-2 overflow-x-auto border-b border-rule px-4 py-3 lg:hidden" aria-label="Documentation">
-        <a href="/docs" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">Docs</a>
-        <a href="/docs/getting-started" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">Getting started</a>
-        <a href="/docs/language" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">Language</a>
-        <a href="/cli" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">CLI</a>
-        <a href="/api" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">API</a>
-        <a href="/internals" class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted">Internals</a>
+        {
+          groups.flatMap((group) =>
+            group.items.map((item) => (
+              <a
+                href={item.href}
+                class="whitespace-nowrap rounded-md px-2.5 py-1.5 text-[0.85rem] text-muted"
+              >
+                {item.label}
+              </a>
+            )),
+          )
+        }
       </nav>
 
       <!-- Content -->
       <div class="min-w-0 px-5 py-8 sm:px-10 lg:px-16 lg:py-10">
-        <p class="text-[0.82rem] text-muted"><a href="/docs" class="underline decoration-rule underline-offset-4 hover:text-body">VL</a> / {shortTitle}</p>
+        <p class="text-[0.82rem] text-muted"><a href={sectionRoot} class="underline decoration-rule underline-offset-4 hover:text-body">VL</a> / {shortTitle}</p>
         <p class="mt-6 text-[0.95rem] font-medium text-muted">{eyebrow}</p>
         <div class="docs-prose">
           <slot />
