@@ -11,14 +11,14 @@ Parser recovers per-item (and per-stmt inside `function`); one bad item hides no
 program := item*
 item    := use_item | let_item | function_item
 use_item := "use" path ("." "{" ident ("," ident)* "}")? ";"
-let_item := "let" ident "=" expr ";"
+let_item := "let" ident (":" type)? "=" expr ";"
 function_item := "function" ident "(" params? ")" (":" type)? block
 params   := param ("," param)*          ; no trailing comma
 param    := ident ":" type
 type     := "u64" | "i64" | "f64" | "bool" | "u8" | "string" | "File" | "void"
 block    := "{" stmt* "}"
 stmt     := let_stmt | assign_stmt | if_stmt | while_stmt | break_stmt | continue_stmt | return_stmt | expr_stmt
-let_stmt := "let" ident "=" expr ";"
+let_stmt := "let" ident (":" type)? "=" expr ";"
 assign_stmt := ident "=" expr ";"
 if_stmt  := "if" "(" expr ")" branch ("else" branch)?
 while_stmt := "while" "(" expr ")" branch

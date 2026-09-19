@@ -3,13 +3,13 @@
 //! Grammar (v0, TypeScript-like surface):
 //! ```text
 //! program := item*
-//! item    := `let` ident `=` expr `;` | `function` ident type-params? `(` params? `)` (`:` type)? block
+//! item    := `let` ident (`:` type)? `=` expr `;` | `function` ident type-params? `(` params? `)` (`:` type)? block
 //! type-params := `[` ident (`,` ident)* `]`
 //! params  := param (`,` param)*
 //! param   := ident `:` type
 //! type    := `u64` | `i64` | `f64` | `bool` | `u8` | `string` | `File` | `Array` `[` type `]` | type-param | `void` (`void` only as return)
 //! block   := `{` stmt* `}`
-//! stmt    := `let` ident `=` expr `;` | ident `=` expr `;` | index `=` expr `;`
+//! stmt    := `let` ident (`:` type)? `=` expr `;` | ident `=` expr `;` | index `=` expr `;`
 //!          | `if` `(` expr `)` branch (`else` branch)?
 //!          | `while` `(` expr `)` branch | `break` `;` | `continue` `;`
 //!          | `return` expr? `;` | expr `;`
@@ -95,6 +95,11 @@ pub enum Item {
     Let {
         name: String,
         name_span: Span,
+        /// Optional annotation (`let x: T = ...`). `None` with `ty_span`
+        /// `None` means absent (infer); `None` with `Some` means invalid
+        /// (already reported; downstream poisons quietly).
+        ty: Option<VlType>,
+        ty_span: Option<Span>,
         value: Expr,
         span: Span,
     },
@@ -118,6 +123,9 @@ pub enum Stmt {
     Let {
         name: String,
         name_span: Span,
+        /// Optional annotation, same encoding as [`Item::Let`].
+        ty: Option<VlType>,
+        ty_span: Option<Span>,
         value: Expr,
         span: Span,
     },
@@ -384,15 +392,45 @@ impl<'a> Parser<'a> {
     fn parse_let_item(&mut self) -> Option<Item> {
         let let_tok = self.bump(); // `let`
         let (name, name_span) = self.parse_ident()?;
+        let (ty, ty_span) = self.parse_let_ann(&[]);
         self.expect(&TokenKind::Eq, "`=`")?;
         let value = self.parse_expr()?;
         let semi = self.expect(&TokenKind::Semi, "`;`")?;
         Some(Item::Let {
             name,
             name_span,
+            ty,
+            ty_span,
             value,
             span: Span::new(let_tok.span.start, semi.span.end),
         })
+    }
+
+    /// Parse an optional `let` annotation (`: type`). Absent means
+    /// `(None, None)` (infer); a failed annotation reports and yields
+    /// `(None, Some(span))` so downstream poisons quietly. `void` is
+    /// rejected: a `let` always binds a value.
+    fn parse_let_ann(&mut self, allowed: &[String]) -> (Option<VlType>, Option<Span>) {
+        if !matches!(self.peek().kind, TokenKind::Colon) {
+            return (None, None);
+        }
+        self.bump(); // `:`
+        let fallback = self.peek().clone();
+        match self.parse_type(allowed, true) {
+            Some((ty, span)) => {
+                if ty.is_void() {
+                    self.diags.push(
+                        Diagnostic::error("a `let` binding cannot be `void`")
+                            .with_label(span, "`void` is not a value")
+                            .with_code("E104"),
+                    );
+                    (None, Some(span))
+                } else {
+                    (Some(ty), Some(span))
+                }
+            }
+            None => (None, Some(fallback.span)),
+        }
     }
 
     /// Parse a type. `allowed` holds the enclosing function's type parameter
@@ -627,7 +665,7 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::LBrace, "`{` for the function body")?;
         let mut body = Vec::new();
         while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
-            match self.parse_stmt() {
+            match self.parse_stmt(&allowed) {
                 Some(s) => body.push(s),
                 None => {
                     let before = self.pos;
@@ -651,12 +689,12 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_stmt(&mut self) -> Option<Stmt> {
+    fn parse_stmt(&mut self, allowed: &[String]) -> Option<Stmt> {
         if matches!(self.peek().kind, TokenKind::If) {
-            return self.parse_if_stmt();
+            return self.parse_if_stmt(allowed);
         }
         if matches!(self.peek().kind, TokenKind::While) {
-            return self.parse_while_stmt();
+            return self.parse_while_stmt(allowed);
         }
         if matches!(self.peek().kind, TokenKind::Break) {
             let t = self.bump();
@@ -690,12 +728,15 @@ impl<'a> Parser<'a> {
         if matches!(self.peek().kind, TokenKind::Let) {
             let let_tok = self.bump();
             let (name, name_span) = self.parse_ident()?;
+            let (ty, ty_span) = self.parse_let_ann(allowed);
             self.expect(&TokenKind::Eq, "`=`")?;
             let value = self.parse_expr()?;
             let semi = self.expect(&TokenKind::Semi, "`;`")?;
             Some(Stmt::Let {
                 name,
                 name_span,
+                ty,
+                ty_span,
                 value,
                 span: Span::new(let_tok.span.start, semi.span.end),
             })
@@ -765,15 +806,15 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_if_stmt(&mut self) -> Option<Stmt> {
+    fn parse_if_stmt(&mut self, allowed: &[String]) -> Option<Stmt> {
         let start = self.bump().span.start;
         self.expect(&TokenKind::LParen, "`(` after `if`")?;
         let condition = self.parse_expr()?;
         self.expect(&TokenKind::RParen, "`)` after condition")?;
-        let then_body = self.parse_branch()?;
+        let then_body = self.parse_branch(allowed)?;
         let else_body = if matches!(self.peek().kind, TokenKind::Else) {
             self.bump();
-            Some(self.parse_branch()?)
+            Some(self.parse_branch(allowed)?)
         } else {
             None
         };
@@ -789,12 +830,12 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_while_stmt(&mut self) -> Option<Stmt> {
+    fn parse_while_stmt(&mut self, allowed: &[String]) -> Option<Stmt> {
         let start = self.bump().span.start; // `while`
         self.expect(&TokenKind::LParen, "`(` after `while`")?;
         let condition = self.parse_expr()?;
         self.expect(&TokenKind::RParen, "`)` after condition")?;
-        let body = self.parse_branch()?;
+        let body = self.parse_branch(allowed)?;
         let end = self
             .toks
             .get(self.pos.saturating_sub(1))
@@ -806,11 +847,11 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_block(&mut self) -> Option<Vec<Stmt>> {
+    fn parse_block(&mut self, allowed: &[String]) -> Option<Vec<Stmt>> {
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut body = Vec::new();
         while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
-            match self.parse_stmt() {
+            match self.parse_stmt(allowed) {
                 Some(stmt) => body.push(stmt),
                 None => {
                     let before = self.pos;
@@ -825,11 +866,11 @@ impl<'a> Parser<'a> {
         Some(body)
     }
 
-    fn parse_branch(&mut self) -> Option<Vec<Stmt>> {
+    fn parse_branch(&mut self, allowed: &[String]) -> Option<Vec<Stmt>> {
         if matches!(self.peek().kind, TokenKind::LBrace) {
-            self.parse_block()
+            self.parse_block(allowed)
         } else {
-            Some(vec![self.parse_stmt()?])
+            Some(vec![self.parse_stmt(allowed)?])
         }
     }
 
@@ -1669,6 +1710,78 @@ mod tests {
     fn turbofish_without_call_is_an_error() {
         let (_prog, diags) = parse_src("function main() { f::[u64]; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E103")));
+    }
+
+    #[test]
+    fn annotated_lets_parse() {
+        let (prog, diags) = parse_src(
+            "let scores: Array[u64] = Array.new::[u64](3); function main() { let n: u64 = 1; n; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Let { ty, ty_span, .. } => {
+                assert_eq!(*ty, Some(VlType::Array(Box::new(VlType::U64))));
+                assert!(ty_span.is_some());
+            }
+            other => panic!("expected let, got {other:?}"),
+        }
+        match &prog.items[1] {
+            Item::Function { body, .. } => match &body[0] {
+                Stmt::Let { ty, .. } => assert_eq!(*ty, Some(VlType::U64)),
+                other => panic!("expected let, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unannotated_lets_stay_untyped() {
+        let (prog, diags) = parse_src("let x = 1; function main() { let y = 2; y; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Let { ty, ty_span, .. } => {
+                assert_eq!(*ty, None);
+                assert_eq!(*ty_span, None);
+            }
+            other => panic!("expected let, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn void_let_is_an_error() {
+        let (_prog, diags) = parse_src("let x: void = 1;");
+        assert!(diags.iter().any(|d| d.code.as_deref() == Some("E104")));
+        let (_prog, diags) = parse_src("function main() { let x: void = 1; }");
+        assert!(diags.iter().any(|d| d.code.as_deref() == Some("E104")));
+    }
+
+    #[test]
+    fn unknown_let_type_is_an_error() {
+        let (_prog, diags) = parse_src("let x: Bogus = 1;");
+        assert!(diags.iter().any(|d| d.code.as_deref() == Some("E105")));
+    }
+
+    #[test]
+    fn let_annotation_sees_type_params() {
+        let (prog, diags) =
+            parse_src("function f[T](x: T): T { let y: T = x; let z: Array[T] = [x]; return y; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { body, .. } => {
+                match &body[0] {
+                    Stmt::Let { ty, .. } => assert_eq!(*ty, Some(VlType::Param("T".into()))),
+                    other => panic!("expected let, got {other:?}"),
+                }
+                match &body[1] {
+                    Stmt::Let { ty, .. } => assert_eq!(
+                        *ty,
+                        Some(VlType::Array(Box::new(VlType::Param("T".into()))))
+                    ),
+                    other => panic!("expected let, got {other:?}"),
+                }
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
     }
 
     #[test]
