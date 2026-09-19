@@ -30,6 +30,10 @@ pub enum HirItem {
     Let {
         id: HirId,
         def: Option<DefId>,
+        /// Optional annotation (`None` = infer; a failed annotation parses
+        /// as `None` with `ty_span` set and poisons quietly downstream).
+        ty: Option<VlType>,
+        ty_span: Option<Span>,
         value: HirExpr,
         span: Span,
     },
@@ -55,6 +59,9 @@ pub enum HirStmt {
     Let {
         id: HirId,
         def: Option<DefId>,
+        /// Optional annotation, same encoding as [`HirItem::Let`].
+        ty: Option<VlType>,
+        ty_span: Option<Span>,
         value: HirExpr,
         span: Span,
     },
@@ -254,12 +261,16 @@ impl<'a> Lowerer<'a> {
                 value,
                 span,
                 name_span,
+                ty,
+                ty_span,
                 ..
             } => {
                 let def = self.def_at_site(*name_span);
                 HirItem::Let {
                     id: self.id(),
                     def,
+                    ty: ty.clone(),
+                    ty_span: *ty_span,
                     value: self.lower_expr(value),
                     span: *span,
                 }
@@ -304,12 +315,16 @@ impl<'a> Lowerer<'a> {
                 value,
                 span,
                 name_span,
+                ty,
+                ty_span,
                 ..
             } => {
                 let def = self.def_at_site(*name_span);
                 HirStmt::Let {
                     id: self.id(),
                     def,
+                    ty: ty.clone(),
+                    ty_span: *ty_span,
                     value: self.lower_expr(value),
                     span: *span,
                 }
@@ -573,6 +588,32 @@ mod tests {
                     other => panic!("expected turbofish call, got {other:?}"),
                 }
             }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn annotated_lets_carry_their_types() {
+        let src =
+            "let scores: Array[u64] = Array.new::[u64](3); function main() { let n: u64 = 1; n; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Let { ty, ty_span, .. } => {
+                assert!(matches!(ty, Some(VlType::Array(_))));
+                assert!(ty_span.is_some());
+            }
+            other => panic!("expected let, got {other:?}"),
+        }
+        match &hir.items[1] {
+            HirItem::Fn { body, .. } => match &body[0] {
+                HirStmt::Let { ty, .. } => assert_eq!(*ty, Some(VlType::U64)),
+                other => panic!("expected let, got {other:?}"),
+            },
             other => panic!("expected fn, got {other:?}"),
         }
     }
