@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use vl_common::Scalar;
 use vl_common::Span;
 use vl_hir::{HirBinOp, HirExpr, HirItem, HirProgram, HirStmt, HirUnOp};
-use vl_typecheck::Ty;
+use vl_typecheck::{subst_ty, Ty};
 
 /// Virtual register.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -62,30 +62,35 @@ pub enum Instr {
         args: Vec<Reg>,
         span: Span,
     },
-    /// Allocate a zero-filled `U64Array` with room for `len` (`u64`) elements.
+    /// Allocate a zero-filled `Array[T]` with room for `len` (`u64`)
+    /// elements. `elem` is the (concrete) element type.
     NewArray {
         dst: Reg,
         len: Reg,
+        elem: Ty,
         span: Span,
     },
-    /// Build a `U64Array` from element registers, in order.
+    /// Build an `Array[T]` from element registers, in order.
     ArrayLit {
         dst: Reg,
         elems: Vec<Reg>,
+        elem: Ty,
         span: Span,
     },
-    /// Read element `index` (a `u64` register) from a `U64Array`.
+    /// Read element `index` (a `u64` register) from an `Array[T]`.
     ArrayGet {
         dst: Reg,
         array: Reg,
         index: Reg,
+        elem: Ty,
         span: Span,
     },
-    /// Write `value` into element `index` of a `U64Array`. Statement-only.
+    /// Write `value` into element `index` of an `Array[T]`. Statement-only.
     ArraySet {
         array: Reg,
         index: Reg,
         value: Reg,
+        elem: Ty,
         span: Span,
     },
     /// Explicit `return` (or fallthrough / global initializer value).
@@ -194,29 +199,39 @@ fn fmt_instr(ins: &Instr) -> String {
                 .join(", ");
             format!("%{} = call {callee}({args})", dst.0)
         }
-        Instr::NewArray { dst, len, .. } => {
-            format!("%{} = new_array %{}", dst.0, len.0)
+        Instr::NewArray { dst, len, elem, .. } => {
+            format!("%{} = new_array %{} : {elem}", dst.0, len.0)
         }
-        Instr::ArrayLit { dst, elems, .. } => {
+        Instr::ArrayLit {
+            dst, elems, elem, ..
+        } => {
             let elems = elems
                 .iter()
                 .map(|e| format!("%{}", e.0))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("%{} = array_lit [{elems}]", dst.0)
+            format!("%{} = array_lit [{elems}] : {elem}", dst.0)
         }
         Instr::ArrayGet {
-            dst, array, index, ..
+            dst,
+            array,
+            index,
+            elem,
+            ..
         } => {
-            format!("%{} = array_get %{}[%{}]", dst.0, array.0, index.0)
+            format!("%{} = array_get %{}[%{}] : {elem}", dst.0, array.0, index.0)
         }
         Instr::ArraySet {
             array,
             index,
             value,
+            elem,
             ..
         } => {
-            format!("array_set %{}[%{}], %{}", array.0, index.0, value.0)
+            format!(
+                "array_set %{}[%{}], %{} : {elem}",
+                array.0, index.0, value.0
+            )
         }
         Instr::Ret { src, .. } => format!("ret %{}", src.0),
         Instr::BranchIfFalse { cond, target, .. } => {
@@ -242,7 +257,7 @@ struct LoopTargets {
     continue_target: u32,
 }
 
-struct Lowerer {
+struct Lowerer<'t> {
     next: u32,
     instrs: Vec<Instr>,
     /// Values currently available in this function. Locals are assigned when
@@ -254,6 +269,13 @@ struct Lowerer {
     evaluating_globals: HashSet<u32>,
     next_label: u32,
     loop_stack: Vec<LoopTargets>,
+    /// Instance substitution (`Param` -> concrete) for monomorphized bodies;
+    /// empty when lowering non-generic code.
+    env: HashMap<String, Ty>,
+    /// Mangled instance name when lowering a monomorphized body (used to
+    /// resolve inner generic calls per instance); `None` for root code.
+    outer: Option<String>,
+    typed: &'t vl_typecheck::TypedProgram,
 }
 
 fn globals(prog: &HirProgram) -> HashMap<u32, HirExpr> {
@@ -270,7 +292,7 @@ fn globals(prog: &HirProgram) -> HashMap<u32, HirExpr> {
         .collect()
 }
 
-impl Lowerer {
+impl Lowerer<'_> {
     fn reg(&mut self) -> Reg {
         let r = Reg(self.next);
         self.next += 1;
@@ -281,6 +303,116 @@ impl Lowerer {
         let label = self.next_label;
         self.next_label += 1;
         label
+    }
+
+    /// Recorded type with the current instance substitution applied.
+    /// `None` means poisoned (already reported; the caller skips).
+    fn resolved_ty(&self, id: vl_hir::HirId) -> Option<Ty> {
+        let ty = subst_ty(&self.typed.type_of_id(id)?, &self.env);
+        if ty == Ty::Error || !ty.is_concrete() {
+            return None;
+        }
+        Some(ty)
+    }
+
+    /// Element type of the array produced by `node` (an `ArrayLiteral`,
+    /// `Array.new` call, or any array-typed expression).
+    fn array_elem_of(&self, id: vl_hir::HirId) -> Option<Ty> {
+        match self.resolved_ty(id)? {
+            Ty::Array(elem) => Some(*elem),
+            _ => None,
+        }
+    }
+}
+
+/// One top-level statement inside a function body. Shared by monomorphic
+/// functions and monomorphized instances.
+fn lower_fn_stmt(
+    l: &mut Lowerer,
+    stmt: &HirStmt,
+    typed: &vl_typecheck::TypedProgram,
+    topped_return: &mut bool,
+) {
+    match stmt {
+        HirStmt::Let { def, value, .. } => {
+            if let Some(reg) = l.lower_expr(value, typed) {
+                if let Some(def) = def {
+                    l.bindings.insert(def.0, reg);
+                }
+            }
+            *topped_return = false;
+        }
+        HirStmt::Expr(e) => {
+            // Discarded value: no implicit return.
+            let _ = l.lower_expr(e, typed);
+            *topped_return = false;
+        }
+        HirStmt::Return { value, span } => {
+            l.lower_return(value.as_ref(), typed, *span);
+            *topped_return = true;
+        }
+        HirStmt::If {
+            condition,
+            then_body,
+            else_body,
+            span,
+        } => {
+            l.lower_if(condition, then_body, else_body.as_deref(), typed, *span);
+            *topped_return = false;
+        }
+        HirStmt::Assign {
+            def, value, span, ..
+        } => {
+            l.lower_assign(def.as_ref(), value, typed, *span);
+            *topped_return = false;
+        }
+        HirStmt::IndexAssign {
+            array,
+            index,
+            value,
+            span,
+            ..
+        } => {
+            l.lower_index_assign(array, index, value, typed, *span);
+            *topped_return = false;
+        }
+        HirStmt::While {
+            condition,
+            body,
+            span,
+        } => {
+            l.lower_while(condition, body, typed, *span);
+            *topped_return = false;
+        }
+        HirStmt::Break { span } => {
+            l.lower_break(*span);
+            *topped_return = false;
+        }
+        HirStmt::Continue { span } => {
+            l.lower_continue(*span);
+            *topped_return = false;
+        }
+    }
+}
+
+/// Function epilogue: every function ends with a `Ret` so backends always
+/// see a well-formed epilogue. Explicit `return` emits its own `Ret` inline
+/// (VM `ret` transfers control immediately, so later instructions are
+/// unreachable fallthrough); only emit the default fallthrough when the top
+/// level does not end with an unconditional `return`.
+fn lower_fn_epilogue(l: &mut Lowerer, topped_return: bool) {
+    let ends_with_ret = topped_return && matches!(l.instrs.last(), Some(Instr::Ret { .. }));
+    if !ends_with_ret {
+        let r = l.reg();
+        l.instrs.push(Instr::Const {
+            dst: r,
+            value: Scalar::I64(0),
+            span: Span::empty(0),
+        });
+        l.instrs.push(Instr::Ret {
+            src: r,
+            span: Span::empty(0),
+        });
     }
 }
 
@@ -305,6 +437,9 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                     evaluating_globals: HashSet::new(),
                     next_label: 0,
                     loop_stack: Vec::new(),
+                    env: HashMap::new(),
+                    outer: None,
+                    typed,
                 };
                 if let Some(r) = l.lower_expr(value, typed) {
                     if let HirItem::Let { def: Some(def), .. } = item {
@@ -330,16 +465,22 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
             }
             HirItem::Fn {
                 name,
+                type_params,
                 params,
                 ret,
                 body,
                 ..
             } => {
+                // Generic templates never emit directly: one function per
+                // concrete instance is produced below.
+                if !type_params.is_empty() {
+                    continue;
+                }
                 let param_tys = params
                     .iter()
-                    .map(|(_, _, t, _)| t.map(Ty::from_vl).unwrap_or(Ty::Error))
+                    .map(|(_, _, t, _)| t.as_ref().map(Ty::from_vl).unwrap_or(Ty::Error))
                     .collect::<Vec<_>>();
-                let ret_ty = ret.map(Ty::from_vl).unwrap_or(Ty::Error);
+                let ret_ty = ret.as_ref().map(Ty::from_vl).unwrap_or(Ty::Error);
                 let mut l = Lowerer {
                     next: 0,
                     instrs: vec![],
@@ -348,6 +489,9 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                     evaluating_globals: HashSet::new(),
                     next_label: 0,
                     loop_stack: Vec::new(),
+                    env: HashMap::new(),
+                    outer: None,
+                    typed,
                 };
 
                 for (index, (_, def, _, span)) in params.iter().enumerate() {
@@ -364,87 +508,9 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
 
                 let mut topped_return = false;
                 for stmt in body {
-                    match stmt {
-                        HirStmt::Let { def, value, .. } => {
-                            if let Some(reg) = l.lower_expr(value, typed) {
-                                if let Some(def) = def {
-                                    l.bindings.insert(def.0, reg);
-                                }
-                            }
-                            topped_return = false;
-                        }
-                        HirStmt::Expr(e) => {
-                            // Discarded value: no implicit return.
-                            let _ = l.lower_expr(e, typed);
-                            topped_return = false;
-                        }
-                        HirStmt::Return { value, span } => {
-                            l.lower_return(value.as_ref(), typed, *span);
-                            topped_return = true;
-                        }
-                        HirStmt::If {
-                            condition,
-                            then_body,
-                            else_body,
-                            span,
-                        } => {
-                            l.lower_if(condition, then_body, else_body.as_deref(), typed, *span);
-                            topped_return = false;
-                        }
-                        HirStmt::Assign {
-                            def, value, span, ..
-                        } => {
-                            l.lower_assign(def.as_ref(), value, typed, *span);
-                            topped_return = false;
-                        }
-                        HirStmt::IndexAssign {
-                            array,
-                            index,
-                            value,
-                            span,
-                            ..
-                        } => {
-                            l.lower_index_assign(array, index, value, typed, *span);
-                            topped_return = false;
-                        }
-                        HirStmt::While {
-                            condition,
-                            body,
-                            span,
-                        } => {
-                            l.lower_while(condition, body, typed, *span);
-                            topped_return = false;
-                        }
-                        HirStmt::Break { span } => {
-                            l.lower_break(*span);
-                            topped_return = false;
-                        }
-                        HirStmt::Continue { span } => {
-                            l.lower_continue(*span);
-                            topped_return = false;
-                        }
-                    }
+                    lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
                 }
-                // Every function ends with a `Ret` so backends always see a
-                // well-formed epilogue. Explicit `return` emits its own `Ret`
-                // inline (VM `ret` transfers control immediately, so later
-                // instructions are unreachable fallthrough); only emit the
-                // default fallthrough when the top level does not end with
-                // an unconditional `return`.
-                let ends_with_ret =
-                    topped_return && matches!(l.instrs.last(), Some(Instr::Ret { .. }));
-                if !ends_with_ret {
-                    let r = l.reg();
-                    l.instrs.push(Instr::Const {
-                        dst: r,
-                        value: Scalar::I64(0),
-                        span: Span::empty(0),
-                    });
-                    l.instrs.push(Instr::Ret {
-                        src: r,
-                        span: Span::empty(0),
-                    });
-                }
+                lower_fn_epilogue(&mut l, topped_return);
                 out.functions.push(Function {
                     name: name.clone(),
                     param_tys,
@@ -454,14 +520,73 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
             }
         }
     }
+    // One function per concrete generic instance (sorted: deterministic
+    // output for goldens). Templates themselves never emit.
+    let mut mangled: Vec<&String> = typed.instances.keys().collect();
+    mangled.sort();
+    for m in mangled {
+        let inst = &typed.instances[m];
+        let template = prog.items.iter().find_map(|item| match item {
+            HirItem::Fn {
+                def: Some(d),
+                type_params,
+                params,
+                body,
+                ..
+            } if d.0 == inst.orig => Some((type_params, params, body)),
+            _ => None,
+        });
+        let Some((type_params, params, body)) = template else {
+            continue;
+        };
+        let env: HashMap<String, Ty> = type_params
+            .iter()
+            .cloned()
+            .zip(inst.args.iter().cloned())
+            .collect();
+        let mut l = Lowerer {
+            next: 0,
+            instrs: vec![],
+            bindings: HashMap::new(),
+            global_values: global_values.clone(),
+            evaluating_globals: HashSet::new(),
+            next_label: 0,
+            loop_stack: Vec::new(),
+            env,
+            outer: Some(m.clone()),
+            typed,
+        };
+        for (index, (_, def, _, span)) in params.iter().enumerate() {
+            let dst = l.reg();
+            l.instrs.push(Instr::Param {
+                dst,
+                index,
+                span: *span,
+            });
+            if let Some(def) = def {
+                l.bindings.insert(def.0, dst);
+            }
+        }
+        let mut topped_return = false;
+        for stmt in body {
+            lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
+        }
+        lower_fn_epilogue(&mut l, topped_return);
+        out.functions.push(Function {
+            name: m.clone(),
+            param_tys: inst.sig.param_tys.clone(),
+            ret: inst.sig.ret.clone(),
+            instrs: l.instrs,
+        });
+    }
     out
 }
 
-impl Lowerer {
+impl Lowerer<'_> {
     fn lower_expr(&mut self, expr: &HirExpr, typed: &vl_typecheck::TypedProgram) -> Option<Reg> {
-        if typed.type_of_id(expr.id()) == Some(vl_typecheck::Ty::Error) {
-            return None;
-        }
+        // Poisoned nodes (and, defensively, types that stayed generic) lower
+        // to nothing — the error was already reported.
+        self.resolved_ty(expr.id())?;
         match expr {
             HirExpr::Literal { value, span, .. } => {
                 let dst = self.reg();
@@ -497,15 +622,19 @@ impl Lowerer {
                 reg
             }
             HirExpr::Var { .. } => None,
-            HirExpr::ArrayLiteral { elems, span, .. } => {
+            HirExpr::ArrayLiteral {
+                id, elems, span, ..
+            } => {
                 let mut regs = Vec::with_capacity(elems.len());
                 for elem in elems {
                     regs.push(self.lower_expr(elem, typed)?);
                 }
+                let elem = self.array_elem_of(*id)?;
                 let dst = self.reg();
                 self.instrs.push(Instr::ArrayLit {
                     dst,
                     elems: regs,
+                    elem,
                     span: *span,
                 });
                 Some(dst)
@@ -513,35 +642,65 @@ impl Lowerer {
             HirExpr::Index {
                 base, index, span, ..
             } => {
+                // The element type comes from the array operand (the `Index`
+                // node's own type *is* the element).
+                let elem = self.array_elem_of(base.id());
                 let array = self.lower_expr(base, typed)?;
                 let index = self.lower_expr(index, typed)?;
+                let elem = elem?;
                 let dst = self.reg();
                 self.instrs.push(Instr::ArrayGet {
                     dst,
                     array,
                     index,
+                    elem,
                     span: *span,
                 });
                 Some(dst)
             }
             HirExpr::Call {
-                name, args, span, ..
+                id,
+                name,
+                args,
+                span,
+                ..
             } => {
-                // The `U64Array.new(len)` builtin desugars to an allocation:
-                // arity and argument types were enforced by `vl-typecheck`.
-                if name == "U64Array.new" {
+                // The `Array.new::[T](len)` builtin desugars to an
+                // allocation: arity and argument types were enforced by
+                // `vl-typecheck`. The element type rides along so ref-element
+                // arrays allocate ref slots.
+                if name == "Array.new" {
                     if args.len() != 1 {
                         return None;
                     }
                     let len = self.lower_expr(&args[0], typed)?;
+                    let elem = self.array_elem_of(*id)?;
                     let dst = self.reg();
                     self.instrs.push(Instr::NewArray {
                         dst,
                         len,
+                        elem,
                         span: *span,
                     });
                     return Some(dst);
                 }
+                // Monomorphized callees: root code consults `root_calls`,
+                // instance bodies consult `inst_calls` for their own outer
+                // instance. Unmapped names call through unchanged.
+                let callee = match &self.outer {
+                    Some(outer) => self
+                        .typed
+                        .inst_calls
+                        .get(&(outer.clone(), id.0))
+                        .cloned()
+                        .unwrap_or_else(|| name.clone()),
+                    None => self
+                        .typed
+                        .root_calls
+                        .get(&id.0)
+                        .cloned()
+                        .unwrap_or_else(|| name.clone()),
+                };
                 let mut arg_regs = Vec::with_capacity(args.len());
                 for arg in args {
                     arg_regs.push(self.lower_expr(arg, typed)?);
@@ -549,7 +708,7 @@ impl Lowerer {
                 let dst = self.reg();
                 self.instrs.push(Instr::Call {
                     dst,
-                    callee: name.clone(),
+                    callee,
                     args: arg_regs,
                     span: *span,
                 });
@@ -727,6 +886,7 @@ impl Lowerer {
 
     /// Element write: evaluate the array, index, and value, then emit one
     /// [`Instr::ArraySet`]. Poisoned sides emit nothing (already reported).
+    /// The element type rides along so ref-element arrays pick ref stores.
     fn lower_index_assign(
         &mut self,
         array: &HirExpr,
@@ -735,6 +895,9 @@ impl Lowerer {
         typed: &vl_typecheck::TypedProgram,
         span: Span,
     ) {
+        // Element type comes from the array operand's recorded type (before
+        // lowering shadows the name with registers).
+        let elem = self.array_elem_of(array.id());
         let (Some(array), Some(index), Some(value)) = (
             self.lower_expr(array, typed),
             self.lower_expr(index, typed),
@@ -742,10 +905,14 @@ impl Lowerer {
         ) else {
             return;
         };
+        let Some(elem) = elem else {
+            return;
+        };
         self.instrs.push(Instr::ArraySet {
             array,
             index,
             value,
+            elem,
             span,
         });
     }
@@ -1027,7 +1194,7 @@ mod tests {
 
     #[test]
     fn arrays_lower_to_dedicated_instrs() {
-        let src = "function get(a: U64Array): u64 { a[0u64] = 1u64; return a[1u64]; } function main() { let a = U64Array.new(2u64); let b = [1u64, 2u64]; let e = []; }";
+        let src = "function get(a: Array[u64]): u64 { a[0u64] = 1u64; return a[1u64]; } function main() { let a = Array.new::[u64](2u64); let b = [1u64, 2u64]; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -1040,7 +1207,25 @@ mod tests {
         assert!(dump.contains("array_lit"), "{dump}");
         assert!(dump.contains("array_get"), "{dump}");
         assert!(dump.contains("array_set"), "{dump}");
-        assert!(!dump.contains("U64Array.new"), "{dump}");
+        assert!(!dump.contains("Array.new"), "{dump}");
+    }
+
+    #[test]
+    fn generic_templates_emit_only_instances() {
+        let src = "function id[T](x: T): T { return x; } function main() { let a = id(1u64); a; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let lir = lower(&hir, &typed);
+        let names: Vec<&str> = lir.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"id$u64"), "{names:?}");
+        assert!(!names.contains(&"id"), "{names:?}");
+        let dump = lir.dump();
+        assert!(dump.contains("call id$u64"), "{dump}");
     }
 
     #[test]
