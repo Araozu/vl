@@ -1391,17 +1391,23 @@ pub fn default_modules() -> Vec<ModuleSpec> {
         ),
         ModuleSpec::new(
             &["std", "string"],
-            &[("len", &[("value", T::String)], T::U64)],
+            &[
+                ("len", &[("value", T::String)], T::U64),
+                ("concat", &[("a", T::String), ("b", T::String)], T::String),
+                ("eq", &[("a", T::String), ("b", T::String)], T::Bool),
+                ("to_u64", &[("value", T::String)], T::U64),
+                ("hex_to_u64", &[("value", T::String)], T::U64),
+            ],
+        ),
+        ModuleSpec::new(
+            &["std", "math"],
+            &[("mod_u64", &[("a", T::U64), ("b", T::U64)], T::U64)],
+        ),
+        ModuleSpec::new(
+            &["std", "fmt"],
+            &[("u64_to_s", &[("value", T::U64)], T::String)],
         ),
     ]
-}
-
-fn crosses_boundary(ty: &vl_common::VlType) -> bool {
-    match ty {
-        vl_common::VlType::Object(_) => true,
-        vl_common::VlType::Array(elem) | vl_common::VlType::Mutable(elem) => crosses_boundary(elem),
-        _ => false,
-    }
 }
 
 #[cfg(test)]
