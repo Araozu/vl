@@ -1,0 +1,52 @@
+// Standard math helpers: pure VL plus the VM's `mod_u64` native.
+//
+// Nothing here is available without an explicit `use std.math;`.
+use std.math;
+
+fun max_u64(a: u64, b: u64): u64 {
+    if (a > b) {
+        return a;
+    } else {
+        return b;
+    }
+}
+
+fun min_u64(a: u64, b: u64): u64 {
+    if (a < b) {
+        return a;
+    } else {
+        return b;
+    }
+}
+
+fun clamp_u64(v: u64, lo: u64, hi: u64): u64 {
+    return min_u64(max_u64(v, lo), hi);
+}
+
+fun max_i64(a: i64, b: i64): i64 {
+    if (a > b) {
+        return a;
+    } else {
+        return b;
+    }
+}
+
+fun min_i64(a: i64, b: i64): i64 {
+    if (a < b) {
+        return a;
+    } else {
+        return b;
+    }
+}
+
+fun abs_i64(a: i64): i64 {
+    if (a < 0i64) {
+        return 0i64 - a;
+    } else {
+        return a;
+    }
+}
+
+fun is_even(v: u64): bool {
+    return math.mod_u64(v, 2u64) == 0u64;
+}

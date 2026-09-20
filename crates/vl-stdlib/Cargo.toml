@@ -9,8 +9,6 @@ license = "MIT OR Apache-2.0"
 vl-common = { path = "../vl-common" }
 vl-lex = { path = "../vl-lex" }
 vl-syntax = { path = "../vl-syntax" }
-
-[dev-dependencies]
 vl-semantic = { path = "../vl-semantic" }
 vl-hir = { path = "../vl-hir" }
 vl-typecheck = { path = "../vl-typecheck" }

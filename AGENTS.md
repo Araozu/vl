@@ -12,8 +12,9 @@ Semicolons are mandatory.
 Workspace crates (dependency order, lower first):
 
 `vl-common` → `vl-lex` → `vl-syntax` → `vl-semantic` → `vl-hir` →
-`vl-typecheck` → `vl-lir` → `vl-codegen`, plus `vl-stdlib` (embedded VL
-prelude over VM natives, injected lazily by the driver) and the `vl` driver binary
+`vl-typecheck` → `vl-lir` → `vl-codegen`, plus `vl-stdlib` (embedded
+`std/*.vl` modules over VM natives, merged into the catalog and linked
+inline by the driver) and the `vl` driver binary
 (`src/main.rs`) that wires them together.
 
 - `vl-common`: `Span`, `Sources`, `Diagnostic`. Everyone depends on it.

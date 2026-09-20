@@ -1,0 +1,8 @@
+// Standard formatting helpers, implemented in VL over VM natives.
+//
+// Nothing here is available without an explicit `use std.fmt;`.
+use std.fmt;
+
+fun u64_to_string(v: u64): String {
+    return fmt.u64_to_s(v);
+}

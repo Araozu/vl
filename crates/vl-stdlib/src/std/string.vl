@@ -1,0 +1,14 @@
+// Standard string helpers, implemented in VL over VM natives.
+//
+// `string.len` / `string.eq` are thin externs (the VM's `byte_count` / `eq`);
+// the helpers below compose them. Nothing here is available without an
+// explicit `use std.string;`.
+use std.string;
+
+fun is_empty(s: String): bool {
+    return string.len(s) == 0u64;
+}
+
+fun strings_equal(a: String, b: String): bool {
+    return string.eq(a, b);
+}
