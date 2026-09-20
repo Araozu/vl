@@ -22,8 +22,7 @@ Workspace crates (dependency order, lower first):
 
 ## Naravm target
 
-The target VM checkout is at `/root/projects/zig/naravm` (the user-facing
-project path is `projects/zig/naravm`). Inspect its ISA and file format when
+The target VM checkout is at `~/projects/zig/naravm`. Inspect its ISA and file format when
 implementing the Naravm backend, but **never modify files in that checkout**.
 All VL-side integration belongs in this repository, including
 `crates/vl-codegen`, `vlc/`, and website deployment configuration.
