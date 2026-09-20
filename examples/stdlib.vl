@@ -1,0 +1,26 @@
+// Standard library v1: VM natives plus embedded prelude helpers.
+//
+// Thin externs (`std.string`, `std.math`, `std.fmt`) map to natives the VM
+// already registers; prelude helpers (`max_u64`, `is_empty`, ...) are VL
+// functions the compiler injects only when called. Fallible natives
+// (`byte_at`, `slice`) and `std.fs` stay out until VL has an error story.
+use std;
+use std.string;
+use std.math;
+
+fun main() {
+    val greeting = string.concat("Hello, ", "stdlib!");
+    std.print(greeting);
+    std.print_u64(string.len(greeting));
+    std.print_u64(math.mod_u64(17u64, 5u64));
+    std.print_u64(string.to_u64("42"));
+    std.print(u64_to_string(max_u64(3u64, 9u64)));
+    if (is_empty("x")) {
+        std.print("unreachable\n");
+    } else {
+        std.print("non-empty\n");
+    }
+    if (is_even(4u64)) {
+        std.print("even\n");
+    }
+}

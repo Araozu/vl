@@ -5,6 +5,9 @@ fn frontend(src: &str) -> Result<vl_lir::LirProgram, Vec<vl_common::Diagnostic>>
     let (toks, mut diags) = vl_lex::lex(src);
     let (ast, mut d) = vl_syntax::parse(&toks, src);
     diags.append(&mut d);
+    // Same lazy prelude as the driver: helpers a snippet calls behave as
+    // locals; untouched snippets compile exactly as before.
+    let ast = vl_stdlib::inject(ast);
     let (res, mut d) = vl_semantic::resolve_with_modules(&ast, &vl_codegen::modules());
     diags.append(&mut d);
     let hir = vl_hir::lower(&ast, &res);
@@ -637,4 +640,101 @@ fn lir_boundary_holds_no_unresolved_types() {
     assert!(typed.validate_normalized(&hir, &diags).is_empty());
     let lir = vl_lir::lower(&hir, &typed);
     assert!(!lir.dump().contains("int"), "{}", lir.dump());
+}
+
+#[test]
+fn stdlib_string_math_fmt_externs_emit_mapped_natives() {
+    use vl_codegen::Target;
+    let lir = frontend(
+        "use std.string; use std.math; use std.fmt; fun main() { val s = string.concat(\"a\", \"b\"); val n = string.len(s); val ok = string.eq(s, \"ab\"); val v = string.to_u64(\"42\"); val h = string.hex_to_u64(\"2a\"); val m = math.mod_u64(7u64, 3u64); val t = fmt.u64_to_s(m); t; n; ok; v; h; }",
+    )
+    .expect("stdlib v1 externs must compile");
+    let dump = lir.dump();
+    for call in [
+        "call std.string::concat",
+        "call std.string::len",
+        "call std.string::eq",
+        "call std.string::to_u64",
+        "call std.string::hex_to_u64",
+        "call std.math::mod_u64",
+        "call std.fmt::u64_to_s",
+    ] {
+        assert!(dump.contains(call), "{call} missing in {dump}");
+    }
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+    // VL dotted names lower to the VM's `::` natives (e.g. `len` is
+    // `byte_count` on the wire).
+    for marker in [
+        "std::string",
+        "concat",
+        "byte_count",
+        "eq",
+        "to_u64",
+        "hex_to_u64",
+        "std::math",
+        "mod_u64",
+        "std::fmt",
+        "u64_to_s",
+    ] {
+        assert!(
+            bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+            "{marker} missing"
+        );
+    }
+    // The VL-module spelling must not leak into the artifact.
+    assert!(!bytes
+        .windows(b"std.string".len())
+        .any(|w| w == b"std.string"));
+}
+
+#[test]
+fn stdlib_extern_arg_types_are_checked() {
+    let err = frontend("use std.string; fun main() { string.concat(1u64, \"b\"); }")
+        .expect_err("concat expects Strings");
+    assert!(
+        err.iter().any(|d| d.message.contains("expects `String`")),
+        "{err:?}"
+    );
+    let err = frontend("use std.math; fun main() { math.mod_u64(1u64); }")
+        .expect_err("mod_u64 expects two args");
+    assert!(
+        err.iter().any(|d| d.message.contains("expects 2")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn stdlib_prelude_helpers_inject_lazily_and_emit() {
+    use vl_codegen::Target;
+    let lir = frontend("use std; fun main() { std.print(u64_to_string(max_u64(3u64, 9u64))); std.print_u64(clamp_u64(100u64, 0u64, 10u64)); }")
+        .expect("prelude helpers must inject");
+    let dump = lir.dump();
+    for name in ["fn max_u64:", "fn u64_to_string:", "fn clamp_u64:"] {
+        assert!(dump.contains(name), "{name} missing in {dump}");
+    }
+    // Unreferenced helpers stay out.
+    assert!(!dump.contains("fn is_even:"), "{dump}");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+    assert!(bytes.contains(&0x20), "expected calli instructions");
+}
+
+#[test]
+fn stdlib_example_compiles_and_runs_on_naravm() {
+    use vl_codegen::Target;
+    let src = std::fs::read_to_string("examples/stdlib.vl").unwrap();
+    let lir = frontend(&src).expect("stdlib.vl must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("call std.string::concat"), "{dump}");
+    assert!(dump.contains("call max_u64"), "{dump}");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+    assert!(bytes.contains(&0x20), "expected calli instructions");
 }
