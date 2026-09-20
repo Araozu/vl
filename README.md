@@ -44,6 +44,29 @@ cargo run -- parse examples/hello.vl
 cargo run -- targets                         # list backends
 ```
 
+## Projects
+
+Initialize a project in the current directory:
+
+```sh
+vl init my_app
+```
+
+This creates `vl.toml` and `src/`:
+
+```toml
+module = "my_app"
+source = "src"
+out = "out"
+```
+
+With no source-file argument, `vl build` reads only the current directory's
+`vl.toml`, recursively builds every `.vl` file under `source`, and writes flat
+Naravm artifacts under `out`. A file such as `src/foo/bar.vl` is compiled as
+module `my_app.foo.bar` and written to `out/my_app__foo__bar.naravm`. The
+`source` and `out` paths are relative to the project directory unless they are
+absolute. `vl build path/to/file.vl` remains available for single-file builds.
+
 Error demo (pretty Ariadne output, exit 1):
 
 ```sh

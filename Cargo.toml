@@ -34,3 +34,5 @@ vl-lir = { path = "crates/vl-lir" }
 vl-codegen = { path = "crates/vl-codegen" }
 clap = { version = "4", features = ["derive"] }
 ariadne = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
