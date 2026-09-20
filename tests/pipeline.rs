@@ -249,6 +249,104 @@ fn unknown_module_export_is_a_single_error() {
         .any(|d| d.message.contains("no export `missing`")));
 }
 
+/// Drive N source modules like the project driver does: parse every file,
+/// collect all interfaces into one catalog, then resolve/check/lower each.
+/// Returns one LIR program per module, in `units` order.
+fn frontend_project(
+    units: &[(&str, &str)],
+) -> Result<Vec<vl_lir::LirProgram>, Vec<vl_common::Diagnostic>> {
+    let mut parsed = Vec::new();
+    let mut diags = Vec::new();
+    for (module, src) in units {
+        let (toks, mut d) = vl_lex::lex(src);
+        diags.append(&mut d);
+        let (ast, mut d) = vl_syntax::parse_with_module(&toks, src, module);
+        diags.append(&mut d);
+        parsed.push(ast);
+    }
+    let mut modules = vl_codegen::modules();
+    for ast in &parsed {
+        let (interface, mut d) = vl_semantic::collect_interface_quiet(ast);
+        diags.append(&mut d);
+        modules.push(interface.as_spec());
+    }
+    let mut out = Vec::new();
+    for ast in &parsed {
+        let ast = vl_stdlib::inject(ast.clone());
+        let (res, mut d) = vl_semantic::resolve_with_modules(&ast, &modules);
+        diags.append(&mut d);
+        let hir = vl_hir::lower(&ast, &res);
+        let (typed, mut d) = vl_typecheck::check_with_modules(&hir, &modules);
+        diags.append(&mut d);
+        diags.append(&mut typed.validate_normalized(&hir, &diags));
+        if diags.iter().any(|d| d.is_error()) {
+            return Err(diags);
+        }
+        out.push(vl_lir::lower(&hir, &typed));
+    }
+    Ok(out)
+}
+
+#[test]
+fn cross_module_object_types_compile_to_lir_and_naravm() {
+    use vl_codegen::Target;
+    let programs = frontend_project(&[
+        (
+            "vl.person",
+            "type Person = object { name: String, age: u64, }; fun new(name: String, age: u64): *Person { return Person { name = name, age = age, }; } fun print_name(person: Person) { person.name; }",
+        ),
+        (
+            "vl.main",
+            "use vl.person; fun main() { var rose = person.new(\"Rose\", 25); person.print_name(rose); rose.age = 26; val lit: vl.person.Person = vl.person.Person { name = \"Lit\", age = 40 }; person.print_name(lit); }",
+        ),
+    ])
+    .expect("cross-module objects must compile");
+    assert_eq!(programs.len(), 2);
+    let importer = &programs[1];
+    assert!(
+        importer
+            .imports
+            .iter()
+            .any(|i| i.symbol.module == "vl.person" && i.symbol.function == "new"),
+        "{:?}",
+        importer.imports
+    );
+    assert!(
+        importer.dump().contains("object_set"),
+        "{}",
+        importer.dump()
+    );
+    assert!(
+        importer.dump().contains("new_object vl.person.Person"),
+        "{}",
+        importer.dump()
+    );
+    for lir in &programs {
+        let (artifact, diags) = vl_codegen::NaraVmTarget.emit(lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+    }
+}
+
+#[test]
+fn same_object_name_in_two_modules_stays_disjoint() {
+    frontend_project(&[
+        (
+            "vl.person",
+            "type Person = object { name: String, }; fun name_of(p: Person): String { return p.name; }",
+        ),
+        (
+            "vl.other",
+            "type Person = object { tag: u64, }; fun tag_of(p: Person): u64 { return p.tag; }",
+        ),
+        (
+            "vl.main",
+            "use vl.person; use vl.other; fun main() { val a: vl.person.Person = vl.person.Person { name = \"R\" }; val b: vl.other.Person = vl.other.Person { tag = 7 }; person.name_of(a); other.tag_of(b); }",
+        ),
+    ])
+    .expect("same-named objects in different modules must stay disjoint");
+}
+
 #[test]
 fn scalar_literals_and_if_lower_to_typed_control_flow() {
     let lir = frontend("fun main() { val x = 1u64; if (true) { x; } else { 255u8; } 1.5f64; }")
