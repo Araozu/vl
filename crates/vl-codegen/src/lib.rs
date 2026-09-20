@@ -6,9 +6,9 @@
 //! - [`DummyTarget`]: human-readable pseudo-assembly, used by tests and
 //!   `--emit asm` until a real target lands.
 //! - [`StackVmTarget`]: stack-machine text format sketch (still TBD).
-//! - [`NaraVmTarget`]: executable Naravm 0.2 vmfiles: `function main()`
-//!   becomes the `<entrypoint>` function plus one Nara function per other
-//!   user function. Integer/float arithmetic, comparisons, and control flow
+//! - [`NaraVmTarget`]: executable Naravm 0.2 vmfiles: `function main()`,
+//!   when present, becomes the `<entrypoint>` function plus one Nara function
+//!   per other user function. Integer/float arithmetic, comparisons, and control flow
 //!   plus `std.print` / `std.println` / `std.print_u64` and user-function calls lower to
 //!   `calli`.
 //!
@@ -271,9 +271,11 @@ impl Target for StackVmTarget {
 
 // --------------------------------------------------------- Naravm ---
 
-/// Naravm 0.2 executable vmfile backend: compiles `function main()` to the
-/// `<entrypoint>` function plus one Nara function per other user function
-/// (see the internals book for the supported subset). Calls to
+/// Naravm 0.2 executable vmfile backend: compiles `function main()`, when
+/// present, to the `<entrypoint>` function plus one Nara function per other
+/// user function (see the internals book for the supported subset). A module
+/// without `main` still compiles (a library); entrypoint presence is the
+/// VM/loader's check, not the compiler's. Calls to
 /// `std.print` / `std.println` / `std.print_u64` and to user functions lower
 /// to `calli`;
 /// `Array[T]` values lower to memory containers (`create`/`getvat`/`setvat`
@@ -287,12 +289,9 @@ impl Target for NaraVmTarget {
     }
 
     fn emit(&self, prog: &LirProgram) -> (Option<Artifact>, Vec<Diagnostic>) {
-        if !prog.functions.iter().any(|f| f.name == "main") {
-            return (
-                None,
-                vec![Diagnostic::error("program must define `function main()`").with_code("E400")],
-            );
-        };
+        // No entrypoint requirement: snippets and libraries compile without
+        // `main`. Whether a runnable module defines a usable entrypoint is
+        // validated by a higher stage (the VM/loader), not the compiler.
         let mut diags = Vec::new();
         let bytes = match nara_vmfile(prog, &mut diags) {
             Some(bytes) if diags.iter().all(|d| !d.is_error()) => bytes,
