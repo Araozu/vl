@@ -234,6 +234,7 @@ fn vl_in_instance(v: &VlType, env: &HashMap<String, Ty>) -> Ty {
     match v {
         VlType::Param(name) => env.get(name).cloned().unwrap_or(Ty::Param(name.clone())),
         VlType::Array(elem) => Ty::Array(Box::new(vl_in_instance(elem, env))),
+        VlType::Mutable(inner) => Ty::Mutable(Box::new(vl_in_instance(inner, env))),
         _ => Ty::from_vl(v),
     }
 }
@@ -279,6 +280,7 @@ fn collect_quiet(formal: &Ty, actual: &Ty, per_param: &mut HashMap<String, Vec<T
             true
         }
         (Ty::Array(f), Ty::Array(a)) => collect_quiet(f, a, per_param),
+        (Ty::Mutable(f), Ty::Mutable(a)) => collect_quiet(f, a, per_param),
         (f, a) if f == a => true,
         (f, Ty::Int) if is_integer(f) => true,
         _ => false,

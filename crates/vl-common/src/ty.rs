@@ -14,6 +14,10 @@ use std::str::FromStr;
 /// `Array[T]` is a fixed-length heap array of `T` (a reference type backed by
 /// the target's memory container). `Param(name)` is a use of an enclosing
 /// generic function's type parameter (e.g. `T` in `function id[T](x: T): T`).
+///
+/// `Mutable(inner)` is a mutable view of a GC-managed reference (`*Foo`,
+/// `*Array[T]`). It is a capability qualifier, not a machine pointer: passing
+/// or assigning either spelling copies the GC reference.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum VlType {
     U64,
@@ -28,6 +32,8 @@ pub enum VlType {
     Array(Box<VlType>),
     Param(String),
     Void,
+    /// Mutable view (`*T`) of a GC-managed reference type.
+    Mutable(Box<VlType>),
 }
 
 impl fmt::Display for VlType {
@@ -44,6 +50,7 @@ impl fmt::Display for VlType {
             VlType::Array(elem) => write!(f, "Array[{elem}]"),
             VlType::Param(name) => write!(f, "{name}"),
             VlType::Void => write!(f, "void"),
+            VlType::Mutable(inner) => write!(f, "*{inner}"),
         }
     }
 }
@@ -90,14 +97,102 @@ impl VlType {
     /// `void` is not a value: it cannot be a parameter, a `let` binding, a
     /// call argument, or an operand. It may only appear as a function return
     /// (value discarded) or as a bare expression statement.
+    /// Recurses through `Mutable`/`Array` so `*void` still counts as void.
     pub fn is_void(&self) -> bool {
-        matches!(self, VlType::Void)
+        match self {
+            VlType::Void => true,
+            VlType::Mutable(inner) => inner.is_void(),
+            VlType::Array(elem) => elem.is_void(),
+            _ => false,
+        }
     }
 
     /// Element type for `Array[T]`; `None` for everything else.
+    /// Looks through an outer `*` so `*Array[T]` still yields `T`.
     pub fn array_elem(&self) -> Option<&VlType> {
         match self {
             VlType::Array(elem) => Some(elem),
+            VlType::Mutable(inner) => inner.array_elem(),
+            _ => None,
+        }
+    }
+
+    /// GC-managed reference types: `String`, `File`, user objects, and
+    /// `Array[T]`. A mutable view counts as a reference when its inner type
+    /// is a reference.
+    pub fn is_reference_type(&self) -> bool {
+        match self {
+            VlType::String | VlType::File => true,
+            VlType::Object(_) => true,
+            VlType::Array(_) => true,
+            VlType::Mutable(inner) => inner.is_reference_type(),
+            _ => false,
+        }
+    }
+
+    /// True for `*T` (one outer mutable capability).
+    pub fn is_mutable_view(&self) -> bool {
+        matches!(self, VlType::Mutable(_))
+    }
+
+    /// Remove one outer mutable capability (`*Foo` -> `Foo`).
+    /// Non-mutable types clone unchanged.
+    pub fn readonly_view(&self) -> VlType {
+        match self {
+            VlType::Mutable(inner) => (**inner).clone(),
+            _ => self.clone(),
+        }
+    }
+
+    /// Recursively erase capability qualifiers before LIR/codegen
+    /// (`*Array[*Foo]` -> `Array[Foo]`). Runtime representation is identical.
+    pub fn erase_capability(&self) -> VlType {
+        match self {
+            VlType::Mutable(inner) => inner.erase_capability(),
+            VlType::Array(elem) => VlType::Array(Box::new(elem.erase_capability())),
+            _ => self.clone(),
+        }
+    }
+
+    /// Alias for [`VlType::erase_capability`].
+    pub fn runtime_type(&self) -> VlType {
+        self.erase_capability()
+    }
+
+    /// Well-formedness of `*` placement. Returns `None` when valid, else a
+    /// human-readable reason. Rejects mutable scalars/void, nested `**T`,
+    /// and `*T` over an unconstrained type parameter. Recurses into
+    /// `Array[T]` and `Mutable` payloads.
+    pub fn mutable_wellformed_error(&self) -> Option<String> {
+        match self {
+            VlType::Mutable(inner) => {
+                // Nested `**T` is never valid.
+                if inner.is_mutable_view() {
+                    return Some(format!(
+                        "repeated capability qualifier `*{inner}` (only one `*` is allowed)"
+                    ));
+                }
+                match &**inner {
+                    VlType::Mutable(_) => Some(format!(
+                        "repeated capability qualifier `*{inner}` (only one `*` is allowed)"
+                    )),
+                    VlType::Param(name) => Some(format!(
+                        "`*{name}` needs a reference-kind bound (unconstrained `T` cannot grant mutation authority)"
+                    )),
+                    VlType::Void => Some("`*void` is not a valid type".to_string()),
+                    VlType::U64
+                    | VlType::I64
+                    | VlType::F64
+                    | VlType::Bool
+                    | VlType::U8 => Some(format!("`*{inner}` is not a reference type")),
+                    VlType::String | VlType::File | VlType::Object(_) | VlType::Array(_) => {
+                        // The payload itself may still be malformed
+                        // (e.g. `*Array[*u64]`).
+                        inner.mutable_wellformed_error()
+                    }
+                }
+            }
+            VlType::Array(elem) => elem.mutable_wellformed_error(),
             _ => None,
         }
     }
@@ -132,5 +227,139 @@ impl FromStr for GenericBound {
             "Comparable" => Ok(GenericBound::Comparable),
             other => Err(ParseTyError(other.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obj(name: &str) -> VlType {
+        VlType::Object(name.into())
+    }
+
+    #[test]
+    fn display_round_trips_mutable_spelling() {
+        assert_eq!(VlType::Mutable(Box::new(obj("Foo"))).to_string(), "*Foo");
+        assert_eq!(
+            VlType::Mutable(Box::new(VlType::Array(Box::new(VlType::U64)))).to_string(),
+            "*Array[u64]"
+        );
+        assert_eq!(
+            VlType::Array(Box::new(VlType::Mutable(Box::new(obj("Foo"))))).to_string(),
+            "Array[*Foo]"
+        );
+        assert_eq!(
+            VlType::Mutable(Box::new(VlType::Array(Box::new(VlType::Mutable(
+                Box::new(obj("Foo"))
+            )))))
+            .to_string(),
+            "*Array[*Foo]"
+        );
+    }
+
+    #[test]
+    fn reference_and_mutable_predicates() {
+        assert!(VlType::String.is_reference_type());
+        assert!(VlType::File.is_reference_type());
+        assert!(obj("Foo").is_reference_type());
+        assert!(VlType::Array(Box::new(VlType::U64)).is_reference_type());
+        assert!(!VlType::U64.is_reference_type());
+        assert!(!VlType::Bool.is_reference_type());
+        assert!(!VlType::Void.is_reference_type());
+        assert!(!VlType::Param("T".into()).is_reference_type());
+
+        let m = VlType::Mutable(Box::new(obj("Foo")));
+        assert!(m.is_mutable_view());
+        assert!(m.is_reference_type());
+        assert!(!obj("Foo").is_mutable_view());
+        assert_eq!(m.readonly_view(), obj("Foo"));
+        assert_eq!(obj("Foo").readonly_view(), obj("Foo"));
+    }
+
+    #[test]
+    fn erase_and_runtime_type() {
+        let t = VlType::Mutable(Box::new(VlType::Array(Box::new(VlType::Mutable(
+            Box::new(obj("Foo")),
+        )))));
+        assert_eq!(t.erase_capability(), VlType::Array(Box::new(obj("Foo"))));
+        assert_eq!(t.runtime_type(), VlType::Array(Box::new(obj("Foo"))));
+        assert_eq!(VlType::U64.erase_capability(), VlType::U64);
+    }
+
+    #[test]
+    fn array_elem_looks_through_mutable() {
+        let inner = VlType::U64;
+        let arr = VlType::Array(Box::new(inner.clone()));
+        let marr = VlType::Mutable(Box::new(arr.clone()));
+        assert_eq!(arr.array_elem(), Some(&inner));
+        assert_eq!(marr.array_elem(), Some(&inner));
+        assert_eq!(VlType::U64.array_elem(), None);
+    }
+
+    #[test]
+    fn mutable_wellformedness() {
+        // Valid reference capabilities.
+        assert_eq!(
+            VlType::Mutable(Box::new(obj("Foo"))).mutable_wellformed_error(),
+            None
+        );
+        assert_eq!(
+            VlType::Mutable(Box::new(VlType::String)).mutable_wellformed_error(),
+            None
+        );
+        assert_eq!(
+            VlType::Mutable(Box::new(VlType::Array(Box::new(VlType::U64))))
+                .mutable_wellformed_error(),
+            None
+        );
+        assert_eq!(
+            VlType::Mutable(Box::new(VlType::Array(Box::new(VlType::Param("T".into())))))
+                .mutable_wellformed_error(),
+            None
+        );
+        assert_eq!(
+            VlType::Array(Box::new(VlType::Mutable(Box::new(obj("Foo")))))
+                .mutable_wellformed_error(),
+            None
+        );
+        // Invalid shapes.
+        assert!(VlType::Mutable(Box::new(VlType::U64))
+            .mutable_wellformed_error()
+            .is_some());
+        assert!(VlType::Mutable(Box::new(VlType::Bool))
+            .mutable_wellformed_error()
+            .is_some());
+        assert!(VlType::Mutable(Box::new(VlType::Void))
+            .mutable_wellformed_error()
+            .is_some());
+        assert!(
+            VlType::Mutable(Box::new(VlType::Mutable(Box::new(obj("Foo")))))
+                .mutable_wellformed_error()
+                .is_some()
+        );
+        assert!(VlType::Mutable(Box::new(VlType::Param("T".into())))
+            .mutable_wellformed_error()
+            .is_some());
+        assert!(
+            VlType::Array(Box::new(VlType::Mutable(Box::new(VlType::U64))))
+                .mutable_wellformed_error()
+                .is_some()
+        );
+        assert!(
+            VlType::Mutable(Box::new(VlType::Array(Box::new(VlType::Mutable(
+                Box::new(VlType::U64)
+            )))))
+            .mutable_wellformed_error()
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn void_is_recursive() {
+        assert!(VlType::Void.is_void());
+        assert!(VlType::Mutable(Box::new(VlType::Void)).is_void());
+        assert!(!obj("Foo").is_void());
+        assert!(!VlType::U64.is_void());
     }
 }

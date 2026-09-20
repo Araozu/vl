@@ -379,9 +379,15 @@ impl Lowerer<'_> {
 
     /// Element type of the array produced by `node` (an `ArrayLiteral`,
     /// `Array.new` call, or any array-typed expression).
+    /// Looks through `*` so `*Array[T]` still yields `T` (capability is
+    /// compile-time-only; runtime layout is identical).
     fn array_elem_of(&self, id: vl_hir::HirId) -> Option<Ty> {
         match self.resolved_ty(id)? {
             Ty::Array(elem) => Some(*elem),
+            Ty::Mutable(inner) => match *inner {
+                Ty::Array(elem) => Some(*elem),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -390,11 +396,16 @@ impl Lowerer<'_> {
 /// Bind an object value in its own local home. Object references alias the
 /// same heap allocation, but rebinding one local must not change another local
 /// that happened to receive that reference from a `let` initializer.
+/// Capability is compile-time-only, so `*Object` aliases like `Object`.
 fn bind_local(l: &mut Lowerer, def: Option<&vl_hir::DefId>, value: &HirExpr, reg: Reg) {
     let Some(def) = def else {
         return;
     };
-    let home = if matches!(l.resolved_ty(value.id()), Some(Ty::Object(_))) {
+    let is_object = matches!(
+        l.resolved_ty(value.id()).map(|t| t.erase_capability()),
+        Some(Ty::Object(_))
+    );
+    let home = if is_object {
         let dst = l.reg();
         l.instrs.push(Instr::Copy {
             dst,

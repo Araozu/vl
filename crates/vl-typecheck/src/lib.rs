@@ -48,6 +48,9 @@ pub enum Ty {
     /// Poison: an earlier error made this node's type unknowable.
     /// Poisoned nodes don't produce follow-on errors.
     Error,
+    /// Mutable view (`*T`) of a GC-managed reference. Capability-only:
+    /// same runtime representation as the read-only view.
+    Mutable(Box<Ty>),
 }
 
 impl std::fmt::Display for Ty {
@@ -66,6 +69,7 @@ impl std::fmt::Display for Ty {
             Ty::Param(name) => write!(f, "{name}"),
             Ty::Void => write!(f, "void"),
             Ty::Error => write!(f, "<error>"),
+            Ty::Mutable(inner) => write!(f, "*{inner}"),
         }
     }
 }
@@ -91,6 +95,7 @@ impl Ty {
             VlType::Array(elem) => Ty::Array(Box::new(Self::from_vl_in(elem, env))),
             VlType::Param(name) => env.get(name).cloned().unwrap_or(Ty::Error),
             VlType::Void => Ty::Void,
+            VlType::Mutable(inner) => Ty::Mutable(Box::new(Self::from_vl_in(inner, env))),
         }
     }
 
@@ -102,6 +107,7 @@ impl Ty {
     pub fn is_concrete(&self) -> bool {
         match self {
             Ty::Array(elem) => elem.is_concrete(),
+            Ty::Mutable(inner) => inner.is_concrete(),
             Ty::Param(_) | Ty::Error | Ty::Int => false,
             _ => true,
         }
@@ -116,10 +122,50 @@ impl Ty {
     }
 
     /// Element type for `Array[T]`; `None` for everything else.
+    /// Looks through `*` so `*Array[T]` still yields `T`.
     pub fn array_elem(&self) -> Option<&Ty> {
         match self {
             Ty::Array(elem) => Some(elem),
+            Ty::Mutable(inner) => inner.array_elem(),
             _ => None,
+        }
+    }
+
+    /// True for `*T`.
+    pub fn is_mutable_view(&self) -> bool {
+        matches!(self, Ty::Mutable(_))
+    }
+
+    /// Remove one outer `*` (`*Foo` -> `Foo`).
+    pub fn readonly_view(&self) -> Ty {
+        match self {
+            Ty::Mutable(inner) => (**inner).clone(),
+            _ => self.clone(),
+        }
+    }
+
+    /// Recursively erase capabilities (`*Array[*Foo]` -> `Array[Foo]`).
+    pub fn erase_capability(&self) -> Ty {
+        match self {
+            Ty::Mutable(inner) => inner.erase_capability(),
+            Ty::Array(elem) => Ty::Array(Box::new(elem.erase_capability())),
+            _ => self.clone(),
+        }
+    }
+
+    /// Alias for [`Ty::erase_capability`].
+    pub fn runtime_type(&self) -> Ty {
+        self.erase_capability()
+    }
+
+    /// GC-managed reference (including mutable views of one).
+    pub fn is_reference_type(&self) -> bool {
+        match self {
+            Ty::String | Ty::File => true,
+            Ty::Object(_) => true,
+            Ty::Array(_) => true,
+            Ty::Mutable(inner) => inner.is_reference_type(),
+            _ => false,
         }
     }
 }
@@ -130,6 +176,7 @@ impl Ty {
 pub fn subst_ty(ty: &Ty, env: &HashMap<String, Ty>) -> Ty {
     match ty {
         Ty::Array(elem) => Ty::Array(Box::new(subst_ty(elem, env))),
+        Ty::Mutable(inner) => Ty::Mutable(Box::new(subst_ty(inner, env))),
         Ty::Param(name) => env.get(name).cloned().unwrap_or(Ty::Param(name.clone())),
         _ => ty.clone(),
     }
@@ -154,6 +201,7 @@ fn mangle_ty(ty: &Ty) -> String {
         Ty::File => "File".into(),
         Ty::Object(name) => format!("Object_{}", name),
         Ty::Array(elem) => format!("Array_{}", mangle_ty(elem)),
+        Ty::Mutable(inner) => format!("Mut_{}", mangle_ty(inner)),
         Ty::Param(name) => name.clone(),
         Ty::Void => "void".into(),
         Ty::Error => "error".into(),
@@ -2235,6 +2283,7 @@ pub(crate) fn ty_has_error(ty: &Ty) -> bool {
     match ty {
         Ty::Error => true,
         Ty::Array(elem) => ty_has_error(elem),
+        Ty::Mutable(inner) => ty_has_error(inner),
         _ => false,
     }
 }
@@ -2245,6 +2294,7 @@ fn ty_contains_int(ty: &Ty) -> bool {
     match ty {
         Ty::Int => true,
         Ty::Array(elem) => ty_contains_int(elem),
+        Ty::Mutable(inner) => ty_contains_int(inner),
         _ => false,
     }
 }
@@ -2264,6 +2314,7 @@ pub(crate) fn unify_solved(a: &Ty, b: &Ty) -> Option<Ty> {
     }
     match (a, b) {
         (Ty::Array(x), Ty::Array(y)) => unify_solved(x, y).map(|e| Ty::Array(Box::new(e))),
+        (Ty::Mutable(x), Ty::Mutable(y)) => unify_solved(x, y).map(|e| Ty::Mutable(Box::new(e))),
         _ => None,
     }
 }
@@ -2320,6 +2371,7 @@ pub(crate) fn default_inferred_ty(ty: Ty) -> Ty {
     match ty {
         Ty::Int => Ty::U64,
         Ty::Array(elem) => Ty::Array(Box::new(default_inferred_ty(*elem))),
+        Ty::Mutable(inner) => Ty::Mutable(Box::new(default_inferred_ty(*inner))),
         _ => ty,
     }
 }
@@ -2355,6 +2407,7 @@ impl ConstraintSet {
                 true
             }
             (Ty::Array(f), Ty::Array(a)) => self.collect(f, a, name, span, diags),
+            (Ty::Mutable(f), Ty::Mutable(a)) => self.collect(f, a, name, span, diags),
             (f, a) if f == a => true,
             // An untyped literal against a concrete integer lane coerces
             // later; it is not an inference conflict.
@@ -2572,7 +2625,9 @@ fn fallthrough_span(body: &[HirStmt]) -> Option<Span> {
 /// lingering `Int` here means "no context supplied one" and must not match
 /// every integer lane.
 fn types_compatible(got: &Ty, want: &Ty) -> bool {
-    got == want || matches!((got, want), (Ty::Array(g), Ty::Array(w)) if types_compatible(g, w))
+    got == want
+        || matches!((got, want), (Ty::Array(g), Ty::Array(w)) if types_compatible(g, w))
+        || matches!((got, want), (Ty::Mutable(g), Ty::Mutable(w)) if types_compatible(g, w))
 }
 
 fn is_numeric(ty: &Ty) -> bool {
@@ -3650,5 +3705,71 @@ mod tests {
         // With a prior error (lowering already blocked): validation is moot.
         let prior = vec![Diagnostic::error("prior failure").with_code("E999")];
         assert!(typed.validate_normalized(&hir, &prior).is_empty());
+    }
+
+    #[test]
+    fn mutable_ty_structural_ops() {
+        use std::collections::HashMap;
+        let foo = Ty::Object("Foo".into());
+        let mfoo = Ty::Mutable(Box::new(foo.clone()));
+        // Display round-trips the `*` spelling.
+        assert_eq!(mfoo.to_string(), "*Foo");
+        assert_eq!(
+            Ty::Mutable(Box::new(Ty::Array(Box::new(mfoo.clone())))).to_string(),
+            "*Array[*Foo]"
+        );
+        // from_vl preserves capability recursively.
+        let v = VlType::Mutable(Box::new(VlType::Array(Box::new(VlType::Mutable(
+            Box::new(VlType::Object("Foo".into())),
+        )))));
+        assert_eq!(
+            Ty::from_vl(&v),
+            Ty::Mutable(Box::new(Ty::Array(Box::new(mfoo.clone()))))
+        );
+        // Predicates and erasure.
+        assert!(mfoo.is_mutable_view());
+        assert!(!foo.is_mutable_view());
+        assert!(mfoo.is_reference_type());
+        assert_eq!(mfoo.readonly_view(), foo);
+        assert_eq!(
+            Ty::Mutable(Box::new(Ty::Array(Box::new(foo.clone())))).erase_capability(),
+            Ty::Array(Box::new(foo.clone()))
+        );
+        assert_eq!(
+            Ty::Mutable(Box::new(Ty::Array(Box::new(mfoo.clone())))).runtime_type(),
+            Ty::Array(Box::new(foo.clone()))
+        );
+        // Substitution descends through `*`.
+        let mut env = HashMap::new();
+        env.insert("T".to_string(), foo.clone());
+        assert_eq!(
+            subst_ty(
+                &Ty::Mutable(Box::new(Ty::Array(Box::new(Ty::Param("T".into()))))),
+                &env
+            ),
+            Ty::Mutable(Box::new(Ty::Array(Box::new(foo.clone()))))
+        );
+        // Mangling distinguishes `Foo` from `*Foo` with identical runtime layout.
+        assert_ne!(mangle_ty(&foo), mangle_ty(&mfoo));
+        assert!(mangle_ty(&mfoo).contains("Mut"));
+        // Poison and int traversal see through `*`.
+        assert!(ty_has_error(&Ty::Mutable(Box::new(Ty::Array(Box::new(
+            Ty::Error
+        ))))));
+        assert!(ty_contains_int(&Ty::Mutable(Box::new(Ty::Array(
+            Box::new(Ty::Int)
+        )))));
+        assert_eq!(
+            default_inferred_ty(Ty::Mutable(Box::new(Ty::Int))),
+            Ty::Mutable(Box::new(Ty::U64))
+        );
+        assert_eq!(
+            unify_solved(&mfoo, &mfoo),
+            Some(mfoo.clone()),
+            "identical mutable views unify"
+        );
+        // Mixed `*Foo` vs `Foo` stays a conflict here; directional
+        // coercion/common-type picks the safe read-only side later.
+        assert_eq!(unify_solved(&mfoo, &foo), None);
     }
 }

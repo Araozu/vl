@@ -349,6 +349,8 @@ impl NaraKind {
             vl_typecheck::Ty::File => Some(NaraKind::File),
             vl_typecheck::Ty::Object(name) => Some(NaraKind::Object(name.clone())),
             vl_typecheck::Ty::Array(elem) => Some(NaraKind::Array(Box::new(Self::of_ty(elem)?))),
+            // Capability-only: same representation as the read-only view.
+            vl_typecheck::Ty::Mutable(inner) => Self::of_ty(inner),
             vl_typecheck::Ty::Param(_) | vl_typecheck::Ty::Void | vl_typecheck::Ty::Error => None,
         }
     }
