@@ -2,7 +2,7 @@
 //!
 //! These are the VL language types enforced by `vl-typecheck`. They are
 //! deliberately distinct from any VM representation: backends map these
-//! to target concepts (e.g. VL `string` -> Naravm blob + const ref,
+//! to target concepts (e.g. VL `String` -> Naravm blob + const ref,
 //! VL `File` -> Naravm `ObjectFile`). The VM may be weakly typed; VL is not.
 
 use std::fmt;
@@ -38,7 +38,7 @@ impl fmt::Display for VlType {
             VlType::F64 => write!(f, "f64"),
             VlType::Bool => write!(f, "bool"),
             VlType::U8 => write!(f, "u8"),
-            VlType::String => write!(f, "string"),
+            VlType::String => write!(f, "String"),
             VlType::File => write!(f, "File"),
             VlType::Object(name) => write!(f, "{name}"),
             VlType::Array(elem) => write!(f, "Array[{elem}]"),
@@ -55,7 +55,7 @@ impl fmt::Display for ParseTyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "unknown type `{}` (have: u64, i64, f64, bool, u8, string, File, Array[T], object types, void)",
+            "unknown type `{}` (have: u64, i64, f64, bool, u8, String, File, Array[T], object types, void)",
             self.0
         )
     }
@@ -70,10 +70,13 @@ impl FromStr for VlType {
             "f64" => Ok(VlType::F64),
             "bool" => Ok(VlType::Bool),
             "u8" => Ok(VlType::U8),
-            // Accept both casings for the string object; canonical is `string`.
-            "string" | "String" => Ok(VlType::String),
-            // Object types are capitalized (`File`); accept lowercase too.
-            "File" | "file" => Ok(VlType::File),
+            // `String` is a reference type, so it is uppercase like `File`,
+            // `Array`, and object types. Only value-semantics primitives
+            // (`u64`, `i64`, `f64`, `bool`, `u8`) are lowercase.
+            "String" => Ok(VlType::String),
+            // Object types are capitalized (`File`); no lowercase fallback:
+            // reference types are uppercase, value types are lowercase.
+            "File" => Ok(VlType::File),
             "void" => Ok(VlType::Void),
             // `Array` needs an element type (`Array[T]`); `T` alone is a type
             // parameter, which only the parser can resolve against an
@@ -105,7 +108,7 @@ impl VlType {
 /// Bounds enable useful generic algorithms without full subtyping: an
 /// unconstrained `T` is fully opaque (no operators), `Numeric` allows
 /// arithmetic (`+ - * /`), ordering (`< <= > >=`), and equality, while
-/// `Comparable` allows equality (`== !=`) over numbers, bools, and strings.
+/// `Comparable` allows equality (`== !=`) over numbers, bools, and Strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenericBound {
     Numeric,

@@ -44,7 +44,7 @@ early, or let it reach the closing brace.
 ```vl
 use std;
 
-function announce(message: string) {
+function announce(message: String) {
     std.print(message);
     std.print("\n");
 }

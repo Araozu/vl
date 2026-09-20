@@ -11,7 +11,7 @@ Objects are declared with:
 ```text
 type Counter = object {
     value: u64,
-    label: string,
+    label: String,
 };
 ```
 

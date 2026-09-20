@@ -10,7 +10,7 @@
 //! object-field := ident `:` type
 //! params  := param (`,` param)*
 //! param   := ident `:` type
-//! type    := `u64` | `i64` | `f64` | `bool` | `u8` | `string` | `File` | object-name | `Array` `[` type `]` | type-param | `void` (`void` only as return)
+//! type    := `u64` | `i64` | `f64` | `bool` | `u8` | `String` | `File` | object-name | `Array` `[` type `]` | type-param | `void` (`void` only as return)
 //! block   := `{` stmt* `}`
 //! stmt    := `let` ident (`:` type)? `=` expr `;` | ident `=` expr `;` | index `=` expr `;` | field `=` expr `;`
 //!          | `if` `(` expr `)` branch (`else` branch)?
@@ -476,8 +476,8 @@ impl<'a> Parser<'a> {
     fn parse_object_item(&mut self) -> Option<Item> {
         let type_tok = self.bump();
         let (name, name_span) = self.parse_ident()?;
-        let reserved_name =
-            matches!(name.as_str(), "Array" | "U64Array") || name.parse::<VlType>().is_ok();
+        let reserved_name = matches!(name.as_str(), "Array" | "U64Array" | "string" | "file")
+            || name.parse::<VlType>().is_ok();
         if reserved_name {
             self.diags.push(
                 Diagnostic::error(format!("object type name `{name}` is reserved"))
@@ -624,6 +624,26 @@ impl<'a> Parser<'a> {
                     self.diags.push(
                         Diagnostic::error("unknown type `U64Array`")
                             .with_label(t.span, "`U64Array` was removed; use `Array[u64]`")
+                            .with_code("E105"),
+                    );
+                    return None;
+                }
+                // `string` was renamed to `String`: reference types are
+                // uppercase, only value-semantics primitives stay lowercase.
+                if name == "string" {
+                    self.diags.push(
+                        Diagnostic::error("unknown type `string`")
+                            .with_label(t.span, "`string` was renamed; use `String`")
+                            .with_code("E105"),
+                    );
+                    return None;
+                }
+                // `file` was never a value type spelling: the reference type
+                // is `File`.
+                if name == "file" {
+                    self.diags.push(
+                        Diagnostic::error("unknown type `file`")
+                            .with_label(t.span, "reference types are uppercase; use `File`")
                             .with_code("E105"),
                     );
                     return None;
@@ -1671,7 +1691,7 @@ mod tests {
     #[test]
     fn parses_object_declaration_literal_and_field_assign() {
         let (prog, diags) = parse_src(
-            "type Counter = object { value: u64, label: string, }; function main() { let c = Counter { label: \"x\", value: 1 }; c.value = 2; }",
+            "type Counter = object { value: u64, label: String, }; function main() { let c = Counter { label: \"x\", value: 1 }; c.value = 2; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(matches!(prog.items[0], Item::Object { ref fields, .. } if fields.len() == 2));
@@ -1923,7 +1943,7 @@ mod tests {
     #[test]
     fn parses_nested_array_types() {
         let (prog, diags) =
-            parse_src("function f(a: Array[Array[u64]]): Array[string] { return [\"s\"]; }");
+            parse_src("function f(a: Array[Array[u64]]): Array[String] { return [\"s\"]; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { params, ret, .. } => {

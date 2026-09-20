@@ -60,7 +60,7 @@ operations make sense for it.
 | `u8` | `255u8` | A small non-negative number |
 | `f64` | `3.14f64` | A decimal number |
 | `bool` | `true` | A yes/no value |
-| `string` | `"hello"` | A byte string |
+| `String` | `"hello"` | A byte string |
 | `object` type | `Counter { value: 1 }` | Named mutable data with reference semantics |
 
 Integer literals are chosen from their context. For example, the parameter

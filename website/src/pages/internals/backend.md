@@ -55,7 +55,7 @@ between user functions (including recursion). `std.println` lowers to two
 operation. A call spills live caller
 registers (`pushv`/`pushrf`, including cached comparison temporaries), moves
 actuals into the callee slots (`rv11` upwards for values, `rf31` upwards for
-`string`/`File` references), emits `calli`, copies the return value out of
+`String`/`File` references), emits `calli`, copies the return value out of
 `rv11` / `rf31`, then restores the spills; returns do the reverse. `Array[T]`
 values are reference values backed by Naravm memory containers: `new` lowers
 to `create` (value counts for value elements, ref counts for reference
@@ -64,7 +64,7 @@ elements), literals to `createi` plus `setvati`/`setrfati` stores, reads to
 value and 9 reference parameters per function are supported. Registers are
 recycled past their last use so idiomatic programs fit the 32 value
 and 32 reference registers; liveness extends across loop back edges so values
-used inside a loop keep their registers for the whole loop. Float ordering, string equality, and string
+used inside a loop keep their registers for the whole loop. Float ordering, `String` equality, and `String`
 ordering are rejected with diagnostics rather than miscompiled.
 
 User-defined `object` values use the same container representation. The

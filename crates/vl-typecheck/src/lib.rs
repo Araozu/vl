@@ -1,7 +1,7 @@
 //! vl-typecheck: type checking over HIR.
 //!
 //! Value types are the compiler-owned [`Ty`] (`u64`, `i64`, `f64`, `bool`,
-//! `u8`, `string`, `File`, named reference-semantic objects, `Array[T]`,
+//! `u8`, `String`, `File`, named reference-semantic objects, `Array[T]`,
 //! `void`) converted from [`vl_common::VlType`].
 //! These are VL language types enforced here — deliberately distinct from any
 //! VM representation, which backends map to separately.
@@ -59,7 +59,7 @@ impl std::fmt::Display for Ty {
             Ty::F64 => write!(f, "f64"),
             Ty::Bool => write!(f, "bool"),
             Ty::U8 => write!(f, "u8"),
-            Ty::String => write!(f, "string"),
+            Ty::String => write!(f, "String"),
             Ty::File => write!(f, "File"),
             Ty::Object(name) => write!(f, "{name}"),
             Ty::Array(elem) => write!(f, "Array[{elem}]"),
@@ -135,7 +135,7 @@ pub fn subst_ty(ty: &Ty, env: &HashMap<String, Ty>) -> Ty {
     }
 }
 
-/// Mangled instance name: `first$u64`, `get$Array_string`. `$` is not lexable
+/// Mangled instance name: `first$u64`, `get$Array_String`. `$` is not lexable
 /// in VL source, so instances can never collide with user-written names.
 pub fn mangle(name: &str, args: &[Ty]) -> String {
     let parts: Vec<String> = args.iter().map(mangle_ty).collect();
@@ -150,7 +150,7 @@ fn mangle_ty(ty: &Ty) -> String {
         Ty::F64 => "f64".into(),
         Ty::Bool => "bool".into(),
         Ty::U8 => "u8".into(),
-        Ty::String => "string".into(),
+        Ty::String => "String".into(),
         Ty::File => "File".into(),
         Ty::Object(name) => format!("Object_{}", name),
         Ty::Array(elem) => format!("Array_{}", mangle_ty(elem)),
@@ -2091,7 +2091,7 @@ impl Checker {
     /// Explicit numeric conversion (`value as u8`, TypeScript-like).
     ///
     /// Semantics (v0, integers only):
-    /// - Target must be `u64`, `i64`, or `u8` (float/string/array casts are
+    /// - Target must be `u64`, `i64`, or `u8` (float/String/array casts are
     ///   rejected with E302; they need ISA conversions not yet specified).
     /// - Source must be a concrete integer (`u64/i64/u8/int` literal).
     ///   Generic parameters are rejected even with a `Numeric` bound: `T`
@@ -2129,7 +2129,7 @@ impl Checker {
             self.diags.push(
                 Diagnostic::error(format!("cannot cast to `{target}` (only `u64`, `i64`, `u8` casts are supported)"))
                     .with_label(target_span, "unsupported cast target")
-                    .with_note("float, string, and array conversions need target conversions not yet specified")
+                    .with_note("float, String, and array conversions need target conversions not yet specified")
                     .with_code("E302"),
             );
             let _ = self.infer_expr(inner);
@@ -2588,7 +2588,7 @@ fn is_comparable(ty: &Ty) -> bool {
 
 /// Does a concrete type satisfy a generic bound? `Numeric` covers the
 /// arithmetic lanes (`u64,i64,f64,u8`, plus undefaulted `int` defensively);
-/// `Comparable` covers those plus `bool` and `string` (equality).
+/// `Comparable` covers those plus `bool` and `String` (equality).
 pub(crate) fn bound_satisfied(bound: GenericBound, ty: &Ty) -> bool {
     match bound {
         GenericBound::Numeric => matches!(ty, Ty::Int | Ty::U64 | Ty::I64 | Ty::F64 | Ty::U8),
@@ -2752,7 +2752,7 @@ mod tests {
             check_src("function main() { let a: Array[u64] = Array.new::[u64](3); a; }");
         assert!(diags.is_empty(), "{diags:?}");
         let (_, diags) =
-            check_src("function main() { let a: Array[string] = Array.new::[u64](3); a; }");
+            check_src("function main() { let a: Array[String] = Array.new::[u64](3); a; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
     }
 
@@ -2797,7 +2797,7 @@ mod tests {
     #[test]
     fn string_arrays_check_clean() {
         let (_, diags) = check_src(
-            "function main() { let a = Array.new::[string](2u64); let b = [\"x\", \"y\"]; b[0u64]; }",
+            "function main() { let a = Array.new::[String](2u64); let b = [\"x\", \"y\"]; b[0u64]; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -3070,11 +3070,11 @@ mod tests {
     #[test]
     fn generic_identity_infers_and_specializes() {
         let (typed, diags) = check_src(
-            "function id[T](x: T): T { return x; } function main() { let a = id(1u64); let b = id::[string](\"s\"); a; b; }",
+            "function id[T](x: T): T { return x; } function main() { let a = id(1u64); let b = id::[String](\"s\"); a; b; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("id$u64"));
-        assert!(typed.instances.contains_key("id$string"));
+        assert!(typed.instances.contains_key("id$String"));
         assert_eq!(typed.root_calls.len(), 2);
         let inst = &typed.instances["id$u64"];
         assert_eq!(inst.sig.ret, Ty::U64);
@@ -3501,7 +3501,7 @@ mod tests {
 
     #[test]
     fn as_cast_rejects_non_integer_target() {
-        let (_, diags) = check_src("function main() { let x = 1u64 as string; x; }");
+        let (_, diags) = check_src("function main() { let x = 1u64 as String; x; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("cannot cast"), "{diags:?}");
     }

@@ -2,7 +2,7 @@
 //
 // Unconstrained `T` is fully opaque (no operators). `Numeric` unlocks
 // arithmetic, ordering, and equality; `Comparable` unlocks equality over
-// numbers, bools, and strings. Bounds are checked at call sites (concrete
+// numbers, bools, and `String`s. Bounds are checked at call sites (concrete
 // types) and by implication for forwarding (`Numeric` implies `Comparable`).
 use std;
 

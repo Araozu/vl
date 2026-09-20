@@ -39,7 +39,7 @@ pub trait Target {
 ///
 /// This is where the language's extern type surface is *declared*: every
 /// export carries VL-level param names/types and a return type. Backends map
-/// these VL types to target concepts (e.g. VL `string` -> Naravm blob).
+/// these VL types to target concepts (e.g. VL `String` -> Naravm blob).
 /// Fallible VM operations (`!File`, `!String` via `errno`/`0x30`) are modeled
 /// as plain returns for now; error handling is out of scope for VL.
 pub fn modules() -> Vec<vl_common::ModuleSpec> {
@@ -328,7 +328,7 @@ enum NaraKind {
     Object(String),
     /// Fixed-length heap array (a memory container). The payload is the
     /// element kind: value elements use `vat` ops, reference elements
-    /// (`string`, `File`, nested arrays) use `rfat` ops.
+    /// (`String`, `File`, nested arrays) use `rfat` ops.
     Array(Box<NaraKind>),
 }
 
@@ -532,7 +532,7 @@ impl NaraEmit {
             self.diags.push(
                 Diagnostic::error("Naravm constant pool has more than 256 entries")
                     .with_label(span, "defined here")
-                    .with_note("string references use an 8-bit constant index")
+                    .with_note("String references use an 8-bit constant index")
                     .with_code("E405"),
             );
             return None;
@@ -619,7 +619,7 @@ impl NaraEmit {
             return None;
         }
         self.diags.push(
-            Diagnostic::error("Naravm backend requires a string argument to std.print")
+            Diagnostic::error("Naravm backend requires a String argument to std.print")
                 .with_label(span, "unsupported argument")
                 .with_code("E402"),
         );
@@ -1240,7 +1240,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             } else if callee == "std.print" || callee == "print" {
                 if args.len() != 1 {
                     e.diags.push(
-                        Diagnostic::error("std.print expects one string argument")
+                        Diagnostic::error("std.print expects one String argument")
                             .with_label(*span, "invalid call")
                             .with_code("E401"),
                     );
@@ -1260,7 +1260,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             } else if callee == "std.println" || callee == "println" {
                 if args.len() != 1 {
                     e.diags.push(
-                        Diagnostic::error("std.println expects one string argument")
+                        Diagnostic::error("std.println expects one String argument")
                             .with_label(*span, "invalid call")
                             .with_code("E401"),
                     );
@@ -2178,7 +2178,7 @@ fn nara_binop(
     let fail = |e: &mut NaraEmit| {
         e.invalid.insert(dst);
     };
-    // Resolve operand kinds before machine registers: string operands live in
+    // Resolve operand kinds before machine registers: String operands live in
     // reference registers, so resolving value registers first would misreport
     // them as a compiler bug instead of clean E404 diagnostics.
     let lkind = e.kinds.get(&lhs).cloned();
@@ -2308,7 +2308,7 @@ fn nara_binop(
 
 /// Lower one ordering comparison. Unsigned kinds use `ltu` directly; signed
 /// `i64` flips the sign bit on both sides first so the unsigned compare
-/// yields signed order. `f64` and strings have no ISA compare: clean error.
+/// yields signed order. `f64` and Strings have no ISA compare: clean error.
 fn nara_compare(
     e: &mut NaraEmit,
     dst: vl_lir::Reg,
@@ -2324,7 +2324,7 @@ fn nara_compare(
                 "Naravm backend does not support `{op}` on `{kind:?}` yet"
             ))
             .with_label(span, "unsupported operation")
-            .with_note("order comparisons lower for u64/i64/u8; f64 and strings are rejected")
+            .with_note("order comparisons lower for u64/i64/u8; f64 and Strings are rejected")
             .with_code("E404"),
         );
         e.invalid.insert(dst);
@@ -2599,7 +2599,7 @@ mod tests {
     #[test]
     fn naravm_emits_string_arrays_with_ref_ops() {
         let lir = lir_of(
-            "function main() { let a = Array.new::[string](2u64); a[0u64] = \"hi\"; let x = a[0u64]; x; }",
+            "function main() { let a = Array.new::[String](2u64); a[0u64] = \"hi\"; let x = a[0u64]; x; }",
         );
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
@@ -2614,7 +2614,7 @@ mod tests {
     #[test]
     fn naravm_emits_objects_with_mixed_lane_field_ops() {
         let lir = lir_of(
-            "use std; type Counter = object { value: u64, label: string, }; function main() { let c = Counter { value: 1, label: \"count\" }; c.value = 2; std.print(c.label); }",
+            "use std; type Counter = object { value: u64, label: String, }; function main() { let c = Counter { value: 1, label: \"count\" }; c.value = 2; std.print(c.label); }",
         );
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
@@ -2676,16 +2676,16 @@ mod tests {
     #[test]
     fn naravm_emits_monomorphized_instances() {
         let lir = lir_of(
-            "function id[T](x: T): T { return x; } function main() { let a = id(1u64); let b = id::[string](\"s\"); a; b; }",
+            "function id[T](x: T): T { return x; } function main() { let a = id(1u64); let b = id::[String](\"s\"); a; b; }",
         );
         let names: Vec<&str> = lir.functions.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains(&"id$u64"), "{names:?}");
-        assert!(names.contains(&"id$string"), "{names:?}");
+        assert!(names.contains(&"id$String"), "{names:?}");
         // The template itself never emits.
         assert!(!names.contains(&"id"), "{names:?}");
         let dump = lir.dump();
         assert!(dump.contains("call id$u64"), "{dump}");
-        assert!(dump.contains("call id$string"), "{dump}");
+        assert!(dump.contains("call id$String"), "{dump}");
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
         assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
@@ -2756,7 +2756,7 @@ mod tests {
             r#"
 use std;
 function add(a: u64, b: u64): u64 { return a + b; }
-function greet(name: string, n: u64): string { return name; }
+function greet(name: String, n: u64): String { return name; }
 function fact(n: u64): u64 {
     let r = 1u64;
     if (n == 0u64) { r; } else { r = n * fact(n - 1u64); }

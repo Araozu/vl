@@ -95,7 +95,7 @@ function main() {
 }
 ```
 
-VL infers `T` from the argument: it chooses `u64` for `numbers` and `string`
+VL infers `T` from the argument: it chooses `u64` for `numbers` and `String`
 for `words`. If inference is unclear, provide the type explicitly with the
 turbofish form `::[T]`:
 
@@ -127,7 +127,7 @@ function eq[T extends Comparable](a: T, b: T): bool {
 
 `Numeric` allows arithmetic (`+ - * /`), ordering, and equality over
 `u64`, `i64`, `f64`, and `u8`. `Comparable` allows equality (`== !=`) over
-numbers, `bool`, and `string`. A `Numeric` bound implies `Comparable`, so a
+numbers, `bool`, and `String`. A `Numeric` bound implies `Comparable`, so a
 `Numeric` value forwards to a `Comparable` function, but an unconstrained `T`
 cannot flow into either.
 

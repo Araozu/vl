@@ -1531,7 +1531,7 @@ mod tests {
 
     #[test]
     fn function_signatures_carry_param_and_return_types() {
-        let src = r#"function greet(name: string, n: u64): string { return name; } function main() { greet("hi", 1u64); }"#;
+        let src = r#"function greet(name: String, n: u64): String { return name; } function main() { greet("hi", 1u64); }"#;
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);

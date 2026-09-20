@@ -20,7 +20,7 @@ object_fields := object_field ("," object_field)* ","?
 object_field := ident ":" type
 params   := param ("," param)*          ; no trailing comma
 param    := ident ":" type
-type     := "u64" | "i64" | "f64" | "bool" | "u8" | "string" | "File" | ident | "Array" "[" type "]" | "void"
+type     := "u64" | "i64" | "f64" | "bool" | "u8" | "String" | "File" | ident | "Array" "[" type "]" | "void"
 block    := "{" stmt* "}"
 stmt     := let_stmt | assign_stmt | index_assign_stmt | field_assign_stmt | if_stmt | while_stmt | break_stmt | continue_stmt | return_stmt | expr_stmt
 let_stmt := "let" ident (":" type)? "=" expr ";"

@@ -87,7 +87,7 @@ A small program can combine an import, a function, and a string:
 ```vl
 use std;
 
-function greet(name: string) {
+function greet(name: String) {
     std.print("Hello, ");
     std.print(name);
     std.print("!\n");

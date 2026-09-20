@@ -15,7 +15,7 @@ ends with a semicolon.
 ```vl
 type Counter = object {
     value: u64,
-    label: string,
+    label: String,
 };
 ```
 
@@ -49,7 +49,7 @@ function main() {
 }
 ```
 
-Object fields use the normal VL types, including `string`, `Array[T]`, and
+Object fields use the normal VL types, including `String`, `Array[T]`, and
 other object types. A field whose type is itself a reference value keeps that
 reference when the containing object is assigned. Array elements remain
 mutable through their existing indexing operations.

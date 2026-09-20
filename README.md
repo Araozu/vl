@@ -11,7 +11,7 @@ Ariadne error reporting, and a Naravm backend with target-neutral LIR.
   ▼  vl-syntax     tokens -> AST (recursive descent, per-item recovery)
   │  vl-semantic   AST -> name resolution (scopes, undefined/duplicate defs)
   ▼  vl-hir        resolved AST -> HIR (desugared, node ids, DefId links)
-  │  vl-typecheck  HIR -> types (scalars, strings, `File`, `Array[T]`, objects)
+  │  vl-typecheck  HIR -> types (scalars, `String`s, `File`, `Array[T]`, objects)
   ▼  vl-lir        typed HIR -> three-address code (target-agnostic)
   │  vl-codegen    LIR -> backend output via `Target` trait
   ▼
@@ -87,13 +87,13 @@ function main() { let d = x - 1; }
 Integer literals are untyped and coerce to contextual `u64`, `i64`, or `u8`;
 floating literals retain the `f64` suffix. Boolean literals are `true` and `false`.
 Value types are `u64`, `i64`,
-`f64`, `bool`, `u8`, `string`, `File`, user-defined `object` types, `Array[T]`,
+`f64`, `bool`, `u8`, `String`, `File`, user-defined `object` types, `Array[T]`,
 and `void` (`void` only as a return).
 `Array[T]` is a fixed-length heap array of `T`: `Array.new::[u64](n)` allocates
 a zero-filled array of `n` elements (no import needed), `[1, 2]` is an
 array literal, `a[i]` reads element `i`, and `a[i] = v;` writes it
 (see `examples/arrays.vl`). Indices are always `u64`.
-Objects use declarations such as `type Counter = object { value: u64, label: string, };`
+Objects use declarations such as `type Counter = object { value: u64, label: String, };`
 and named literals such as `Counter { value: 1, label: "count" }`. Object values
 have reference semantics: assignment, parameters, and returns alias the same
 heap object, and `p.field = value;` mutates it through every alias. Fields are
@@ -128,5 +128,5 @@ target concepts. See the [lexical grammar](crates/vl-lex/GRAMMAR.md) and
 ## Roadmap
 
 1. Harden/add more `vl-codegen` backends.
-2. Fallible externs (`!File`, `!string` via `errno`/`0x30`) once VL gains error handling.
+2. Fallible externs (`!File`, `!String` via `errno`/`0x30`) once VL gains error handling.
 3. Bytecode/assembly emission + runner.

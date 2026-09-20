@@ -26,7 +26,7 @@
     - name: print
       params:
         - name: value
-          type: string
+          type: String
           detail: Byte string to write. No implicit newline is added.
       returns:
         type: void
@@ -34,13 +34,13 @@
         Writes one byte string to standard output. It does not add an implicit newline.
 
         `std.print` is supported by the Naravm target and currently expects exactly one
-        string argument.
+        String argument.
       example: |
         print("ready\n");
     - name: println
       params:
         - name: value
-          type: string
+          type: String
           detail: Byte string to write. A single trailing newline is added.
       returns:
         type: void
@@ -49,7 +49,7 @@
         `println("hi")` prints the same bytes as `print("hi\n")`.
 
         `std.println` is supported by the Naravm target and currently expects exactly one
-        string argument. The VM has no native newline operation, so it lowers
+        String argument. The VM has no native newline operation, so it lowers
         to two `print` calls (the value, then `"\n"`).
       example: |
         println("ready");
@@ -86,7 +86,7 @@
     - name: open
       params:
         - name: path
-          type: string
+          type: String
           detail: Byte string path of the file to open.
       returns:
         type: File
@@ -104,11 +104,11 @@
           type: File
           detail: Open file to read from.
       returns:
-        type: string
+        type: String
       detail: |
         Reads from an opened file, yielding a byte string.
 
-        Like `open`, fallible at the VM level but surfaced as a plain `string`
+        Like `open`, fallible at the VM level but surfaced as a plain `String`
         return until VL gains error handling. Not yet emitted by Naravm.
       example: |
         let s = read(f);
@@ -136,12 +136,12 @@
     - name: len
       params:
         - name: value
-          type: string
+          type: String
           detail: Byte string to measure.
       returns:
         type: u64
       detail: |
-        Returns the length of a string. Checked during general module checking;
+        Returns the length of a `String`. Checked during general module checking;
         the current Naravm target does not emit it yet.
       example: |
         let n = len("hi");

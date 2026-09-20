@@ -2,7 +2,7 @@ use std;
 
 type Counter = object {
     value: u64,
-    label: string,
+    label: String,
 };
 
 function bump(counter: Counter): Counter {

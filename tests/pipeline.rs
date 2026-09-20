@@ -44,9 +44,9 @@ fn println_compiles_and_runs_on_naravm() {
 #[test]
 fn println_arg_types_are_checked() {
     let err = frontend("use std; function main() { std.println(1); }")
-        .expect_err("println expects string");
+        .expect_err("println expects String");
     assert!(
-        err.iter().any(|d| d.message.contains("expects `string`")),
+        err.iter().any(|d| d.message.contains("expects `String`")),
         "{err:?}"
     );
 }
@@ -132,7 +132,7 @@ fn naravm_emits_mixed_params_string_return_and_recursion() {
         r#"
 use std;
 function add(a: u64, b: u64): u64 { return a + b; }
-function greet(name: string): string { return name; }
+function greet(name: String): String { return name; }
 function fact(n: u64): u64 {
     let r = 1u64;
     if (n == 0u64) { r; } else { r = n * fact(n - 1u64); }
@@ -144,7 +144,7 @@ function main() {
 }
 "#,
     )
-    .expect("mixed params, string return, and recursion must compile");
+    .expect("mixed params, String return, and recursion must compile");
     let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
     assert!(diags.is_empty(), "{diags:?}");
     let bytes = artifact.unwrap().bytes.unwrap();
@@ -154,7 +154,7 @@ function main() {
 
 #[test]
 fn strings_lower_to_byte_constants() {
-    let lir = frontend(r#"let greeting = "hi\n";"#).expect("string must compile");
+    let lir = frontend(r#"let greeting = "hi\n";"#).expect("String must compile");
     let dump = lir.dump();
     assert!(dump.contains("string [104, 105, 10]"), "{dump}");
 }
@@ -218,9 +218,9 @@ fn unbraced_conditional_branches_compile() {
 #[test]
 fn extern_call_arg_types_are_checked() {
     let err =
-        frontend("use std; function main() { std.print(1); }").expect_err("print expects string");
+        frontend("use std; function main() { std.print(1); }").expect_err("print expects String");
     assert!(
-        err.iter().any(|d| d.message.contains("expects `string`")),
+        err.iter().any(|d| d.message.contains("expects `String`")),
         "{err:?}"
     );
 }
@@ -435,7 +435,7 @@ fn generics_example_compiles_to_instances_and_runs_on_naravm() {
     let src = std::fs::read_to_string("examples/generics.vl").unwrap();
     let lir = frontend(&src).expect("generics.vl must compile");
     let dump = lir.dump();
-    for name in ["first$u64", "first$string", "second$u64"] {
+    for name in ["first$u64", "first$String", "second$u64"] {
         assert!(dump.contains(name), "{name} missing in {dump}");
     }
     assert!(!dump.contains("fn first:\n"), "{dump}");

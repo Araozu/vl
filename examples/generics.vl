@@ -28,5 +28,5 @@ function main() {
     std.print_u64(second(nums, 99));
     let words = ["hi", "bye"];
     std.print(first(words));
-    std.print(first::[string](words));
+    std.print(first::[String](words));
 }
