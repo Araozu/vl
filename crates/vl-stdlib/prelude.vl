@@ -1,0 +1,82 @@
+// VL standard prelude (embedded in the compiler, injected lazily).
+//
+// Only functions the user program actually calls are merged into the
+// compilation unit, so programs that use nothing from here are unaffected.
+// Every helper is monomorphic with scalar/`String` signatures and no
+// globals, so it can merge into any program as a local item.
+//
+// Helpers that need VM natives call them qualified (`string.len`, `math.*`,
+// `fmt.*`); injection adds the matching `use` when the user lacks the alias.
+// Helpers that need nothing (`max_u64`, ...) are pure VL.
+
+use std.string;
+use std.math;
+use std.fmt;
+
+fun max_u64(a: u64, b: u64): u64 {
+    if (a > b) {
+        return a;
+    } else {
+        return b;
+    }
+}
+
+fun min_u64(a: u64, b: u64): u64 {
+    if (a < b) {
+        return a;
+    } else {
+        return b;
+    }
+}
+
+fun clamp_u64(v: u64, lo: u64, hi: u64): u64 {
+    if (v < lo) {
+        return lo;
+    } else {
+        if (v > hi) {
+            return hi;
+        } else {
+            return v;
+        }
+    }
+}
+
+fun max_i64(a: i64, b: i64): i64 {
+    if (a > b) {
+        return a;
+    } else {
+        return b;
+    }
+}
+
+fun min_i64(a: i64, b: i64): i64 {
+    if (a < b) {
+        return a;
+    } else {
+        return b;
+    }
+}
+
+fun abs_i64(a: i64): i64 {
+    if (a < 0i64) {
+        return 0i64 - a;
+    } else {
+        return a;
+    }
+}
+
+fun is_empty(s: String): bool {
+    return string.len(s) == 0u64;
+}
+
+fun strings_equal(a: String, b: String): bool {
+    return string.eq(a, b);
+}
+
+fun u64_to_string(v: u64): String {
+    return fmt.u64_to_s(v);
+}
+
+fun is_even(v: u64): bool {
+    return math.mod_u64(v, 2u64) == 0u64;
+}

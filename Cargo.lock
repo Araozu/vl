@@ -301,6 +301,7 @@ dependencies = [
  "vl-lex",
  "vl-lir",
  "vl-semantic",
+ "vl-stdlib",
  "vl-syntax",
  "vl-typecheck",
 ]
@@ -361,6 +362,20 @@ dependencies = [
  "vl-common",
  "vl-lex",
  "vl-syntax",
+]
+
+[[package]]
+name = "vl-stdlib"
+version = "0.1.0"
+dependencies = [
+ "vl-codegen",
+ "vl-common",
+ "vl-hir",
+ "vl-lex",
+ "vl-lir",
+ "vl-semantic",
+ "vl-syntax",
+ "vl-typecheck",
 ]
 
 [[package]]

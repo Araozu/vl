@@ -1,0 +1,18 @@
+[package]
+name = "vl-stdlib"
+version = "0.1.0"
+edition = "2021"
+description = "VL standard prelude: embedded VL helpers over VM natives, injected lazily"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+vl-common = { path = "../vl-common" }
+vl-lex = { path = "../vl-lex" }
+vl-syntax = { path = "../vl-syntax" }
+
+[dev-dependencies]
+vl-semantic = { path = "../vl-semantic" }
+vl-hir = { path = "../vl-hir" }
+vl-typecheck = { path = "../vl-typecheck" }
+vl-lir = { path = "../vl-lir" }
+vl-codegen = { path = "../vl-codegen" }

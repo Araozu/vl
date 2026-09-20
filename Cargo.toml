@@ -20,6 +20,7 @@ members = [
     "crates/vl-typecheck",
     "crates/vl-lir",
     "crates/vl-codegen",
+    "crates/vl-stdlib",
 ]
 resolver = "2"
 
@@ -32,6 +33,7 @@ vl-hir = { path = "crates/vl-hir" }
 vl-typecheck = { path = "crates/vl-typecheck" }
 vl-lir = { path = "crates/vl-lir" }
 vl-codegen = { path = "crates/vl-codegen" }
+vl-stdlib = { path = "crates/vl-stdlib" }
 clap = { version = "4", features = ["derive"] }
 ariadne = "0.4"
 serde = { version = "1", features = ["derive"] }
