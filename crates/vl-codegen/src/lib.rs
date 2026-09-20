@@ -115,7 +115,20 @@ impl Target for DummyTarget {
     }
 
     fn emit(&self, prog: &LirProgram) -> (Option<Artifact>, Vec<Diagnostic>) {
+        if let Some(bad) = prog.validate_runtime() {
+            return (
+                None,
+                vec![Diagnostic::error(format!("internal compiler error: {bad}")).with_code("E500")],
+            );
+        }
         let mut text = format!("; vl dummy target — module {}\n", prog.module);
+        for g in &prog.globals {
+            text.push_str(&format!("global %{} {} : {} =\n", g.id, g.name, g.ty));
+            for ins in &g.init {
+                text.push_str(&format!("  {}\n", dummy_instr(ins)));
+            }
+            text.push_str(&format!("  init %{}\n", g.result.0));
+        }
         for f in &prog.functions {
             text.push_str(&format!("{}:\n", f.name));
             for ins in &f.instrs {
@@ -139,6 +152,8 @@ fn dummy_instr(ins: &Instr) -> String {
         Instr::StringConst { dst, .. } => format!("string %{} (unsupported)", dst.0),
         Instr::Param { dst, index, .. } => format!("param %{}, {index}", dst.0),
         Instr::Copy { dst, src, .. } => format!("mov %{}, %{}", dst.0, src.0),
+        Instr::GlobalLoad { dst, global, .. } => format!("global_load %{}, %{}", dst.0, global),
+        Instr::GlobalStore { global, src, .. } => format!("global_store %{}, %{}", global, src.0),
         Instr::Not { dst, src, .. } => format!("not %{}, %{}", dst.0, src.0),
         Instr::BinOp {
             dst, op, lhs, rhs, ..
@@ -251,7 +266,19 @@ impl Target for StackVmTarget {
                 Diagnostic::warning("stackvm backend is a sketch; output is not yet executable")
                     .with_note("track the target-platform decision before hardening this"),
             ];
+        if let Some(bad) = prog.validate_runtime() {
+            return (
+                None,
+                vec![Diagnostic::error(format!("internal compiler error: {bad}")).with_code("E500")],
+            );
+        }
         let mut text = format!("# vl stackvm sketch — module {}\n", prog.module);
+        for g in &prog.globals {
+            text.push_str(&format!(".global %{} {} : {}\n", g.id, g.name, g.ty));
+            for ins in &g.init {
+                text.push_str(&format!("  {}\n", stackvm_instr(ins)));
+            }
+        }
         for f in &prog.functions {
             text.push_str(&format!(".fn {}\n", f.name));
             for ins in &f.instrs {
@@ -390,6 +417,12 @@ impl NaraKind {
     }
 }
 
+/// Reserved callee-saved reference register for module state (global storage
+/// container). Removed from the ordinary allocator, initialized at the
+/// entrypoint before any initializer runs, and preserved across calls
+/// (callee-saved) including recursion and extern calls.
+const MODULE_STATE_RF: u8 = 0x3F;
+
 /// Return whether a field uses the reference lane, its lane-local slot, and
 /// its VL type. Naravm containers keep value and reference fields in separate
 /// arrays, so a declaration's source index is not the runtime index.
@@ -503,6 +536,10 @@ impl NaraEmit {
 
     fn fresh_rf(&mut self, span: Span) -> Option<u8> {
         if let Some(rf) = self.free_rf.pop() {
+            // Never recycle the reserved module-state register.
+            if rf == MODULE_STATE_RF {
+                return self.fresh_rf(span);
+            }
             return Some(rf);
         }
         loop {
@@ -513,8 +550,9 @@ impl NaraEmit {
             }
             self.next_rf += 1;
             // Reserve rf31 (userland 0x31) as the single reference argument
-            // register for calls.
-            if rf == 0x31 {
+            // register for calls, and rf3F (0x3F, callee-saved) for module
+            // state (global storage container).
+            if rf == 0x31 || rf == MODULE_STATE_RF {
                 continue;
             }
             return Some(rf);
@@ -666,9 +704,171 @@ struct NaraFnCtx<'a> {
     objects: &'a std::collections::HashMap<&'a str, &'a vl_lir::ObjectDef>,
     print_fn_idx: usize,
     print_u64_fn_idx: usize,
+    /// Stable global ID -> (is_ref lane, slot in container).
+    global_slots: &'a std::collections::HashMap<u32, (bool, u8)>,
+    /// Stable global ID -> runtime-erased global type (for dst kinds).
+    global_tys: &'a std::collections::HashMap<u32, vl_typecheck::Ty>,
+}
+
+/// Last-use map for one initializer fragment (straight-line temps die at
+/// their last textual use; branchy `&&`/`||` inits use offset labels above).
+/// The fragment `result` counts as used at the end (by the store), so its
+/// defining `Const`/`StringConst`/`NewArray` allocates a register.
+fn nara_last_use_fragment(
+    instrs: &[Instr],
+    result: &vl_lir::Reg,
+) -> std::collections::HashMap<vl_lir::Reg, usize> {
+    use vl_lir::Instr as I;
+    let mut uses: std::collections::HashMap<vl_lir::Reg, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut touch = |reg: vl_lir::Reg, idx: usize| {
+        uses.entry(reg).or_default().push(idx);
+    };
+    for (idx, ins) in instrs.iter().enumerate() {
+        match ins {
+            I::BinOp { lhs, rhs, .. } => {
+                touch(*lhs, idx);
+                touch(*rhs, idx);
+            }
+            I::Copy { src, .. }
+            | I::Cast { src, .. }
+            | I::Not { src, .. }
+            | I::GlobalStore { src, .. }
+            | I::BranchIfFalse { cond: src, .. }
+            | I::Ret { src, .. } => {
+                touch(*src, idx);
+            }
+            I::Call { args, .. } | I::ArrayLit { elems: args, .. } => {
+                for arg in args {
+                    touch(*arg, idx);
+                }
+            }
+            I::NewArray { len, .. } => {
+                touch(*len, idx);
+            }
+            I::ArrayGet { array, index, .. } => {
+                touch(*array, idx);
+                touch(*index, idx);
+            }
+            I::ArraySet {
+                array,
+                index,
+                value,
+                ..
+            } => {
+                touch(*array, idx);
+                touch(*index, idx);
+                touch(*value, idx);
+            }
+            I::NewObject { fields, .. } => {
+                for (_, value) in fields {
+                    touch(*value, idx);
+                }
+            }
+            I::ObjectGet { object, .. } => touch(*object, idx),
+            I::ObjectSet { object, value, .. } => {
+                touch(*object, idx);
+                touch(*value, idx);
+            }
+            I::Const { .. }
+            | I::StringConst { .. }
+            | I::Param { .. }
+            | I::GlobalLoad { .. }
+            | I::Jump { .. }
+            | I::Label { .. } => {}
+        }
+    }
+    // The fragment result is consumed by the store after the last
+    // instruction; without this, terminal `Const`/`NewArray`/etc. look dead
+    // and allocate no register, failing the store with E500.
+    if !instrs.is_empty() {
+        touch(*result, instrs.len());
+    }
+    let mut last = std::collections::HashMap::new();
+    for (reg, idxs) in uses {
+        if let Some(end) = idxs.iter().copied().max() {
+            last.insert(reg, end);
+        }
+    }
+    last
+}
+
+/// Remap branch labels in one initializer fragment by `base` so inlined
+/// initializers never collide with each other or the main body.
+fn remap_labels(ins: &Instr, base: u32) -> Instr {
+    use vl_lir::Instr as I;
+    match ins {
+        I::BranchIfFalse { cond, target, span } => I::BranchIfFalse {
+            cond: *cond,
+            target: target + base,
+            span: *span,
+        },
+        I::Jump { target, span } => I::Jump {
+            target: target + base,
+            span: *span,
+        },
+        I::Label { id, span } => I::Label {
+            id: id + base,
+            span: *span,
+        },
+        _ => ins.clone(),
+    }
+}
+
+/// Free every machine register used by one initializer fragment after its
+/// result was stored, so the next initializer and the main body reuse them.
+fn free_fragment_regs(e: &mut NaraEmit, instrs: &[Instr], result: &vl_lir::Reg) {
+    use vl_lir::Instr as I;
+    let mut lir_regs: std::collections::HashSet<vl_lir::Reg> = std::collections::HashSet::new();
+    lir_regs.insert(*result);
+    for ins in instrs {
+        match ins {
+            I::Const { dst, .. }
+            | I::StringConst { dst, .. }
+            | I::Param { dst, .. }
+            | I::Copy { dst, .. }
+            | I::Not { dst, .. }
+            | I::BinOp { dst, .. }
+            | I::Call { dst, .. }
+            | I::NewArray { dst, .. }
+            | I::ArrayLit { dst, .. }
+            | I::ArrayGet { dst, .. }
+            | I::GlobalLoad { dst, .. }
+            | I::Cast { dst, .. } => {
+                lir_regs.insert(*dst);
+            }
+            I::ObjectGet { dst, .. } => {
+                lir_regs.insert(*dst);
+            }
+            _ => {}
+        }
+    }
+    for reg in lir_regs {
+        if let Some(rv) = e.rv_map.remove(&reg) {
+            if rv != 0x10 && rv != 0x11 {
+                e.free_rv.push(rv);
+            }
+        }
+        if let Some(rf) = e.rf_map.remove(&reg) {
+            if rf != 0x31 && rf != MODULE_STATE_RF {
+                e.free_rf.push(rf);
+            }
+        }
+        e.kinds.remove(&reg);
+        e.invalid.remove(&reg);
+    }
+    // Fragment branch labels live in `label_pos`/`patches` by remapped ID;
+    // they stay (positions are absolute) and never collide thanks to `base`.
 }
 
 fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>> {
+    // Target-neutral LIR must already be runtime-erased; a leaked `*`,
+    // `Param`, `int`, or `Error` is an internal compiler bug, not a silent
+    // representation choice.
+    if let Some(bad) = prog.validate_runtime() {
+        diags.push(Diagnostic::error(format!("internal compiler error: {bad}")).with_code("E500"));
+        return None;
+    }
     let mut e = NaraEmit {
         blob: Vec::new(),
         values: Vec::new(),
@@ -693,6 +893,49 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
         param_vi: 0,
         param_ri: 0,
     };
+    // Module-state layout: separate value and reference slots in one GC
+    // container. Stable global IDs map to (lane, slot); counts size the
+    // `createi` at the entrypoint.
+    let mut global_slots: std::collections::HashMap<u32, (bool, u8)> =
+        std::collections::HashMap::new();
+    let mut global_tys: std::collections::HashMap<u32, vl_typecheck::Ty> =
+        std::collections::HashMap::new();
+    let mut value_count: u8 = 0;
+    let mut ref_count: u8 = 0;
+    for g in &prog.globals {
+        let Some(kind) = NaraKind::of_ty(&g.ty) else {
+            diags.push(
+                Diagnostic::error(format!(
+                    "internal compiler error: global `{}` has non-runtime type `{}`",
+                    g.name, g.ty
+                ))
+                .with_code("E500"),
+            );
+            return None;
+        };
+        let is_ref = kind.is_ref();
+        if is_ref {
+            if ref_count == u8::MAX {
+                diags.push(
+                    Diagnostic::error("too many reference globals for module state")
+                        .with_code("E500"),
+                );
+                return None;
+            }
+            global_slots.insert(g.id, (true, ref_count));
+            ref_count += 1;
+        } else {
+            if value_count == u8::MAX {
+                diags.push(
+                    Diagnostic::error("too many value globals for module state").with_code("E500"),
+                );
+                return None;
+            }
+            global_slots.insert(g.id, (false, value_count));
+            value_count += 1;
+        }
+        global_tys.insert(g.id, g.ty.clone());
+    }
     // Pre-intern the module name, entrypoint, and std exports. These occupy
     // the first constant slots; user strings/values follow.
     let module_idx = e
@@ -720,7 +963,7 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
     let mut fn_consts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut fn_names: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for f in &prog.functions {
-        if f.name == "<global>" || fn_consts.contains_key(&f.name) {
+        if fn_consts.contains_key(&f.name) {
             continue;
         }
         if f.name == "main" {
@@ -745,9 +988,7 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
     let mut sigs: std::collections::HashMap<&str, &vl_lir::Function> =
         std::collections::HashMap::new();
     for f in &prog.functions {
-        if f.name != "<global>" {
-            sigs.entry(f.name.as_str()).or_insert(f);
-        }
+        sigs.entry(f.name.as_str()).or_insert(f);
     }
     let objects: std::collections::HashMap<&str, &vl_lir::ObjectDef> = prog
         .objects
@@ -757,10 +998,11 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
 
     let mut functions_out: Vec<(usize, Vec<u8>)> = Vec::new();
     for f in &prog.functions {
-        if f.name == "<global>" {
-            continue;
-        }
         let is_main = f.name == "main";
+        // Entry function initializes module state before anything else, so
+        // initializers may call functions that read earlier globals.
+        // Liveness covers the main body; initializer temps below are emitted
+        // inline and freed explicitly after each store.
         e.reset_fn(nara_last_use(f));
         let ctx = NaraFnCtx {
             func: f,
@@ -770,7 +1012,80 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
             objects: &objects,
             print_fn_idx,
             print_u64_fn_idx,
+            global_slots: &global_slots,
+            global_tys: &global_tys,
         };
+        if is_main && !prog.globals.is_empty() {
+            // Allocate the module-state container first.
+            e.bytecode
+                .extend_from_slice(&[0x27, MODULE_STATE_RF, value_count, ref_count]); // createi rf3F, V, R
+                                                                                      // Run initializers in source order, storing each result.
+            for (gi, g) in prog.globals.iter().enumerate() {
+                let Some((is_ref, slot)) = global_slots.get(&g.id).copied() else {
+                    continue;
+                };
+                // Remap initializer labels to avoid colliding with the main
+                // body's 0-based labels or other initializers'. Stride 1M
+                // exceeds any realistic label count (instr count bounded).
+                let base = ((gi as u32) + 1) * 1_000_000;
+                // Emit init body with a scratch last-use (straight-line temps
+                // die at their last textual use inside this fragment).
+                let frag_last = nara_last_use_fragment(&g.init, &g.result);
+                let saved_last = std::mem::replace(&mut e.last_use, frag_last);
+                for ins in &g.init {
+                    let remapped = remap_labels(ins, base);
+                    nara_instr(&mut e, &remapped, &ctx);
+                    // Free against the fragment's liveness, not the main's.
+                    // (Uses `e.last_use` currently holding the fragment map;
+                    // indices below are fragment-relative, which is fine for
+                    // straight-line temps. Branchy inits use offset labels.)
+                    if e.diags.iter().any(|d| d.is_error()) {
+                        break;
+                    }
+                }
+                e.last_use = saved_last;
+                if e.diags.iter().any(|d| d.is_error()) {
+                    break;
+                }
+                // Store the computed result into its container slot.
+                // (Empty/poisoned initializers have no result; lowering is
+                // blocked on prior errors and the driver never emits here.)
+                if g.init.is_empty() {
+                    continue;
+                }
+                if is_ref {
+                    let Some(rf) = e.rf_map.get(&g.result).copied() else {
+                        e.diags.push(
+                            Diagnostic::error(
+                                "internal compiler error: reference global init did not produce a reference",
+                            )
+                            .with_code("E500"),
+                        );
+                        break;
+                    };
+                    e.bytecode
+                        .extend_from_slice(&[0x2f, MODULE_STATE_RF, slot, rf]); // setrfati
+                } else {
+                    let Some(rv) = e.rv_map.get(&g.result).copied() else {
+                        e.diags.push(
+                            Diagnostic::error(
+                                "internal compiler error: value global init did not produce a value",
+                            )
+                            .with_code("E500"),
+                        );
+                        break;
+                    };
+                    e.bytecode
+                        .extend_from_slice(&[0x2d, MODULE_STATE_RF, slot, rv]); // setvati
+                }
+                // Free this fragment's temps so the next initializer and the
+                // main body reuse machine registers.
+                free_fragment_regs(&mut e, &g.init, &g.result);
+            }
+            if e.diags.iter().any(|d| d.is_error()) {
+                break;
+            }
+        }
         for (idx, ins) in f.instrs.iter().enumerate() {
             nara_instr(&mut e, ins, &ctx);
             nara_free_dead(&mut e, ins, idx);
@@ -790,6 +1105,61 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
             fn_names.get(&f.name).copied().unwrap_or(entry_name_idx)
         };
         functions_out.push((name_idx, std::mem::take(&mut e.bytecode)));
+    }
+    // Library without `main` but with globals: emit an `<entrypoint>` that
+    // only initializes module state, so globals are never silently dropped.
+    // (Future library loading reuses this; no second entrypoint policy.)
+    if !prog.functions.iter().any(|f| f.name == "main") && !prog.globals.is_empty() {
+        e.reset_fn(std::collections::HashMap::new());
+        if let Some(first) = prog.functions.first() {
+            let ctx = NaraFnCtx {
+                func: first,
+                is_main: false,
+                sigs: &sigs,
+                fn_consts: &fn_consts,
+                objects: &objects,
+                print_fn_idx,
+                print_u64_fn_idx,
+                global_slots: &global_slots,
+                global_tys: &global_tys,
+            };
+            e.bytecode
+                .extend_from_slice(&[0x27, MODULE_STATE_RF, value_count, ref_count]);
+            for (gi, g) in prog.globals.iter().enumerate() {
+                let Some((is_ref, slot)) = global_slots.get(&g.id).copied() else {
+                    continue;
+                };
+                if g.init.is_empty() {
+                    continue;
+                }
+                let base = ((gi as u32) + 1) * 1_000_000;
+                let frag_last = nara_last_use_fragment(&g.init, &g.result);
+                let saved_last = std::mem::replace(&mut e.last_use, frag_last);
+                for ins in &g.init {
+                    nara_instr(&mut e, &remap_labels(ins, base), &ctx);
+                    if e.diags.iter().any(|d| d.is_error()) {
+                        break;
+                    }
+                }
+                e.last_use = saved_last;
+                if e.diags.iter().any(|d| d.is_error()) {
+                    break;
+                }
+                if is_ref {
+                    if let Some(rf) = e.rf_map.get(&g.result).copied() {
+                        e.bytecode
+                            .extend_from_slice(&[0x2f, MODULE_STATE_RF, slot, rf]);
+                    }
+                } else if let Some(rv) = e.rv_map.get(&g.result).copied() {
+                    e.bytecode
+                        .extend_from_slice(&[0x2d, MODULE_STATE_RF, slot, rv]);
+                }
+                free_fragment_regs(&mut e, &g.init, &g.result);
+            }
+            if !e.diags.iter().any(|d| d.is_error()) && nara_resolve_jumps(&mut e) {
+                functions_out.push((entry_name_idx, std::mem::take(&mut e.bytecode)));
+            }
+        }
     }
     if e.diags.iter().any(|d| d.is_error()) {
         diags.append(&mut e.diags);
@@ -932,9 +1302,13 @@ fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::R
             I::Ret { src, .. } => {
                 touch(*src, idx);
             }
+            I::GlobalStore { src, .. } => {
+                touch(*src, idx);
+            }
             I::Const { .. }
             | I::StringConst { .. }
             | I::Param { .. }
+            | I::GlobalLoad { .. }
             | I::Jump { .. }
             | I::Label { .. } => {}
         }
@@ -1026,9 +1400,13 @@ fn nara_free_dead(e: &mut NaraEmit, ins: &Instr, idx: usize) {
         I::Ret { src, .. } => {
             dead.push(*src);
         }
+        I::GlobalStore { src, .. } => {
+            dead.push(*src);
+        }
         I::Const { .. }
         | I::StringConst { .. }
         | I::Param { .. }
+        | I::GlobalLoad { .. }
         | I::Jump { .. }
         | I::Label { .. } => {}
     }
@@ -1791,6 +2169,78 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             }
         }
         Instr::Ret { src, span } => nara_ret(e, ctx, *src, *span),
+        Instr::GlobalLoad { dst, global, span } => {
+            let Some((is_ref, slot)) = ctx.global_slots.get(global).copied() else {
+                e.diags.push(
+                    Diagnostic::error("internal compiler error: unknown global ID")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(gty) = ctx.global_tys.get(global).cloned() else {
+                e.diags.push(
+                    Diagnostic::error("internal compiler error: unknown global type")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(kind) = NaraKind::of_ty(&gty) else {
+                e.diags.push(
+                    Diagnostic::error("internal compiler error: global has non-runtime type")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            };
+            // Discarded reads (`g;`) emit nothing, like dead `ArrayGet`.
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, kind);
+                return;
+            }
+            if is_ref {
+                let Some(rf) = e.fresh_rf(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.rf_map.insert(*dst, rf);
+                e.kinds.insert(*dst, kind);
+                e.bytecode
+                    .extend_from_slice(&[0x2e, rf, MODULE_STATE_RF, slot]); // getrfati
+            } else {
+                let Some(rv) = e.fresh_rv(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.rv_map.insert(*dst, rv);
+                e.kinds.insert(*dst, kind);
+                e.bytecode
+                    .extend_from_slice(&[0x2c, rv, MODULE_STATE_RF, slot]); // getvati
+            }
+        }
+        Instr::GlobalStore { global, src, span } => {
+            let Some((is_ref, slot)) = ctx.global_slots.get(global).copied() else {
+                e.diags.push(
+                    Diagnostic::error("internal compiler error: unknown global ID")
+                        .with_code("E500"),
+                );
+                return;
+            };
+            if is_ref {
+                let Some(rf) = e.ref_reg(*src, *span) else {
+                    return;
+                };
+                e.bytecode
+                    .extend_from_slice(&[0x2f, MODULE_STATE_RF, slot, rf]); // setrfati
+            } else {
+                let Some(rv) = e.value_reg(*src, *span) else {
+                    return;
+                };
+                e.bytecode
+                    .extend_from_slice(&[0x2d, MODULE_STATE_RF, slot, rv]); // setvati
+            }
+        }
         Instr::BranchIfFalse { cond, target, span } => {
             let Some(c) = e.value_reg(*cond, *span) else {
                 return;
@@ -2473,6 +2923,8 @@ fn stackvm_instr(ins: &Instr) -> String {
             format!("call {callee}({args})")
         }
         Instr::Ret { .. } => "ret".into(),
+        Instr::GlobalLoad { dst, global, .. } => format!("global_load %{} %{}", dst.0, global),
+        Instr::GlobalStore { global, src, .. } => format!("global_store %{} %{}", global, src.0),
         Instr::NewArray { dst, len, .. } => {
             format!("new_array %{} len %{}", dst.0, len.0)
         }
@@ -2635,6 +3087,7 @@ mod tests {
                 name: "Counter".into(),
                 fields: vec![("value".into(), vl_typecheck::Ty::U64)],
             }],
+            globals: vec![],
             functions: vec![
                 vl_lir::Function {
                     name: "read".into(),
@@ -2784,6 +3237,7 @@ function main() {
         let lir = LirProgram {
             module: "t".into(),
             objects: vec![],
+            globals: vec![],
             functions: vec![Function {
                 name: "main".into(),
                 param_tys: vec![],

@@ -8,7 +8,7 @@
 //! for a function; trailing expression values are discarded and the
 //! fallthrough epilogue returns a dummy zero (`void` backends ignore it).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use vl_common::Scalar;
 use vl_common::Span;
@@ -128,6 +128,20 @@ pub enum Instr {
         src: Reg,
         span: Span,
     },
+    /// Load a module global by stable ID (see `LirProgram::globals`).
+    /// Target-neutral: backends run initializers once before `main` and keep
+    /// one shared cell per global.
+    GlobalLoad {
+        dst: Reg,
+        global: u32,
+        span: Span,
+    },
+    /// Store a module global by stable ID (rebinding or initializing).
+    GlobalStore {
+        global: u32,
+        src: Reg,
+        span: Span,
+    },
     BranchIfFalse {
         cond: Reg,
         target: u32,
@@ -191,17 +205,41 @@ pub struct ObjectDef {
     pub fields: Vec<(String, Ty)>,
 }
 
+/// One module global: ordered source-order initializer run once before
+/// `main`. `ty` is runtime-erased (no `*`), `init` computes the initial
+/// value with `result` holding it. Initializers may call functions that
+/// read earlier globals; backends allocate module state before running any
+/// initializer.
+#[derive(Debug, Clone)]
+pub struct Global {
+    pub id: u32,
+    pub name: String,
+    pub ty: Ty,
+    pub init: Vec<Instr>,
+    pub result: Reg,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LirProgram {
     pub module: String,
     pub objects: Vec<ObjectDef>,
+    pub globals: Vec<Global>,
     pub functions: Vec<Function>,
 }
 
 impl LirProgram {
     /// Human-readable dump (`vl build --emit lir`, golden tests).
+    /// Displays runtime-erased types; capabilities have served their purpose.
     pub fn dump(&self) -> String {
         let mut out = String::new();
+        for g in &self.globals {
+            out.push_str(&format!("global %{} {} : {} =\n", g.id, g.name, g.ty));
+            for (i, ins) in g.init.iter().enumerate() {
+                out.push_str(&format!("  {i:>3}: {}\n", fmt_instr(ins)));
+            }
+            out.push_str(&format!("  init %{}\n", g.result.0));
+        }
         for f in &self.functions {
             out.push_str(&format!("fn {}:\n", f.name));
             for (i, ins) in f.instrs.iter().enumerate() {
@@ -209,6 +247,75 @@ impl LirProgram {
             }
         }
         out
+    }
+
+    /// Boundary validation: no capability, generic, literal, or poison type
+    /// may reach backend emission (signatures, layouts, globals, and every
+    /// instruction's type metadata). Returns the offending description, if any.
+    pub fn validate_runtime(&self) -> Option<String> {
+        fn bad(ty: &Ty) -> bool {
+            matches!(ty, Ty::Mutable(_) | Ty::Param(_) | Ty::Int | Ty::Error)
+                || match ty {
+                    Ty::Array(elem) => bad(elem),
+                    _ => false,
+                }
+        }
+        for o in &self.objects {
+            for (_, ty) in &o.fields {
+                if bad(ty) {
+                    return Some(format!(
+                        "object {} field has non-runtime type `{ty}`",
+                        o.name
+                    ));
+                }
+            }
+        }
+        for g in &self.globals {
+            if bad(&g.ty) {
+                return Some(format!("global {} has non-runtime type `{}`", g.name, g.ty));
+            }
+            for ins in &g.init {
+                if let Some(ty) = instr_ty(ins) {
+                    if bad(ty) {
+                        return Some(format!(
+                            "global {} init has non-runtime type `{ty}`",
+                            g.name
+                        ));
+                    }
+                }
+            }
+        }
+        for f in &self.functions {
+            for ty in f.param_tys.iter().chain(std::iter::once(&f.ret)) {
+                if bad(ty) {
+                    return Some(format!("function {} has non-runtime type `{ty}`", f.name));
+                }
+            }
+            for ins in &f.instrs {
+                if let Some(ty) = instr_ty(ins) {
+                    if bad(ty) {
+                        return Some(format!(
+                            "function {} instruction has non-runtime type `{ty}`",
+                            f.name
+                        ));
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Runtime type metadata carried by one instruction, if any.
+fn instr_ty(ins: &Instr) -> Option<&Ty> {
+    match ins {
+        Instr::NewArray { elem, .. }
+        | Instr::ArrayLit { elem, .. }
+        | Instr::ArrayGet { elem, .. }
+        | Instr::ArraySet { elem, .. } => Some(elem),
+        Instr::ObjectGet { ty, .. } | Instr::ObjectSet { ty, .. } => Some(ty),
+        Instr::Cast { target, .. } => Some(target),
+        _ => None,
     }
 }
 
@@ -295,6 +402,8 @@ fn fmt_instr(ins: &Instr) -> String {
             format!("%{} = cast %{} : {target}", dst.0, src.0)
         }
         Instr::Ret { src, .. } => format!("ret %{}", src.0),
+        Instr::GlobalLoad { dst, global, .. } => format!("%{} = global_load %{}", dst.0, global),
+        Instr::GlobalStore { global, src, .. } => format!("global_store %{}, %{}", global, src.0),
         Instr::BranchIfFalse { cond, target, .. } => {
             format!("branch_if_false %{} -> L{}", cond.0, target)
         }
@@ -322,13 +431,14 @@ struct LoopTargets {
 struct Lowerer<'t> {
     next: u32,
     instrs: Vec<Instr>,
-    /// Values currently available in this function. Locals are assigned when
-    /// declared; globals are materialized lazily from their initializer.
+    /// Values currently available in this function. Locals (including params)
+    /// are assigned when declared; globals live in module state and are
+    /// accessed via explicit `GlobalLoad`/`GlobalStore` (never cached here).
     /// Assignment writes in place (`Copy` into the bound register) so values
     /// stay correct across branches and loop iterations without phi nodes.
     bindings: HashMap<u32, Reg>,
-    global_values: HashMap<u32, HirExpr>,
-    evaluating_globals: HashSet<u32>,
+    /// Top-level `DefId.0` -> stable global ID (`LirProgram::globals` index).
+    globals: HashMap<u32, u32>,
     next_label: u32,
     loop_stack: Vec<LoopTargets>,
     /// Instance substitution (`Param` -> concrete) for monomorphized bodies;
@@ -340,18 +450,10 @@ struct Lowerer<'t> {
     typed: &'t vl_typecheck::TypedProgram,
 }
 
-fn globals(prog: &HirProgram) -> HashMap<u32, HirExpr> {
-    prog.items
-        .iter()
-        .filter_map(|item| match item {
-            HirItem::Let {
-                def: Some(def),
-                value,
-                ..
-            } => Some((def.0, value.clone())),
-            _ => None,
-        })
-        .collect()
+/// Runtime-erased type: capability qualifiers removed recursively.
+/// LIR and backends never see `*`.
+fn rt(ty: &Ty) -> Ty {
+    ty.erase_capability()
 }
 
 impl Lowerer<'_> {
@@ -377,35 +479,26 @@ impl Lowerer<'_> {
         Some(ty)
     }
 
-    /// Element type of the array produced by `node` (an `ArrayLiteral`,
-    /// `Array.new` call, or any array-typed expression).
-    /// Looks through `*` so `*Array[T]` still yields `T` (capability is
-    /// compile-time-only; runtime layout is identical).
+    /// Erased element type of the array produced by `node`.
+    /// Looks through `*` so `*Array[T]` still yields `T`.
     fn array_elem_of(&self, id: vl_hir::HirId) -> Option<Ty> {
-        match self.resolved_ty(id)? {
-            Ty::Array(elem) => Some(*elem),
-            Ty::Mutable(inner) => match *inner {
-                Ty::Array(elem) => Some(*elem),
-                _ => None,
-            },
-            _ => None,
-        }
+        self.resolved_ty(id)?.array_elem().cloned().map(|t| rt(&t))
     }
 }
 
-/// Bind an object value in its own local home. Object references alias the
-/// same heap allocation, but rebinding one local must not change another local
-/// that happened to receive that reference from a `let` initializer.
-/// Capability is compile-time-only, so `*Object` aliases like `Object`.
+/// Bind an object/array value in its own local home. GC references alias the
+/// same heap allocation, but rebinding one local must not change another
+/// local that happened to receive that reference from a `let` initializer.
+/// Capability is already erased, so `*Object`/`*Array` alias alike.
 fn bind_local(l: &mut Lowerer, def: Option<&vl_hir::DefId>, value: &HirExpr, reg: Reg) {
     let Some(def) = def else {
         return;
     };
-    let is_object = matches!(
+    let is_ref = matches!(
         l.resolved_ty(value.id()).map(|t| t.erase_capability()),
-        Some(Ty::Object(_))
+        Some(Ty::Object(_) | Ty::Array(_))
     );
-    let home = if is_object {
+    let home = if is_ref {
         let dst = l.reg();
         l.instrs.push(Instr::Copy {
             dst,
@@ -522,61 +615,116 @@ fn lower_fn_epilogue(l: &mut Lowerer, topped_return: bool) {
 
 /// Lower typed HIR to LIR. Poisoned (`Error`-typed) nodes are skipped —
 /// errors were already reported, so no new diagnostics are produced here.
+/// Capabilities are erased (`*Foo` -> `Foo`); globals become an ordered
+/// table with explicit load/store operations run once before `main`.
 pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgram {
-    let global_values = globals(prog);
+    // Runtime-erased object layouts (capabilities served their purpose).
     let mut objects = typed
         .objects
         .iter()
         .map(|(name, sig)| ObjectDef {
             name: name.clone(),
-            fields: sig.fields.clone(),
+            fields: sig.fields.iter().map(|(n, t)| (n.clone(), rt(t))).collect(),
         })
         .collect::<Vec<_>>();
     objects.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Stable global IDs in source order: top-level `let` with a definition.
+    // Poisoned initializers still reserve an ID so later indices stay stable,
+    // but their bodies are empty (backends never run them because lowering
+    // is blocked on prior errors).
+    let global_items: Vec<(u32, String, vl_hir::HirId, HirExpr, Span)> = prog
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            HirItem::Let {
+                def: Some(def),
+                value,
+                id,
+                span,
+                ..
+            } => {
+                // Top-level name for debugging; HIR `Let` has no name field
+                // here, so use the definition span? Use `let#id` fallback and
+                // try to recover the name from... HIR Item::Let has no name?
+                // Actually HirItem::Let has no `name` in this version? Check:
+                // it has `def` only. Use `g{id}`.
+                Some((def.0, format!("g{}", def.0), *id, value.clone(), *span))
+            }
+            _ => None,
+        })
+        .collect();
+    let global_map: HashMap<u32, u32> = global_items
+        .iter()
+        .enumerate()
+        .map(|(idx, (def, _, _, _, _))| (*def, idx as u32))
+        .collect();
+
     let mut out = LirProgram {
         module: prog.module.clone(),
         objects,
+        globals: Vec::new(),
         functions: Vec::new(),
     };
+
+    // Globals first (source order): initializers may read earlier globals via
+    // `GlobalLoad`; forward references are poisoned (E305) and lower to empty.
+    for (idx, (_def, name, id, value, span)) in global_items.iter().enumerate() {
+        let gid = idx as u32;
+        let ty = typed
+            .type_of_id(*id)
+            .or_else(|| typed.type_of_id(value.id()))
+            .unwrap_or(Ty::Error);
+        // Poisoned globals lower to empty (lowering blocked on prior errors).
+        if ty == Ty::Error || !ty.is_concrete() {
+            out.globals.push(Global {
+                id: gid,
+                name: name.clone(),
+                ty: Ty::Error,
+                init: Vec::new(),
+                result: Reg(u32::MAX),
+                span: *span,
+            });
+            continue;
+        }
+        let rty = rt(&ty);
+        let mut l = Lowerer {
+            next: 0,
+            instrs: vec![],
+            bindings: HashMap::new(),
+            globals: global_map.clone(),
+            next_label: 0,
+            loop_stack: Vec::new(),
+            env: HashMap::new(),
+            outer: None,
+            typed,
+        };
+        if let Some(r) = l.lower_expr(value, typed) {
+            out.globals.push(Global {
+                id: gid,
+                name: name.clone(),
+                ty: rty,
+                init: l.instrs,
+                result: r,
+                span: *span,
+            });
+        } else {
+            out.globals.push(Global {
+                id: gid,
+                name: name.clone(),
+                ty: rty,
+                init: l.instrs,
+                result: Reg(u32::MAX),
+                span: *span,
+            });
+        }
+    }
+
     for item in &prog.items {
         match item {
             HirItem::Object { .. } => {}
-            HirItem::Let {
-                id, value, span, ..
-            } => {
-                let mut l = Lowerer {
-                    next: 0,
-                    instrs: vec![],
-                    bindings: HashMap::new(),
-                    global_values: global_values.clone(),
-                    evaluating_globals: HashSet::new(),
-                    next_label: 0,
-                    loop_stack: Vec::new(),
-                    env: HashMap::new(),
-                    outer: None,
-                    typed,
-                };
-                if let Some(r) = l.lower_expr(value, typed) {
-                    if let HirItem::Let { def: Some(def), .. } = item {
-                        l.bindings.insert(def.0, r);
-                    }
-                    l.instrs.push(Instr::Ret {
-                        src: r,
-                        span: *span,
-                    });
-                }
-                // Globals record their value type so backends can treat the
-                // initializer uniformly with function returns.
-                let ret = typed
-                    .type_of_id(*id)
-                    .or_else(|| typed.type_of_id(value.id()))
-                    .unwrap_or(Ty::Error);
-                out.functions.push(Function {
-                    name: "<global>".into(),
-                    param_tys: Vec::new(),
-                    ret,
-                    instrs: l.instrs,
-                });
+            HirItem::Let { .. } => {
+                // Already emitted as globals above; no `<global>` functions.
             }
             HirItem::Fn {
                 name,
@@ -593,15 +741,19 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                 }
                 let param_tys = params
                     .iter()
-                    .map(|(_, _, t, _)| t.as_ref().map(Ty::from_vl).unwrap_or(Ty::Error))
+                    .map(|(_, _, t, _)| {
+                        t.as_ref().map(|v| rt(&Ty::from_vl(v))).unwrap_or(Ty::Error)
+                    })
                     .collect::<Vec<_>>();
-                let ret_ty = ret.as_ref().map(Ty::from_vl).unwrap_or(Ty::Error);
+                let ret_ty = ret
+                    .as_ref()
+                    .map(|v| rt(&Ty::from_vl(v)))
+                    .unwrap_or(Ty::Error);
                 let mut l = Lowerer {
                     next: 0,
                     instrs: vec![],
                     bindings: HashMap::new(),
-                    global_values: global_values.clone(),
-                    evaluating_globals: HashSet::new(),
+                    globals: global_map.clone(),
                     next_label: 0,
                     loop_stack: Vec::new(),
                     env: HashMap::new(),
@@ -663,8 +815,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
             next: 0,
             instrs: vec![],
             bindings: HashMap::new(),
-            global_values: global_values.clone(),
-            evaluating_globals: HashSet::new(),
+            globals: global_map.clone(),
             next_label: 0,
             loop_stack: Vec::new(),
             env,
@@ -689,8 +840,8 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
         lower_fn_epilogue(&mut l, topped_return);
         out.functions.push(Function {
             name: m.clone(),
-            param_tys: inst.sig.param_tys.clone(),
-            ret: inst.sig.ret.clone(),
+            param_tys: inst.sig.param_tys.iter().map(|t| rt(t)).collect(),
+            ret: rt(&inst.sig.ret),
             instrs: l.instrs,
         });
     }
@@ -728,20 +879,26 @@ impl Lowerer<'_> {
                 });
                 Some(dst)
             }
-            HirExpr::Var { def: Some(def), .. } => {
+            HirExpr::Var {
+                def: Some(def),
+                span,
+                ..
+            } => {
                 if let Some(reg) = self.bindings.get(&def.0) {
                     return Some(*reg);
                 }
-                let value = self.global_values.get(&def.0)?.clone();
-                if !self.evaluating_globals.insert(def.0) {
-                    return None;
+                // Module globals live in shared state, never in a local home.
+                // (Poisoned forward globals already returned `None` above.)
+                if let Some(gid) = self.globals.get(&def.0).copied() {
+                    let dst = self.reg();
+                    self.instrs.push(Instr::GlobalLoad {
+                        dst,
+                        global: gid,
+                        span: *span,
+                    });
+                    return Some(dst);
                 }
-                let reg = self.lower_expr(&value, typed);
-                self.evaluating_globals.remove(&def.0);
-                if let Some(reg) = reg {
-                    self.bindings.insert(def.0, reg);
-                }
-                reg
+                None
             }
             HirExpr::Var { .. } => None,
             HirExpr::ArrayLiteral {
@@ -804,7 +961,7 @@ impl Lowerer<'_> {
                 base, name, span, ..
             } => {
                 let object = self.lower_expr(base, typed)?;
-                let ty = self.resolved_ty(expr.id())?;
+                let ty = self.resolved_ty(expr.id()).map(|t| rt(&t))?;
                 let dst = self.reg();
                 self.instrs.push(Instr::ObjectGet {
                     dst,
@@ -923,7 +1080,7 @@ impl Lowerer<'_> {
                 // reinterpretation (variables). Emit a cast so backends set
                 // the target register class.
                 let src = self.lower_expr(inner, typed)?;
-                let target = self.resolved_ty(expr.id())?;
+                let target = self.resolved_ty(expr.id()).map(|t| rt(&t))?;
                 let dst = self.reg();
                 self.instrs.push(Instr::Cast {
                     dst,
@@ -1026,9 +1183,10 @@ impl Lowerer<'_> {
     }
 
     /// Assignment writes in place: evaluate the RHS then `Copy` it into the
-    /// already-bound register. The bindings map is unchanged, so branches and
-    /// loops that assign keep working without phi nodes; branch-local `let`s
-    /// are still pruned by the caller restoring the incoming map.
+    /// already-bound register (locals) or `GlobalStore` it (globals). The
+    /// bindings map is unchanged, so branches and loops that assign keep
+    /// working without phi nodes; branch-local `let`s are still pruned by
+    /// the caller restoring the incoming map.
     fn lower_assign(
         &mut self,
         def: Option<&vl_hir::DefId>,
@@ -1046,21 +1204,12 @@ impl Lowerer<'_> {
             self.instrs.push(Instr::Copy { dst, src, span });
             return;
         }
-        // Assignment to a not-yet-materialized global: materialize first.
-        if let Some(init) = self.global_values.get(&def.0).cloned() {
-            if !self.evaluating_globals.insert(def.0) {
-                return;
-            }
-            let base = self.lower_expr(&init, typed);
-            self.evaluating_globals.remove(&def.0);
-            if let Some(base) = base {
-                self.bindings.insert(def.0, base);
-                self.instrs.push(Instr::Copy {
-                    dst: base,
-                    src,
-                    span,
-                });
-            }
+        if let Some(gid) = self.globals.get(&def.0).copied() {
+            self.instrs.push(Instr::GlobalStore {
+                global: gid,
+                src,
+                span,
+            });
         }
     }
 
@@ -1111,7 +1260,7 @@ impl Lowerer<'_> {
         else {
             return;
         };
-        let Some(ty) = self.resolved_ty(value_id) else {
+        let Some(ty) = self.resolved_ty(value_id).map(|t| rt(&t)) else {
             return;
         };
         self.instrs.push(Instr::ObjectSet {
@@ -1520,7 +1669,7 @@ mod tests {
         let lir = lower(&hir, &typed);
         let dump = lir.dump();
         assert!(dump.contains("add"));
-        assert!(dump.contains("ret"));
+        assert!(dump.contains("global"), "{dump}");
     }
 
     #[test]
@@ -1568,9 +1717,9 @@ mod tests {
         let (typed, diags) = vl_typecheck::check(&hir);
         assert!(diags.is_empty(), "{diags:?}");
         let lir = lower(&hir, &typed);
-        assert_eq!(lir.functions.len(), 1);
-        assert!(lir.functions[0].param_tys.is_empty());
-        assert_eq!(lir.functions[0].ret, Ty::U64);
+        assert_eq!(lir.functions.len(), 0);
+        assert_eq!(lir.globals.len(), 1);
+        assert_eq!(lir.globals[0].ty, Ty::U64);
     }
 
     #[test]
@@ -1659,5 +1808,66 @@ mod tests {
         let dump = lower(&hir, &typed).dump();
         assert!(!dump.contains("int"), "{dump}");
         assert!(dump.contains("u64"), "{dump}");
+    }
+
+    #[test]
+    fn capabilities_erase_to_identical_runtime_layouts() {
+        let src = "type Foo = object { value: u64, }; function read(v: Foo): u64 { return v.value; } function edit(m: *Foo): u64 { return m.value; } function main() { let e: *Foo = Foo { value = 1u64 }; read(e); }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let lir = lower(&hir, &typed);
+        assert!(
+            lir.validate_runtime().is_none(),
+            "{:?}",
+            lir.validate_runtime()
+        );
+        let dump = lir.dump();
+        assert!(!dump.contains('*'), "{dump}");
+        // Both functions read via `object_get`; no `*` in types.
+        assert!(dump.contains("object_get"), "{dump}");
+    }
+
+    #[test]
+    fn globals_use_stable_ids_and_explicit_ops() {
+        let src = "let a = 1u64; let b = 2u64; function main() { let x = a + b; a = 3u64; x; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let lir = lower(&hir, &typed);
+        assert_eq!(lir.globals.len(), 2);
+        assert_eq!(lir.globals[0].id, 0);
+        assert_eq!(lir.globals[1].id, 1);
+        let dump = lir.dump();
+        assert!(dump.contains("global %0"), "{dump}");
+        assert!(dump.contains("global_load"), "{dump}");
+        assert!(dump.contains("global_store"), "{dump}");
+        // No rematerialized `<global>` pseudo-functions.
+        assert!(!dump.contains("<global>"), "{dump}");
+        assert!(lir.validate_runtime().is_none());
+    }
+
+    #[test]
+    fn no_capability_survives_lir() {
+        let src = "type Foo = object { value: u64, }; function main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = e; e.value = 2u64; v.value; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let lir = lower(&hir, &typed);
+        assert!(lir.validate_runtime().is_none());
+        let dump = lir.dump();
+        assert!(!dump.contains('*'), "{dump}");
+        assert!(dump.contains("object_set"), "{dump}");
     }
 }
