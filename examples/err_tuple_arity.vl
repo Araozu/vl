@@ -1,0 +1,4 @@
+// Tuple arity mismatch: the annotation and the literal disagree.
+fun main() {
+  val t: #(u64, String) = #(1u64, "a", 2u64);
+}

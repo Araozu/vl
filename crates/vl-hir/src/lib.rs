@@ -42,6 +42,18 @@ pub struct HirProgram {
     pub items: Vec<HirItem>,
 }
 
+/// One destructured binding: new local name plus how to read it.
+/// `field` is `None` for positional (unnamed) access by `index`,
+/// `Some(field)` for named access by field name.
+#[derive(Debug, Clone)]
+pub struct HirDestructureBinding {
+    pub field: Option<String>,
+    pub binding: String,
+    pub index: usize,
+    pub def: Option<DefId>,
+    pub binding_span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub enum HirItem {
     Object {
@@ -55,6 +67,15 @@ pub enum HirItem {
         kind: BindingKind,
         /// Optional annotation (`None` = infer; a failed annotation parses
         /// as `None` with `ty_span` set and poisons quietly downstream).
+        ty: Option<VlType>,
+        ty_span: Option<Span>,
+        value: HirExpr,
+        span: Span,
+    },
+    Destructure {
+        id: HirId,
+        kind: BindingKind,
+        bindings: Vec<HirDestructureBinding>,
         ty: Option<VlType>,
         ty_span: Option<Span>,
         value: HirExpr,
@@ -108,6 +129,22 @@ pub enum HirStmt {
         base: Box<HirExpr>,
         field: String,
         value: Box<HirExpr>,
+        span: Span,
+    },
+    TupleAssign {
+        id: HirId,
+        base: Box<HirExpr>,
+        index: usize,
+        value: Box<HirExpr>,
+        span: Span,
+    },
+    Destructure {
+        id: HirId,
+        kind: BindingKind,
+        bindings: Vec<HirDestructureBinding>,
+        ty: Option<VlType>,
+        ty_span: Option<Span>,
+        value: HirExpr,
         span: Span,
     },
     If {
@@ -169,6 +206,17 @@ pub enum HirExpr {
         id: HirId,
         base: Box<HirExpr>,
         name: String,
+        span: Span,
+    },
+    TupleLiteral {
+        id: HirId,
+        elems: Vec<(Option<String>, HirExpr)>,
+        span: Span,
+    },
+    TupleIndex {
+        id: HirId,
+        base: Box<HirExpr>,
+        index: usize,
         span: Span,
     },
     Var {
@@ -244,6 +292,8 @@ impl HirExpr {
             | HirExpr::String { id, .. }
             | HirExpr::ArrayLiteral { id, .. }
             | HirExpr::ObjectLiteral { id, .. }
+            | HirExpr::TupleLiteral { id, .. }
+            | HirExpr::TupleIndex { id, .. }
             | HirExpr::Index { id, .. }
             | HirExpr::Field { id, .. }
             | HirExpr::Var { id, .. }
@@ -260,6 +310,8 @@ impl HirExpr {
             | HirExpr::String { span, .. }
             | HirExpr::ArrayLiteral { span, .. }
             | HirExpr::ObjectLiteral { span, .. }
+            | HirExpr::TupleLiteral { span, .. }
+            | HirExpr::TupleIndex { span, .. }
             | HirExpr::Index { span, .. }
             | HirExpr::Field { span, .. }
             | HirExpr::Var { span, .. }
@@ -340,6 +392,36 @@ impl<'a> Lowerer<'a> {
                     id: self.id(),
                     def,
                     kind: *kind,
+                    ty: ty.clone(),
+                    ty_span: *ty_span,
+                    value: self.lower_expr(value),
+                    span: *span,
+                }
+            }
+            AstItem::Destructure {
+                kind,
+                bindings,
+                ty,
+                ty_span,
+                value,
+                span,
+                ..
+            } => {
+                let lowered: Vec<HirDestructureBinding> = bindings
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| HirDestructureBinding {
+                        field: b.field.clone(),
+                        binding: b.binding.clone(),
+                        index: i,
+                        def: self.def_at_site(b.binding_span),
+                        binding_span: b.binding_span,
+                    })
+                    .collect();
+                HirItem::Destructure {
+                    id: self.id(),
+                    kind: *kind,
+                    bindings: lowered,
                     ty: ty.clone(),
                     ty_span: *ty_span,
                     value: self.lower_expr(value),
@@ -449,6 +531,49 @@ impl<'a> Lowerer<'a> {
                 value: Box::new(self.lower_expr(value)),
                 span: *span,
             },
+            AstStmt::TupleAssign {
+                base,
+                index,
+                value,
+                span,
+                ..
+            } => HirStmt::TupleAssign {
+                id: self.id(),
+                base: Box::new(self.lower_expr(base)),
+                index: *index,
+                value: Box::new(self.lower_expr(value)),
+                span: *span,
+            },
+            AstStmt::Destructure {
+                kind,
+                bindings,
+                ty,
+                ty_span,
+                value,
+                span,
+                ..
+            } => {
+                let lowered: Vec<HirDestructureBinding> = bindings
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| HirDestructureBinding {
+                        field: b.field.clone(),
+                        binding: b.binding.clone(),
+                        index: i,
+                        def: self.def_at_site(b.binding_span),
+                        binding_span: b.binding_span,
+                    })
+                    .collect();
+                HirStmt::Destructure {
+                    id: self.id(),
+                    kind: *kind,
+                    bindings: lowered,
+                    ty: ty.clone(),
+                    ty_span: *ty_span,
+                    value: self.lower_expr(value),
+                    span: *span,
+                }
+            }
             AstStmt::Expr(e) => HirStmt::Expr(self.lower_expr(e)),
             AstStmt::Return { value, span } => HirStmt::Return {
                 value: value.as_ref().map(|e| self.lower_expr(e)),
@@ -519,6 +644,22 @@ impl<'a> Lowerer<'a> {
                 id: self.id(),
                 base: Box::new(self.lower_expr(base)),
                 name: name.clone(),
+                span: *span,
+            },
+            AstExpr::TupleLiteral { elems, span } => HirExpr::TupleLiteral {
+                id: self.id(),
+                elems: elems
+                    .iter()
+                    .map(|(name, _, value)| (name.clone(), self.lower_expr(value)))
+                    .collect(),
+                span: *span,
+            },
+            AstExpr::TupleIndex {
+                base, index, span, ..
+            } => HirExpr::TupleIndex {
+                id: self.id(),
+                base: Box::new(self.lower_expr(base)),
+                index: *index,
                 span: *span,
             },
             AstExpr::Var { path, span: s } => HirExpr::Var {
@@ -644,6 +785,36 @@ fn scalar_zero(value: Scalar) -> Scalar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tuples_lower_with_index_assign_and_destructure() {
+        let src = "fun main() { val t = #(1u64, \"a\"); val a = t.`0; var m = #(1u64, 2u64); m.`0 = 3u64; val #(p, q) = t; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Fn { body, .. } => {
+                assert!(
+                    matches!(&body[0], HirStmt::Let { value: HirExpr::TupleLiteral { elems, .. }, .. } if elems.len() == 2)
+                );
+                assert!(matches!(
+                    &body[1],
+                    HirStmt::Let {
+                        value: HirExpr::TupleIndex { index: 0, .. },
+                        ..
+                    }
+                ));
+                assert!(matches!(&body[3], HirStmt::TupleAssign { index: 0, .. }));
+                assert!(
+                    matches!(&body[4], HirStmt::Destructure { bindings, .. } if bindings.len() == 2)
+                );
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
 
     #[test]
     fn not_lowers_to_explicit_unary() {

@@ -341,6 +341,12 @@ fn calls_in_item(
                 walk_expr(typed, base, out);
                 walk_expr(typed, index, out);
             }
+            HirExpr::TupleLiteral { elems, .. } => {
+                for (_, value) in elems {
+                    walk_expr(typed, value, out);
+                }
+            }
+            HirExpr::TupleIndex { base, .. } => walk_expr(typed, base, out),
             HirExpr::Field { base, .. } => walk_expr(typed, base, out),
             HirExpr::Binary { lhs, rhs, .. } => {
                 walk_expr(typed, lhs, out);
@@ -380,6 +386,11 @@ fn calls_in_item(
                 walk_expr(typed, base, out);
                 walk_expr(typed, value, out);
             }
+            HirStmt::TupleAssign { base, value, .. } => {
+                walk_expr(typed, base, out);
+                walk_expr(typed, value, out);
+            }
+            HirStmt::Destructure { value, .. } => walk_expr(typed, value, out),
             HirStmt::If {
                 condition,
                 then_body,

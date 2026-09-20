@@ -1,0 +1,39 @@
+// Tuples: fixed-arity heterogeneous values with copy semantics.
+//
+// Unnamed tuples use positional access (``t.`0``); named tuples use field
+// access (`u.x`). Destructuring binds each element to a fresh local.
+// Element writes need a mutable (`*`) tuple view; rebinding a whole tuple
+// copies the container, so later writes never affect the source.
+use std;
+
+fun main() {
+  val t: #(u64, String) = #(1u64, "a");
+  val a = t.`0;
+  val b = t.`1;
+  std.print_u64(a);
+  std.print(b);
+  val u: #(x: u64, y: String) = #(x = 2u64, y = "b");
+  std.print_u64(u.x);
+  std.print(u.y);
+  val #(p, q) = t;
+  std.print_u64(p);
+  std.print(q);
+  val #(x: x2, y: y2) = u;
+  std.print_u64(x2);
+  std.print(y2);
+  var m: *#(u64, u64) = #(3u64, 4u64);
+  m.`0 = 30u64;
+  val #(mp, mq) = m;
+  std.print_u64(mp);
+  std.print_u64(mq);
+  var n: *#(x: u64, y: u64) = #(x = 1u64, y = 2u64);
+  n.x = 10u64;
+  std.print_u64(n.x);
+  std.print_u64(n.y);
+  // Copy on bind: rebinding duplicates the container.
+  var src: *#(u64, u64) = #(1u64, 2u64);
+  var dst = src;
+  dst.`0 = 99u64;
+  std.print_u64(src.`0);
+  std.print_u64(dst.`0);
+}

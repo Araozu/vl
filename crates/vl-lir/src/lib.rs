@@ -137,6 +137,33 @@ pub enum Instr {
         ty: Ty,
         span: Span,
     },
+    /// Build a fixed-arity heterogeneous tuple from element registers.
+    /// `tys` holds the erased element types in order (names are a
+    /// typecheck-only concern; codegen maps each position to a value or
+    /// reference container slot).
+    TupleLit {
+        dst: Reg,
+        elems: Vec<Reg>,
+        tys: Vec<Ty>,
+        span: Span,
+    },
+    /// Read tuple position `index` (positional; named access lowers to the
+    /// field's position during HIR lowering, so names are erased here).
+    TupleGet {
+        dst: Reg,
+        tuple: Reg,
+        index: usize,
+        tys: Vec<Ty>,
+        span: Span,
+    },
+    /// Write tuple position `index`. Statement-only.
+    TupleSet {
+        tuple: Reg,
+        index: usize,
+        value: Reg,
+        tys: Vec<Ty>,
+        span: Span,
+    },
     /// Explicit integer conversion (`value as u8`). Backends lower it to a
     /// value copy reinterpreting the 64-bit payload per `target` (literals
     /// were range-checked by typechecking; variables are unchecked).
@@ -285,6 +312,7 @@ impl LirProgram {
             matches!(ty, Ty::Mutable(_) | Ty::Param(_) | Ty::Int | Ty::Error)
                 || match ty {
                     Ty::Array(elem) => bad(elem),
+                    Ty::Tuple(fields) => fields.iter().any(|(_, t)| bad(t)),
                     _ => false,
                 }
         }
@@ -328,6 +356,37 @@ impl LirProgram {
                         ));
                     }
                 }
+                if let Some(tys) = instr_tuple_tys(ins) {
+                    for ty in tys {
+                        if bad(ty) {
+                            return Some(format!(
+                                "function {} instruction has non-runtime type `{ty}`",
+                                f.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        for g in &self.globals {
+            for ins in &g.init {
+                if let Some(tys) = instr_tuple_tys(ins) {
+                    for ty in tys {
+                        if bad(ty) {
+                            return Some(format!(
+                                "global {} init has non-runtime type `{ty}`",
+                                g.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        for i in &self.imports {
+            for ty in i.param_tys.iter().chain(std::iter::once(&i.ret)) {
+                if bad(ty) {
+                    return Some(format!("import {} has non-runtime type `{ty}`", i.symbol));
+                }
             }
         }
         None
@@ -343,6 +402,18 @@ fn instr_ty(ins: &Instr) -> Option<&Ty> {
         | Instr::ArraySet { elem, .. } => Some(elem),
         Instr::ObjectGet { ty, .. } | Instr::ObjectSet { ty, .. } => Some(ty),
         Instr::Cast { target, .. } => Some(target),
+        // Tuples carry a `Vec<Ty>`; validated element-wise in `validate_runtime`.
+        Instr::TupleLit { .. } | Instr::TupleGet { .. } | Instr::TupleSet { .. } => None,
+        _ => None,
+    }
+}
+
+/// Element types carried by tuple instructions, if any.
+fn instr_tuple_tys(ins: &Instr) -> Option<&Vec<Ty>> {
+    match ins {
+        Instr::TupleLit { tys, .. } | Instr::TupleGet { tys, .. } | Instr::TupleSet { tys, .. } => {
+            Some(tys)
+        }
         _ => None,
     }
 }
@@ -431,6 +502,49 @@ fn fmt_instr(ins: &Instr) -> String {
             value,
             ..
         } => format!("object_set %{}.{} = %{}", object.0, name, value.0),
+        Instr::TupleLit {
+            dst, elems, tys, ..
+        } => {
+            let elems = elems
+                .iter()
+                .map(|e| format!("%{}", e.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let tys = tys
+                .iter()
+                .map(|t| format!("{t}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("%{} = tuple_lit [{elems}] : #({tys})", dst.0)
+        }
+        Instr::TupleGet {
+            dst,
+            tuple,
+            index,
+            tys,
+            ..
+        } => {
+            let tys = tys
+                .iter()
+                .map(|t| format!("{t}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("%{} = tuple_get %{}[{index}] : #({tys})", dst.0, tuple.0)
+        }
+        Instr::TupleSet {
+            tuple,
+            index,
+            value,
+            tys,
+            ..
+        } => {
+            let tys = tys
+                .iter()
+                .map(|t| format!("{t}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("tuple_set %{}[{index}], %{} : #({tys})", tuple.0, value.0)
+        }
         Instr::Cast {
             dst, src, target, ..
         } => {
@@ -543,6 +657,12 @@ fn collect_import_expr(
             collect_import_expr(base, typed, out);
             collect_import_expr(index, typed, out);
         }
+        HirExpr::TupleLiteral { elems, .. } => {
+            for (_, e) in elems {
+                collect_import_expr(e, typed, out)
+            }
+        }
+        HirExpr::TupleIndex { base, .. } => collect_import_expr(base, typed, out),
         HirExpr::Field { base, .. }
         | HirExpr::Unary { inner: base, .. }
         | HirExpr::Cast { inner: base, .. } => collect_import_expr(base, typed, out),
@@ -580,6 +700,11 @@ fn collect_import_stmt(
             collect_import_expr(base, typed, out);
             collect_import_expr(value, typed, out);
         }
+        HirStmt::TupleAssign { base, value, .. } => {
+            collect_import_expr(base, typed, out);
+            collect_import_expr(value, typed, out);
+        }
+        HirStmt::Destructure { value, .. } => collect_import_expr(value, typed, out),
         HirStmt::If {
             condition,
             then_body,
@@ -618,6 +743,7 @@ fn collect_imports(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> Vec
                 }
             }
             HirItem::Let { value, .. } => collect_import_expr(value, typed, &mut out),
+            HirItem::Destructure { value, .. } => collect_import_expr(value, typed, &mut out),
             HirItem::Object { .. } => {}
         }
     }
@@ -654,6 +780,14 @@ impl Lowerer<'_> {
     /// Looks through `*` so `*Array[T]` still yields `T`.
     fn array_elem_of(&self, id: vl_hir::HirId) -> Option<Ty> {
         self.resolved_ty(id)?.array_elem().cloned().map(|t| rt(&t))
+    }
+
+    /// Erased element types of the tuple produced by `node`, in order.
+    /// Looks through `*` so `*#(...)` still yields its elements.
+    fn tuple_tys_of(&self, id: vl_hir::HirId) -> Option<Vec<Ty>> {
+        let ty = self.resolved_ty(id)?;
+        let elems = ty.tuple_elems()?;
+        Some(elems.into_iter().map(|(_, t)| rt(&t)).collect())
     }
 }
 
@@ -733,6 +867,25 @@ fn lower_fn_stmt(
             l.lower_field_assign(base, field, value, typed, *span);
             *topped_return = false;
         }
+        HirStmt::TupleAssign {
+            base,
+            index,
+            value,
+            span,
+            ..
+        } => {
+            l.lower_tuple_assign(base, *index, value, typed, *span);
+            *topped_return = false;
+        }
+        HirStmt::Destructure {
+            bindings,
+            value,
+            span,
+            ..
+        } => {
+            l.lower_destructure(bindings, value, typed, *span);
+            *topped_return = false;
+        }
         HirStmt::While {
             condition,
             body,
@@ -775,6 +928,37 @@ fn lower_fn_epilogue(l: &mut Lowerer, topped_return: bool) {
     }
 }
 
+/// Tuple position for one destructure binding given the base tuple type.
+/// Unnamed tuples bind positionally (`b.index`); named tuples resolve by
+/// explicit `field:` or by the binding name (shorthand). `None` when the
+/// base is not a tuple or the field is unknown (already reported).
+fn destructure_position(base: &Ty, b: &vl_hir::HirDestructureBinding) -> Option<usize> {
+    let elems = base.tuple_elems()?;
+    if elems.iter().all(|(n, _)| n.is_none()) {
+        if b.index < elems.len() {
+            return Some(b.index);
+        }
+        return None;
+    }
+    if let Some(field) = &b.field {
+        return elems
+            .iter()
+            .position(|(n, _)| n.as_deref() == Some(field.as_str()));
+    }
+    // Shorthand: binding name is the field.
+    if let Some(pos) = elems
+        .iter()
+        .position(|(n, _)| n.as_deref() == Some(b.binding.as_str()))
+    {
+        return Some(pos);
+    }
+    // Fallback to pattern index when in range (defensive; typecheck reports).
+    if b.index < elems.len() {
+        return Some(b.index);
+    }
+    None
+}
+
 /// Lower typed HIR to LIR. Poisoned (`Error`-typed) nodes are skipped —
 /// errors were already reported, so no new diagnostics are produced here.
 /// Capabilities are erased (`*Foo` -> `Foo`); globals become an ordered
@@ -795,10 +979,26 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
     // Poisoned initializers still reserve an ID so later indices stay stable,
     // but their bodies are empty (backends never run them because lowering
     // is blocked on prior errors).
-    let global_items: Vec<(u32, String, vl_hir::HirId, HirExpr, Span)> = prog
-        .items
-        .iter()
-        .filter_map(|item| match item {
+    //
+    // Destructured bindings expand to one global each. The shared base
+    // expression is evaluated once into a hidden base global immediately
+    // before its bindings; each binding then loads the base and extracts
+    // its element. Without this, the base would evaluate once per binding
+    // (duplicating side effects).
+    //
+    // Entry: (def for `global_map`, debug name, item id, base/value expr,
+    // span, destructure binding plus its hidden base gid).
+    type GlobalEntry = (
+        Option<u32>,
+        String,
+        vl_hir::HirId,
+        HirExpr,
+        Span,
+        Option<(vl_hir::HirDestructureBinding, u32)>,
+    );
+    let mut global_items: Vec<GlobalEntry> = Vec::new();
+    for item in &prog.items {
+        match item {
             HirItem::Let {
                 def: Some(def),
                 value,
@@ -811,15 +1011,53 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                 // try to recover the name from... HIR Item::Let has no name?
                 // Actually HirItem::Let has no `name` in this version? Check:
                 // it has `def` only. Use `g{id}`.
-                Some((def.0, format!("g{}", def.0), *id, value.clone(), *span))
+                global_items.push((
+                    Some(def.0),
+                    format!("g{}", def.0),
+                    *id,
+                    value.clone(),
+                    *span,
+                    None,
+                ));
             }
-            _ => None,
-        })
-        .collect();
+            HirItem::Destructure {
+                bindings,
+                value,
+                id,
+                span,
+                ..
+            } => {
+                let hidden_gid = global_items.len() as u32;
+                global_items.push((
+                    None,
+                    format!("g{hidden_gid}_tuplebase"),
+                    *id,
+                    value.clone(),
+                    *span,
+                    None,
+                ));
+                for b in bindings {
+                    if let Some(def) = &b.def {
+                        global_items.push((
+                            Some(def.0),
+                            format!("g{}", def.0),
+                            *id,
+                            value.clone(),
+                            *span,
+                            Some((b.clone(), hidden_gid)),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Hidden base globals carry no `DefId` and stay out of the map; only
+    // real bindings are addressable by later code.
     let global_map: HashMap<u32, u32> = global_items
         .iter()
         .enumerate()
-        .map(|(idx, (def, _, _, _, _))| (*def, idx as u32))
+        .filter_map(|(idx, (def, _, _, _, _, _))| def.map(|d| (d, idx as u32)))
         .collect();
 
     let mut out = LirProgram {
@@ -834,8 +1072,100 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
 
     // Globals first (source order): initializers may read earlier globals via
     // `GlobalLoad`; forward references are poisoned (E305) and lower to empty.
-    for (idx, (_def, name, id, value, span)) in global_items.iter().enumerate() {
+    for (idx, (_def, name, id, value, span, binding)) in global_items.iter().enumerate() {
         let gid = idx as u32;
+        // Destructured bindings take their element type from the base tuple
+        // and load the hidden base global (evaluated once); plain lets use
+        // the item/value type as before.
+        if let Some((b, hidden)) = binding {
+            let base_ty = typed
+                .type_of_id(*id)
+                .or_else(|| typed.type_of_id(value.id()))
+                .unwrap_or(Ty::Error);
+            let Some(pos) = destructure_position(&base_ty, b) else {
+                out.globals.push(Global {
+                    id: gid,
+                    name: name.clone(),
+                    ty: Ty::Error,
+                    init: Vec::new(),
+                    result: Reg(u32::MAX),
+                    span: *span,
+                });
+                continue;
+            };
+            let Some(elems) = base_ty.tuple_elems() else {
+                out.globals.push(Global {
+                    id: gid,
+                    name: name.clone(),
+                    ty: Ty::Error,
+                    init: Vec::new(),
+                    result: Reg(u32::MAX),
+                    span: *span,
+                });
+                continue;
+            };
+            let Some((_, elem_ty)) = elems.get(pos).cloned() else {
+                out.globals.push(Global {
+                    id: gid,
+                    name: name.clone(),
+                    ty: Ty::Error,
+                    init: Vec::new(),
+                    result: Reg(u32::MAX),
+                    span: *span,
+                });
+                continue;
+            };
+            if elem_ty == Ty::Error || !elem_ty.is_concrete() {
+                out.globals.push(Global {
+                    id: gid,
+                    name: name.clone(),
+                    ty: Ty::Error,
+                    init: Vec::new(),
+                    result: Reg(u32::MAX),
+                    span: *span,
+                });
+                continue;
+            }
+            let rty = rt(&elem_ty);
+            let tys: Vec<Ty> = elems.into_iter().map(|(_, t)| rt(&t)).collect();
+            let mut l = Lowerer {
+                next: 0,
+                instrs: vec![],
+                bindings: HashMap::new(),
+                globals: global_map.clone(),
+                next_label: 0,
+                loop_stack: Vec::new(),
+                env: HashMap::new(),
+                outer: None,
+                typed,
+                module: prog.module.as_str(),
+            };
+            // The hidden base global ran before us; load it and extract.
+            // (Its own init lowered the shared base expression exactly once.)
+            let base_reg = l.reg();
+            l.instrs.push(Instr::GlobalLoad {
+                dst: base_reg,
+                global: *hidden,
+                span: *span,
+            });
+            let dst = l.reg();
+            l.instrs.push(Instr::TupleGet {
+                dst,
+                tuple: base_reg,
+                index: pos,
+                tys,
+                span: *span,
+            });
+            out.globals.push(Global {
+                id: gid,
+                name: name.clone(),
+                ty: rty,
+                init: l.instrs,
+                result: dst,
+                span: *span,
+            });
+            continue;
+        }
         let ty = typed
             .type_of_id(*id)
             .or_else(|| typed.type_of_id(value.id()))
@@ -889,7 +1219,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
     for item in &prog.items {
         match item {
             HirItem::Object { .. } => {}
-            HirItem::Let { .. } => {
+            HirItem::Let { .. } | HirItem::Destructure { .. } => {
                 // Already emitted as globals above; no `<global>` functions.
             }
             HirItem::Fn {
@@ -1125,9 +1455,58 @@ impl Lowerer<'_> {
                 });
                 Some(dst)
             }
+            HirExpr::TupleLiteral { id, elems, span } => {
+                let mut regs = Vec::with_capacity(elems.len());
+                for (_, elem) in elems {
+                    regs.push(self.lower_expr(elem, typed)?);
+                }
+                let tys = self.tuple_tys_of(*id)?;
+                let dst = self.reg();
+                self.instrs.push(Instr::TupleLit {
+                    dst,
+                    elems: regs,
+                    tys,
+                    span: *span,
+                });
+                Some(dst)
+            }
+            HirExpr::TupleIndex {
+                base, index, span, ..
+            } => {
+                let tys = self.tuple_tys_of(base.id())?;
+                let tuple = self.lower_expr(base, typed)?;
+                let dst = self.reg();
+                self.instrs.push(Instr::TupleGet {
+                    dst,
+                    tuple,
+                    index: *index,
+                    tys,
+                    span: *span,
+                });
+                Some(dst)
+            }
             HirExpr::Field {
                 base, name, span, ..
             } => {
+                // Named-tuple field reads lower to positional `TupleGet`
+                // (names are erased after typecheck); objects use `ObjectGet`.
+                if let Some(tys) = self.tuple_tys_of(base.id()) {
+                    let base_ty = self.resolved_ty(base.id())?;
+                    let elems = base_ty.tuple_elems()?;
+                    let index = elems
+                        .iter()
+                        .position(|(n, _)| n.as_deref() == Some(name.as_str()))?;
+                    let tuple = self.lower_expr(base, typed)?;
+                    let dst = self.reg();
+                    self.instrs.push(Instr::TupleGet {
+                        dst,
+                        tuple,
+                        index,
+                        tys,
+                        span: *span,
+                    });
+                    return Some(dst);
+                }
                 let object = self.lower_expr(base, typed)?;
                 let ty = self.resolved_ty(expr.id()).map(|t| rt(&t))?;
                 let dst = self.reg();
@@ -1316,6 +1695,23 @@ impl Lowerer<'_> {
             } => {
                 self.lower_field_assign(base, field, value, typed, *span);
             }
+            HirStmt::TupleAssign {
+                base,
+                index,
+                value,
+                span,
+                ..
+            } => {
+                self.lower_tuple_assign(base, *index, value, typed, *span);
+            }
+            HirStmt::Destructure {
+                bindings,
+                value,
+                span,
+                ..
+            } => {
+                self.lower_destructure(bindings, value, typed, *span);
+            }
             HirStmt::While {
                 condition,
                 body,
@@ -1433,6 +1829,37 @@ impl Lowerer<'_> {
         typed: &vl_typecheck::TypedProgram,
         span: Span,
     ) {
+        // Named-tuple field writes lower to positional `TupleSet`.
+        if let Some(tys) = self.tuple_tys_of(base.id()) {
+            let base_ty = self.resolved_ty(base.id());
+            let index = base_ty
+                .as_ref()
+                .and_then(|t| t.tuple_elems())
+                .and_then(|elems| elems.iter().position(|(n, _)| n.as_deref() == Some(field)));
+            let (Some(object), Some(value), Some(index)) = (
+                self.lower_expr(base, typed),
+                self.lower_expr(value, typed),
+                index,
+            ) else {
+                return;
+            };
+            self.instrs.push(Instr::TupleSet {
+                tuple: object,
+                index,
+                value,
+                tys,
+                span,
+            });
+            // Global bases load by value: store the mutated container back.
+            if let Some(gid) = self.global_base_of(base) {
+                self.instrs.push(Instr::GlobalStore {
+                    global: gid,
+                    src: object,
+                    span,
+                });
+            }
+            return;
+        }
         let value_id = value.id();
         let (Some(object), Some(value)) =
             (self.lower_expr(base, typed), self.lower_expr(value, typed))
@@ -1449,6 +1876,126 @@ impl Lowerer<'_> {
             ty,
             span,
         });
+    }
+
+    /// Stable global ID behind a base expression, if it is a plain global
+    /// variable. Tuple element writes through such a base must store the
+    /// mutated container back: globals load by value (a copy), so a bare
+    /// `TupleSet` on the loaded copy would vanish.
+    fn global_base_of(&self, base: &HirExpr) -> Option<u32> {
+        if let HirExpr::Var { def: Some(def), .. } = base {
+            return self.globals.get(&def.0).copied();
+        }
+        None
+    }
+
+    /// Unnamed tuple element write: evaluate the base and value, then emit
+    /// one [`Instr::TupleSet`]. The full erased element list rides along so
+    /// the backend picks the value/ref slot for the position.
+    fn lower_tuple_assign(
+        &mut self,
+        base: &HirExpr,
+        index: usize,
+        value: &HirExpr,
+        typed: &vl_typecheck::TypedProgram,
+        span: Span,
+    ) {
+        let tys = self.tuple_tys_of(base.id());
+        let (Some(tuple), Some(value)) =
+            (self.lower_expr(base, typed), self.lower_expr(value, typed))
+        else {
+            return;
+        };
+        let Some(tys) = tys else {
+            return;
+        };
+        self.instrs.push(Instr::TupleSet {
+            tuple,
+            index,
+            value,
+            tys,
+            span,
+        });
+        // Global bases load by value: store the mutated container back.
+        if let Some(gid) = self.global_base_of(base) {
+            self.instrs.push(Instr::GlobalStore {
+                global: gid,
+                src: tuple,
+                span,
+            });
+        }
+    }
+
+    /// Destructure lowering: evaluate the base once, then one `TupleGet`
+    /// per binding plus `bind_local` (same copy semantics as other locals).
+    fn lower_destructure(
+        &mut self,
+        bindings: &[vl_hir::HirDestructureBinding],
+        value: &HirExpr,
+        typed: &vl_typecheck::TypedProgram,
+        span: Span,
+    ) {
+        let base_ty = self.resolved_ty(value.id());
+        let Some(tuple_reg) = self.lower_expr(value, typed) else {
+            return;
+        };
+        let (Some(base_ty), Some(tys)) = (base_ty, self.tuple_tys_of(value.id())) else {
+            return;
+        };
+        let Some(elems) = base_ty.tuple_elems() else {
+            return;
+        };
+        for b in bindings {
+            let pos = if elems.iter().all(|(n, _)| n.is_none()) {
+                b.index
+            } else if let Some(field) = &b.field {
+                match elems
+                    .iter()
+                    .position(|(n, _)| n.as_deref() == Some(field.as_str()))
+                {
+                    Some(pos) => pos,
+                    None => continue,
+                }
+            } else {
+                match elems
+                    .iter()
+                    .position(|(n, _)| n.as_deref() == Some(b.binding.as_str()))
+                {
+                    Some(pos) => pos,
+                    None => continue,
+                }
+            };
+            if pos >= tys.len() {
+                continue;
+            }
+            let dst = self.reg();
+            self.instrs.push(Instr::TupleGet {
+                dst,
+                tuple: tuple_reg,
+                index: pos,
+                tys: tys.clone(),
+                span,
+            });
+            // Bind the extracted element like any other local (globals use
+            // `GlobalStore` via the same map when the def is top-level).
+            if let Some(def) = &b.def {
+                if let Some(gid) = self.globals.get(&def.0).copied() {
+                    self.instrs.push(Instr::GlobalStore {
+                        global: gid,
+                        src: dst,
+                        span,
+                    });
+                } else {
+                    let home = self.reg();
+                    self.instrs.push(Instr::Copy {
+                        dst: home,
+                        src: dst,
+                        span,
+                    });
+                    self.bindings.insert(def.0, home);
+                }
+            }
+        }
     }
 
     /// Short-circuit `&&`: sides evaluate at most once, left to right.
@@ -1883,6 +2430,77 @@ mod tests {
         let main = lir.functions.iter().find(|f| f.name == "main").unwrap();
         assert!(main.param_tys.is_empty());
         assert_eq!(main.ret, Ty::Void);
+    }
+
+    #[test]
+    fn tuples_lower_to_dedicated_instrs() {
+        let src = "fun main() { val t = #(1u64, \"a\"); val a = t.`0; var m = #(1u64, 2u64); m.`0 = 3u64; val #(p, q) = t; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, tdiags) = vl_typecheck::check(&hir);
+        assert!(tdiags.is_empty(), "{tdiags:?}");
+        let lir = lower(&hir, &typed);
+        let dump = lir.dump();
+        assert!(dump.contains("tuple_lit"), "{dump}");
+        assert!(dump.contains("tuple_get"), "{dump}");
+        assert!(dump.contains("tuple_set"), "{dump}");
+    }
+
+    #[test]
+    fn tuple_writes_to_globals_store_back() {
+        // Globals load by value, so `g.`0 = v;` must lower to
+        // `tuple_set` + `global_store` — a bare `tuple_set` would mutate a
+        // temporary copy and vanish.
+        let src = "var g: *#(u64, u64) = #(1u64, 2u64); fun main() { g.`0 = 9u64; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let lir = lower(&hir, &typed);
+        let main = lir
+            .functions
+            .iter()
+            .find(|f| f.name == "main")
+            .expect("main");
+        let has_set = main
+            .instrs
+            .iter()
+            .any(|i| matches!(i, Instr::TupleSet { .. }));
+        let has_store = main
+            .instrs
+            .iter()
+            .any(|i| matches!(i, Instr::GlobalStore { .. }));
+        assert!(has_set && has_store, "{}", lir.dump());
+    }
+
+    #[test]
+    fn top_level_destructure_evaluates_base_once() {
+        // The shared base must lower to exactly one call: a hidden base
+        // global holds it and each binding loads from there.
+        let src = "fun make(): #(u64, u64) { return #(7u64, 8u64); } val #(a, b) = make(); fun main() { a; b; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let lir = lower(&hir, &typed);
+        assert_eq!(lir.globals.len(), 3, "{}", lir.dump());
+        let calls: usize = lir
+            .globals
+            .iter()
+            .flat_map(|g| g.init.iter())
+            .filter(|i| matches!(i, Instr::Call { .. }))
+            .count();
+        assert_eq!(calls, 1, "base must evaluate once: {}", lir.dump());
     }
 
     #[test]

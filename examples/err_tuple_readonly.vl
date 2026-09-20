@@ -1,0 +1,5 @@
+// Tuple element write through a read-only view.
+fun main() {
+  val t = #(1u64, "a");
+  t.`0 = 2u64;
+}

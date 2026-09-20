@@ -40,7 +40,9 @@ string     := `"` string_char* `"`
 operator   := "==" | "!=" | "<=" | ">=" | "&&" | "||"
             | "+" | "-" | "*" | "/" | "=" | "!" | "<" | ">"
 delimiter  := "::" | ";" | "(" | ")" | "{" | "}" | "[" | "]"
-            | "," | "." | ":"
+            | "," | "." | ":" | "#" | "`"
+tuple_intro := "#"   ; `Hash`: `#(...)` types, literals, and destructure patterns
+tuple_index := "`"   ; `Backtick`: unnamed access is `.` backtick int
 ```
 
 Keywords are exact word matches; all other words are `Ident(String)`. The
@@ -71,6 +73,8 @@ bytes; no UTF-8 decoding is performed.
 | `== != ! < <= > >=` | `EqEq`, `BangEq`, `Bang`, `Lt`, `LtEq`, `Gt`, `GtEq` | one or two bytes |
 | `&& \|\|` | `AmpAmp`, `PipePipe` | two bytes |
 | `; ( ) { } [ ] , . :` | matching delimiter | one byte |
+| `#` | `Hash` (tuple introducer) | one byte |
+| backtick | `Backtick` (unnamed tuple index) | one byte |
 | `::` | `ColonColon` | two bytes |
 | malformed numeric/string or unexpected character | `Invalid` plus diagnostic | offending span |
 | end of input | `Eof` | `Span::empty(src.len())` |

@@ -149,9 +149,12 @@ fn collect_interface_impl(
     let global_names = prog
         .items
         .iter()
-        .filter_map(|item| match item {
-            Item::Let { name, .. } => Some(name.clone()),
-            _ => None,
+        .flat_map(|item| match item {
+            Item::Let { name, .. } => vec![name.clone()],
+            Item::Destructure { bindings, .. } => {
+                bindings.iter().map(|b| b.binding.clone()).collect()
+            }
+            _ => Vec::new(),
         })
         .collect::<std::collections::HashSet<_>>();
     let mut functions_by_name = HashMap::new();
@@ -337,6 +340,15 @@ fn qualify_export_ty(
         vl_common::VlType::Array(elem) => {
             vl_common::VlType::Array(Box::new(qualify_export_ty(elem, module, local_objects)))
         }
+        vl_common::VlType::Tuple(fields) => vl_common::VlType::Tuple(
+            fields
+                .iter()
+                .map(|f| vl_common::TupleField {
+                    name: f.name.clone(),
+                    ty: Box::new(qualify_export_ty(&f.ty, module, local_objects)),
+                })
+                .collect(),
+        ),
         vl_common::VlType::Mutable(inner) => {
             vl_common::VlType::Mutable(Box::new(qualify_export_ty(inner, module, local_objects)))
         }
@@ -359,6 +371,10 @@ fn collect_local_calls(stmts: &[Stmt], calls: &mut Vec<String>) {
             Expr::ObjectLiteral { fields, .. } => {
                 fields.iter().for_each(|(_, _, e)| visit_expr(e, calls))
             }
+            Expr::TupleLiteral { elems, .. } => {
+                elems.iter().for_each(|(_, _, e)| visit_expr(e, calls))
+            }
+            Expr::TupleIndex { base, .. } => visit_expr(base, calls),
             Expr::Index { base, index, .. } => {
                 visit_expr(base, calls);
                 visit_expr(index, calls);
@@ -392,6 +408,11 @@ fn collect_local_calls(stmts: &[Stmt], calls: &mut Vec<String>) {
                 visit_expr(base, calls);
                 visit_expr(value, calls);
             }
+            Stmt::TupleAssign { base, value, .. } => {
+                visit_expr(base, calls);
+                visit_expr(value, calls);
+            }
+            Stmt::Destructure { value, .. } => visit_expr(value, calls),
             Stmt::If {
                 condition,
                 then_body,
@@ -447,6 +468,10 @@ fn function_depends_on_global(
             Expr::ObjectLiteral { fields, .. } => fields
                 .iter()
                 .any(|(_, _, e)| expr_depends(e, locals, globals)),
+            Expr::TupleLiteral { elems, .. } => elems
+                .iter()
+                .any(|(_, _, e)| expr_depends(e, locals, globals)),
+            Expr::TupleIndex { base, .. } => expr_depends(base, locals, globals),
             Expr::Index { base, index, .. } => {
                 expr_depends(base, locals, globals) || expr_depends(index, locals, globals)
             }
@@ -489,6 +514,18 @@ fn function_depends_on_global(
                 }
                 Stmt::FieldAssign { base, value, .. } => {
                     expr_depends(base, locals, globals) || expr_depends(value, locals, globals)
+                }
+                Stmt::TupleAssign { base, value, .. } => {
+                    expr_depends(base, locals, globals) || expr_depends(value, locals, globals)
+                }
+                Stmt::Destructure {
+                    value, bindings, ..
+                } => {
+                    let depends = expr_depends(value, locals, globals);
+                    for b in bindings {
+                        locals.insert(b.binding.clone());
+                    }
+                    depends
                 }
                 Stmt::If {
                     condition,
@@ -576,6 +613,11 @@ pub fn resolve_with_modules(
             } => {
                 r.declare_global(name.clone(), *name_span, Some(*kind));
             }
+            Item::Destructure { bindings, kind, .. } => {
+                for b in bindings {
+                    r.declare_global(b.binding.clone(), b.binding_span, Some(*kind));
+                }
+            }
             Item::Function {
                 name, name_span, ..
             } => {
@@ -590,6 +632,9 @@ pub fn resolve_with_modules(
             Item::Use { .. } => {}
             Item::Object { .. } => {}
             Item::Let { value, .. } => {
+                r.resolve_expr(value);
+            }
+            Item::Destructure { value, .. } => {
                 r.resolve_expr(value);
             }
             Item::Function { params, body, .. } => {
@@ -813,6 +858,21 @@ impl Resolver {
                 self.resolve_expr(base);
                 self.resolve_expr(value);
             }
+            Stmt::TupleAssign { base, value, .. } => {
+                self.resolve_expr(base);
+                self.resolve_expr(value);
+            }
+            Stmt::Destructure {
+                bindings,
+                kind,
+                value,
+                ..
+            } => {
+                self.resolve_expr(value);
+                for b in bindings {
+                    self.declare_local(b.binding.clone(), b.binding_span, *kind);
+                }
+            }
             Stmt::Expr(e) => self.resolve_expr(e),
             Stmt::Return { value, .. } => {
                 if let Some(e) = value {
@@ -885,6 +945,12 @@ impl Resolver {
                     self.resolve_expr(elem);
                 }
             }
+            Expr::TupleLiteral { elems, .. } => {
+                for (_, _, value) in elems {
+                    self.resolve_expr(value);
+                }
+            }
+            Expr::TupleIndex { base, .. } => self.resolve_expr(base),
             Expr::Index { base, index, .. } => {
                 self.resolve_expr(base);
                 self.resolve_expr(index);
@@ -1489,6 +1555,27 @@ mod tests {
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         resolve(&prog)
+    }
+
+    #[test]
+    fn destructure_bindings_resolve_as_locals() {
+        let (toks, _) = vl_lex::lex("fun main() { val t = #(1u64, 2u64); val #(a, b) = t; a; b; }");
+        let (prog, pdiags) = vl_syntax::parse(&toks, "");
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, diags) = resolve(&prog);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let names: Vec<&str> = res.defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"a") && names.contains(&"b"), "{names:?}");
+    }
+
+    #[test]
+    fn destructure_of_unresolved_base_poisons_quietly() {
+        // `missing` is one E201; the pattern bindings still intern so later
+        // stages stay quiet downstream (no cascade).
+        let (_, diags) = resolve_src("fun main() { val #(a, b) = missing; }");
+        let errors: Vec<_> = diags.iter().filter(|d| d.is_error()).collect();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E201"));
     }
 
     #[test]
