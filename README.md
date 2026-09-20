@@ -79,8 +79,12 @@ and reports errors from the whole project. Final artifacts are written only
 after every source unit is clean, and a project may contain at most one `main`.
 The `source` and `out` paths are relative to the project directory unless they
 are absolute. `vl build path/to/file.vl` remains available for single-file
-builds; project imports require the project build/check path. Imported generic
-functions and cross-module object/global boundaries remain deferred.
+builds; project imports require the project build/check path. Object types are
+nominal and cross modules by fully qualified name: a `type Person` declared
+in module `my_app.person` is named `my_app.person.Person` in any other
+module's signatures, annotations, and literals (`val p: my_app.person.Person`,
+`my_app.person.Person { ... }`). Imported generic functions and cross-module
+global boundaries remain deferred.
 
 Project scripts are commands in the optional `[scripts]` table. They run only
 through `vl run`: `vl run` runs the special `run` script, while `vl run check`

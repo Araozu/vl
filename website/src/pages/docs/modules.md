@@ -55,6 +55,27 @@ fun main() {
 Unknown modules and exports are reported when you run `check`. The [standard
 library catalog](/std) lists the modules and functions currently available.
 
+## Sharing object types
+
+Object types are nominal and cross modules by fully qualified name. A
+`type Person` declared in module `my_app.person` is spelled
+`my_app.person.Person` everywhere else: in function signatures, annotations,
+and literals.
+
+```vl
+use my_app.person;
+
+fun main() {
+    var rose = person.new("Rose", 25);
+    val same: my_app.person.Person = rose;
+    val lit: my_app.person.Person = my_app.person.Person { name = "Lit", age = 40 };
+}
+```
+
+Two modules may each declare their own `Person`; the qualified name keeps
+them disjoint. Referring to a qualified type with no layout in scope is an
+error, just like a misspelled bare type.
+
 ## Strings
 
 Strings use double quotes. They are byte strings for now, which means they are
