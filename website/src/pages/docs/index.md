@@ -38,12 +38,17 @@ results, and call one function from another.
 [Arrays and generics](/docs/arrays) introduces fixed-length arrays and the
 type parameters that let one function work with several element types.
 
-## 6. Organize a program
+## 6. Model named data
+
+[Objects](/docs/objects) explains object declarations, named literals, field
+access, and reference semantics.
+
+## 7. Organize a program
 
 [Modules and strings](/docs/modules) covers imports, source files, text values,
 and the standard library.
 
-## 7. Use the command line
+## 8. Use the command line
 
 When you are ready to work with your own files, use the [CLI reference](/cli)
 to check, build, inspect, and select a target from the `vl` driver.

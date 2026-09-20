@@ -1,0 +1,19 @@
+use std;
+
+type Counter = object {
+    value: u64,
+    label: string,
+};
+
+function bump(counter: Counter): Counter {
+    counter.value = counter.value + 1;
+    return counter;
+}
+
+function main() {
+    let counter = Counter { value: 1, label: "count" };
+    let same = bump(counter);
+    same.value = same.value + 1;
+    std.print(same.label);
+    std.print_u64(counter.value);
+}

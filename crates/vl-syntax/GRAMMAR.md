@@ -9,17 +9,22 @@ Parser recovers per-item (and per-stmt inside `function`); one bad item hides no
 
 ```text
 program := item*
-item    := use_item | let_item | function_item
+item    := use_item | let_item | function_item | object_item
 use_item := "use" path ("." "{" ident ("," ident)* "}")? ";"
 let_item := "let" ident (":" type)? "=" expr ";"
 function_item := "function" ident "(" params? ")" (":" type)? block
+object_item := "type" ident "=" "object" "{" object_fields? "}" ";"
+object_fields := object_field ("," object_field)* ","?
+object_field := ident ":" type
 params   := param ("," param)*          ; no trailing comma
 param    := ident ":" type
-type     := "u64" | "i64" | "f64" | "bool" | "u8" | "string" | "File" | "void"
+type     := "u64" | "i64" | "f64" | "bool" | "u8" | "string" | "File" | ident | "Array" "[" type "]" | "void"
 block    := "{" stmt* "}"
-stmt     := let_stmt | assign_stmt | if_stmt | while_stmt | break_stmt | continue_stmt | return_stmt | expr_stmt
+stmt     := let_stmt | assign_stmt | index_assign_stmt | field_assign_stmt | if_stmt | while_stmt | break_stmt | continue_stmt | return_stmt | expr_stmt
 let_stmt := "let" ident (":" type)? "=" expr ";"
 assign_stmt := ident "=" expr ";"
+index_assign_stmt := expr "[" expr "]" "=" expr ";"
+field_assign_stmt := expr "." ident "=" expr ";"
 if_stmt  := "if" "(" expr ")" branch ("else" branch)?
 while_stmt := "while" "(" expr ")" branch
 break_stmt := "break" ";"
@@ -36,19 +41,21 @@ term     := factor (("+" | "-") factor)* ; left-assoc
 factor   := unary (("*" | "/") unary)*   ; left-assoc
 unary    := ("-" | "!") unary | call
 call     := path "(" args? ")"
+postfix  := primary ("[" expr "]" | "." ident)*
+object_literal := ident "{" (ident ":" expr ("," ident ":" expr)* ","?)? "}"
 args     := expr ("," expr)*
 literal  := int | i64 | u64 | f64 | u8 | bool
 path     := ident ("." ident)*
 ```
 
-Terminal names are `vl-lex` `TokenKind`s: `Let Function If Else While Break
+Terminal names are `vl-lex` `TokenKind`s: `Let Function Type Object If Else While Break
 Continue Return Eq Semi LParen RParen LBrace RBrace Comma Dot Colon Plus Minus
 Star Slash EqEq Bang BangEq Lt LtEq Gt GtEq AmpAmp PipePipe Ident I64 U64 F64 U8
 Bool String Eof`.
 
 ### Notes
 
-* Semicolons are mandatory everywhere: `let`, `return`, `break`, `continue`,
+* Semicolons are mandatory everywhere: `let`, object declarations, `return`, `break`, `continue`,
   and expression-statements need `;` — including the last statement of a
   function body (`{ let d = x; }`). A bare trailing `d` without `;` is `E100`.
 * There are no implicit returns: only `return expr;` yields a value
@@ -65,15 +72,19 @@ Program { items: Vec<Item> }
 Item ::= Use { path, names, span }
        | Let { name, name_span, value: Expr, span }
        | Function { name, name_span, params: Vec<Param>, ret: Option<VlType>, ret_span, body: Vec<Stmt>, span }
+       | Object { name, name_span, fields: Vec<ObjectField>, span }
 Param ::= { name, name_span, ty: Option<VlType>, ty_span }
 Stmt ::= Let { name, name_span, value: Expr, span }
        | Assign { name, name_span, value: Expr, span }
+       | IndexAssign { array, index, value, span }
+       | FieldAssign { base, field, value, span }
        | If { condition, then_body, else_body, span }
        | While { condition, body, span }
        | Break { span } | Continue { span }
        | Return { value: Option<Expr>, span }
        | Expr(Expr)
-Expr ::= Literal(Scalar, Span) | String(Vec<u8>, Span) | Var { path, span }
+Expr ::= Literal(Scalar, Span) | String(Vec<u8>, Span) | ObjectLiteral { name, fields, span }
+         | Field { base, name, span } | Var { path, span }
          | Call { callee: path, callee_span, args, span }
          | Unary { op, rhs, span } | Binary { op, lhs, rhs, span }
 BinOp ::= Add | Sub | Mul | Div | Eq | Ne | Lt | Le | Gt | Ge | And | Or
@@ -88,7 +99,7 @@ Spans (`vl_common::Span`, byte, half-open): `let` spans `let..;`, `function` spa
 | Code | When | Message shape |
 |---|---|---|
 | `E100` | `expect()` mismatch (missing `= ; ( ) { }`) | `expected {what}, found {describe}` + label `unexpected token here` |
-| `E101` | item doesn't start with `use`/`let`/`function` | `expected an item (\`use\`, \`let\` or \`function\`), found …` + label `items start with …` |
+| `E101` | item doesn't start with `use`/`let`/`function`/`type` | `expected an item (\`use\`, \`let\`, \`function\` or \`type\`), found …` + label `items start with …` |
 | `E102` | missing name (after `let`/`function`, or bad param) | `expected a name, found …` + label `expected identifier here` |
 | `E103` | bad expression start | `expected an expression, found …` + label `expected value here` |
 | `E104` | missing param type / `void` param | `parameter \`{name}\` is missing a type` / `cannot be \`void\`` |
@@ -101,7 +112,7 @@ Missing `;` (`let x = 1`) → `E100`; `@` never reaches here (lexer `E000`).
 ## Recovery
 
 * `program` loop: failed `parse_item()` → `recover_to_item_boundary`: skip
-  until (and consuming) `;`/`}`, or stopping at `let`/`function`/`Eof`.
+  until (and consuming) `;`/`}`, or stopping at `let`/`function`/`type`/`Eof`.
 * `function` body loop: failed `parse_stmt()` → `recover_to_stmt_boundary`: skip
   until (and consuming) `;`, or stopping at `}`/`let`/`function`/`if`/`while`/
   `break`/`continue`/`return`/`Eof`.

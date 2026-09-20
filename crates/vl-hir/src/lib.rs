@@ -35,6 +35,11 @@ pub struct HirProgram {
 
 #[derive(Debug, Clone)]
 pub enum HirItem {
+    Object {
+        name: String,
+        fields: Vec<(String, Option<VlType>, Span)>,
+        span: Span,
+    },
     Let {
         id: HirId,
         def: Option<DefId>,
@@ -87,6 +92,13 @@ pub enum HirStmt {
         value: Box<HirExpr>,
         span: Span,
     },
+    FieldAssign {
+        id: HirId,
+        base: Box<HirExpr>,
+        field: String,
+        value: Box<HirExpr>,
+        span: Span,
+    },
     If {
         condition: HirExpr,
         then_body: Vec<HirStmt>,
@@ -129,11 +141,23 @@ pub enum HirExpr {
         elems: Vec<HirExpr>,
         span: Span,
     },
+    ObjectLiteral {
+        id: HirId,
+        name: String,
+        fields: Vec<(String, HirExpr)>,
+        span: Span,
+    },
     /// Element read: `array[index]`.
     Index {
         id: HirId,
         base: Box<HirExpr>,
         index: Box<HirExpr>,
+        span: Span,
+    },
+    Field {
+        id: HirId,
+        base: Box<HirExpr>,
+        name: String,
         span: Span,
     },
     Var {
@@ -206,7 +230,9 @@ impl HirExpr {
             HirExpr::Literal { id, .. }
             | HirExpr::String { id, .. }
             | HirExpr::ArrayLiteral { id, .. }
+            | HirExpr::ObjectLiteral { id, .. }
             | HirExpr::Index { id, .. }
+            | HirExpr::Field { id, .. }
             | HirExpr::Var { id, .. }
             | HirExpr::Call { id, .. }
             | HirExpr::Binary { id, .. }
@@ -220,7 +246,9 @@ impl HirExpr {
             HirExpr::Literal { span, .. }
             | HirExpr::String { span, .. }
             | HirExpr::ArrayLiteral { span, .. }
+            | HirExpr::ObjectLiteral { span, .. }
             | HirExpr::Index { span, .. }
+            | HirExpr::Field { span, .. }
             | HirExpr::Var { span, .. }
             | HirExpr::Call { span, .. }
             | HirExpr::Binary { span, .. }
@@ -275,6 +303,16 @@ impl<'a> Lowerer<'a> {
     fn lower_item(&mut self, item: &AstItem) -> HirItem {
         match item {
             AstItem::Use { .. } => unreachable!("use items are filtered before lowering"),
+            AstItem::Object {
+                name, fields, span, ..
+            } => HirItem::Object {
+                name: name.clone(),
+                fields: fields
+                    .iter()
+                    .map(|f| (f.name.clone(), f.ty.clone(), f.name_span))
+                    .collect(),
+                span: *span,
+            },
             AstItem::Let {
                 value,
                 span,
@@ -381,6 +419,19 @@ impl<'a> Lowerer<'a> {
                 value: Box::new(self.lower_expr(value)),
                 span: *span,
             },
+            AstStmt::FieldAssign {
+                base,
+                field,
+                value,
+                span,
+                ..
+            } => HirStmt::FieldAssign {
+                id: self.id(),
+                base: Box::new(self.lower_expr(base)),
+                field: field.clone(),
+                value: Box::new(self.lower_expr(value)),
+                span: *span,
+            },
             AstStmt::Expr(e) => HirStmt::Expr(self.lower_expr(e)),
             AstStmt::Return { value, span } => HirStmt::Return {
                 value: value.as_ref().map(|e| self.lower_expr(e)),
@@ -430,10 +481,27 @@ impl<'a> Lowerer<'a> {
                 elems: elems.iter().map(|e| self.lower_expr(e)).collect(),
                 span: *span,
             },
+            AstExpr::ObjectLiteral {
+                name, fields, span, ..
+            } => HirExpr::ObjectLiteral {
+                id: self.id(),
+                name: name.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(name, _, value)| (name.clone(), self.lower_expr(value)))
+                    .collect(),
+                span: *span,
+            },
             AstExpr::Index { base, index, span } => HirExpr::Index {
                 id: self.id(),
                 base: Box::new(self.lower_expr(base)),
                 index: Box::new(self.lower_expr(index)),
+                span: *span,
+            },
+            AstExpr::Field { base, name, span } => HirExpr::Field {
+                id: self.id(),
+                base: Box::new(self.lower_expr(base)),
+                name: name.clone(),
                 span: *span,
             },
             AstExpr::Var { path, span: s } => HirExpr::Var {

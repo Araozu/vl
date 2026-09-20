@@ -37,6 +37,8 @@ pub enum Ty {
     U8,
     String,
     File,
+    /// User-defined nominal object (reference semantics).
+    Object(String),
     /// Fixed-length heap array of `T` (reference type, like `String`).
     Array(Box<Ty>),
     /// Opaque use of an enclosing generic function's type parameter.
@@ -58,6 +60,7 @@ impl std::fmt::Display for Ty {
             Ty::U8 => write!(f, "u8"),
             Ty::String => write!(f, "string"),
             Ty::File => write!(f, "File"),
+            Ty::Object(name) => write!(f, "{name}"),
             Ty::Array(elem) => write!(f, "Array[{elem}]"),
             Ty::Param(name) => write!(f, "{name}"),
             Ty::Void => write!(f, "void"),
@@ -83,6 +86,7 @@ impl Ty {
             VlType::U8 => Ty::U8,
             VlType::String => Ty::String,
             VlType::File => Ty::File,
+            VlType::Object(name) => Ty::Object(name.clone()),
             VlType::Array(elem) => Ty::Array(Box::new(Self::from_vl_in(elem, env))),
             VlType::Param(name) => env.get(name).cloned().unwrap_or(Ty::Error),
             VlType::Void => Ty::Void,
@@ -147,11 +151,18 @@ fn mangle_ty(ty: &Ty) -> String {
         Ty::U8 => "u8".into(),
         Ty::String => "string".into(),
         Ty::File => "File".into(),
+        Ty::Object(name) => format!("Object_{}", name),
         Ty::Array(elem) => format!("Array_{}", mangle_ty(elem)),
         Ty::Param(name) => name.clone(),
         Ty::Void => "void".into(),
         Ty::Error => "error".into(),
     }
+}
+
+/// Statically known layout of one user-defined object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectSigTy {
+    pub fields: Vec<(String, Ty)>,
 }
 
 /// Compiler-owned signature of one user function.
@@ -198,6 +209,8 @@ pub struct Instance {
 #[derive(Debug, Default)]
 pub struct TypedProgram {
     pub types: HashMap<u32, Ty>,
+    /// User-defined object declarations and their field types.
+    pub objects: HashMap<String, ObjectSigTy>,
     /// Top-level value names in order (for LIR/codegen).
     pub globals: Vec<String>,
     /// Function `DefId.0` -> parameter count (for arity checks + LIR).
@@ -331,10 +344,16 @@ fn template_expr_ids(e: &HirExpr, out: &mut HashSet<u32>) {
                 template_expr_ids(el, out);
             }
         }
+        HirExpr::ObjectLiteral { fields, .. } => {
+            for (_, value) in fields {
+                template_expr_ids(value, out);
+            }
+        }
         HirExpr::Index { base, index, .. } => {
             template_expr_ids(base, out);
             template_expr_ids(index, out);
         }
+        HirExpr::Field { base, .. } => template_expr_ids(base, out),
         HirExpr::Call { args, .. } => {
             for a in args {
                 template_expr_ids(a, out);
@@ -366,6 +385,13 @@ fn template_stmt_ids(s: &HirStmt, out: &mut HashSet<u32>) {
             out.insert(id.0);
             template_expr_ids(array, out);
             template_expr_ids(index, out);
+            template_expr_ids(value, out);
+        }
+        HirStmt::FieldAssign {
+            id, base, value, ..
+        } => {
+            out.insert(id.0);
+            template_expr_ids(base, out);
             template_expr_ids(value, out);
         }
         HirStmt::Expr(e) => template_expr_ids(e, out),
@@ -466,6 +492,30 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
         type_bounds: HashMap::new(),
         pending_instances: Vec::new(),
     };
+    // Pass 0: collect object layouts so field types and object literals can
+    // refer to declarations in either order.
+    for item in &prog.items {
+        if let HirItem::Object { name, fields, .. } = item {
+            let mut out_fields = Vec::with_capacity(fields.len());
+            for (field, ty, span) in fields {
+                let field_ty = ty
+                    .as_ref()
+                    .map(|v| Ty::from_vl_in(v, &HashMap::new()))
+                    .unwrap_or(Ty::Error);
+                if field_ty == Ty::Void {
+                    cx.diags.push(
+                        Diagnostic::error("an object field cannot be `void`")
+                            .with_label(*span, "`void` is not a value type")
+                            .with_code("E104"),
+                    );
+                }
+                out_fields.push((field.clone(), field_ty));
+            }
+            cx.typed
+                .objects
+                .insert(name.clone(), ObjectSigTy { fields: out_fields });
+        }
+    }
     // Pass 1: collect function signatures so calls resolve arity + types
     // regardless of definition order (matches the resolver pre-pass).
     for item in &prog.items {
@@ -556,6 +606,7 @@ impl Checker {
 
     fn check_item(&mut self, item: &HirItem) {
         match item {
+            HirItem::Object { .. } => {}
             HirItem::Let {
                 id,
                 def,
@@ -970,6 +1021,59 @@ impl Checker {
                 }
                 self.record(*id, elem);
             }
+            HirStmt::FieldAssign {
+                id,
+                base,
+                field,
+                value,
+                span,
+            } => {
+                let bt = self.infer_expr(base);
+                let Some(object_name) = (match &bt {
+                    Ty::Object(name) => Some(name.clone()),
+                    _ => None,
+                }) else {
+                    if !ty_has_error(&bt) {
+                        self.diags.push(
+                            Diagnostic::error(format!("cannot assign field `{field}` on `{bt}`"))
+                                .with_label(*span, "expected an object value here")
+                                .with_code("E302"),
+                        );
+                    }
+                    let _ = self.infer_expr(value);
+                    self.record(*id, Ty::Error);
+                    return;
+                };
+                let Some(sig) = self.typed.objects.get(&object_name).cloned() else {
+                    self.record(*id, Ty::Error);
+                    return;
+                };
+                let Some((_, want)) = sig.fields.iter().find(|(name, _)| name == field) else {
+                    self.diags.push(
+                        Diagnostic::error(format!("object `{object_name}` has no field `{field}`"))
+                            .with_label(*span, "unknown object field")
+                            .with_code("E302"),
+                    );
+                    let _ = self.infer_expr(value);
+                    self.record(*id, Ty::Error);
+                    return;
+                };
+                let got = self.infer_expr_expected(value, want);
+                if ty_has_error(&got) || !types_compatible(&got, want) {
+                    if !ty_has_error(&got) {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "object field `{field}` expects `{want}`, got `{got}`"
+                            ))
+                            .with_label(value.span(), format!("expected `{want}` here"))
+                            .with_code("E302"),
+                        );
+                    }
+                    self.record(*id, Ty::Error);
+                } else {
+                    self.record(*id, want.clone());
+                }
+            }
             HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
             HirStmt::While {
                 condition, body, ..
@@ -1367,6 +1471,19 @@ impl Checker {
                     self.record(*id, expected.clone());
                 }
             }
+            HirExpr::ObjectLiteral { id, fields, .. } => {
+                if let Ty::Object(name) = expected {
+                    if let Some(sig) = self.typed.objects.get(name).cloned() {
+                        for (field, value) in fields {
+                            if let Some((_, field_ty)) = sig.fields.iter().find(|(n, _)| n == field)
+                            {
+                                self.coerce_expr_literals(value, field_ty);
+                            }
+                        }
+                        self.record(*id, expected.clone());
+                    }
+                }
+            }
             HirExpr::Binary { lhs, rhs, .. } if is_integer(expected) => {
                 self.coerce_expr_literals(lhs, expected);
                 self.coerce_expr_literals(rhs, expected);
@@ -1473,6 +1590,76 @@ impl Checker {
                 }
                 self.record(*id, Ty::Array(Box::new(first)))
             }
+            HirExpr::ObjectLiteral {
+                id,
+                name,
+                fields,
+                span,
+            } => {
+                let Some(sig) = self.typed.objects.get(name).cloned() else {
+                    self.diags.push(
+                        Diagnostic::error(format!("cannot find object type `{name}`"))
+                            .with_label(*span, "unknown object type")
+                            .with_code("E302"),
+                    );
+                    for (_, value) in fields {
+                        self.infer_expr(value);
+                    }
+                    return self.record(*id, Ty::Error);
+                };
+                let mut poisoned = fields.len() != sig.fields.len();
+                if poisoned {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "object `{name}` expects {} field(s), got {}",
+                            sig.fields.len(),
+                            fields.len()
+                        ))
+                        .with_label(*span, "wrong number of object fields")
+                        .with_code("E302"),
+                    );
+                }
+                let mut seen = HashSet::new();
+                for (field, value) in fields {
+                    if !seen.insert(field.clone()) {
+                        self.diags.push(
+                            Diagnostic::error(format!("duplicate object field `{field}`"))
+                                .with_label(value.span(), "field repeated here")
+                                .with_code("E302"),
+                        );
+                        poisoned = true;
+                        continue;
+                    }
+                    let Some((_, want)) = sig.fields.iter().find(|(name, _)| name == field) else {
+                        self.diags.push(
+                            Diagnostic::error(format!("object `{name}` has no field `{field}`"))
+                                .with_label(value.span(), "unknown object field")
+                                .with_code("E302"),
+                        );
+                        self.infer_expr(value);
+                        poisoned = true;
+                        continue;
+                    };
+                    let got = self.infer_expr_expected(value, want);
+                    if ty_has_error(&got) {
+                        poisoned = true;
+                    } else if !types_compatible(&got, want) {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "object field `{field}` expects `{want}`, got `{got}`"
+                            ))
+                            .with_label(value.span(), format!("expected `{want}` here"))
+                            .with_code("E302"),
+                        );
+                        poisoned = true;
+                    }
+                }
+                if poisoned {
+                    self.record(*id, Ty::Error)
+                } else {
+                    self.record(*id, Ty::Object(name.clone()))
+                }
+            }
             HirExpr::Index {
                 id, base, index, ..
             } => {
@@ -1498,6 +1685,39 @@ impl Checker {
                     return self.record(*id, Ty::Error);
                 }
                 self.record(*id, elem)
+            }
+            HirExpr::Field {
+                id,
+                base,
+                name,
+                span,
+            } => {
+                let bt = self.infer_expr(base);
+                let Some(object_name) = (match &bt {
+                    Ty::Object(name) => Some(name.clone()),
+                    _ => None,
+                }) else {
+                    if !ty_has_error(&bt) {
+                        self.diags.push(
+                            Diagnostic::error(format!("cannot access field `{name}` on `{bt}`"))
+                                .with_label(*span, "expected an object value here")
+                                .with_code("E302"),
+                        );
+                    }
+                    return self.record(*id, Ty::Error);
+                };
+                let Some(sig) = self.typed.objects.get(&object_name) else {
+                    return self.record(*id, Ty::Error);
+                };
+                let Some((_, ty)) = sig.fields.iter().find(|(field, _)| field == name) else {
+                    self.diags.push(
+                        Diagnostic::error(format!("object `{object_name}` has no field `{name}`"))
+                            .with_label(*span, "unknown object field")
+                            .with_code("E302"),
+                    );
+                    return self.record(*id, Ty::Error);
+                };
+                self.record(*id, ty.clone())
             }
             HirExpr::Var { id, def, span, .. } => {
                 // Unresolved names were already reported by `vl-semantic`;
@@ -2224,6 +2444,7 @@ pub fn stmt_flow(stmt: &HirStmt) -> Flow {
         HirStmt::Let { .. }
         | HirStmt::Assign { .. }
         | HirStmt::IndexAssign { .. }
+        | HirStmt::FieldAssign { .. }
         | HirStmt::Expr(_) => Flow::FallsThrough,
         HirStmt::While { .. } => Flow::FallsThrough,
         HirStmt::If {
@@ -2303,6 +2524,7 @@ fn stmt_span(stmt: &HirStmt) -> Span {
         HirStmt::Let { span, .. }
         | HirStmt::Assign { span, .. }
         | HirStmt::IndexAssign { span, .. }
+        | HirStmt::FieldAssign { span, .. }
         | HirStmt::If { span, .. }
         | HirStmt::While { span, .. }
         | HirStmt::Break { span }

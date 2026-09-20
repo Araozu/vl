@@ -370,6 +370,20 @@ fn arrays_compile_through_frontend_to_naravm() {
 }
 
 #[test]
+fn objects_compile_with_reference_field_semantics() {
+    use vl_codegen::Target;
+    let src = std::fs::read_to_string("examples/objects.vl").unwrap();
+    let lir = frontend(&src).expect("objects.vl must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("new_object Counter"), "{dump}");
+    assert!(dump.contains("object_get"), "{dump}");
+    assert!(dump.contains("object_set"), "{dump}");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+}
+
+#[test]
 fn array_new_needs_no_import() {
     let lir = frontend("function main() { let a = Array.new::[u64](2u64); a[0u64] = 1u64; }")
         .expect("Array.new must compile without imports");

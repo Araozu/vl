@@ -19,6 +19,8 @@ pub enum TokenKind {
     String(Vec<u8>),
     Let,
     Function,
+    Type,
+    Object,
     If,
     Else,
     While,
@@ -365,6 +367,8 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 let kind = match word {
                     "let" => TokenKind::Let,
                     "function" => TokenKind::Function,
+                    "type" => TokenKind::Type,
+                    "object" => TokenKind::Object,
                     "if" => TokenKind::If,
                     "else" => TokenKind::Else,
                     "while" => TokenKind::While,

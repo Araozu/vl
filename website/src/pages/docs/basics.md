@@ -61,6 +61,7 @@ operations make sense for it.
 | `f64` | `3.14f64` | A decimal number |
 | `bool` | `true` | A yes/no value |
 | `string` | `"hello"` | A byte string |
+| `object` type | `Counter { value: 1 }` | Named mutable data with reference semantics |
 
 Integer literals are chosen from their context. For example, the parameter
 type tells VL what type the `1` and `2` should have here:
@@ -113,6 +114,19 @@ turbofish:
 let retries: u64 = 3;
 let scores: Array[u64] = Array.new(3);
 ```
+
+Named object types use `type Name = object { ... };` declarations. Their fields
+are comma-separated, and an object literal initializes every field:
+
+```vl
+type Point = object { x: u64, y: u64, };
+let point = Point { x: 10, y: 20 };
+point.x = 11;
+```
+
+Objects have reference semantics: assignment and function calls share the same
+heap object, so a field write is visible through every alias. See the
+[Objects](/docs/objects) chapter for details.
 
 The name can be assigned a new value later, but the replacement must have the
 same type:

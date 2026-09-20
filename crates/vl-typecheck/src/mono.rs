@@ -322,10 +322,16 @@ fn calls_in_item(
                     walk_expr(typed, elem, out);
                 }
             }
+            HirExpr::ObjectLiteral { fields, .. } => {
+                for (_, value) in fields {
+                    walk_expr(typed, value, out);
+                }
+            }
             HirExpr::Index { base, index, .. } => {
                 walk_expr(typed, base, out);
                 walk_expr(typed, index, out);
             }
+            HirExpr::Field { base, .. } => walk_expr(typed, base, out),
             HirExpr::Binary { lhs, rhs, .. } => {
                 walk_expr(typed, lhs, out);
                 walk_expr(typed, rhs, out);
@@ -358,6 +364,10 @@ fn calls_in_item(
             } => {
                 walk_expr(typed, array, out);
                 walk_expr(typed, index, out);
+                walk_expr(typed, value, out);
+            }
+            HirStmt::FieldAssign { base, value, .. } => {
+                walk_expr(typed, base, out);
                 walk_expr(typed, value, out);
             }
             HirStmt::If {

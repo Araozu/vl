@@ -63,3 +63,9 @@ recycled past their last use so idiomatic programs fit the 32 value
 and 32 reference registers; liveness extends across loop back edges so values
 used inside a loop keep their registers for the whole loop. Float ordering, string equality, and string
 ordering are rejected with diagnostics rather than miscompiled.
+
+User-defined `object` values use the same container representation. The
+compiler assigns each field to the value or reference lane, emits `createi`
+plus the corresponding immediate field stores, and lowers reads/writes to
+`getvati`/`getrfati` and `setvati`/`setrfati`. Object values are passed and
+returned through Naravm reference registers, preserving VL's aliasing semantics.

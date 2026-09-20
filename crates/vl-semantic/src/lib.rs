@@ -4,7 +4,7 @@
 //! reports undefined names and duplicate definitions. The resulting
 //! [`Resolution`] is consumed by `vl-hir` lowering.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use vl_common::{Diagnostic, ModuleSpec, Span};
 use vl_syntax::{Expr, Item, Program, Stmt};
@@ -75,6 +75,7 @@ struct Resolver {
     imports: HashMap<String, ModuleSpec>,
     poisoned_imports: std::collections::HashSet<String>,
     loop_depth: usize,
+    object_names: HashSet<String>,
 }
 
 pub fn resolve(prog: &Program) -> (Resolution, Vec<Diagnostic>) {
@@ -93,6 +94,14 @@ pub fn resolve_with_modules(
         imports: HashMap::new(),
         poisoned_imports: std::collections::HashSet::new(),
         loop_depth: 0,
+        object_names: prog
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Object { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect(),
     };
 
     for item in &prog.items {
@@ -102,9 +111,26 @@ pub fn resolve_with_modules(
     }
 
     // Pass 1: declare top-level names so forward references work.
+    let mut object_spans: HashMap<String, Span> = HashMap::new();
+    for item in &prog.items {
+        if let Item::Object {
+            name, name_span, ..
+        } = item
+        {
+            if let Some(previous) = object_spans.insert(name.clone(), *name_span) {
+                r.diags.push(
+                    Diagnostic::error(format!("duplicate object type `{name}`"))
+                        .with_label(*name_span, "redefined here")
+                        .with_bare_label(previous)
+                        .with_code("E200"),
+                );
+            }
+        }
+    }
     for item in &prog.items {
         match item {
             Item::Use { .. } => {}
+            Item::Object { .. } => {}
             Item::Let {
                 name, name_span, ..
             } => {
@@ -122,6 +148,7 @@ pub fn resolve_with_modules(
     for item in &prog.items {
         match item {
             Item::Use { .. } => {}
+            Item::Object { .. } => {}
             Item::Let { value, .. } => {
                 r.resolve_expr(value);
             }
@@ -246,6 +273,10 @@ impl Resolver {
                 self.resolve_expr(index);
                 self.resolve_expr(value);
             }
+            Stmt::FieldAssign { base, value, .. } => {
+                self.resolve_expr(base);
+                self.resolve_expr(value);
+            }
             Stmt::Expr(e) => self.resolve_expr(e),
             Stmt::Return { value, .. } => {
                 if let Some(e) = value {
@@ -308,6 +339,23 @@ impl Resolver {
     fn resolve_expr(&mut self, expr: &Expr) {
         match expr {
             Expr::Literal(_, _) | Expr::String(_, _) => {}
+            Expr::ObjectLiteral {
+                name,
+                name_span,
+                fields,
+                ..
+            } => {
+                if !self.object_names.contains(name) {
+                    self.diags.push(
+                        Diagnostic::error(format!("cannot find object type `{name}`"))
+                            .with_label(*name_span, "unknown object type")
+                            .with_code("E201"),
+                    );
+                }
+                for (_, _, value) in fields {
+                    self.resolve_expr(value);
+                }
+            }
             Expr::ArrayLiteral { elems, .. } => {
                 for elem in elems {
                     self.resolve_expr(elem);
@@ -317,6 +365,7 @@ impl Resolver {
                 self.resolve_expr(base);
                 self.resolve_expr(index);
             }
+            Expr::Field { base, .. } => self.resolve_expr(base),
             Expr::Var { path, span } => match self.lookup_path(path, *span) {
                 Some(id) => {
                     self.out.uses.insert((span.start, span.end), id);

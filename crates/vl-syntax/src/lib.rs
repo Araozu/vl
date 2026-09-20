@@ -3,14 +3,14 @@
 //! Grammar (v0, TypeScript-like surface):
 //! ```text
 //! program := item*
-//! item    := `let` ident (`:` type)? `=` expr `;` | `function` ident type-params? `(` params? `)` (`:` type)? block
+//! item    := `use` ... | `let` ident (`:` type)? `=` expr `;` | `function` ident type-params? `(` params? `)` (`:` type)? block | `type` ident `=` `object` `{` fields? `}` `;`
 //! type-params := `[` type-param (`,` type-param)* `]`
 //! type-param  := ident (`extends` (`Numeric` | `Comparable`))?
 //! params  := param (`,` param)*
 //! param   := ident `:` type
-//! type    := `u64` | `i64` | `f64` | `bool` | `u8` | `string` | `File` | `Array` `[` type `]` | type-param | `void` (`void` only as return)
+//! type    := `u64` | `i64` | `f64` | `bool` | `u8` | `string` | `File` | object-name | `Array` `[` type `]` | type-param | `void` (`void` only as return)
 //! block   := `{` stmt* `}`
-//! stmt    := `let` ident (`:` type)? `=` expr `;` | ident `=` expr `;` | index `=` expr `;`
+//! stmt    := `let` ident (`:` type)? `=` expr `;` | ident `=` expr `;` | index `=` expr `;` | field `=` expr `;`
 //!          | `if` `(` expr `)` branch (`else` branch)?
 //!          | `while` `(` expr `)` branch | `break` `;` | `continue` `;`
 //!          | `return` expr? `;` | expr `;`
@@ -25,9 +25,10 @@
 //! term    := factor ((`+`|`-`) factor)*
 //! factor  := unary ((`*`|`/`) unary)*
 //! unary   := (`-`|`!`) unary | postfix
-//! postfix := primary (`[` expr `]`)*
-//! primary := literal | array-literal | call | `(` expr `)`
+//! postfix := primary (`[` expr `]` | `.` ident)*
+//! primary := literal | array-literal | object-literal | call | `(` expr `)`
 //! array-literal := `[` (expr (`,` expr)* `,`?)? `]`
+//! object-literal := ident `{` (ident `:` expr (`,` ident `:` expr)* `,`?)? `}`
 //! call    := path (`::` `[` type (`,` type)* `]`)? `(` args? `)`
 //! path    := ident (`.` ident)*
 //! args    := expr (`,` expr)*
@@ -37,6 +38,10 @@
 //! creates a zero-filled array of `n` elements, `[1u64, 2u64]` is an array
 //! literal, `a[i]` reads element `i`, and `a[i] = v;` writes it. Indices are
 //! always `u64`; elements have the array's `T`.
+//!
+//! Objects are named reference types: `type Name = object { field: type, };`
+//! creates a heap object, `Name { field: value }` initializes one, and field
+//! assignment mutates the shared object visible through every alias.
 //!
 //! Generic functions declare type parameters after the name
 //! (`function first[T](a: Array[T]): T { ... }`, optionally bounded as
@@ -96,11 +101,26 @@ pub struct TypeParam {
     pub bound: Option<GenericBound>,
 }
 
+/// One field in a user-defined object type.
+#[derive(Debug, Clone)]
+pub struct ObjectField {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: Option<VlType>,
+    pub ty_span: Option<Span>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Item {
     Use {
         path: Vec<String>,
         names: Option<Vec<String>>,
+        span: Span,
+    },
+    Object {
+        name: String,
+        name_span: Span,
+        fields: Vec<ObjectField>,
         span: Span,
     },
     Let {
@@ -154,6 +174,13 @@ pub enum Stmt {
         value: Box<Expr>,
         span: Span,
     },
+    FieldAssign {
+        base: Box<Expr>,
+        field: String,
+        field_span: Span,
+        value: Box<Expr>,
+        span: Span,
+    },
     If {
         condition: Expr,
         then_body: Vec<Stmt>,
@@ -189,10 +216,21 @@ pub enum Expr {
         elems: Vec<Expr>,
         span: Span,
     },
+    ObjectLiteral {
+        name: String,
+        name_span: Span,
+        fields: Vec<(String, Span, Expr)>,
+        span: Span,
+    },
     /// Element read: `array[index]`.
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
+        span: Span,
+    },
+    Field {
+        base: Box<Expr>,
+        name: String,
         span: Span,
     },
     Var {
@@ -259,7 +297,9 @@ impl Expr {
             Expr::Literal(_, s) => *s,
             Expr::String(_, s) => *s,
             Expr::ArrayLiteral { span, .. } => *span,
+            Expr::ObjectLiteral { span, .. } => *span,
             Expr::Index { span, .. } => *span,
+            Expr::Field { span, .. } => *span,
             Expr::Var { span, .. } => *span,
             Expr::Call { span, .. } => *span,
             Expr::Unary { span, .. } | Expr::Binary { span, .. } | Expr::Cast { span, .. } => *span,
@@ -273,6 +313,7 @@ struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
     diags: Vec<Diagnostic>,
+    known_objects: std::collections::HashSet<String>,
 }
 
 pub fn parse(toks: &[Token], src: &str) -> (Program, Vec<Diagnostic>) {
@@ -280,10 +321,27 @@ pub fn parse(toks: &[Token], src: &str) -> (Program, Vec<Diagnostic>) {
 }
 
 pub fn parse_with_module(toks: &[Token], _src: &str, module: &str) -> (Program, Vec<Diagnostic>) {
+    let known_objects = toks
+        .windows(4)
+        .filter_map(|window| {
+            match (
+                &window[0].kind,
+                &window[1].kind,
+                &window[2].kind,
+                &window[3].kind,
+            ) {
+                (TokenKind::Type, TokenKind::Ident(name), TokenKind::Eq, TokenKind::Object) => {
+                    Some(name.clone())
+                }
+                _ => None,
+            }
+        })
+        .collect();
     let mut p = Parser {
         toks,
         pos: 0,
         diags: vec![],
+        known_objects,
     };
     let mut items = Vec::new();
     while !p.at_eof() {
@@ -349,7 +407,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     return;
                 }
-                TokenKind::Let | TokenKind::Function => return,
+                TokenKind::Let | TokenKind::Function | TokenKind::Type => return,
                 _ => {
                     self.bump();
                 }
@@ -361,6 +419,7 @@ impl<'a> Parser<'a> {
         match &self.peek().kind {
             TokenKind::Let => self.parse_let_item(),
             TokenKind::Function => self.parse_function_item(),
+            TokenKind::Type => self.parse_object_item(),
             TokenKind::Ident(name) if name == "use" => self.parse_use_item(),
             TokenKind::Eof => None,
             TokenKind::Invalid => {
@@ -371,10 +430,13 @@ impl<'a> Parser<'a> {
                 let t = self.peek().clone();
                 self.diags.push(
                     Diagnostic::error(format!(
-                        "expected an item (`use`, `let` or `function`), found {}",
+                        "expected an item (`use`, `let`, `function` or `type`), found {}",
                         describe(&t.kind)
                     ))
-                    .with_label(t.span, "items start with `use`, `let` or `function`")
+                    .with_label(
+                        t.span,
+                        "items start with `use`, `let`, `function`, or `type`",
+                    )
                     .with_code("E101"),
                 );
                 None
@@ -406,6 +468,66 @@ impl<'a> Parser<'a> {
             path,
             names,
             span: Span::new(start.start, semi.span.end),
+        })
+    }
+
+    fn parse_object_item(&mut self) -> Option<Item> {
+        let type_tok = self.bump();
+        let (name, name_span) = self.parse_ident()?;
+        self.expect(&TokenKind::Eq, "`=` after object name")?;
+        self.expect(&TokenKind::Object, "`object` after `=`")?;
+        self.expect(&TokenKind::LBrace, "`{` after `object`")?;
+        let mut fields = Vec::new();
+        while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
+            let (field_name, field_span) = self.parse_ident()?;
+            self.expect(&TokenKind::Colon, "`:` after field name")?;
+            let fallback = self.peek().clone();
+            let (ty, ty_span) = match self.parse_type(&[], true) {
+                Some((ty, span)) if !ty.is_void() => (Some(ty), Some(span)),
+                Some((_ty, span)) => {
+                    self.diags.push(
+                        Diagnostic::error("an object field cannot be `void`")
+                            .with_label(span, "`void` is not a value type")
+                            .with_code("E104"),
+                    );
+                    (None, Some(span))
+                }
+                None => (None, Some(fallback.span)),
+            };
+            if fields.iter().any(|f: &ObjectField| f.name == field_name) {
+                self.diags.push(
+                    Diagnostic::error(format!("duplicate object field `{field_name}`"))
+                        .with_label(field_span, "redefined here")
+                        .with_code("E200"),
+                );
+            }
+            fields.push(ObjectField {
+                name: field_name,
+                name_span: field_span,
+                ty,
+                ty_span,
+            });
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.bump();
+                continue;
+            }
+            if !matches!(self.peek().kind, TokenKind::RBrace) {
+                let t = self.peek().clone();
+                self.diags.push(
+                    Diagnostic::error(format!("expected `,` or `}}`, found {}", describe(&t.kind)))
+                        .with_label(t.span, "separate object fields with commas")
+                        .with_code("E100"),
+                );
+                return None;
+            }
+        }
+        let close = self.expect(&TokenKind::RBrace, "`}` after object fields")?;
+        let semi = self.expect(&TokenKind::Semi, "`;` after object declaration")?;
+        Some(Item::Object {
+            name,
+            name_span,
+            fields,
+            span: Span::new(type_tok.span.start, semi.span.end.max(close.span.end)),
         })
     }
 
@@ -496,6 +618,9 @@ impl<'a> Parser<'a> {
                 }
                 match name.parse::<VlType>() {
                     Ok(ty) => Some((ty, t.span)),
+                    Err(_) if self.known_objects.contains(&name) => {
+                        Some((VlType::Object(name), t.span))
+                    }
                     Err(_) if allowed.iter().any(|a| a == &name) => {
                         Some((VlType::Param(name), t.span))
                     }
@@ -515,7 +640,7 @@ impl<'a> Parser<'a> {
                     Diagnostic::error(format!("expected a type, found {}", describe(&t.kind)))
                         .with_label(
                             t.span,
-                            "expected one of u64, i64, f64, bool, u8, string, File, Array[T], void",
+                            "expected a built-in type, an object type, Array[T], or void",
                         )
                         .with_code("E104"),
                 );
@@ -796,16 +921,10 @@ impl<'a> Parser<'a> {
                 value,
                 span: Span::new(let_tok.span.start, semi.span.end),
             })
-        } else if matches!(self.peek().kind, TokenKind::Ident(_))
-            && matches!(
-                self.toks.get(self.pos + 1).map(|t| &t.kind),
-                Some(TokenKind::LBracket)
-            )
-        {
-            // Possible element write `a[i] = v;`. Parse only the postfix
-            // base (not a full expression, so `a[i] == 1;` still parses as a
-            // comparison statement): when no `=` follows, rewind and fall
-            // through to the expression-statement path.
+        } else if matches!(self.peek().kind, TokenKind::Ident(_)) {
+            // Possible assignment to a variable, array element, or object
+            // field. Parse only the postfix base; when no `=` follows, rewind
+            // and use the normal expression-statement path.
             let save = self.pos;
             let diags_len = self.diags.len();
             let base = self.parse_postfix()?;
@@ -820,9 +939,22 @@ impl<'a> Parser<'a> {
                 let value = self.parse_expr()?;
                 let semi = self.expect(&TokenKind::Semi, "`;`")?;
                 match base {
+                    Expr::Var { path, span } if path.len() == 1 => Some(Stmt::Assign {
+                        name: path[0].clone(),
+                        name_span: span,
+                        value,
+                        span: Span::new(span.start, semi.span.end),
+                    }),
                     Expr::Index { base, index, span } => Some(Stmt::IndexAssign {
                         array: base,
                         index,
+                        value: Box::new(value),
+                        span: Span::new(span.start, semi.span.end),
+                    }),
+                    Expr::Field { base, name, span } => Some(Stmt::FieldAssign {
+                        base,
+                        field: name,
+                        field_span: span,
                         value: Box::new(value),
                         span: Span::new(span.start, semi.span.end),
                     }),
@@ -831,7 +963,7 @@ impl<'a> Parser<'a> {
                             Diagnostic::error("cannot assign to this expression")
                                 .with_label(
                                     other.span(),
-                                    "only variables and array elements are assignable",
+                                    "only variables, array elements, and object fields are assignable",
                                 )
                                 .with_code("E103"),
                         );
@@ -839,22 +971,6 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-        } else if matches!(self.peek().kind, TokenKind::Ident(_))
-            && matches!(
-                self.toks.get(self.pos + 1).map(|t| &t.kind),
-                Some(TokenKind::Eq)
-            )
-        {
-            let (name, name_span) = self.parse_ident_opt().expect("checked above");
-            self.bump(); // `=`
-            let value = self.parse_expr()?;
-            let semi = self.expect(&TokenKind::Semi, "`;`")?;
-            Some(Stmt::Assign {
-                name,
-                name_span,
-                value,
-                span: Span::new(name_span.start, semi.span.end),
-            })
         } else {
             let value = self.parse_expr()?;
             self.expect(&TokenKind::Semi, "`;`")?;
@@ -944,7 +1060,8 @@ impl<'a> Parser<'a> {
                 | TokenKind::While
                 | TokenKind::Break
                 | TokenKind::Continue
-                | TokenKind::Return => return,
+                | TokenKind::Return
+                | TokenKind::Type => return,
                 _ => {
                     self.bump();
                 }
@@ -1180,17 +1297,30 @@ impl<'a> Parser<'a> {
     fn parse_postfix(&mut self) -> Option<Expr> {
         let mut base = self.parse_primary()?;
         let mut indexed = false;
-        while matches!(self.peek().kind, TokenKind::LBracket) {
-            self.bump(); // `[`
-            let index = self.parse_expr()?;
-            let close = self.expect(&TokenKind::RBracket, "`]`")?;
-            let span = Span::new(base.span().start, close.span.end);
-            base = Expr::Index {
-                base: Box::new(base),
-                index: Box::new(index),
-                span,
-            };
-            indexed = true;
+        loop {
+            if matches!(self.peek().kind, TokenKind::LBracket) {
+                self.bump(); // `[`
+                let index = self.parse_expr()?;
+                let close = self.expect(&TokenKind::RBracket, "`]`")?;
+                let span = Span::new(base.span().start, close.span.end);
+                base = Expr::Index {
+                    base: Box::new(base),
+                    index: Box::new(index),
+                    span,
+                };
+                indexed = true;
+            } else if matches!(self.peek().kind, TokenKind::Dot) {
+                self.bump();
+                let (name, name_span) = self.parse_ident()?;
+                let start = base.span().start;
+                base = Expr::Field {
+                    base: Box::new(base),
+                    name,
+                    span: Span::new(start, name_span.end),
+                };
+            } else {
+                break;
+            }
         }
         if indexed && matches!(self.peek().kind, TokenKind::LParen) {
             let paren = self.peek().clone();
@@ -1271,6 +1401,9 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(_) => {
                 let path = self.parse_path()?;
                 let end = self.toks[self.pos.saturating_sub(1)].span.end;
+                if path.len() == 1 && matches!(self.peek().kind, TokenKind::LBrace) {
+                    return self.parse_object_literal(path[0].clone(), t.span);
+                }
                 let (type_args, type_args_span) = self.parse_type_args()?;
                 if !type_args.is_empty() && !matches!(self.peek().kind, TokenKind::LParen) {
                     let t = self.peek().clone();
@@ -1307,10 +1440,25 @@ impl<'a> Parser<'a> {
                         span,
                     })
                 } else {
-                    Some(Expr::Var {
-                        path,
-                        span: Span::new(t.span.start, end),
-                    })
+                    if path.len() == 1 {
+                        Some(Expr::Var {
+                            path,
+                            span: Span::new(t.span.start, end),
+                        })
+                    } else {
+                        let mut base = Expr::Var {
+                            path: vec![path[0].clone()],
+                            span: t.span,
+                        };
+                        for name in path.into_iter().skip(1) {
+                            base = Expr::Field {
+                                base: Box::new(base),
+                                name,
+                                span: Span::new(t.span.start, end),
+                            };
+                        }
+                        Some(base)
+                    }
                 }
             }
             TokenKind::LParen => {
@@ -1358,6 +1506,37 @@ impl<'a> Parser<'a> {
             }
         }
     }
+
+    fn parse_object_literal(&mut self, name: String, name_span: Span) -> Option<Expr> {
+        self.bump(); // `{`
+        let mut fields = Vec::new();
+        while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
+            let (field, field_span) = self.parse_ident()?;
+            self.expect(&TokenKind::Colon, "`:` after object field")?;
+            let value = self.parse_expr()?;
+            fields.push((field, field_span, value));
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.bump();
+                continue;
+            }
+            if !matches!(self.peek().kind, TokenKind::RBrace) {
+                let t = self.peek().clone();
+                self.diags.push(
+                    Diagnostic::error(format!("expected `,` or `}}`, found {}", describe(&t.kind)))
+                        .with_label(t.span, "separate object fields with commas")
+                        .with_code("E100"),
+                );
+                return None;
+            }
+        }
+        let close = self.expect(&TokenKind::RBrace, "`}` after object literal")?;
+        Some(Expr::ObjectLiteral {
+            name,
+            name_span,
+            fields,
+            span: Span::new(name_span.start, close.span.end),
+        })
+    }
 }
 
 fn discriminant(k: &TokenKind) -> std::mem::Discriminant<TokenKind> {
@@ -1376,6 +1555,8 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::String(_) => "string literal".into(),
         TokenKind::Let => "`let`".into(),
         TokenKind::Function => "`function`".into(),
+        TokenKind::Type => "`type`".into(),
+        TokenKind::Object => "`object`".into(),
         TokenKind::If => "`if`".into(),
         TokenKind::Else => "`else`".into(),
         TokenKind::While => "`while`".into(),

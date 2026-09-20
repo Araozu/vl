@@ -192,6 +192,24 @@ fn dummy_instr(ins: &Instr) -> String {
         } => {
             format!("array_set %{}[%{}], %{}", array.0, index.0, value.0)
         }
+        Instr::NewObject {
+            dst, name, fields, ..
+        } => {
+            format!("new_object %{} {name} ({} fields)", dst.0, fields.len())
+        }
+        Instr::ObjectGet {
+            dst, object, name, ..
+        } => {
+            format!("object_get %{} %{}.{}", dst.0, object.0, name)
+        }
+        Instr::ObjectSet {
+            object,
+            name,
+            value,
+            ..
+        } => {
+            format!("object_set %{}.{} = %{}", object.0, name, value.0)
+        }
         Instr::Cast {
             dst, src, target, ..
         } => {
@@ -307,6 +325,7 @@ enum NaraKind {
     U8,
     String,
     File,
+    Object(String),
     /// Fixed-length heap array (a memory container). The payload is the
     /// element kind: value elements use `vat` ops, reference elements
     /// (`string`, `File`, nested arrays) use `rfat` ops.
@@ -329,6 +348,7 @@ impl NaraKind {
             vl_typecheck::Ty::U8 => Some(NaraKind::U8),
             vl_typecheck::Ty::String => Some(NaraKind::String),
             vl_typecheck::Ty::File => Some(NaraKind::File),
+            vl_typecheck::Ty::Object(name) => Some(NaraKind::Object(name.clone())),
             vl_typecheck::Ty::Array(elem) => Some(NaraKind::Array(Box::new(Self::of_ty(elem)?))),
             vl_typecheck::Ty::Param(_) | vl_typecheck::Ty::Void | vl_typecheck::Ty::Error => None,
         }
@@ -336,7 +356,10 @@ impl NaraKind {
 
     /// Reference kinds live in `rf`, everything else in `rv`.
     fn is_ref(&self) -> bool {
-        matches!(self, NaraKind::String | NaraKind::File | NaraKind::Array(_))
+        matches!(
+            self,
+            NaraKind::String | NaraKind::File | NaraKind::Object(_) | NaraKind::Array(_)
+        )
     }
 
     fn of_scalar(value: Scalar) -> Self {
@@ -364,6 +387,33 @@ impl NaraKind {
     fn is_integer(&self) -> bool {
         matches!(self, NaraKind::U64 | NaraKind::I64 | NaraKind::U8)
     }
+}
+
+/// Return whether a field uses the reference lane, its lane-local slot, and
+/// its VL type. Naravm containers keep value and reference fields in separate
+/// arrays, so a declaration's source index is not the runtime index.
+fn object_slot<'a>(
+    def: &'a vl_lir::ObjectDef,
+    name: &str,
+) -> Option<(bool, usize, &'a vl_typecheck::Ty)> {
+    let mut value_slot = 0;
+    let mut ref_slot = 0;
+    for (field, ty) in &def.fields {
+        let kind = NaraKind::of_ty(ty)?;
+        let (is_ref, slot) = if kind.is_ref() {
+            let slot = ref_slot;
+            ref_slot += 1;
+            (true, slot)
+        } else {
+            let slot = value_slot;
+            value_slot += 1;
+            (false, slot)
+        };
+        if field == name {
+            return Some((is_ref, slot, ty));
+        }
+    }
+    None
 }
 
 struct NaraEmit {
@@ -612,6 +662,7 @@ struct NaraFnCtx<'a> {
     is_main: bool,
     sigs: &'a std::collections::HashMap<&'a str, &'a vl_lir::Function>,
     fn_consts: &'a std::collections::HashMap<String, usize>,
+    objects: &'a std::collections::HashMap<&'a str, &'a vl_lir::ObjectDef>,
     print_fn_idx: usize,
     print_u64_fn_idx: usize,
 }
@@ -697,6 +748,11 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
             sigs.entry(f.name.as_str()).or_insert(f);
         }
     }
+    let objects: std::collections::HashMap<&str, &vl_lir::ObjectDef> = prog
+        .objects
+        .iter()
+        .map(|object| (object.name.as_str(), object))
+        .collect();
 
     let mut functions_out: Vec<(usize, Vec<u8>)> = Vec::new();
     for f in &prog.functions {
@@ -710,6 +766,7 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
             is_main,
             sigs: &sigs,
             fn_consts: &fn_consts,
+            objects: &objects,
             print_fn_idx,
             print_u64_fn_idx,
         };
@@ -858,6 +915,16 @@ fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::R
                 touch(*index, idx);
                 touch(*value, idx);
             }
+            I::NewObject { fields, .. } => {
+                for (_, value) in fields {
+                    touch(*value, idx);
+                }
+            }
+            I::ObjectGet { object, .. } => touch(*object, idx),
+            I::ObjectSet { object, value, .. } => {
+                touch(*object, idx);
+                touch(*value, idx);
+            }
             I::BranchIfFalse { cond, .. } => {
                 touch(*cond, idx);
             }
@@ -942,6 +1009,14 @@ fn nara_free_dead(e: &mut NaraEmit, ins: &Instr, idx: usize) {
         } => {
             dead.push(*array);
             dead.push(*index);
+            dead.push(*value);
+        }
+        I::NewObject { fields, .. } => {
+            dead.extend(fields.iter().map(|(_, value)| *value));
+        }
+        I::ObjectGet { object, .. } => dead.push(*object),
+        I::ObjectSet { object, value, .. } => {
+            dead.push(*object);
             dead.push(*value);
         }
         I::BranchIfFalse { cond, .. } => {
@@ -1393,6 +1468,190 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                         e.bytecode.extend_from_slice(&[0x29, rf, s, v]); // setvat
                     }
                 }
+            }
+        }
+        Instr::NewObject {
+            dst,
+            name,
+            fields,
+            span,
+        } => {
+            let object_kind = NaraKind::Object(name.clone());
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, object_kind);
+                return;
+            }
+            for (_, value) in fields {
+                if e.invalid.contains(value) {
+                    e.invalid.insert(*dst);
+                    return;
+                }
+            }
+            let Some(def) = ctx.objects.get(name.as_str()).copied() else {
+                e.invalid.insert(*dst);
+                e.diags.push(
+                    Diagnostic::error(format!("unknown object layout `{name}` (compiler bug)"))
+                        .with_label(*span, "object emitted here")
+                        .with_code("E500"),
+                );
+                return;
+            };
+            let mut value_count = 0usize;
+            let mut ref_count = 0usize;
+            for (_, ty) in &def.fields {
+                match NaraKind::of_ty(ty) {
+                    Some(kind) if kind.is_ref() => ref_count += 1,
+                    Some(_) => value_count += 1,
+                    None => {
+                        e.invalid.insert(*dst);
+                        return;
+                    }
+                }
+            }
+            let Some(rf) = e.fresh_rf(*span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            if value_count > u8::MAX as usize || ref_count > u8::MAX as usize {
+                e.diags.push(
+                    Diagnostic::error(
+                        "Naravm object has more than 255 fields in one register lane",
+                    )
+                    .with_label(*span, "object allocated here")
+                    .with_note("split the object into smaller objects")
+                    .with_code("E404"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            }
+            e.bytecode
+                .extend_from_slice(&[0x27, rf, value_count as u8, ref_count as u8]);
+            for (field, ty) in &def.fields {
+                let Some((_, value)) = fields.iter().find(|(name, _)| name == field) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                let Some((is_ref, slot, _)) = object_slot(def, field) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                let Some(slot) = u8::try_from(slot).ok() else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                if is_ref {
+                    let Some(src) = e.ref_reg(*value, *span) else {
+                        e.invalid.insert(*dst);
+                        return;
+                    };
+                    e.bytecode.extend_from_slice(&[0x2f, rf, slot, src]);
+                } else {
+                    let Some(src) = e.value_reg(*value, *span) else {
+                        e.invalid.insert(*dst);
+                        return;
+                    };
+                    e.bytecode.extend_from_slice(&[0x2d, rf, slot, src]);
+                }
+                let _ = ty;
+            }
+            e.rf_map.insert(*dst, rf);
+            e.kinds.insert(*dst, object_kind);
+        }
+        Instr::ObjectGet {
+            dst,
+            object,
+            name,
+            ty,
+            span,
+        } => {
+            let Some(NaraKind::Object(object_name)) = e.kinds.get(object).cloned() else {
+                if !e.invalid.contains(object) {
+                    e.diags.push(
+                        Diagnostic::error("Naravm backend expected an object reference")
+                            .with_label(*span, "field read emitted here")
+                            .with_code("E500"),
+                    );
+                }
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(def) = ctx.objects.get(object_name.as_str()).copied() else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some((is_ref, slot, field_ty)) = object_slot(def, name) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(obj) = e.rf_map.get(object).copied() else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(kind) = NaraKind::of_ty(ty).or_else(|| NaraKind::of_ty(field_ty)) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(slot) = u8::try_from(slot).ok() else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, kind);
+                return;
+            }
+            if is_ref {
+                let Some(d) = e.fresh_rf(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x2e, d, obj, slot]);
+                e.rf_map.insert(*dst, d);
+            } else {
+                let Some(d) = e.fresh_rv(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x2c, d, obj, slot]);
+                e.rv_map.insert(*dst, d);
+            }
+            e.kinds.insert(*dst, kind);
+        }
+        Instr::ObjectSet {
+            object,
+            name,
+            value,
+            ty,
+            span,
+        } => {
+            if e.invalid.contains(object) || e.invalid.contains(value) {
+                return;
+            }
+            let Some(NaraKind::Object(object_name)) = e.kinds.get(object).cloned() else {
+                return;
+            };
+            let Some(def) = ctx.objects.get(object_name.as_str()).copied() else {
+                return;
+            };
+            let Some((is_ref, slot, field_ty)) = object_slot(def, name) else {
+                return;
+            };
+            let Some(obj) = e.rf_map.get(object).copied() else {
+                return;
+            };
+            let Some(slot) = u8::try_from(slot).ok() else {
+                return;
+            };
+            let kind = NaraKind::of_ty(ty).or_else(|| NaraKind::of_ty(field_ty));
+            if is_ref || kind.as_ref().is_some_and(NaraKind::is_ref) {
+                let Some(src) = e.ref_reg(*value, *span) else {
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x2f, obj, slot, src]);
+            } else {
+                let Some(src) = e.value_reg(*value, *span) else {
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x2d, obj, slot, src]);
             }
         }
         Instr::ArrayGet {
@@ -2166,6 +2425,24 @@ fn stackvm_instr(ins: &Instr) -> String {
         } => {
             format!("array_set %{}[%{}] %{}", array.0, index.0, value.0)
         }
+        Instr::NewObject {
+            dst, name, fields, ..
+        } => {
+            format!("new_object %{} {name} ({} fields)", dst.0, fields.len())
+        }
+        Instr::ObjectGet {
+            dst, object, name, ..
+        } => {
+            format!("object_get %{} %{}.{}", dst.0, object.0, name)
+        }
+        Instr::ObjectSet {
+            object,
+            name,
+            value,
+            ..
+        } => {
+            format!("object_set %{}.{} = %{}", object.0, name, value.0)
+        }
         Instr::Cast {
             dst, src, target, ..
         } => {
@@ -2377,6 +2654,7 @@ function main() {
         use vl_lir::{Function, Instr, LirProgram, Reg};
         let lir = LirProgram {
             module: "t".into(),
+            objects: vec![],
             functions: vec![Function {
                 name: "main".into(),
                 param_tys: vec![],

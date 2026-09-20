@@ -23,6 +23,8 @@ pub enum VlType {
     U8,
     String,
     File,
+    /// A user-defined nominal object type. Objects have reference semantics.
+    Object(String),
     Array(Box<VlType>),
     Param(String),
     Void,
@@ -38,6 +40,7 @@ impl fmt::Display for VlType {
             VlType::U8 => write!(f, "u8"),
             VlType::String => write!(f, "string"),
             VlType::File => write!(f, "File"),
+            VlType::Object(name) => write!(f, "{name}"),
             VlType::Array(elem) => write!(f, "Array[{elem}]"),
             VlType::Param(name) => write!(f, "{name}"),
             VlType::Void => write!(f, "void"),
@@ -52,7 +55,7 @@ impl fmt::Display for ParseTyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "unknown type `{}` (have: u64, i64, f64, bool, u8, string, File, Array[T], void)",
+            "unknown type `{}` (have: u64, i64, f64, bool, u8, string, File, Array[T], object types, void)",
             self.0
         )
     }

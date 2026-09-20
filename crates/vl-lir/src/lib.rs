@@ -93,6 +93,27 @@ pub enum Instr {
         elem: Ty,
         span: Span,
     },
+    /// Allocate a named object and initialize its fields.
+    NewObject {
+        dst: Reg,
+        name: String,
+        fields: Vec<(String, Reg)>,
+        span: Span,
+    },
+    ObjectGet {
+        dst: Reg,
+        object: Reg,
+        name: String,
+        ty: Ty,
+        span: Span,
+    },
+    ObjectSet {
+        object: Reg,
+        name: String,
+        value: Reg,
+        ty: Ty,
+        span: Span,
+    },
     /// Explicit integer conversion (`value as u8`). Backends lower it to a
     /// value copy reinterpreting the 64-bit payload per `target` (literals
     /// were range-checked by typechecking; variables are unchecked).
@@ -164,9 +185,16 @@ pub struct Function {
     pub instrs: Vec<Instr>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ObjectDef {
+    pub name: String,
+    pub fields: Vec<(String, Ty)>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LirProgram {
     pub module: String,
+    pub objects: Vec<ObjectDef>,
     pub functions: Vec<Function>,
 }
 
@@ -242,6 +270,25 @@ fn fmt_instr(ins: &Instr) -> String {
                 array.0, index.0, value.0
             )
         }
+        Instr::NewObject {
+            dst, name, fields, ..
+        } => {
+            let fields = fields
+                .iter()
+                .map(|(name, reg)| format!("{name}: %{}", reg.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("%{} = new_object {name} {{{fields}}}", dst.0)
+        }
+        Instr::ObjectGet {
+            dst, object, name, ..
+        } => format!("%{} = object_get %{}.{}", dst.0, object.0, name),
+        Instr::ObjectSet {
+            object,
+            name,
+            value,
+            ..
+        } => format!("object_set %{}.{} = %{}", object.0, name, value.0),
         Instr::Cast {
             dst, src, target, ..
         } => {
@@ -391,6 +438,16 @@ fn lower_fn_stmt(
             l.lower_index_assign(array, index, value, typed, *span);
             *topped_return = false;
         }
+        HirStmt::FieldAssign {
+            base,
+            field,
+            value,
+            span,
+            ..
+        } => {
+            l.lower_field_assign(base, field, value, typed, *span);
+            *topped_return = false;
+        }
         HirStmt::While {
             condition,
             body,
@@ -437,12 +494,23 @@ fn lower_fn_epilogue(l: &mut Lowerer, topped_return: bool) {
 /// errors were already reported, so no new diagnostics are produced here.
 pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgram {
     let global_values = globals(prog);
+    let mut objects = typed
+        .objects
+        .iter()
+        .map(|(name, sig)| ObjectDef {
+            name: name.clone(),
+            fields: sig.fields.clone(),
+        })
+        .collect::<Vec<_>>();
+    objects.sort_by(|a, b| a.name.cmp(&b.name));
     let mut out = LirProgram {
         module: prog.module.clone(),
+        objects,
         functions: Vec::new(),
     };
     for item in &prog.items {
         match item {
+            HirItem::Object { .. } => {}
             HirItem::Let {
                 id, value, span, ..
             } => {
@@ -663,6 +731,26 @@ impl Lowerer<'_> {
                 });
                 Some(dst)
             }
+            HirExpr::ObjectLiteral {
+                name, fields, span, ..
+            } => {
+                let mut regs = Vec::with_capacity(fields.len());
+                for (_, value) in fields {
+                    regs.push(self.lower_expr(value, typed)?);
+                }
+                let dst = self.reg();
+                self.instrs.push(Instr::NewObject {
+                    dst,
+                    name: name.clone(),
+                    fields: fields
+                        .iter()
+                        .zip(regs)
+                        .map(|((field, _), reg)| (field.clone(), reg))
+                        .collect(),
+                    span: *span,
+                });
+                Some(dst)
+            }
             HirExpr::Index {
                 base, index, span, ..
             } => {
@@ -678,6 +766,21 @@ impl Lowerer<'_> {
                     array,
                     index,
                     elem,
+                    span: *span,
+                });
+                Some(dst)
+            }
+            HirExpr::Field {
+                base, name, span, ..
+            } => {
+                let object = self.lower_expr(base, typed)?;
+                let ty = self.resolved_ty(expr.id())?;
+                let dst = self.reg();
+                self.instrs.push(Instr::ObjectGet {
+                    dst,
+                    object,
+                    name: name.clone(),
+                    ty,
                     span: *span,
                 });
                 Some(dst)
@@ -840,6 +943,15 @@ impl Lowerer<'_> {
             } => {
                 self.lower_index_assign(array, index, value, typed, *span);
             }
+            HirStmt::FieldAssign {
+                base,
+                field,
+                value,
+                span,
+                ..
+            } => {
+                self.lower_field_assign(base, field, value, typed, *span);
+            }
             HirStmt::While {
                 condition,
                 body,
@@ -953,6 +1065,32 @@ impl Lowerer<'_> {
             index,
             value,
             elem,
+            span,
+        });
+    }
+
+    fn lower_field_assign(
+        &mut self,
+        base: &HirExpr,
+        field: &str,
+        value: &HirExpr,
+        typed: &vl_typecheck::TypedProgram,
+        span: Span,
+    ) {
+        let value_id = value.id();
+        let (Some(object), Some(value)) =
+            (self.lower_expr(base, typed), self.lower_expr(value, typed))
+        else {
+            return;
+        };
+        let Some(ty) = self.resolved_ty(value_id) else {
+            return;
+        };
+        self.instrs.push(Instr::ObjectSet {
+            object,
+            name: field.to_owned(),
+            value,
+            ty,
             span,
         });
     }
