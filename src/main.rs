@@ -6,10 +6,10 @@
 //! Every stage appends to one `Vec<Diagnostic>`; all printing goes through
 //! Ariadne (`vl_common::diagnostic::emit_all`). Exit code 1 iff any error.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
@@ -46,6 +46,8 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Run a project script; omit the name to run the `run` script.
+    Run { name: Option<String> },
     /// List available codegen backends.
     Targets,
 }
@@ -58,6 +60,8 @@ struct ProjectConfig {
     source: PathBuf,
     #[serde(default = "default_out_dir")]
     out: PathBuf,
+    #[serde(default)]
+    scripts: BTreeMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -135,6 +139,14 @@ fn validate_project_config(config: &ProjectConfig) -> Result<(), String> {
     if config.out.as_os_str().is_empty() {
         return Err("project output folder cannot be empty".into());
     }
+    for (name, command) in &config.scripts {
+        if name.is_empty() {
+            return Err("project script name cannot be empty".into());
+        }
+        if command.trim().is_empty() {
+            return Err(format!("project script `{name}` cannot be empty"));
+        }
+    }
     Ok(())
 }
 
@@ -197,6 +209,65 @@ fn init_project(module: Option<String>) -> Result<(), String> {
         .map_err(|e| format!("cannot write {}: {e}", config_path.display()))?;
     println!("created {}", config_path.display());
     Ok(())
+}
+
+fn run_project_script(name: Option<&str>) -> ExitCode {
+    let project = match load_project(Path::new(".")) {
+        Ok(project) => project,
+        Err(message) => {
+            emit_driver_error(&message, "E602");
+            return ExitCode::from(2);
+        }
+    };
+    let name = name.unwrap_or("run");
+    let Some(command) = project.config.scripts.get(name) else {
+        emit_driver_error(&format!("project script `{name}` is not defined"), "E604");
+        return ExitCode::from(2);
+    };
+
+    #[cfg(windows)]
+    let mut process = {
+        let mut process = Command::new("cmd");
+        process.args(["/C", command]);
+        process
+    };
+    #[cfg(not(windows))]
+    let mut process = {
+        let mut process = Command::new("sh");
+        process.args(["-c", command]);
+        process
+    };
+
+    let status = match process
+        .current_dir(&project.root)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+    {
+        Ok(status) => status,
+        Err(error) => {
+            emit_driver_error(
+                &format!("cannot run project script `{name}`: {error}"),
+                "E605",
+            );
+            return ExitCode::from(2);
+        }
+    };
+
+    match status.code() {
+        // `ExitCode::from` only accepts a `u8`, but Windows child statuses
+        // may use the full `i32` range. Exit directly so scripts preserve
+        // their platform exit status instead of truncating it.
+        Some(code) => std::process::exit(code),
+        None => {
+            emit_driver_error(
+                &format!("project script `{name}` terminated without an exit code"),
+                "E605",
+            );
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn resolve_project_path(root: &Path, path: &Path) -> PathBuf {
@@ -440,6 +511,7 @@ fn main() -> ExitCode {
             Some(file) => build_single(&file, &target, emit, &out),
             None => build_project(&target, emit, out.as_ref()),
         },
+        Cmd::Run { name } => run_project_script(name.as_deref()),
         Cmd::Targets => {
             let mut output = String::new();
             for t in vl_codegen::all_targets() {

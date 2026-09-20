@@ -60,12 +60,25 @@ source = "src"
 out = "out"
 ```
 
+Add scripts as needed:
+
+```toml
+[scripts]
+run = "vl build"
+check = "vl check src/main.vl"
+```
+
 With no source-file argument, `vl build` reads only the current directory's
 `vl.toml`, recursively builds every `.vl` file under `source`, and writes flat
 Naravm artifacts under `out`. A file such as `src/foo/bar.vl` is compiled as
 module `my_app.foo.bar` and written to `out/my_app__foo__bar.naravm`. The
 `source` and `out` paths are relative to the project directory unless they are
 absolute. `vl build path/to/file.vl` remains available for single-file builds.
+
+Project scripts are commands in the optional `[scripts]` table. They run only
+through `vl run`: `vl run` runs the special `run` script, while `vl run check`
+runs the script named `check`. Commands execute from the project root and use
+the platform shell; their output and exit status are passed through.
 
 Error demo (pretty Ariadne output, exit 1):
 

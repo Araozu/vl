@@ -91,3 +91,54 @@ fn project_build_uses_default_source_and_flat_custom_output() {
         .any(|w| w == b"project.foo.bar"));
     fs::remove_dir_all(root).expect("remove temporary project");
 }
+
+#[test]
+fn project_scripts_run_default_and_named_commands() {
+    let root = temp_project("scripts");
+    fs::write(
+        root.join("vl.toml"),
+        "module = \"scripts\"\n[scripts]\nrun = \"echo default-script > script-marker.txt\"\ncheck = \"echo named-script\"\nfail = \"exit 37\"\n",
+    )
+    .expect("write project config");
+
+    let default_output = run(&root, &["run"]);
+    assert!(
+        default_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&default_output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("script-marker.txt"))
+            .expect("script writes relative to the project root")
+            .trim(),
+        "default-script"
+    );
+
+    let named_output = run(&root, &["run", "check"]);
+    assert!(
+        named_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&named_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&named_output.stdout).trim(),
+        "named-script"
+    );
+
+    let failed_output = run(&root, &["run", "fail"]);
+    assert_eq!(failed_output.status.code(), Some(37));
+
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
+
+#[test]
+fn project_run_reports_missing_script() {
+    let root = temp_project("missing-script");
+    fs::write(root.join("vl.toml"), "module = \"missing\"\n").expect("write project config");
+
+    let output = run(&root, &["run"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("project script `run` is not defined"));
+
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
