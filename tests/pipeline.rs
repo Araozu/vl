@@ -10,6 +10,8 @@ fn frontend(src: &str) -> Result<vl_lir::LirProgram, Vec<vl_common::Diagnostic>>
     let hir = vl_hir::lower(&ast, &res);
     let (typed, mut d) = vl_typecheck::check(&hir);
     diags.append(&mut d);
+    // Same boundary guard as the driver: no unresolved type reaches LIR.
+    diags.append(&mut typed.validate_normalized(&hir, &diags));
     if diags.iter().any(|d| d.is_error()) {
         return Err(diags);
     }
@@ -547,6 +549,17 @@ fn unconstrained_generic_operator_is_one_error() {
 }
 
 #[test]
+fn generic_array_literal_int_defers_to_u8() {
+    let lir = frontend(
+        "function same[T](a: T, b: T): T { return a; } function main() { same([1], [2u8]); }",
+    )
+    .expect("nested int must defer to u8");
+    let dump = lir.dump();
+    assert!(dump.contains("call same$Array_u8"), "{dump}");
+    assert!(dump.contains("const 1u8"), "{dump}");
+}
+
+#[test]
 fn lir_boundary_holds_no_unresolved_types() {
     let (toks, _) = vl_lex::lex("function main() { 1 + 2; }");
     let (ast, _) = vl_syntax::parse(&toks, "");
@@ -554,7 +567,7 @@ fn lir_boundary_holds_no_unresolved_types() {
     let hir = vl_hir::lower(&ast, &res);
     let (typed, diags) = vl_typecheck::check(&hir);
     assert!(diags.iter().all(|d| !d.is_error()));
-    assert!(typed.validate_normalized(&hir).is_empty());
+    assert!(typed.validate_normalized(&hir, &diags).is_empty());
     let lir = vl_lir::lower(&hir, &typed);
     assert!(!lir.dump().contains("int"), "{}", lir.dump());
 }

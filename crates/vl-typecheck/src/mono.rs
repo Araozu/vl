@@ -240,9 +240,10 @@ fn vl_in_instance(v: &VlType, env: &HashMap<String, Ty>) -> Ty {
 
 /// Quiet inference for worklist expansion (errors were already reported
 /// while checking the template generically). Constraint-based: collect
-/// first, solve quietly after.
+/// first, solve quietly after, with the same structural `int` deferral as
+/// the reporting path.
 fn infer_quiet(sig: &FuncSigTy, actuals: &[Ty]) -> Option<Vec<Ty>> {
-    use super::default_inferred_ty;
+    use super::{default_inferred_ty, unify_solved};
     let mut per_param: HashMap<String, Vec<Ty>> = HashMap::new();
     for (formal, actual) in sig.param_tys.iter().zip(actuals.iter()) {
         if !collect_quiet(formal, actual, &mut per_param) {
@@ -255,19 +256,17 @@ fn infer_quiet(sig: &FuncSigTy, actuals: &[Ty]) -> Option<Vec<Ty>> {
         if constraints.is_empty() {
             return None;
         }
-        let mut concrete: Option<Ty> = None;
+        let mut acc: Option<Ty> = None;
         for t in &constraints {
-            if *t == Ty::Int {
-                continue;
-            }
-            let t = default_inferred_ty(t.clone());
-            match &concrete {
-                None => concrete = Some(t),
-                Some(c) if *c == t => {}
-                Some(_) => return None,
+            match &acc {
+                None => acc = Some(t.clone()),
+                Some(c) => {
+                    let u = unify_solved(c, t)?;
+                    acc = Some(u)
+                }
             }
         }
-        out.push(concrete.unwrap_or(Ty::U64));
+        out.push(default_inferred_ty(acc.expect("non-empty constraints")));
     }
     Some(out)
 }

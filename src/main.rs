@@ -126,6 +126,9 @@ fn run_frontend(
     let hir = vl_hir::lower(&ast, &res);
     let (typed, mut d) = vl_typecheck::check(&hir);
     diags.append(&mut d);
+    // Boundary guard: no unresolved `int`/`Param`/nested-`Error` type may
+    // reach lowering without a diagnostic. E500s here are compiler bugs.
+    diags.append(&mut typed.validate_normalized(&hir, &diags));
 
     if diags.iter().any(|d| d.is_error()) {
         return Err(diags);

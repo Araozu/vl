@@ -1441,7 +1441,7 @@ mod tests {
         let hir = vl_hir::lower(&prog, &res);
         let (typed, diags) = vl_typecheck::check(&hir);
         assert!(diags.is_empty(), "{diags:?}");
-        assert!(typed.validate_normalized(&hir).is_empty());
+        assert!(typed.validate_normalized(&hir, &diags).is_empty());
         let dump = lower(&hir, &typed).dump();
         assert!(dump.contains("cast"), "{dump}");
         assert!(dump.contains(": u8"), "{dump}");
@@ -1458,7 +1458,7 @@ mod tests {
         let hir = vl_hir::lower(&prog, &res);
         let (typed, diags) = vl_typecheck::check(&hir);
         assert!(diags.is_empty(), "{diags:?}");
-        assert!(typed.validate_normalized(&hir).is_empty());
+        assert!(typed.validate_normalized(&hir, &diags).is_empty());
         let dump = lower(&hir, &typed).dump();
         assert!(!dump.contains("int"), "{dump}");
         assert!(dump.contains("u64"), "{dump}");

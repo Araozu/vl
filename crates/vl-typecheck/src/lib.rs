@@ -228,31 +228,46 @@ impl TypedProgram {
     }
 
     /// Validate the normalized-type invariant at the typecheck-to-LIR
-    /// boundary: every non-poisoned type in monomorphic code and every
-    /// instance signature must be normalized (no `Int`, no `Param`, no
-    /// nested `Error`). Generic template bodies legitimately contain
-    /// `Param` and are skipped. Returns diagnostics (E500, compiler bug)
-    /// for any violation so invalid types cannot silently disappear in LIR.
-    pub fn validate_normalized(&self, prog: &HirProgram) -> Vec<Diagnostic> {
-        validate_normalized(self, prog)
+    /// boundary: every type in monomorphic code, every instance signature,
+    /// and every instance body type after argument substitution must be
+    /// normalized (no `Int`, no `Param`, no nested `Error`). Generic template
+    /// bodies legitimately contain `Param` and are checked per instance
+    /// instead of skipped. When `prior` already holds errors, lowering is
+    /// blocked anyway, so validation stands down entirely (error subtrees
+    /// may still hold undefaulted `int`s, and exact-error-count tests must
+    /// not see a second diagnostic). Otherwise poison at the boundary is
+    /// itself an E500. Returns E500 (compiler bug) diagnostics so invalid
+    /// types cannot silently disappear in LIR.
+    pub fn validate_normalized(&self, prog: &HirProgram, prior: &[Diagnostic]) -> Vec<Diagnostic> {
+        validate_normalized(self, prog, prior)
     }
 }
 
 /// See [`TypedProgram::validate_normalized`].
-pub fn validate_normalized(typed: &TypedProgram, prog: &HirProgram) -> Vec<Diagnostic> {
+pub fn validate_normalized(
+    typed: &TypedProgram,
+    prog: &HirProgram,
+    prior: &[Diagnostic],
+) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
-    let generic_ids = generic_template_ids(prog);
-    for (id, ty) in &typed.types {
-        if generic_ids.contains(id) {
-            continue;
-        }
+    // Earlier errors already block lowering: boundary validation is moot.
+    if prior.iter().any(|d| d.is_error()) {
+        return diags;
+    }
+    let check_ty = |what: String, ty: &Ty, diags: &mut Vec<Diagnostic>| {
         if ty_has_error(ty) {
-            continue;
+            diags.push(
+                Diagnostic::error(format!(
+                    "{what} is poisoned without a prior error (compiler bug)"
+                ))
+                .with_code("E500"),
+            );
+            return;
         }
         if !ty.is_normalized() {
             diags.push(
                 Diagnostic::error(format!(
-                    "non-normalized type `{ty}` reached the LIR boundary (compiler bug)"
+                    "{what} has non-normalized type `{ty}` (compiler bug)"
                 ))
                 .with_note(
                     "unresolved `int`/`Param` must be defaulted or monomorphized before lowering",
@@ -260,6 +275,13 @@ pub fn validate_normalized(typed: &TypedProgram, prog: &HirProgram) -> Vec<Diagn
                 .with_code("E500"),
             );
         }
+    };
+    let generic_ids = generic_template_ids(prog);
+    for (id, ty) in &typed.types {
+        if generic_ids.contains(id) {
+            continue;
+        }
+        check_ty(format!("node `{id}`"), ty, &mut diags);
     }
     for (name, inst) in &typed.instances {
         for ty in inst
@@ -268,25 +290,32 @@ pub fn validate_normalized(typed: &TypedProgram, prog: &HirProgram) -> Vec<Diagn
             .iter()
             .chain(std::iter::once(&inst.sig.ret))
         {
-            if ty_has_error(ty) {
-                continue;
-            }
-            if !ty.is_normalized() {
-                diags.push(
-                    Diagnostic::error(format!(
-                        "instance `{name}` has non-normalized type `{ty}` (compiler bug)"
-                    ))
-                    .with_code("E500"),
-                );
-            }
+            check_ty(format!("instance `{name}` signature"), ty, &mut diags);
         }
         for arg in &inst.args {
-            if !arg.is_normalized() && !ty_has_error(arg) {
-                diags.push(
-                    Diagnostic::error(format!(
-                        "instance `{name}` has non-normalized argument `{arg}` (compiler bug)"
-                    ))
-                    .with_code("E500"),
+            check_ty(format!("instance `{name}` argument"), arg, &mut diags);
+        }
+        // Instance bodies: substitute this instance's arguments into the
+        // template's recorded types, then validate the result. A `Param`
+        // surviving substitution is unbound; an `Int` was never defaulted.
+        let env: HashMap<String, Ty> = typed
+            .func_sigs
+            .get(&inst.orig)
+            .map(|sig| {
+                sig.type_params
+                    .iter()
+                    .cloned()
+                    .zip(inst.args.iter().cloned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in template_ids_for(prog, inst.orig) {
+            if let Some(ty) = typed.types.get(&id) {
+                let substed = subst_ty(ty, &env);
+                check_ty(
+                    format!("instance `{name}` node `{id}`"),
+                    &substed,
+                    &mut diags,
                 );
             }
         }
@@ -294,86 +323,114 @@ pub fn validate_normalized(typed: &TypedProgram, prog: &HirProgram) -> Vec<Diagn
     diags
 }
 
-/// All `HirId.0` values inside generic function templates (bodies, params,
-/// and the item id itself). Their recorded types may contain `Param`.
-fn generic_template_ids(prog: &HirProgram) -> HashSet<u32> {
-    fn expr_ids(e: &HirExpr, out: &mut HashSet<u32>) {
-        out.insert(e.id().0);
-        match e {
-            HirExpr::ArrayLiteral { elems, .. } => {
-                for el in elems {
-                    expr_ids(el, out);
-                }
+fn template_expr_ids(e: &HirExpr, out: &mut HashSet<u32>) {
+    out.insert(e.id().0);
+    match e {
+        HirExpr::ArrayLiteral { elems, .. } => {
+            for el in elems {
+                template_expr_ids(el, out);
             }
-            HirExpr::Index { base, index, .. } => {
-                expr_ids(base, out);
-                expr_ids(index, out);
-            }
-            HirExpr::Call { args, .. } => {
-                for a in args {
-                    expr_ids(a, out);
-                }
-            }
-            HirExpr::Binary { lhs, rhs, .. } => {
-                expr_ids(lhs, out);
-                expr_ids(rhs, out);
-            }
-            HirExpr::Unary { inner, .. } => expr_ids(inner, out),
-            HirExpr::Cast { inner, .. } => expr_ids(inner, out),
-            HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
         }
+        HirExpr::Index { base, index, .. } => {
+            template_expr_ids(base, out);
+            template_expr_ids(index, out);
+        }
+        HirExpr::Call { args, .. } => {
+            for a in args {
+                template_expr_ids(a, out);
+            }
+        }
+        HirExpr::Binary { lhs, rhs, .. } => {
+            template_expr_ids(lhs, out);
+            template_expr_ids(rhs, out);
+        }
+        HirExpr::Unary { inner, .. } => template_expr_ids(inner, out),
+        HirExpr::Cast { inner, .. } => template_expr_ids(inner, out),
+        HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
     }
-    fn stmt_ids(s: &HirStmt, out: &mut HashSet<u32>) {
-        match s {
-            HirStmt::Let { id, value, .. } | HirStmt::Assign { id, value, .. } => {
-                out.insert(id.0);
-                expr_ids(value, out);
+}
+
+fn template_stmt_ids(s: &HirStmt, out: &mut HashSet<u32>) {
+    match s {
+        HirStmt::Let { id, value, .. } | HirStmt::Assign { id, value, .. } => {
+            out.insert(id.0);
+            template_expr_ids(value, out);
+        }
+        HirStmt::IndexAssign {
+            id,
+            array,
+            index,
+            value,
+            ..
+        } => {
+            out.insert(id.0);
+            template_expr_ids(array, out);
+            template_expr_ids(index, out);
+            template_expr_ids(value, out);
+        }
+        HirStmt::Expr(e) => template_expr_ids(e, out),
+        HirStmt::Return { value, .. } => {
+            if let Some(e) = value {
+                template_expr_ids(e, out);
             }
-            HirStmt::IndexAssign {
-                id,
-                array,
-                index,
-                value,
-                ..
-            } => {
-                out.insert(id.0);
-                expr_ids(array, out);
-                expr_ids(index, out);
-                expr_ids(value, out);
+        }
+        HirStmt::If {
+            condition,
+            then_body,
+            else_body,
+            ..
+        } => {
+            template_expr_ids(condition, out);
+            for st in then_body {
+                template_stmt_ids(st, out);
             }
-            HirStmt::Expr(e) => expr_ids(e, out),
-            HirStmt::Return { value, .. } => {
-                if let Some(e) = value {
-                    expr_ids(e, out);
-                }
-            }
-            HirStmt::If {
-                condition,
-                then_body,
-                else_body,
-                ..
-            } => {
-                expr_ids(condition, out);
-                for st in then_body {
-                    stmt_ids(st, out);
-                }
-                if let Some(body) = else_body {
-                    for st in body {
-                        stmt_ids(st, out);
-                    }
-                }
-            }
-            HirStmt::While {
-                condition, body, ..
-            } => {
-                expr_ids(condition, out);
+            if let Some(body) = else_body {
                 for st in body {
-                    stmt_ids(st, out);
+                    template_stmt_ids(st, out);
                 }
             }
-            HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
+        }
+        HirStmt::While {
+            condition, body, ..
+        } => {
+            template_expr_ids(condition, out);
+            for st in body {
+                template_stmt_ids(st, out);
+            }
+        }
+        HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
+    }
+}
+
+/// All `HirId.0` values of one function template (the item id plus every
+/// node in its body), used to validate instance bodies after substitution.
+fn template_ids_for(prog: &HirProgram, def: u32) -> HashSet<u32> {
+    let mut out = HashSet::new();
+    for item in &prog.items {
+        if let HirItem::Fn {
+            id,
+            def: Some(d),
+            body,
+            ..
+        } = item
+        {
+            if d.0 != def {
+                continue;
+            }
+            out.insert(id.0);
+            for st in body {
+                template_stmt_ids(st, &mut out);
+            }
         }
     }
+    out
+}
+
+/// All `HirId.0` values inside generic function templates (bodies, params,
+/// and the item id itself). Their recorded types may contain `Param`, so the
+/// monomorphic validation loop skips them (instances are validated after
+/// substitution instead).
+fn generic_template_ids(prog: &HirProgram) -> HashSet<u32> {
     let mut out = HashSet::new();
     for item in &prog.items {
         if let HirItem::Fn {
@@ -388,7 +445,7 @@ fn generic_template_ids(prog: &HirProgram) -> HashSet<u32> {
             }
             out.insert(id.0);
             for st in body {
-                stmt_ids(st, &mut out);
+                template_stmt_ids(st, &mut out);
             }
         }
     }
@@ -695,17 +752,22 @@ impl Checker {
             }
             return inferred;
         }
-        // Unannotated `int` bindings resolve to the target's default unsigned
-        // lane (`u64`): an `int` variable must not stay compatible with every
-        // integer type, or `let v = 300; take_u8(v);` would pass.
-        if inferred == Ty::Int {
-            self.coerce_expr_literals(value, &Ty::U64);
+        // Unannotated bindings holding an unresolved `int` (top level or
+        // nested, e.g. `Array[Int]`) resolve through the target's default
+        // unsigned lane (`u64`): an `int` variable must not stay compatible
+        // with every integer type, or `let v = 300; take_u8(v);` would pass.
+        if ty_contains_int(&inferred) {
+            let defaulted = default_inferred_ty(inferred.clone());
+            self.coerce_expr_literals(value, &defaulted);
             let resolved = self.infer_expr(value);
             if ty_has_error(&resolved) {
                 return Ty::Error;
             }
-            if resolved == Ty::Int {
-                return Ty::U64;
+            if ty_contains_int(&resolved) {
+                // Non-coercible shape (unreachable for literals, which the
+                // arms above handle): record the default so no `Int` lingers
+                // for the LIR boundary.
+                return self.record(value.id(), defaulted);
             }
             return resolved;
         }
@@ -732,13 +794,17 @@ impl Checker {
                 }
             }
             HirStmt::Expr(e) => {
-                // Value discarded; still infer for inner errors. A bare `int`
-                // result defaults to `u64` so no unresolved `Int` reaches LIR
-                // (e.g. `1 + 2;` in a void function lowers as `u64`).
+                // Value discarded; still infer for inner errors. A result
+                // holding `int` (top level or nested, e.g. `[1];`) defaults
+                // through the `u64` lane so no unresolved `Int` reaches LIR.
                 let t = self.infer_expr(e);
-                if t == Ty::Int {
-                    self.coerce_expr_literals(e, &Ty::U64);
-                    let _ = self.infer_expr(e);
+                if !ty_has_error(&t) && ty_contains_int(&t) {
+                    let defaulted = default_inferred_ty(t);
+                    self.coerce_expr_literals(e, &defaulted);
+                    let t2 = self.infer_expr(e);
+                    if ty_contains_int(&t2) && !ty_has_error(&t2) {
+                        self.record(e.id(), defaulted);
+                    }
                 }
             }
             HirStmt::Return { value, span } => {
@@ -1392,16 +1458,14 @@ impl Checker {
                         poisoned = true;
                     }
                 }
-                // An array literal with no concrete integer context still
-                // needs a runtime element type. Use the target's default
-                // unsigned lane, while contextual uses above can select i64
-                // or u8 before this point.
-                if !poisoned && first == Ty::Int {
-                    for elem in elems {
-                        self.coerce_expr_literals(elem, &Ty::U64);
-                    }
-                    first = Ty::U64;
-                }
+                // An all-`int` literal keeps `Array[Int]` here on purpose:
+                // defaulting eagerly to `u64` would erase the literal's
+                // deference before generic constraint solving sees it
+                // (`same([1], [2u8])` must solve `T = Array[u8]`, not
+                // conflict `u64` vs `u8`). The `Int` is defaulted at use
+                // sites instead: `let`/discarded-statement defaulting,
+                // `infer_expr_expected` coercion, and per-argument coercion
+                // after generic solving all coerce the elements then.
                 // One bad element poisons the whole literal (single root
                 // cause, no cascade).
                 if poisoned {
@@ -1803,8 +1867,10 @@ impl Checker {
     /// Semantics (v0, integers only):
     /// - Target must be `u64`, `i64`, or `u8` (float/string/array casts are
     ///   rejected with E302; they need ISA conversions not yet specified).
-    /// - Source must be an integer (`u64/i64/u8/int` literal, or a `Param`
-    ///   with a `Numeric` bound). All other sources are E302.
+    /// - Source must be a concrete integer (`u64/i64/u8/int` literal).
+    ///   Generic parameters are rejected even with a `Numeric` bound: `T`
+    ///   may instantiate to `f64`, whose IEEE-754 bits must never be copied
+    ///   into an integer lane by the backend's value copy.
     /// - Literals are range-checked at compile time (`300 as u8` is E302).
     /// - Variable conversions are unchecked reinterpretations with no runtime
     ///   cost (no trap, no wrap instruction): the 64-bit payload is kept and
@@ -1856,13 +1922,23 @@ impl Checker {
             );
             return self.record(id, Ty::Error);
         }
-        // Source must be an integer (or a `Numeric` parameter).
-        let source_ok = match &inner_ty {
-            Ty::Int | Ty::U64 | Ty::I64 | Ty::U8 => true,
-            Ty::Param(name) => self.type_bounds.get(name) == Some(&GenericBound::Numeric),
-            _ => false,
-        };
-        if !source_ok {
+        // Source must be a concrete integer. Generic parameters are rejected
+        // even with a `Numeric` bound: `T` may instantiate to `f64`, and the
+        // backend lowers casts to a value copy, which would reinterpret IEEE
+        // bits as an integer.
+        if matches!(&inner_ty, Ty::Param(_)) {
+            self.diags.push(
+                Diagnostic::error(format!("cannot cast generic `{inner_ty}` to `{target}`"))
+                    .with_label(
+                        inner.span(),
+                        "casts need a concrete integer source (`u64`, `i64`, `u8`)",
+                    )
+                    .with_note("monomorphize first (call with a concrete type), then cast")
+                    .with_code("E302"),
+            );
+            return self.record(id, Ty::Error);
+        }
+        if !matches!(&inner_ty, Ty::Int | Ty::U64 | Ty::I64 | Ty::U8) {
             self.diags.push(
                 Diagnostic::error(format!("cannot cast `{inner_ty}` to `{target}`"))
                     .with_label(
@@ -1934,6 +2010,35 @@ pub(crate) fn ty_has_error(ty: &Ty) -> bool {
         Ty::Error => true,
         Ty::Array(elem) => ty_has_error(elem),
         _ => false,
+    }
+}
+
+/// Does a type still hold an unresolved `int` literal (top level or nested
+/// in `Array`)? Such types must be defaulted (`u64` lane) before lowering.
+fn ty_contains_int(ty: &Ty) -> bool {
+    match ty {
+        Ty::Int => true,
+        Ty::Array(elem) => ty_contains_int(elem),
+        _ => false,
+    }
+}
+
+/// Structurally unify two solved constraint types, letting `int` defer to a
+/// concrete integer lane at any depth (`Array[Int]` + `Array[u8]` gives
+/// `Array[u8]`). Returns `None` on genuine conflict.
+pub(crate) fn unify_solved(a: &Ty, b: &Ty) -> Option<Ty> {
+    if a == b {
+        return Some(a.clone());
+    }
+    if *a == Ty::Int && is_integer(b) {
+        return Some(b.clone());
+    }
+    if *b == Ty::Int && is_integer(a) {
+        return Some(a.clone());
+    }
+    match (a, b) {
+        (Ty::Array(x), Ty::Array(y)) => unify_solved(x, y).map(|e| Ty::Array(Box::new(e))),
+        _ => None,
     }
 }
 
@@ -2041,8 +2146,10 @@ impl ConstraintSet {
 
     /// Solve collected constraints into concrete type arguments, defaulting
     /// leftover `int` to `u64`. Integer literals defer to concrete
-    /// constraints, so `same(1u64, 2)` and `same(1, 2u64)` both solve
-    /// `T = u64`. Reports one diagnostic per failure.
+    /// constraints structurally at any depth, so `same(1u64, 2)` and
+    /// `same(1, 2u64)` both solve `T = u64`, and `same([1], [2u8])` solves
+    /// `T = Array[u8]` (elements are coerced after solving). Reports one
+    /// diagnostic per failure.
     fn solve(
         mut self,
         name: &str,
@@ -2062,39 +2169,32 @@ impl ConstraintSet {
                 );
                 return None;
             }
-            // Concrete (non-`Int`) constraints must all agree; `Int`
-            // constraints defer to them.
-            let mut concrete: Option<Ty> = None;
+            // Fold constraints structurally: `Int` defers to a concrete
+            // integer lane even when nested (`Array[Int]` vs `Array[u8]`).
+            let mut acc: Option<Ty> = None;
             for t in &constraints {
-                if *t == Ty::Int {
-                    continue;
-                }
-                // An `Int` nested inside an array (should not survive
-                // literal defaulting, but be safe) defaults before compare.
-                let t = default_inferred_ty(t.clone());
-                match &concrete {
-                    None => concrete = Some(t),
-                    Some(c) if *c == t => {}
-                    Some(c) => {
-                        diags.push(
-                            Diagnostic::error(format!(
-                                "`{name}` infers conflicting types for `{p}`: `{c}` vs `{t}`"
-                            ))
-                            .with_label(span, "conflicting arguments here")
-                            .with_code("E306"),
-                        );
-                        return None;
-                    }
+                match &acc {
+                    None => acc = Some(t.clone()),
+                    Some(c) => match unify_solved(c, t) {
+                        Some(u) => acc = Some(u),
+                        None => {
+                            diags.push(
+                                Diagnostic::error(format!(
+                                    "`{name}` infers conflicting types for `{p}`: `{c}` vs `{t}`"
+                                ))
+                                .with_label(span, "conflicting arguments here")
+                                .with_code("E306"),
+                            );
+                            return None;
+                        }
+                    },
                 }
             }
-            match concrete {
-                Some(t) => out.push(t),
-                // All constraints were `int` literals: default to `u64` so a
-                // generic result crossing a concrete boundary (`return
-                // id(300);` in a `u8` function) mismatches instead of
-                // silently truncating.
-                None => out.push(Ty::U64),
-            }
+            // Anything still holding `int` (all-literal constraints) defaults
+            // through the `u64` lane, so a generic result crossing a concrete
+            // boundary (`return id(300);` in a `u8` function) mismatches
+            // instead of silently truncating.
+            out.push(default_inferred_ty(acc.expect("non-empty constraints")));
         }
         Some(out)
     }
@@ -3011,7 +3111,7 @@ mod tests {
         ] {
             let (hir, typed, diags) = check_src_with_hir(src);
             assert!(diags.iter().all(|d| !d.is_error()), "{src}: {diags:?}");
-            assert!(typed.validate_normalized(&hir).is_empty(), "{src}");
+            assert!(typed.validate_normalized(&hir, &diags).is_empty(), "{src}");
         }
     }
 
@@ -3020,7 +3120,7 @@ mod tests {
         let (hir, mut typed, _) = check_src_with_hir("function main() { let x = 1u64; x; }");
         // Inject a non-normalized `Int` where a concrete type belongs.
         typed.types.insert(0, Ty::Int);
-        let errs = typed.validate_normalized(&hir);
+        let errs = typed.validate_normalized(&hir, &[]);
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].code.as_deref(), Some("E500"));
     }
@@ -3033,7 +3133,7 @@ mod tests {
             "function id[T](x: T): T { return x; } function main() { id(1u64); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
-        assert!(typed.validate_normalized(&hir).is_empty());
+        assert!(typed.validate_normalized(&hir, &diags).is_empty());
         assert!(typed.instances.contains_key("id$u64"));
     }
 
@@ -3221,5 +3321,77 @@ mod tests {
             "function eq[T extends Comparable](a: T, b: T): bool { return a == b; } function wrap[T extends Numeric](x: T): bool { return eq(x, x); } function main() { wrap(1u64); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn as_cast_on_generic_param_is_rejected() {
+        // `Numeric` includes `f64`: allowing `x as u8` for `x: T` would copy
+        // IEEE-754 bits into an integer lane once `T = f64`.
+        let (_, diags) = check_src(
+            "function get[T extends Numeric](x: T): u8 { return x as u8; } function main() { get(1.5f64); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("generic"), "{diags:?}");
+        assert_eq!(diags[0].code.as_deref(), Some("E302"));
+    }
+
+    #[test]
+    fn as_cast_from_f64_is_rejected() {
+        let (_, diags) = check_src("function main() { let x = 1.0f64 as u8; x; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("cannot cast"), "{diags:?}");
+    }
+
+    #[test]
+    fn nested_int_literal_defers_to_concrete_element() {
+        // Array literals keep `Array[Int]` until solving: `T` solves to
+        // `Array[u8]` (not a `u64`-vs-`u8` conflict) and the `1` coerces.
+        let (typed, diags) = check_src(
+            "function same[T](a: T, b: T): T { return a; } function main() { same([1], [2u8]); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.instances.contains_key("same$Array_u8"));
+    }
+
+    #[test]
+    fn nested_int_conflict_still_conflicts() {
+        let (_, diags) = check_src(
+            "function same[T](a: T, b: T): T { return a; } function main() { same([1u64], [2u8]); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("conflicting types"), "{diags:?}");
+    }
+
+    #[test]
+    fn unannotated_all_int_array_defaults_to_u64() {
+        let (typed, diags) = check_src("function main() { let a = [1, 2]; a; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed
+            .types
+            .values()
+            .any(|t| *t == Ty::Array(Box::new(Ty::U64))));
+        assert!(!typed.types.values().any(ty_contains_int));
+    }
+
+    #[test]
+    fn instance_bodies_validate_after_substitution() {
+        let (hir, typed, diags) = check_src_with_hir(
+            "function add[T extends Numeric](a: T, b: T): T { return a + b; } function main() { add(1u64, 2u64); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.validate_normalized(&hir, &diags).is_empty());
+    }
+
+    #[test]
+    fn validation_stands_down_with_prior_errors() {
+        let (hir, mut typed, _) = check_src_with_hir("function main() { let x = 1u64; x; }");
+        typed.types.insert(0, Ty::Error);
+        // No prior errors: poison at the boundary is itself reported.
+        let errs = typed.validate_normalized(&hir, &[]);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].code.as_deref(), Some("E500"));
+        // With a prior error (lowering already blocked): validation is moot.
+        let prior = vec![Diagnostic::error("prior failure").with_code("E999")];
+        assert!(typed.validate_normalized(&hir, &prior).is_empty());
     }
 }
