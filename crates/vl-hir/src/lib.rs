@@ -799,6 +799,23 @@ mod tests {
     }
 
     #[test]
+    fn objects_lower_with_field_reads_and_writes() {
+        let src = "type Counter = object { value: u64, }; function main() { let c = Counter { value: 1 }; c.value = c.value + 1; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.is_empty(), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        assert!(matches!(hir.items[0], HirItem::Object { .. }));
+        assert!(matches!(
+            hir.items[1],
+            HirItem::Fn { ref body, .. }
+                if body.iter().any(|stmt| matches!(stmt, HirStmt::FieldAssign { .. }))
+        ));
+    }
+
+    #[test]
     fn return_lowers_with_value() {
         let src = "function f(): i64 { return 1; } function m() { return; }";
         let (toks, _) = vl_lex::lex(src);

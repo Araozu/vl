@@ -4,7 +4,7 @@
 //! reports undefined names and duplicate definitions. The resulting
 //! [`Resolution`] is consumed by `vl-hir` lowering.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use vl_common::{Diagnostic, ModuleSpec, Span};
 use vl_syntax::{Expr, Item, Program, Stmt};
@@ -75,7 +75,6 @@ struct Resolver {
     imports: HashMap<String, ModuleSpec>,
     poisoned_imports: std::collections::HashSet<String>,
     loop_depth: usize,
-    object_names: HashSet<String>,
 }
 
 pub fn resolve(prog: &Program) -> (Resolution, Vec<Diagnostic>) {
@@ -94,14 +93,6 @@ pub fn resolve_with_modules(
         imports: HashMap::new(),
         poisoned_imports: std::collections::HashSet::new(),
         loop_depth: 0,
-        object_names: prog
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Object { name, .. } => Some(name.clone()),
-                _ => None,
-            })
-            .collect(),
     };
 
     for item in &prog.items {
@@ -339,19 +330,7 @@ impl Resolver {
     fn resolve_expr(&mut self, expr: &Expr) {
         match expr {
             Expr::Literal(_, _) | Expr::String(_, _) => {}
-            Expr::ObjectLiteral {
-                name,
-                name_span,
-                fields,
-                ..
-            } => {
-                if !self.object_names.contains(name) {
-                    self.diags.push(
-                        Diagnostic::error(format!("cannot find object type `{name}`"))
-                            .with_label(*name_span, "unknown object type")
-                            .with_code("E201"),
-                    );
-                }
+            Expr::ObjectLiteral { fields, .. } => {
                 for (_, _, value) in fields {
                     self.resolve_expr(value);
                 }
@@ -691,6 +670,12 @@ mod tests {
     #[test]
     fn assignment_to_a_bound_local_resolves() {
         let (_, diags) = resolve_src("function main() { let x = 1; x = 2; }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+    }
+
+    #[test]
+    fn unknown_object_literal_is_deferred_to_typechecking() {
+        let (_, diags) = resolve_src("function main() { let x = Missing {}; }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
     }
 

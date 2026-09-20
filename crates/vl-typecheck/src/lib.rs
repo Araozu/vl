@@ -1,7 +1,8 @@
 //! vl-typecheck: type checking over HIR.
 //!
 //! Value types are the compiler-owned [`Ty`] (`u64`, `i64`, `f64`, `bool`,
-//! `u8`, `string`, `File`, `Array[T]`, `void`) converted from [`vl_common::VlType`].
+//! `u8`, `string`, `File`, named reference-semantic objects, `Array[T]`,
+//! `void`) converted from [`vl_common::VlType`].
 //! These are VL language types enforced here — deliberately distinct from any
 //! VM representation, which backends map to separately.
 //!
@@ -1607,8 +1608,8 @@ impl Checker {
                     }
                     return self.record(*id, Ty::Error);
                 };
-                let mut poisoned = fields.len() != sig.fields.len();
-                if poisoned {
+                let wrong_count = fields.len() != sig.fields.len();
+                if wrong_count {
                     self.diags.push(
                         Diagnostic::error(format!(
                             "object `{name}` expects {} field(s), got {}",
@@ -1618,7 +1619,12 @@ impl Checker {
                         .with_label(*span, "wrong number of object fields")
                         .with_code("E302"),
                     );
+                    for (_, value) in fields {
+                        self.infer_expr(value);
+                    }
+                    return self.record(*id, Ty::Error);
                 }
+                let mut poisoned = false;
                 let mut seen = HashSet::new();
                 for (field, value) in fields {
                     if !seen.insert(field.clone()) {
@@ -2638,6 +2644,35 @@ mod tests {
             "function sum(a: Array[u64]): u64 { return a[0u64]; } function main() { let a = Array.new::[u64](3u64); a[0u64] = 1u64; let b = [1u64, 2u64]; sum(a); sum(b); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn objects_check_field_types_and_reference_operations() {
+        let (_, diags) = check_src(
+            "type Counter = object { value: u64, }; function bump(c: Counter): Counter { c.value = c.value + 1; return c; } function main() { let c = Counter { value: 1 }; let d = bump(c); d.value = 3; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn object_literal_field_count_is_one_diagnostic() {
+        let (_, diags) = check_src(
+            "type Point = object { x: u64, }; function main() { let p = Point { y: 1, z: 2 }; }",
+        );
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert!(errors[0].message.contains("expects 1 field"), "{diags:?}");
+    }
+
+    #[test]
+    fn unknown_object_literal_is_one_diagnostic() {
+        let (_, diags) = check_src("function main() { let x = Missing {}; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert!(
+            errors[0].message.contains("cannot find object type"),
+            "{diags:?}"
+        );
     }
 
     #[test]

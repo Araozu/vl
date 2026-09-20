@@ -424,6 +424,14 @@ mod tests {
     }
 
     #[test]
+    fn lexes_object_declaration_keywords() {
+        let (toks, diags) = lex("type Counter = object { value: u64, };");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(matches!(toks[0].kind, TokenKind::Type));
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Object)));
+    }
+
+    #[test]
     fn bad_char_is_a_diagnostic_not_a_panic() {
         let (toks, diags) = lex("let x = @;");
         assert_eq!(diags.len(), 1);

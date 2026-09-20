@@ -387,6 +387,27 @@ impl Lowerer<'_> {
     }
 }
 
+/// Bind an object value in its own local home. Object references alias the
+/// same heap allocation, but rebinding one local must not change another local
+/// that happened to receive that reference from a `let` initializer.
+fn bind_local(l: &mut Lowerer, def: Option<&vl_hir::DefId>, value: &HirExpr, reg: Reg) {
+    let Some(def) = def else {
+        return;
+    };
+    let home = if matches!(l.resolved_ty(value.id()), Some(Ty::Object(_))) {
+        let dst = l.reg();
+        l.instrs.push(Instr::Copy {
+            dst,
+            src: reg,
+            span: value.span(),
+        });
+        dst
+    } else {
+        reg
+    };
+    l.bindings.insert(def.0, home);
+}
+
 /// One top-level statement inside a function body. Shared by monomorphic
 /// functions and monomorphized instances.
 fn lower_fn_stmt(
@@ -398,9 +419,7 @@ fn lower_fn_stmt(
     match stmt {
         HirStmt::Let { def, value, .. } => {
             if let Some(reg) = l.lower_expr(value, typed) {
-                if let Some(def) = def {
-                    l.bindings.insert(def.0, reg);
-                }
+                bind_local(l, def.as_ref(), value, reg);
             }
             *topped_return = false;
         }
@@ -910,9 +929,7 @@ impl Lowerer<'_> {
         match stmt {
             HirStmt::Let { def, value, .. } => {
                 if let Some(reg) = self.lower_expr(value, typed) {
-                    if let Some(def) = def {
-                        self.bindings.insert(def.0, reg);
-                    }
+                    bind_local(self, def.as_ref(), value, reg);
                 }
             }
             HirStmt::Expr(value) => {
@@ -1386,6 +1403,37 @@ mod tests {
         assert!(dump.contains("array_get"), "{dump}");
         assert!(dump.contains("array_set"), "{dump}");
         assert!(!dump.contains("Array.new"), "{dump}");
+    }
+
+    #[test]
+    fn objects_lower_to_dedicated_instrs() {
+        let src = "type Counter = object { value: u64, }; function main() { let c = Counter { value: 1 }; c.value = c.value + 1; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let dump = lower(&hir, &typed).dump();
+        assert!(dump.contains("new_object Counter"), "{dump}");
+        assert!(dump.contains("object_get"), "{dump}");
+        assert!(dump.contains("object_set"), "{dump}");
+    }
+
+    #[test]
+    fn object_let_alias_gets_an_independent_rebinding_home() {
+        let src = "type Counter = object { value: u64, }; function main() { let a = Counter { value: 1 }; let b = a; b = Counter { value: 2 }; a.value = 3; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let dump = lower(&hir, &typed).dump();
+        assert!(
+            dump.contains("copy"),
+            "object aliases need separate homes: {dump}"
+        );
     }
 
     #[test]

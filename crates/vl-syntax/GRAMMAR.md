@@ -12,7 +12,9 @@ program := item*
 item    := use_item | let_item | function_item | object_item
 use_item := "use" path ("." "{" ident ("," ident)* "}")? ";"
 let_item := "let" ident (":" type)? "=" expr ";"
-function_item := "function" ident "(" params? ")" (":" type)? block
+function_item := "function" ident type_params? "(" params? ")" (":" type)? block
+type_params := "[" type_param ("," type_param)* "]"
+type_param := ident ("extends" ("Numeric" | "Comparable"))?
 object_item := "type" ident "=" "object" "{" object_fields? "}" ";"
 object_fields := object_field ("," object_field)* ","?
 object_field := ident ":" type
@@ -39,10 +41,12 @@ equality := comparison (("==" | "!=") comparison)*
 comparison := term (("<" | "<=" | ">" | ">=") term)*
 term     := factor (("+" | "-") factor)* ; left-assoc
 factor   := unary (("*" | "/") unary)*   ; left-assoc
-unary    := ("-" | "!") unary | call
-call     := path "(" args? ")"
+unary    := ("-" | "!") unary | postfix
+call     := path ("::" "[" type ("," type)* "]")? "(" args? ")"
 postfix  := primary ("[" expr "]" | "." ident)*
+primary  := literal | string | array_literal | object_literal | call | path | "(" expr ")"
 object_literal := ident "{" (ident ":" expr ("," ident ":" expr)* ","?)? "}"
+array_literal := "[" (expr ("," expr)* ","?)? "]"
 args     := expr ("," expr)*
 literal  := int | i64 | u64 | f64 | u8 | bool
 path     := ident ("." ident)*
@@ -64,6 +68,9 @@ Bool String Eof`.
 * Parens are transparent in the AST: `(e)` returns inner `Expr`, span drops parens.
 * Calls are callee-by-name (`ident(args)`), TypeScript-style, so forward
   references to `function` items work.
+* Assignment statements are recognized from identifier-led postfix expressions;
+  field and index writes may therefore chain postfix operations, while a
+  parenthesized assignment base remains an expression-statement parse error.
 
 ## AST
 
@@ -83,7 +90,8 @@ Stmt ::= Let { name, name_span, value: Expr, span }
        | Break { span } | Continue { span }
        | Return { value: Option<Expr>, span }
        | Expr(Expr)
-Expr ::= Literal(Scalar, Span) | String(Vec<u8>, Span) | ObjectLiteral { name, fields, span }
+Expr ::= Literal(Scalar, Span) | String(Vec<u8>, Span) | ArrayLiteral { elems, span }
+         | ObjectLiteral { name, fields, span } | Index { base, index, span }
          | Field { base, name, span } | Var { path, span }
          | Call { callee: path, callee_span, args, span }
          | Unary { op, rhs, span } | Binary { op, lhs, rhs, span }

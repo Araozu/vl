@@ -474,6 +474,16 @@ impl<'a> Parser<'a> {
     fn parse_object_item(&mut self) -> Option<Item> {
         let type_tok = self.bump();
         let (name, name_span) = self.parse_ident()?;
+        let reserved_name =
+            matches!(name.as_str(), "Array" | "U64Array") || name.parse::<VlType>().is_ok();
+        if reserved_name {
+            self.diags.push(
+                Diagnostic::error(format!("object type name `{name}` is reserved"))
+                    .with_label(name_span, "choose a different object type name")
+                    .with_note("object names cannot shadow built-in or legacy type names")
+                    .with_code("E200"),
+            );
+        }
         self.expect(&TokenKind::Eq, "`=` after object name")?;
         self.expect(&TokenKind::Object, "`object` after `=`")?;
         self.expect(&TokenKind::LBrace, "`{` after `object`")?;
@@ -618,11 +628,11 @@ impl<'a> Parser<'a> {
                 }
                 match name.parse::<VlType>() {
                     Ok(ty) => Some((ty, t.span)),
-                    Err(_) if self.known_objects.contains(&name) => {
-                        Some((VlType::Object(name), t.span))
-                    }
                     Err(_) if allowed.iter().any(|a| a == &name) => {
                         Some((VlType::Param(name), t.span))
+                    }
+                    Err(_) if self.known_objects.contains(&name) => {
+                        Some((VlType::Object(name), t.span))
                     }
                     Err(_) if !strict => Some((VlType::Param(name), t.span)),
                     Err(e) => {
@@ -1654,6 +1664,49 @@ mod tests {
             }
             other => panic!("expected fn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_object_declaration_literal_and_field_assign() {
+        let (prog, diags) = parse_src(
+            "type Counter = object { value: u64, label: string, }; function main() { let c = Counter { label: \"x\", value: 1 }; c.value = 2; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(matches!(prog.items[0], Item::Object { ref fields, .. } if fields.len() == 2));
+        match &prog.items[1] {
+            Item::Function { body, .. } => {
+                assert!(matches!(
+                    &body[0],
+                    Stmt::Let {
+                        value: Expr::ObjectLiteral { name, fields, .. },
+                        ..
+                    } if name == "Counter" && fields.len() == 2
+                ));
+                assert!(matches!(&body[1], Stmt::FieldAssign { field, .. } if field == "value"));
+            }
+            other => panic!("expected function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generic_type_parameter_shadows_object_name() {
+        let (prog, diags) =
+            parse_src("type T = object { value: u64, }; function id[T](x: T): T { return x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[1] {
+            Item::Function { params, ret, .. } => {
+                assert_eq!(params[0].ty, Some(VlType::Param("T".into())));
+                assert_eq!(*ret, Some(VlType::Param("T".into())));
+            }
+            other => panic!("expected function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_object_names_reserved_for_builtins() {
+        let (_prog, diags) = parse_src("type String = object { value: u64, };");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("reserved"));
     }
 
     #[test]

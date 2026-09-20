@@ -1576,22 +1576,51 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 return;
             };
             let Some(def) = ctx.objects.get(object_name.as_str()).copied() else {
+                e.diags.push(
+                    Diagnostic::error(format!(
+                        "unknown object layout `{object_name}` (compiler bug)"
+                    ))
+                    .with_label(*span, "field read emitted here")
+                    .with_code("E500"),
+                );
                 e.invalid.insert(*dst);
                 return;
             };
             let Some((is_ref, slot, field_ty)) = object_slot(def, name) else {
+                e.diags.push(
+                    Diagnostic::error(format!(
+                        "object `{object_name}` has no usable field `{name}` (compiler bug)"
+                    ))
+                    .with_label(*span, "field read emitted here")
+                    .with_code("E500"),
+                );
                 e.invalid.insert(*dst);
                 return;
             };
             let Some(obj) = e.rf_map.get(object).copied() else {
+                e.diags.push(
+                    Diagnostic::error("Naravm backend could not resolve an object reference")
+                        .with_label(*span, "field read emitted here")
+                        .with_code("E500"),
+                );
                 e.invalid.insert(*dst);
                 return;
             };
             let Some(kind) = NaraKind::of_ty(ty).or_else(|| NaraKind::of_ty(field_ty)) else {
+                e.diags.push(
+                    Diagnostic::error("Naravm backend could not resolve an object field type")
+                        .with_label(*span, "field read emitted here")
+                        .with_code("E500"),
+                );
                 e.invalid.insert(*dst);
                 return;
             };
             let Some(slot) = u8::try_from(slot).ok() else {
+                e.diags.push(
+                    Diagnostic::error("Naravm object field slot is out of range (compiler bug)")
+                        .with_label(*span, "field read emitted here")
+                        .with_code("E500"),
+                );
                 e.invalid.insert(*dst);
                 return;
             };
@@ -1627,22 +1656,59 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 return;
             }
             let Some(NaraKind::Object(object_name)) = e.kinds.get(object).cloned() else {
+                e.diags.push(
+                    Diagnostic::error("Naravm backend expected an object reference")
+                        .with_label(*span, "field write emitted here")
+                        .with_code("E500"),
+                );
                 return;
             };
             let Some(def) = ctx.objects.get(object_name.as_str()).copied() else {
+                e.diags.push(
+                    Diagnostic::error(format!(
+                        "unknown object layout `{object_name}` (compiler bug)"
+                    ))
+                    .with_label(*span, "field write emitted here")
+                    .with_code("E500"),
+                );
                 return;
             };
             let Some((is_ref, slot, field_ty)) = object_slot(def, name) else {
+                e.diags.push(
+                    Diagnostic::error(format!(
+                        "object `{object_name}` has no usable field `{name}` (compiler bug)"
+                    ))
+                    .with_label(*span, "field write emitted here")
+                    .with_code("E500"),
+                );
                 return;
             };
             let Some(obj) = e.rf_map.get(object).copied() else {
+                e.diags.push(
+                    Diagnostic::error("Naravm backend could not resolve an object reference")
+                        .with_label(*span, "field write emitted here")
+                        .with_code("E500"),
+                );
                 return;
             };
             let Some(slot) = u8::try_from(slot).ok() else {
+                e.diags.push(
+                    Diagnostic::error("Naravm object field slot is out of range (compiler bug)")
+                        .with_label(*span, "field write emitted here")
+                        .with_code("E500"),
+                );
                 return;
             };
             let kind = NaraKind::of_ty(ty).or_else(|| NaraKind::of_ty(field_ty));
-            if is_ref || kind.as_ref().is_some_and(NaraKind::is_ref) {
+            let Some(kind) = kind else {
+                e.diags.push(
+                    Diagnostic::error("Naravm backend could not resolve an object field type")
+                        .with_label(*span, "field write emitted here")
+                        .with_code("E500"),
+                );
+                return;
+            };
+            if is_ref || kind.is_ref() {
                 let Some(src) = e.ref_reg(*value, *span) else {
                     return;
                 };
@@ -2543,6 +2609,68 @@ mod tests {
         for op in [0x26u8, 0x2b, 0x2a] {
             assert!(bytes.contains(&op), "no {op:#x} in {bytes:?}");
         }
+    }
+
+    #[test]
+    fn naravm_emits_objects_with_mixed_lane_field_ops() {
+        let lir = lir_of(
+            "use std; type Counter = object { value: u64, label: string, }; function main() { let c = Counter { value: 1, label: \"count\" }; c.value = 2; std.print(c.label); }",
+        );
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let bytes = artifact.unwrap().bytes.unwrap();
+        assert_eq!(&bytes[..4], b"nara");
+        // createi = 0x27, getrfati = 0x2E, setvati/setrfati = 0x2D/0x2F.
+        for op in [0x27u8, 0x2d, 0x2e, 0x2f] {
+            assert!(bytes.contains(&op), "no {op:#x} in {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn naravm_rejects_missing_object_fields_in_lir() {
+        let lir = LirProgram {
+            module: "t".into(),
+            objects: vec![vl_lir::ObjectDef {
+                name: "Counter".into(),
+                fields: vec![("value".into(), vl_typecheck::Ty::U64)],
+            }],
+            functions: vec![
+                vl_lir::Function {
+                    name: "read".into(),
+                    param_tys: vec![vl_typecheck::Ty::Object("Counter".into())],
+                    ret: vl_typecheck::Ty::U64,
+                    instrs: vec![
+                        Instr::Param {
+                            dst: vl_lir::Reg(0),
+                            index: 0,
+                            span: Span::empty(0),
+                        },
+                        Instr::ObjectGet {
+                            dst: vl_lir::Reg(1),
+                            object: vl_lir::Reg(0),
+                            name: "missing".into(),
+                            ty: vl_typecheck::Ty::U64,
+                            span: Span::empty(0),
+                        },
+                        Instr::Ret {
+                            src: vl_lir::Reg(1),
+                            span: Span::empty(0),
+                        },
+                    ],
+                },
+                vl_lir::Function {
+                    name: "main".into(),
+                    param_tys: vec![],
+                    ret: vl_typecheck::Ty::Void,
+                    instrs: vec![],
+                },
+            ],
+        };
+        let (_, diags) = NaraVmTarget.emit(&lir);
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E500")),
+            "{diags:?}"
+        );
     }
 
     #[test]
