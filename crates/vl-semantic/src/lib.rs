@@ -28,6 +28,7 @@ pub struct Def {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefKind {
     Local,
+    Parameter,
     External,
 }
 
@@ -41,12 +42,20 @@ pub struct Resolution {
 
 impl Resolution {
     fn intern_def(&mut self, name: String, span: Span) -> DefId {
+        self.intern_def_as(name, span, DefKind::Local)
+    }
+
+    fn intern_param(&mut self, name: String, span: Span) -> DefId {
+        self.intern_def_as(name, span, DefKind::Parameter)
+    }
+
+    fn intern_def_as(&mut self, name: String, span: Span, kind: DefKind) -> DefId {
         let id = DefId(self.defs.len() as u32);
         self.defs.push(Def {
             id: id.clone(),
             name,
             span,
-            kind: DefKind::Local,
+            kind,
             sig: None,
         });
         id
@@ -74,6 +83,10 @@ struct Resolver {
     modules: Vec<ModuleSpec>,
     imports: HashMap<String, ModuleSpec>,
     poisoned_imports: std::collections::HashSet<String>,
+    /// Parameter `DefId`s shadowed by a duplicate declaration in the same
+    /// function. Assigning to them already has one root cause (E200), so E205
+    /// stays quiet.
+    poisoned_params: std::collections::HashSet<u32>,
     loop_depth: usize,
 }
 
@@ -92,6 +105,7 @@ pub fn resolve_with_modules(
         modules: modules.to_vec(),
         imports: HashMap::new(),
         poisoned_imports: std::collections::HashSet::new(),
+        poisoned_params: std::collections::HashSet::new(),
         loop_depth: 0,
     };
 
@@ -164,9 +178,14 @@ pub fn resolve_with_modules(
                             diagnostic = diagnostic.with_bare_label(previous);
                         }
                         r.diags.push(diagnostic);
+                        // The surviving binding is ambiguous; suppress E205
+                        // for it so the duplicate stays the one root cause.
+                        if let Some(id) = r.scopes.last().and_then(|s| s.get(&p.name)) {
+                            r.poisoned_params.insert(id.0);
+                        }
                         continue;
                     }
-                    let id = r.out.intern_def(p.name.clone(), p.name_span);
+                    let id = r.out.intern_param(p.name.clone(), p.name_span);
                     r.scopes.last_mut().unwrap().insert(p.name.clone(), id);
                 }
                 for stmt in body {
@@ -240,7 +259,32 @@ impl Resolver {
                 self.resolve_expr(value);
                 match self.lookup(name) {
                     Some(id) => {
-                        self.out.uses.insert((name_span.start, name_span.end), id);
+                        self.out
+                            .uses
+                            .insert((name_span.start, name_span.end), id.clone());
+                        // Parameters are fixed bindings: direct rebinding is
+                        // rejected here (E205). Field/index mutation through a
+                        // parameter (`p.field = ...`, `p[i] = ...`) is a
+                        // referent mutation decided by type checking, not here.
+                        // Duplicated parameters already have one root cause
+                        // (E200), so E205 stays quiet for them.
+                        if self.poisoned_params.contains(&id.0) {
+                            return;
+                        }
+                        if let Some(def) = self.out.defs.iter().find(|d| d.id == id) {
+                            if def.kind == DefKind::Parameter {
+                                self.diags.push(
+                                    Diagnostic::error(format!(
+                                        "cannot rebind parameter `{name}`"
+                                    ))
+                                    .with_label(*name_span, "parameters are fixed bindings")
+                                    .with_note(
+                                        "`*Foo` parameters permit field or index mutation, not assignment to the parameter; declare a local `let` when rebinding is needed",
+                                    )
+                                    .with_code("E205"),
+                                );
+                            }
+                        }
                     }
                     None => {
                         self.diags.push(
@@ -818,6 +862,68 @@ mod tests {
     fn index_into_undefined_array_errors() {
         let (_, diags) = resolve_src("function main() { let x = missing[0u64]; x; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E201")));
+    }
+
+    #[test]
+    fn direct_parameter_rebinding_is_one_e205() {
+        for src in [
+            "function f(x: u64) { x = 1u64; }",
+            "type Foo = object { value: u64, }; function f(x: Foo, y: Foo) { x = y; }",
+            "type Foo = object { value: u64, }; function f(x: *Foo, y: *Foo) { x = y; }",
+        ] {
+            let (_, diags) = resolve_src(src);
+            let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{src}: {diags:?}");
+            assert_eq!(errors[0].code.as_deref(), Some("E205"), "{src}: {diags:?}");
+            assert!(
+                errors[0].message.contains("cannot rebind parameter"),
+                "{diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parameter_field_and_index_mutation_still_resolve() {
+        let (_, diags) = resolve_src(
+            "type Foo = object { value: u64, }; function f(x: *Foo, a: *Array[u64]) { x.value = 1u64; a[0u64] = 1u64; }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+    }
+
+    #[test]
+    fn local_rebinding_and_shadowing_still_allowed() {
+        let (_, diags) = resolve_src(
+            "function f(x: u64) { let x = 1u64; x = 2u64; } function g() { let y = 1u64; y = 2u64; }",
+        );
+        // Shadowing is a warning; rebinding the local is fine.
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+    }
+
+    #[test]
+    fn unresolved_assign_target_is_one_e201() {
+        let (_, diags) = resolve_src("function main() { missing = 1u64; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code.as_deref(), Some("E201"));
+    }
+
+    #[test]
+    fn parameter_assign_keeps_target_mapping_for_hir() {
+        let (res, diags) = resolve_src("function f(x: u64) { x = 1u64; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        // Target mapping retained so HIR stays structurally complete.
+        let uses = res.uses.len();
+        assert!(uses >= 1, "assign target must remain mapped");
+        let param_def = res.defs.iter().find(|d| d.name == "x").expect("param def");
+        assert_eq!(param_def.kind, DefKind::Parameter);
+    }
+
+    #[test]
+    fn duplicate_parameter_suppresses_e205() {
+        let (_, diags) = resolve_src("function f(x: u64, x: u64) { x = 1u64; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E200"), "{diags:?}");
     }
 
     fn vl_codegen_modules() -> Vec<ModuleSpec> {

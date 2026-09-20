@@ -540,6 +540,7 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
         type_env: HashMap::new(),
         type_bounds: HashMap::new(),
         pending_instances: Vec::new(),
+        param_defs: HashSet::new(),
     };
     // Pass 0: collect object layouts so field types and object literals can
     // refer to declarations in either order.
@@ -645,6 +646,10 @@ struct Checker {
     /// Concrete `(template DefId.0, args)` pairs awaiting the separate
     /// monomorphization pass ([`mono::expand`]).
     pending_instances: Vec<(u32, Vec<Ty>)>,
+    /// Parameter `DefId.0`s of the function being checked. Direct `Assign`
+    /// to one already has its root cause (E205 from resolution), so boundary
+    /// mismatches stay quiet here to keep one diagnostic.
+    param_defs: HashSet<u32>,
 }
 
 impl Checker {
@@ -722,6 +727,9 @@ impl Checker {
                             .map(|v| Ty::from_vl_in(v, &self.type_env))
                             .unwrap_or(Ty::Error);
                         self.bindings.insert(def.0, t);
+                        // Direct rebinding of a parameter already has its root
+                        // cause (E205); remember it so `Assign` stays quiet.
+                        self.param_defs.insert(def.0);
                     }
                 }
                 // Explicit returns only: the body's tail value is discarded.
@@ -963,6 +971,14 @@ impl Checker {
             HirStmt::Assign { id, def, value, .. } => {
                 let Some(def) = def else {
                     // Unresolved target already reported (E201); stay quiet.
+                    self.record(*id, Ty::Error);
+                    return;
+                };
+                // Direct parameter rebinding already has its root cause (E205
+                // from resolution). Infer the RHS for inner errors, then poison
+                // quietly without a second boundary diagnostic.
+                if self.param_defs.contains(&def.0) {
+                    let _ = self.infer_expr(value);
                     self.record(*id, Ty::Error);
                     return;
                 };
