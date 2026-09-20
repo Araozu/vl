@@ -1,6 +1,6 @@
 # Project module resolution plan
 
-Status: proposed
+Status: implemented for monomorphic source function imports
 
 ## Goal
 
@@ -715,4 +715,3 @@ The function-module feature is complete when:
 - documentation clearly states the canonical path rules and the temporary
   object/global boundary;
 - `./scripts/check.sh` passes.
-

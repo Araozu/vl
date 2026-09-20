@@ -7,8 +7,8 @@
 //!   `--emit asm` until a real target lands.
 //! - [`StackVmTarget`]: stack-machine text format sketch (still TBD).
 //! - [`NaraVmTarget`]: executable Naravm 0.2 vmfiles: `fun main()`,
-//!   when present, becomes the `<entrypoint>` function plus one Nara function
-//!   per other user function. Integer/float arithmetic, comparisons, and control flow
+//!   when present, gets an ordinary callable body plus a single `<entrypoint>`
+//!   wrapper. Integer/float arithmetic, comparisons, and control flow
 //!   plus `std.print` / `std.println` / `std.print_u64` and user-function calls lower to
 //!   `calli`.
 //!
@@ -180,7 +180,21 @@ fn dummy_instr(ins: &Instr) -> String {
                 .map(|arg| format!("%{}", arg.0))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("call %{}, {callee}({args})", dst.0)
+            if callee.module == "<anonymous>"
+                || (callee.module == "std" && !callee.function.contains('.'))
+            {
+                format!("call %{}, {}({args})", dst.0, callee.function)
+            } else if callee.module == "std" {
+                format!(
+                    "call %{}, {}.{}({args})",
+                    dst.0, callee.module, callee.function
+                )
+            } else {
+                format!(
+                    "call %{}, {}::{}({args})",
+                    dst.0, callee.module, callee.function
+                )
+            }
         }
         Instr::Ret { src, .. } => format!("ret %{}", src.0),
         Instr::NewArray { dst, len, .. } => {
@@ -299,8 +313,9 @@ impl Target for StackVmTarget {
 // --------------------------------------------------------- Naravm ---
 
 /// Naravm 0.2 executable vmfile backend: compiles `fun main()`, when
-/// present, to the `<entrypoint>` function plus one Nara function per other
-/// user function (see the internals book for the supported subset). A module
+/// present, to an ordinary callable function plus a single `<entrypoint>`
+/// wrapper and one Nara function per other user function (see the internals
+/// book for the supported subset). A module
 /// without `main` still compiles (a library); entrypoint presence is the
 /// VM/loader's check, not the compiler's. Calls to
 /// `std.print` / `std.println` / `std.print_u64` and to user functions lower
@@ -702,6 +717,9 @@ struct NaraFnCtx<'a> {
     is_main: bool,
     sigs: &'a std::collections::HashMap<&'a str, &'a vl_lir::Function>,
     fn_consts: &'a std::collections::HashMap<String, usize>,
+    imported_fn_consts: &'a std::collections::HashMap<vl_lir::FunctionRef, usize>,
+    imports: &'a std::collections::HashMap<vl_lir::FunctionRef, vl_lir::FunctionImport>,
+    module: &'a str,
     objects: &'a std::collections::HashMap<&'a str, &'a vl_lir::ObjectDef>,
     print_fn_idx: usize,
     print_u64_fn_idx: usize,
@@ -942,7 +960,13 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
     let module_idx = e
         .add_string(prog.module.as_bytes(), Span::empty(0))
         .unwrap_or(0);
-    let entry_name_idx = e.add_string(b"<entrypoint>", Span::empty(0)).unwrap_or(0);
+    let owns_entrypoint =
+        prog.entrypoint && prog.entrypoint_module.as_deref() == Some(prog.module.as_str());
+    let entry_name_idx = if owns_entrypoint && prog.functions.iter().any(|f| f.name == "main") {
+        e.add_string(b"<entrypoint>", Span::empty(0)).unwrap_or(0)
+    } else {
+        0
+    };
     let std_idx = e.add_string(b"std", Span::empty(0)).unwrap_or(0);
     let print_idx = e.add_string(b"print", Span::empty(0)).unwrap_or(0);
     let print_u64_idx = e.add_string(b"print_u64", Span::empty(0)).unwrap_or(0);
@@ -957,18 +981,17 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
         function: print_u64_idx,
     });
 
-    // Pre-pass: intern every user function name plus a
-    // `Function{module, function}` constant for it, so (mutually) recursive
-    // calls resolve even when the callee is emitted later. With globals,
-    // `main` calls resolve to the separate `main` body (no re-init);
-    // `<entrypoint>` runs inits once at startup then calls `main`.
-    // Without globals, `main` maps directly to `<entrypoint>` as before.
+    // Pre-pass: intern every user function name plus a function constant so
+    // recursive calls resolve even when the callee is emitted later. `main`
+    // is always ordinary callable code; the separate `<entrypoint>` wrapper
+    // is the only VM entrypoint.
     let has_globals = !prog.globals.is_empty();
     let has_main = prog.functions.iter().any(|f| f.name == "main");
     // Keep library initialization as ordinary module metadata. A library must
     // not claim the VM's unique entrypoint; a future loader can invoke this
     // function before exposing the library's other functions.
-    let module_init_name_idx = if !has_main && has_globals {
+    let has_entrypoint = owns_entrypoint && has_main;
+    let module_init_name_idx = if !has_entrypoint && has_globals {
         e.add_string(b"<module-init>", Span::empty(0))
     } else {
         None
@@ -980,19 +1003,16 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
             continue;
         }
         if f.name == "main" {
-            if has_globals {
-                // Separate `main` body for recursion; entrypoint calls it.
-                let Some(main_idx) = e.add_string(b"main", Span::empty(0)) else {
-                    continue;
-                };
-                if let Some(idx) = nara_push_fn_const(&mut e, module_idx, main_idx) {
-                    fn_consts.insert(f.name.clone(), idx);
-                    fn_names.insert(f.name.clone(), main_idx);
-                }
-                // Entrypoint const (not in fn_consts; startup only).
-                let _ = nara_push_fn_const(&mut e, module_idx, entry_name_idx);
-            } else if let Some(idx) = nara_push_fn_const(&mut e, module_idx, entry_name_idx) {
+            let Some(main_idx) = e.add_string(b"main", Span::empty(0)) else {
+                continue;
+            };
+            if let Some(idx) = nara_push_fn_const(&mut e, module_idx, main_idx) {
                 fn_consts.insert(f.name.clone(), idx);
+                fn_names.insert(f.name.clone(), main_idx);
+            }
+            // Entrypoint const (not in fn_consts; startup only).
+            if has_entrypoint {
+                let _ = nara_push_fn_const(&mut e, module_idx, entry_name_idx);
             }
             continue;
         }
@@ -1002,6 +1022,31 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
         if let Some(idx) = nara_push_fn_const(&mut e, module_idx, name_idx) {
             fn_consts.insert(f.name.clone(), idx);
             fn_names.insert(f.name.clone(), name_idx);
+        }
+    }
+    let imports: std::collections::HashMap<vl_lir::FunctionRef, vl_lir::FunctionImport> = prog
+        .imports
+        .iter()
+        .cloned()
+        .map(|i| (i.symbol.clone(), i))
+        .collect();
+    let mut imported_fn_consts = std::collections::HashMap::new();
+    let mut ordered_imports = imports.values().collect::<Vec<_>>();
+    ordered_imports.sort_by(|a, b| {
+        a.symbol
+            .module
+            .cmp(&b.symbol.module)
+            .then_with(|| a.symbol.function.cmp(&b.symbol.function))
+    });
+    for import in ordered_imports {
+        let Some(module) = e.add_string(import.symbol.module.as_bytes(), Span::empty(0)) else {
+            continue;
+        };
+        let Some(function) = e.add_string(import.symbol.function.as_bytes(), Span::empty(0)) else {
+            continue;
+        };
+        if let Some(idx) = nara_push_fn_const(&mut e, module, function) {
+            imported_fn_consts.insert(import.symbol.clone(), idx);
         }
     }
     if e.diags.iter().any(|d| d.is_error()) {
@@ -1033,13 +1078,16 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
             is_main,
             sigs: &sigs,
             fn_consts: &fn_consts,
+            imported_fn_consts: &imported_fn_consts,
+            imports: &imports,
+            module: &prog.module,
             objects: &objects,
             print_fn_idx,
             print_u64_fn_idx,
             global_slots: &global_slots,
             global_tys: &global_tys,
         };
-        if is_main && !prog.globals.is_empty() {
+        if is_main {
             // Allocate the module-state container first (exact sizes).
             // Initializers run once at startup before the main body.
             // Note: a pathological recursive `main()` call would re-enter the
@@ -1117,7 +1165,7 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
         // With globals, `main` calls resolve to the separate `main` body
         // below (no re-init); the `<entrypoint>` above runs inits once at
         // startup then calls it. Without globals, `main` IS the entrypoint.
-        if is_main && !prog.globals.is_empty() {
+        if is_main && has_entrypoint {
             // Call `main` (zero args, void) then bare return.
             if let Some(main_const) = fn_consts.get("main").copied() {
                 nara_calli(&mut e, main_const, Span::empty(0));
@@ -1143,6 +1191,9 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
                 is_main: false,
                 sigs: &sigs,
                 fn_consts: &fn_consts,
+                imported_fn_consts: &imported_fn_consts,
+                imports: &imports,
+                module: &prog.module,
                 objects: &objects,
                 print_fn_idx,
                 print_u64_fn_idx,
@@ -1179,7 +1230,7 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
         if !nara_resolve_jumps(&mut e) {
             break;
         }
-        let name_idx = if is_main {
+        let name_idx = if is_main && has_entrypoint {
             entry_name_idx
         } else {
             fn_names.get(&f.name).copied().unwrap_or(entry_name_idx)
@@ -1190,7 +1241,7 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
     // deliberately not `<entrypoint>`: Naravm allows only one entrypoint when
     // loading multiple modules, while a future loader can invoke this
     // metadata function before exposing the library's other functions.
-    if !has_main && !prog.globals.is_empty() {
+    if !has_entrypoint && !prog.globals.is_empty() {
         e.reset_fn(std::collections::HashMap::new());
         // Stub function for init-only emission when no user function exists.
         let stub;
@@ -1212,6 +1263,9 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
                 is_main: false,
                 sigs: &sigs,
                 fn_consts: &fn_consts,
+                imported_fn_consts: &imported_fn_consts,
+                imports: &imports,
+                module: &prog.module,
                 objects: &objects,
                 print_fn_idx,
                 print_u64_fn_idx,
@@ -1721,9 +1775,17 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             // User functions first: a user function may share a bare name
             // with a std export, and the LIR callee spelling alone cannot
             // tell them apart (imports are resolved away before lowering).
-            if ctx.sigs.contains_key(callee.as_str()) {
+            let target_name = callee
+                .function
+                .strip_prefix("std.")
+                .unwrap_or(&callee.function);
+            if ((callee.module == ctx.module && ctx.sigs.contains_key(callee.function.as_str()))
+                || ctx.imports.contains_key(callee))
+                && !(callee.module == "std"
+                    && matches!(target_name, "print" | "println" | "print_u64"))
+            {
                 nara_user_call(e, ctx, *dst, callee, args, *span);
-            } else if callee == "std.print" || callee == "print" {
+            } else if callee.module == "std" && target_name == "print" {
                 if args.len() != 1 {
                     e.diags.push(
                         Diagnostic::error("std.print expects one String argument")
@@ -1743,7 +1805,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 };
                 e.bytecode.extend_from_slice(&[0x05, 0x31, s]); // cprf rf31, src
                 nara_calli(e, ctx.print_fn_idx, *span);
-            } else if callee == "std.println" || callee == "println" {
+            } else if callee.module == "std" && target_name == "println" {
                 if args.len() != 1 {
                     e.diags.push(
                         Diagnostic::error("std.println expects one String argument")
@@ -1775,7 +1837,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 // The newline register is a backend temporary, not a LIR
                 // value, so recycle it immediately for the next call.
                 e.free_rf.push(nl);
-            } else if callee == "std.print_u64" || callee == "print_u64" {
+            } else if callee.module == "std" && target_name == "print_u64" {
                 if args.len() != 1 {
                     e.diags.push(
                         Diagnostic::error("std.print_u64 expects one u64 argument")
@@ -2472,11 +2534,20 @@ fn nara_user_call(
     e: &mut NaraEmit,
     ctx: &NaraFnCtx,
     dst: vl_lir::Reg,
-    callee: &str,
+    callee: &vl_lir::FunctionRef,
     args: &[vl_lir::Reg],
     span: Span,
 ) {
-    let Some(callee_fn) = ctx.sigs.get(callee).copied() else {
+    let signature = if callee.module == ctx.module {
+        ctx.sigs
+            .get(callee.function.as_str())
+            .map(|f| (f.param_tys.clone(), f.ret.clone()))
+    } else {
+        ctx.imports
+            .get(callee)
+            .map(|f| (f.param_tys.clone(), f.ret.clone()))
+    };
+    let Some((param_tys, ret)) = signature else {
         e.diags.push(
             Diagnostic::error(format!(
                 "Naravm backend does not support call `{callee}` yet"
@@ -2497,7 +2568,7 @@ fn nara_user_call(
             return;
         }
     }
-    if args.len() != callee_fn.param_tys.len() {
+    if args.len() != param_tys.len() {
         e.diags.push(
             Diagnostic::error(format!(
                 "codegen: arity mismatch calling `{callee}` (compiler bug)"
@@ -2571,7 +2642,7 @@ fn nara_user_call(
     }
     // Reserve the return register before spilling so it cannot alias a live
     // caller register. This emits no code, only reserves a register number.
-    let ret_kind = NaraKind::of_ty(&callee_fn.ret);
+    let ret_kind = NaraKind::of_ty(&ret);
     let ret_rv = match &ret_kind {
         Some(kind) if !kind.is_ref() => match e.fresh_rv(span) {
             Some(rv) => Some(rv),
@@ -2631,7 +2702,12 @@ fn nara_user_call(
             vi += 1;
         }
     }
-    let Some(fn_idx) = ctx.fn_consts.get(callee).copied() else {
+    let fn_idx = if callee.module == ctx.module {
+        ctx.fn_consts.get(&callee.function).copied()
+    } else {
+        ctx.imported_fn_consts.get(callee).copied()
+    };
+    let Some(fn_idx) = fn_idx else {
         e.diags.push(
             Diagnostic::error(format!(
                 "codegen: missing function constant for `{callee}` (compiler bug)"
@@ -3172,6 +3248,30 @@ mod tests {
     }
 
     #[test]
+    fn naravm_keeps_main_callable_and_adds_one_designated_entrypoint() {
+        let mut lir = lir_of("fun main() { }");
+        lir.entrypoint = true;
+        lir.entrypoint_module = Some(lir.module.clone());
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let bytes = artifact.unwrap().bytes.unwrap();
+        assert_eq!(
+            bytes
+                .windows(b"<entrypoint>".len())
+                .filter(|w| *w == b"<entrypoint>")
+                .count(),
+            1
+        );
+        assert_eq!(
+            bytes
+                .windows(b"main".len())
+                .filter(|w| *w == b"main")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn naravm_passes_arrays_through_calls() {
         let lir = lir_of(
             "fun fill(a: Array[u64]): Array[u64] { a[0u64] = 7u64; return a; } fun main() { let a = fill(Array.new::[u64](1u64)); }",
@@ -3215,11 +3315,14 @@ mod tests {
     fn naravm_rejects_missing_object_fields_in_lir() {
         let lir = LirProgram {
             module: "t".into(),
+            entrypoint: false,
+            entrypoint_module: None,
             objects: vec![vl_lir::ObjectDef {
                 name: "Counter".into(),
                 fields: vec![("value".into(), vl_typecheck::Ty::U64)],
             }],
             globals: vec![],
+            imports: vec![],
             functions: vec![
                 vl_lir::Function {
                     name: "read".into(),
@@ -3368,8 +3471,11 @@ fun main() {
         use vl_lir::{Function, Instr, LirProgram, Reg};
         let lir = LirProgram {
             module: "t".into(),
+            entrypoint: false,
+            entrypoint_module: None,
             objects: vec![],
             globals: vec![],
+            imports: vec![],
             functions: vec![Function {
                 name: "main".into(),
                 param_tys: vec![],
@@ -3382,7 +3488,10 @@ fun main() {
                     },
                     Instr::Call {
                         dst: Reg(1),
-                        callee: "nope".into(),
+                        callee: vl_lir::FunctionRef {
+                            module: "t".into(),
+                            function: "nope".into(),
+                        },
                         args: vec![Reg(0)],
                         span: Span::empty(0),
                     },
@@ -3465,7 +3574,7 @@ fun main() {
         let (typed, tdiags) = vl_typecheck::check(&hir);
         assert!(tdiags.is_empty(), "{tdiags:?}");
         let lir = vl_lir::lower(&hir, &typed);
-        assert!(lir.dump().contains("call print"), "{}", lir.dump());
+        assert!(lir.dump().contains("call std::print"), "{}", lir.dump());
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
         assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
@@ -3495,7 +3604,7 @@ fun main() {
         let (typed, tdiags) = vl_typecheck::check(&hir);
         assert!(tdiags.is_empty(), "{tdiags:?}");
         let lir = vl_lir::lower(&hir, &typed);
-        assert!(lir.dump().contains("call println"), "{}", lir.dump());
+        assert!(lir.dump().contains("call std::println"), "{}", lir.dump());
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
         assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
@@ -3651,6 +3760,8 @@ fun main() {
         use vl_lir::{Function, Global, LirProgram, Reg};
         let lir = LirProgram {
             module: "t".into(),
+            entrypoint: false,
+            entrypoint_module: None,
             objects: vec![],
             globals: vec![Global {
                 id: 0,
@@ -3660,6 +3771,7 @@ fun main() {
                 result: Reg(u32::MAX),
                 span: Span::empty(0),
             }],
+            imports: vec![],
             functions: vec![Function {
                 name: "main".into(),
                 param_tys: vec![],

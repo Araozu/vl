@@ -19,6 +19,29 @@ use vl_typecheck::{subst_ty, Ty};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Reg(pub u32);
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FunctionRef {
+    pub module: String,
+    pub function: String,
+}
+
+impl std::fmt::Display for FunctionRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.module == "<anonymous>" {
+            write!(f, "{}", self.function)
+        } else {
+            write!(f, "{}::{}", self.module, self.function)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionImport {
+    pub symbol: FunctionRef,
+    pub param_tys: Vec<Ty>,
+    pub ret: Ty,
+}
+
 /// Three-address instructions. Strings are carried as raw bytes; backends
 /// in `vl-codegen` lower them to target concepts.
 #[derive(Debug, Clone)]
@@ -58,7 +81,7 @@ pub enum Instr {
     },
     Call {
         dst: Reg,
-        callee: String,
+        callee: FunctionRef,
         args: Vec<Reg>,
         span: Span,
     },
@@ -223,9 +246,14 @@ pub struct Global {
 #[derive(Debug, Clone, Default)]
 pub struct LirProgram {
     pub module: String,
+    /// Whether this module owns the standalone/project VM entrypoint.
+    pub entrypoint: bool,
+    /// Project entrypoint ownership, carried explicitly through the pipeline.
+    pub entrypoint_module: Option<String>,
     pub objects: Vec<ObjectDef>,
     pub globals: Vec<Global>,
     pub functions: Vec<Function>,
+    pub imports: Vec<FunctionImport>,
 }
 
 impl LirProgram {
@@ -341,7 +369,14 @@ fn fmt_instr(ins: &Instr) -> String {
                 .map(|arg| format!("%{}", arg.0))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("%{} = call {callee}({args})", dst.0)
+            if callee.module == "<anonymous>" {
+                format!("%{} = call {}({args})", dst.0, callee.function)
+            } else {
+                format!(
+                    "%{} = call {}::{}({args})",
+                    dst.0, callee.module, callee.function
+                )
+            }
         }
         Instr::NewArray { dst, len, elem, .. } => {
             format!("%{} = new_array %{} : {elem}", dst.0, len.0)
@@ -448,6 +483,7 @@ struct Lowerer<'t> {
     /// resolve inner generic calls per instance); `None` for root code.
     outer: Option<String>,
     typed: &'t vl_typecheck::TypedProgram,
+    module: &'t str,
 }
 
 /// Runtime-erased type: capability qualifiers removed recursively.
@@ -456,7 +492,142 @@ fn rt(ty: &Ty) -> Ty {
     ty.erase_capability()
 }
 
+fn collect_import_expr(
+    expr: &HirExpr,
+    typed: &vl_typecheck::TypedProgram,
+    out: &mut Vec<FunctionImport>,
+) {
+    match expr {
+        HirExpr::Call {
+            symbol: Some(symbol),
+            args,
+            id,
+            ..
+        } => {
+            let reference = FunctionRef {
+                module: symbol.module.as_string(),
+                function: symbol.name.clone(),
+            };
+            if !out.iter().any(|i| i.symbol == reference) {
+                let param_tys = args
+                    .iter()
+                    .filter_map(|a| typed.type_of_id(a.id()).map(|t| rt(&t)))
+                    .collect();
+                let ret = typed.type_of_id(*id).map(|t| rt(&t)).unwrap_or(Ty::Error);
+                out.push(FunctionImport {
+                    symbol: reference,
+                    param_tys,
+                    ret,
+                });
+            }
+            for arg in args {
+                collect_import_expr(arg, typed, out);
+            }
+        }
+        HirExpr::Call { args, .. } => {
+            for arg in args {
+                collect_import_expr(arg, typed, out)
+            }
+        }
+        HirExpr::ArrayLiteral { elems, .. } => {
+            for e in elems {
+                collect_import_expr(e, typed, out)
+            }
+        }
+        HirExpr::ObjectLiteral { fields, .. } => {
+            for (_, e) in fields {
+                collect_import_expr(e, typed, out)
+            }
+        }
+        HirExpr::Index { base, index, .. } => {
+            collect_import_expr(base, typed, out);
+            collect_import_expr(index, typed, out);
+        }
+        HirExpr::Field { base, .. }
+        | HirExpr::Unary { inner: base, .. }
+        | HirExpr::Cast { inner: base, .. } => collect_import_expr(base, typed, out),
+        HirExpr::Binary { lhs, rhs, .. } => {
+            collect_import_expr(lhs, typed, out);
+            collect_import_expr(rhs, typed, out);
+        }
+        HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
+    }
+}
+
+fn collect_import_stmt(
+    stmt: &HirStmt,
+    typed: &vl_typecheck::TypedProgram,
+    out: &mut Vec<FunctionImport>,
+) {
+    match stmt {
+        HirStmt::Let { value, .. } | HirStmt::Assign { value, .. } | HirStmt::Expr(value) => {
+            collect_import_expr(value, typed, out)
+        }
+        HirStmt::Return {
+            value: Some(value), ..
+        } => collect_import_expr(value, typed, out),
+        HirStmt::IndexAssign {
+            array,
+            index,
+            value,
+            ..
+        } => {
+            collect_import_expr(array, typed, out);
+            collect_import_expr(index, typed, out);
+            collect_import_expr(value, typed, out);
+        }
+        HirStmt::FieldAssign { base, value, .. } => {
+            collect_import_expr(base, typed, out);
+            collect_import_expr(value, typed, out);
+        }
+        HirStmt::If {
+            condition,
+            then_body,
+            else_body,
+            ..
+        } => {
+            collect_import_expr(condition, typed, out);
+            for s in then_body {
+                collect_import_stmt(s, typed, out);
+            }
+            if let Some(body) = else_body {
+                for s in body {
+                    collect_import_stmt(s, typed, out);
+                }
+            }
+        }
+        HirStmt::While {
+            condition, body, ..
+        } => {
+            collect_import_expr(condition, typed, out);
+            for s in body {
+                collect_import_stmt(s, typed, out);
+            }
+        }
+        HirStmt::Return { value: None, .. } | HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
+    }
+}
+
+fn collect_imports(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> Vec<FunctionImport> {
+    let mut out = Vec::new();
+    for item in &prog.items {
+        match item {
+            HirItem::Fn { body, .. } => {
+                for stmt in body {
+                    collect_import_stmt(stmt, typed, &mut out)
+                }
+            }
+            HirItem::Let { value, .. } => collect_import_expr(value, typed, &mut out),
+            HirItem::Object { .. } => {}
+        }
+    }
+    out
+}
+
 impl Lowerer<'_> {
+    fn typed_module(&self) -> String {
+        self.module.to_owned()
+    }
     fn reg(&mut self) -> Reg {
         let r = Reg(self.next);
         self.next += 1;
@@ -653,9 +824,12 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
 
     let mut out = LirProgram {
         module: prog.module.clone(),
+        entrypoint: false,
+        entrypoint_module: None,
         objects,
         globals: Vec::new(),
         functions: Vec::new(),
+        imports: collect_imports(prog, typed),
     };
 
     // Globals first (source order): initializers may read earlier globals via
@@ -689,6 +863,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
             env: HashMap::new(),
             outer: None,
             typed,
+            module: prog.module.as_str(),
         };
         if let Some(r) = l.lower_expr(value, typed) {
             out.globals.push(Global {
@@ -750,6 +925,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                     env: HashMap::new(),
                     outer: None,
                     typed,
+                    module: prog.module.as_str(),
                 };
 
                 for (index, (_, def, _, span)) in params.iter().enumerate() {
@@ -812,6 +988,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
             env,
             outer: Some(m.clone()),
             typed,
+            module: prog.module.as_str(),
         };
         for (index, (_, def, _, span)) in params.iter().enumerate() {
             let dst = l.reg();
@@ -966,6 +1143,7 @@ impl Lowerer<'_> {
             HirExpr::Call {
                 id,
                 name,
+                symbol,
                 args,
                 span,
                 ..
@@ -992,7 +1170,7 @@ impl Lowerer<'_> {
                 // Monomorphized callees: root code consults `root_calls`,
                 // instance bodies consult `inst_calls` for their own outer
                 // instance. Unmapped names call through unchanged.
-                let callee = match &self.outer {
+                let function = match &self.outer {
                     Some(outer) => self
                         .typed
                         .inst_calls
@@ -1006,6 +1184,16 @@ impl Lowerer<'_> {
                         .cloned()
                         .unwrap_or_else(|| name.clone()),
                 };
+                let callee = symbol
+                    .as_ref()
+                    .map(|s| FunctionRef {
+                        module: s.module.as_string(),
+                        function: s.name.clone(),
+                    })
+                    .unwrap_or_else(|| FunctionRef {
+                        module: self.typed_module(),
+                        function,
+                    });
                 let mut arg_regs = Vec::with_capacity(args.len());
                 for arg in args {
                     arg_regs.push(self.lower_expr(arg, typed)?);

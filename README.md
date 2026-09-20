@@ -69,11 +69,18 @@ check = "vl check src/main.vl"
 ```
 
 With no source-file argument, `vl build` reads only the current directory's
-`vl.toml`, recursively builds every `.vl` file under `source`, and writes flat
-Naravm artifacts under `out`. A file such as `src/foo/bar.vl` is compiled as
-module `my_app.foo.bar` and written to `out/my_app__foo__bar.naravm`. The
-`source` and `out` paths are relative to the project directory unless they are
-absolute. `vl build path/to/file.vl` remains available for single-file builds.
+`vl.toml`, recursively discovers and parses every `.vl` file before resolving
+any imports, and writes flat Naravm artifacts under `out`. A file such as
+`src/foo/bar.vl` is compiled as module `my_app.foo.bar` and written to
+`out/my_app__foo__bar.naravm`. Top-level functions are public by default and
+can be imported with `use my_app.foo.bar;`, `use my_app.foo.bar.run;`, or
+`use my_app.foo.bar.{run, stop};`. Project `check` uses the same source catalog
+and reports errors from the whole project. Final artifacts are written only
+after every source unit is clean, and a project may contain at most one `main`.
+The `source` and `out` paths are relative to the project directory unless they
+are absolute. `vl build path/to/file.vl` remains available for single-file
+builds; project imports require the project build/check path. Imported generic
+functions and cross-module object/global boundaries remain deferred.
 
 Project scripts are commands in the optional `[scripts]` table. They run only
 through `vl run`: `vl run` runs the special `run` script, while `vl run check`

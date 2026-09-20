@@ -181,6 +181,8 @@ pub enum HirExpr {
         /// Compiler-owned extern signature copied from the resolved `Def`.
         /// `None` for locals, poisoned imports, or unresolved callees.
         extern_sig: Option<vl_common::FuncSig>,
+        /// Qualified provider identity for imported and target functions.
+        symbol: Option<vl_common::SymbolRef>,
         name: String,
         /// Explicit type arguments (`f::[u64]`); empty means infer.
         type_args: Vec<VlType>,
@@ -529,18 +531,24 @@ impl<'a> Lowerer<'a> {
                 let resolved = def
                     .as_ref()
                     .and_then(|d| self.res.defs.iter().find(|r| r.id == *d));
-                let external =
-                    resolved.is_some_and(|r| matches!(r.kind, vl_semantic::DefKind::External));
+                let external = resolved.is_some_and(|r| {
+                    matches!(
+                        r.kind,
+                        vl_semantic::DefKind::External | vl_semantic::DefKind::ImportedFunction
+                    )
+                });
                 let extern_sig = if external {
                     resolved.and_then(|r| r.sig.clone())
                 } else {
                     None
                 };
+                let symbol = resolved.and_then(|r| r.symbol.clone());
                 HirExpr::Call {
                     id: self.id(),
                     def,
                     external,
                     extern_sig,
+                    symbol,
                     name: callee.join("."),
                     type_args: type_args.clone(),
                     args: args.iter().map(|a| self.lower_expr(a)).collect(),

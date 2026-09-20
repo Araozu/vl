@@ -23,7 +23,7 @@ fn hello_compiles_to_lir() {
     let src = std::fs::read_to_string("examples/hello.vl").unwrap();
     let lir = frontend(&src).expect("hello.vl must compile");
     let dump = lir.dump();
-    assert!(dump.contains("call std.print"), "{dump}");
+    assert!(dump.contains("call std::print"), "{dump}");
     assert!(dump.contains("ret"), "{dump}");
 }
 
@@ -49,7 +49,7 @@ fn println_compiles_and_runs_on_naravm() {
     let lir = frontend("use std; fun main() { std.println(\"hi\"); std.print(\"x\\n\"); }")
         .expect("println must compile");
     let dump = lir.dump();
-    assert!(dump.contains("call std.println"), "{dump}");
+    assert!(dump.contains("call std::println"), "{dump}");
     let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
     assert!(diags.is_empty(), "{diags:?}");
     let bytes = artifact.unwrap().bytes.unwrap();
@@ -63,6 +63,20 @@ fn println_arg_types_are_checked() {
         frontend("use std; fun main() { std.println(1); }").expect_err("println expects String");
     assert!(
         err.iter().any(|d| d.message.contains("expects `String`")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn module_alias_is_not_treated_as_a_callable_import() {
+    let err =
+        frontend("use std; fun main() { std(); }").expect_err("a module alias is not callable");
+    assert!(
+        err.iter().any(|d| d.code.as_deref() == Some("E303")),
+        "{err:?}"
+    );
+    assert!(
+        !err.iter().any(|d| d.code.as_deref() == Some("E500")),
         "{err:?}"
     );
 }
@@ -155,7 +169,7 @@ fn dummy_backend_emits_pseudo_asm() {
     let (art, diags) = vl_codegen::DummyTarget.emit(&lir);
     assert!(diags.is_empty());
     let text = art.unwrap().text;
-    assert!(text.contains("std.print") && text.contains("ret"), "{text}");
+    assert!(text.contains("print") && text.contains("ret"), "{text}");
 }
 
 #[test]
@@ -233,9 +247,9 @@ fn module_imports_resolve_without_importing_descendants() {
     let src = std::fs::read_to_string("examples/modules.vl").unwrap();
     let lir = frontend(&src).expect("module imports must compile");
     let dump = lir.dump();
-    assert!(dump.contains("call string.len"), "{dump}");
-    assert!(dump.contains("call open"), "{dump}");
-    assert!(dump.contains("call read"), "{dump}");
+    assert!(dump.contains("call std.string::len"), "{dump}");
+    assert!(dump.contains("call std.fs::open"), "{dump}");
+    assert!(dump.contains("call std.fs::read"), "{dump}");
 }
 
 #[test]
