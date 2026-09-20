@@ -1562,7 +1562,14 @@ impl Checker {
                 if ty_has_error(&t) {
                     return None;
                 }
-                if t == Ty::Void {
+                if !is_capability_valid(&t) {
+                    // Explicit `*T`, `*u64`, `**Foo` never valid, even as
+                    // generic arguments. Substitution could otherwise launder
+                    // `*T` with `T = u64` into `*u64`.
+                    validate_capability(&t, span, &mut self.diags);
+                    return None;
+                }
+                if t == Ty::Void || t.is_void() {
                     self.diags.push(
                         Diagnostic::error("type argument cannot be `void`")
                             .with_label(span, "`void` is not a value type")
@@ -3161,7 +3168,8 @@ pub(crate) fn can_coerce(got: &Ty, want: &Ty) -> bool {
 
 /// Safe common type for array literals and generic constraint merging.
 /// Picks the read-only side when mixing `*R` and `R`, defers `int` to a
-/// concrete integer lane, and recurses through `Array`. Returns `None` on
+/// concrete integer lane, and recurses through `Array` (combining both, so
+/// `*Array[u64]` + `Array[int]` gives `Array[u64]`). Returns `None` on
 /// genuine conflict.
 fn common_type(a: &Ty, b: &Ty) -> Option<Ty> {
     if same_type(a, b) {
@@ -3179,10 +3187,22 @@ fn common_type(a: &Ty, b: &Ty) -> Option<Ty> {
         if same_type(ai, b) {
             return Some(b.clone());
         }
+        // Combined downgrade + structural (e.g. `*Array[u64]` vs
+        // `Array[int]`): try the readonly view first.
+        if let Some(c) = common_type(ai, b) {
+            // Only accept when the result is readonly-safe (no invented
+            // authority): `c` must be coercible to itself and not introduce
+            // a new `*` beyond `b`'s shape. Since `ai` is readonly, `c`
+            // derived from it is safe.
+            return Some(c);
+        }
     }
     if let Ty::Mutable(bi) = b {
         if same_type(a, bi) {
             return Some(a.clone());
+        }
+        if let Some(c) = common_type(a, bi) {
+            return Some(c);
         }
     }
     match (a, b) {
@@ -3294,7 +3314,7 @@ fn validate_capability(ty: &Ty, span: Span, diags: &mut Vec<Diagnostic>) -> bool
 /// Quiet validity check for capability placement (no diagnostics).
 /// False for `*` over scalars/`void`, nested `**`, `*T`, and any `Array`
 /// containing such.
-fn is_capability_valid(ty: &Ty) -> bool {
+pub(crate) fn is_capability_valid(ty: &Ty) -> bool {
     match ty {
         Ty::Mutable(inner) => {
             if inner.is_mutable_view() {
@@ -4650,5 +4670,88 @@ mod tests {
         );
         // `Foo as u64` is an unsupported cast (E302), not a capability upgrade.
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E302")));
+    }
+
+    #[test]
+    fn generic_mutable_inference_preserves_and_merges() {
+        // Unconstrained `T` preserves `*Foo`.
+        let (typed, diags) = check_src(
+            "type Foo = object { value: u64, }; function identity[T](x: T): T { return x; } function main() { let e: *Foo = Foo { value = 1u64 }; let same = identity(e); same; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.instances.contains_key("identity$Mut_Object_Foo"));
+
+        // Explicit turbofish accepts `*Foo`.
+        let (_, diags) = check_src(
+            "type Foo = object { value: u64, }; function identity[T](x: T): T { return x; } function main() { let e: *Foo = Foo { value = 1u64 }; let same = identity::[*Foo](e); same; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+
+        // Mixed `*Foo` + `Foo` constraints choose read-only `Foo`.
+        let (typed, diags) = check_src(
+            "type Foo = object { value: u64, }; function same[T](a: T, b: T): T { return a; } function main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = Foo { value = 2u64 }; let r = same(e, v); r; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.instances.contains_key("same$Object_Foo"));
+
+        // Mangling distinguishes `Foo` from `*Foo`.
+        let (typed, diags) = check_src(
+            "type Foo = object { value: u64, }; function identity[T](x: T): T { return x; } function main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = Foo { value = 2u64 }; let a = identity(e); let b = identity(v); a; b; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.instances.contains_key("identity$Mut_Object_Foo"));
+        assert!(typed.instances.contains_key("identity$Object_Foo"));
+    }
+
+    #[test]
+    fn generic_mutable_forwarding_and_array_context() {
+        // Forwarding preserves `*Foo` through `wrap[T]` -> `id[T]`.
+        let (_, diags) = check_src(
+            "type Foo = object { value: u64, }; function id[T](x: T): T { return x; } function wrap[T](x: T): T { return id(x); } function main() { let e: *Foo = Foo { value = 1u64 }; let r = wrap(e); r.value = 1u64; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+
+        // `*Array[T]` is valid with a mutable formal.
+        let (_, diags) = check_src(
+            "function get[T](a: *Array[T]): T { return a[0u64]; } function main() { let a: *Array[u64] = [1u64]; let x = get(a); x; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+
+        // Read-only `Array[T]` formal accepts `*Array[u64]` via downgrade.
+        let (_, diags) = check_src(
+            "function first[T](a: Array[T]): T { return a[0u64]; } function main() { let a: *Array[u64] = [1u64]; let x = first(a); x; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+
+        // Fresh array infers through a mutable generic formal.
+        let (_, diags) = check_src(
+            "function take[T](a: *Array[T]): u64 { return 1u64; } function main() { let x = take([1u64]); x; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn generic_bounds_rechecked_after_substitution() {
+        // `*Foo` does not satisfy `Numeric`.
+        let (_, diags) = check_src(
+            "type Foo = object { value: u64, }; function add[T extends Numeric](a: T, b: T): T { return a + b; } function main() { let e: *Foo = Foo { value = 1u64 }; let x = add(e, e); x; }",
+        );
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E303")),
+            "{diags:?}"
+        );
+
+        // `*String` satisfies `Comparable` via its base.
+        let (_, diags) = check_src(
+            "function eq[T extends Comparable](a: T, b: T): bool { return a == b; } function f(s: *String): bool { return eq(s, s); } function main() { let x = 1u64; x; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+
+        // Every monomorphized instance is normalized (no `Param`/`*T` leaks).
+        let (hir, typed, diags) = check_src_with_hir(
+            "type Foo = object { value: u64, }; function identity[T](x: T): T { return x; } function main() { let e: *Foo = Foo { value = 1u64 }; let r = identity(e); r; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.validate_normalized(&hir, &diags).is_empty());
     }
 }

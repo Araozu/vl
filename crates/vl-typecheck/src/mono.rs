@@ -148,9 +148,11 @@ impl Monomorphizer<'_> {
                         // Explicit arguments name outer parameters (`T`
                         // means the caller's `T`): substitute, and anything
                         // still a `Param` afterwards is unbound (already
-                        // reported while checking the template).
+                        // reported while checking the template). Invalid
+                        // capabilities (`*T`, `*u64` via substitution) stay
+                        // quiet here: the template already owns the E106.
                         let t = vl_in_instance(v, &env);
-                        if !t.is_concrete() {
+                        if !t.is_concrete() || !super::is_capability_valid(&t) {
                             ok = false;
                             break;
                         }
