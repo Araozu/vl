@@ -86,17 +86,17 @@ function main() { let d = x - 1; }
 
 Integer literals are untyped and coerce to contextual `u64`, `i64`, or `u8`;
 floating literals retain the `f64` suffix. Boolean literals are `true` and `false`.
-Value types are `u64`, `i64`,
-`f64`, `bool`, `u8`, `String`, `File`, user-defined `object` types, `Array[T]`,
-and `void` (`void` only as a return).
-`Array[T]` is a fixed-length heap array of `T`: `Array.new::[u64](n)` allocates
-a zero-filled array of `n` elements (no import needed), `[1, 2]` is an
-array literal, `a[i]` reads element `i`, and `a[i] = v;` writes it
-(see `examples/arrays.vl`). Indices are always `u64`.
+Primitive value types are `u64`, `i64`, `f64`, `bool`, and `u8`. `String`,
+`File`, user-defined `object` types, and `Array[T]` are reference types; `void`
+is only valid as a return type. `Array[T]` is a read-only view of a fixed-length
+heap array of `T`, while `*Array[T]` is the mutable view: `Array.new::[u64](n)`
+allocates a zero-filled array of `n` elements (no import needed), `[1, 2]` is an
+array literal, `a[i]` reads an element, and `a[i] = v;` writes through a
+`*Array[T]` view (see `examples/arrays.vl`). Indices are always `u64`.
 Objects use declarations such as `type Counter = object { value: u64, label: String, };`
 and named literals such as `Counter { value = 1, label = "count" }`. Object values
 have reference semantics: assignment, parameters, and returns alias the same
-heap object, and `p.field = value;` mutates it through every alias. Fields are
+heap object, and `p.field = value;` mutates it through every mutable `*Foo` alias. Fields are
 comma-separated and every field must be initialized. Objects are nominal data
 types; VL does not currently attach methods, inheritance, or runtime type
 reflection to them.

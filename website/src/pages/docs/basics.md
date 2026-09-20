@@ -113,10 +113,12 @@ An annotation is required to give `Array.new` its element type without a
 turbofish. A fresh object or array adopts an expected `*` capability:
 
 ```vl
+type Foo = object { value: u64, };
+
 let retries: u64 = 3;
 let scores: *Array[u64] = Array.new(3);
-let view = Foo {};
-let editable: *Foo = Foo {};
+let view = Foo { value = 0 };
+let editable: *Foo = Foo { value = 0 };
 ```
 
 Named object types use `type Name = object { ... };` declarations. Their fields
@@ -124,8 +126,11 @@ are comma-separated, and an object literal initializes every field:
 
 ```vl
 type Point = object { x: u64, y: u64, };
-let point: *Point = Point { x = 10, y = 20 };
-point.x = 11;
+
+function main() {
+    let point: *Point = Point { x = 10, y = 20 };
+    point.x = 11;
+}
 ```
 
 Objects have reference semantics: assignment and function calls share the same
@@ -139,6 +144,8 @@ binding, while a `Foo` value never upgrades into a `*Foo` binding (a
 `*Foo` binding accepts a fresh `Foo {}` via contextual capability):
 
 ```vl
+type Counter = object { value: u64, };
+
 function main() {
     let count = 0;
     count = count + 1;
@@ -157,15 +164,18 @@ Arithmetic operators work on numbers: `+`, `-`, `*`, and `/`. Parentheses make
 the order explicit, just as they do in mathematics.
 
 ```vl
-let first = 1 + 2 * 3;       // 7
-let second = (1 + 2) * 3;    // 9
+let first = 1u64 + 2u64 * 3u64;       // 7
+let second = (1u64 + 2u64) * 3u64;    // 9
 let third = -second;
 ```
 
 Comparisons produce a `bool`:
 
 ```vl
-let old_enough = age >= 18;
+let age = 21u64;
+let left = 1u64;
+let right = 2u64;
+let old_enough = age >= 18u64;
 let same = left == right;
 let different = left != right;
 ```

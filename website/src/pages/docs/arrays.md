@@ -28,10 +28,12 @@ so the element type comes from the annotation. Element writes require a
 `*Array[T]` view; reads work through either capability:
 
 ```vl
-let scores: *Array[u64] = Array.new(3);
-scores[0] = 10;
-scores[1] = 20;
-scores[2] = 30;
+function main() {
+    let scores: *Array[u64] = Array.new(3);
+    scores[0] = 10;
+    scores[1] = 20;
+    scores[2] = 30;
+}
 ```
 
 The explicit turbofish form says the element type at the call instead:
@@ -111,7 +113,15 @@ unclear, provide the type explicitly with the
 turbofish form `::[T]` (including capabilities, e.g. `::[*Foo]`):
 
 ```vl
-let number = first::[u64](numbers);
+function first[T](values: Array[T]): T {
+    return values[0];
+}
+
+function main() {
+    let numbers: *Array[u64] = [10, 20];
+    let number = first::[u64](numbers);
+}
+
 ```
 
 The `::` is important. `first[T](...)` without it means indexing syntax, not a

@@ -6,7 +6,7 @@ import vlLang from '../grammars/vl.tmLanguage.json';
 
 const heroSample = `use std.println;\nfunction main() { println("Hello, world!"); }`;
 const overviewSample = `// A complete program has one required entrypoint\nuse std.println;\nfunction main() { println("Hello, world!"); }`;
-const vlThemes = { light: 'github-light', dark: 'github-dark' };
+const vlThemes = { light: 'github-light', dark: 'github-dark' } as const;
 ---
 
 <Base title="VL Documentation">

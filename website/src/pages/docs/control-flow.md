@@ -38,23 +38,33 @@ You can omit braces when a branch contains one statement, but braces are often
 clearer and make it easier to add another statement later:
 
 ```vl
-if (ready) std.println("go");
+use std;
+
+function main() {
+    let ready = true;
+    if (ready) std.println("go");
+}
 ```
 
 Several choices can be chained with `else if`:
 
 ```vl
-if (score >= 90) {
-    std.println("A");
-} else if (score >= 80) {
-    std.println("B");
-} else {
-    std.println("keep practicing");
+use std;
+
+function main() {
+    let score = 85u64;
+    if (score >= 90u64) {
+        std.println("A");
+    } else if (score >= 80u64) {
+        std.println("B");
+    } else {
+        std.println("keep practicing");
+    }
 }
 ```
 
-The example is intentionally just the decision-making part; place it inside a
-function and define `score` before using it.
+The complete example keeps the decision and its input together so you can run it
+as written.
 
 ## Repeating with `while`
 
@@ -109,8 +119,12 @@ Use parentheses to make a complicated condition easy to read. `&&` requires
 both sides to be true; `||` requires at least one side to be true.
 
 ```vl
-if (logged_in && has_permission) {
-    open_settings();
+function main() {
+    let logged_in = true;
+    let has_permission = true;
+    if (logged_in && has_permission) {
+        // Open the settings view here.
+    }
 }
 ```
 

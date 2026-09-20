@@ -44,6 +44,8 @@ alike. A function may mutate through a `*Foo` parameter, but it may never
 rebind the parameter itself:
 
 ```vl
+type Foo = object { value: u64, };
+
 function inspect(item: Foo) {
     // item = other; // error: parameters cannot be rebound
 }
@@ -93,8 +95,10 @@ declared after the parameter list. A `*Foo` result may initialize either a
 mutable or read-only binding; a `Foo` result can never initialize `*Foo`:
 
 ```vl
+type Foo = object { value: u64, };
+
 function create_foo(): *Foo {
-    return Foo {};
+    return Foo { value = 0 };
 }
 
 function main() {

@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -69,6 +73,53 @@ func TestCompileFailureReturnsDiagnostics(t *testing.T) {
 	if body.OK || !strings.Contains(body.Diagnostics, "undefined variable") {
 		t.Fatalf("unexpected response: %+v", body)
 	}
+}
+
+func TestCompilerAdapterInvokesRustCompiler(t *testing.T) {
+	binary := rustCompilerBinary(t)
+	c := compiler{binary: binary}
+
+	bytecode, diagnostics, err := c.compile(context.Background(), "function main() {}", "adapter.vl")
+	if err != nil {
+		t.Fatalf("compile success: %v (%s)", err, diagnostics)
+	}
+	if len(bytecode) < 4 || string(bytecode[:4]) != "nara" {
+		t.Fatalf("compiler returned invalid vmfile: %q", bytecode)
+	}
+
+	_, diagnostics, err = c.compile(
+		context.Background(),
+		"function main() { let missing = nope; }",
+		"adapter-error.vl",
+	)
+	if err == nil {
+		t.Fatal("invalid source unexpectedly compiled")
+	}
+	if !strings.Contains(diagnostics, "undefined") {
+		t.Fatalf("compiler diagnostics = %q", diagnostics)
+	}
+}
+
+func rustCompilerBinary(t *testing.T) string {
+	t.Helper()
+	if binary := os.Getenv("VL_COMPILER"); binary != "" {
+		return binary
+	}
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	root := filepath.Clean(filepath.Join(filepath.Dir(filename), "..", "..", ".."))
+	binary := filepath.Join(root, "target", "debug", "vl")
+	if _, err := os.Stat(binary); err == nil {
+		return binary
+	}
+	cmd := exec.Command("cargo", "build", "--quiet", "--bin", "vl")
+	cmd.Dir = root
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build Rust compiler: %v\n%s", err, output)
+	}
+	return binary
 }
 
 func TestCompileMutableViewSuccess(t *testing.T) {

@@ -25,6 +25,8 @@ while literals assign with `name = value`. A fresh literal adopts an expected
 `*` capability and otherwise defaults to a read-only view:
 
 ```vl
+type Counter = object { value: u64, label: String, };
+
 function main() {
     let counter: *Counter = Counter { label = "count", value = 0 };
     counter.value = counter.value + 1;
@@ -40,6 +42,8 @@ mutable alias. Multiple `*Foo` aliases may coexist with read-only ones, and a
 read-only alias observes writes made through a mutable one.
 
 ```vl
+type Counter = object { value: u64, label: String, };
+
 function bump(counter: *Counter): *Counter {
     counter.value = counter.value + 1;
     return counter;
@@ -63,6 +67,8 @@ or returning it passes the same object; it does not copy the fields. A field
 write through a mutable view is therefore visible through every alias:
 
 ```vl
+type Counter = object { value: u64, label: String, };
+
 function bump(counter: *Counter): *Counter {
     counter.value = counter.value + 1;
     return counter;

@@ -2389,7 +2389,8 @@ impl Checker {
                     // Bare `Array.new` and empty `[]` defer to expected-formal
                     // contextual handling below; other poisoned args stay quiet.
                     let is_bare_new = matches!(&args[i], HirExpr::Call { name, type_args, .. } if name == "Array.new" && type_args.is_empty());
-                    let is_empty_array = matches!(&args[i], HirExpr::ArrayLiteral { elems, .. } if elems.is_empty());
+                    let is_empty_array =
+                        matches!(&args[i], HirExpr::ArrayLiteral { elems, .. } if elems.is_empty());
                     if ty_has_error(original_got) && !(is_bare_new || is_empty_array) {
                         continue;
                     }
@@ -4108,6 +4109,13 @@ mod tests {
             assert!(diags.is_empty(), "{call}: {diags:?}");
             assert!(typed.instances.contains_key("same$u64"), "{call}");
         }
+    }
+
+    #[test]
+    fn explicit_generic_call_contextualizes_empty_array_argument() {
+        let (_, diags) =
+            check_src("function take[T](a: *Array[T]) {} function main() { take::[u64]([]); }");
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]

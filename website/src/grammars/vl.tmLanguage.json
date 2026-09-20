@@ -269,7 +269,7 @@
     },
     "capability": {
       "name": "storage.modifier.capability.vl",
-      "match": "\\*(?=\\s*(?:u64|i64|f64|bool|u8|void|String|File|Array|[A-Z]))"
+      "match": "(?:(?<=:)|(?<=\\[)|(?<=,))\\s*\\*(?=\\s*(?:u64|i64|f64|bool|u8|void|String|File|Array|[A-Z]))"
     },
     "operator": {
       "patterns": [

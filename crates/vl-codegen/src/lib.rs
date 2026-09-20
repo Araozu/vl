@@ -307,7 +307,8 @@ impl Target for StackVmTarget {
 /// to `calli`;
 /// `Array[T]` values lower to memory containers (`create`/`getvat`/`setvat`
 /// for value elements, `getrfat`/`setrfat` for reference elements);
-/// anything else is a diagnostic.
+/// modules without `main` retain their ordered global initializer as the
+/// ordinary `<module-init>` function; anything else is a diagnostic.
 pub struct NaraVmTarget;
 
 impl Target for NaraVmTarget {
@@ -963,6 +964,15 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
     // `<entrypoint>` runs inits once at startup then calls `main`.
     // Without globals, `main` maps directly to `<entrypoint>` as before.
     let has_globals = !prog.globals.is_empty();
+    let has_main = prog.functions.iter().any(|f| f.name == "main");
+    // Keep library initialization as ordinary module metadata. A library must
+    // not claim the VM's unique entrypoint; a future loader can invoke this
+    // function before exposing the library's other functions.
+    let module_init_name_idx = if !has_main && has_globals {
+        e.add_string(b"<module-init>", Span::empty(0))
+    } else {
+        None
+    };
     let mut fn_consts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut fn_names: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for f in &prog.functions {
@@ -1176,14 +1186,11 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
         };
         functions_out.push((name_idx, std::mem::take(&mut e.bytecode)));
     }
-    // Library without `main` but with globals: emit an `<entrypoint>` that
-    // only initializes module state, so globals are never silently dropped.
-    // LIR already retains the initializer bodies; this keeps the executable
-    // artifact consistent (standalone `naravm lib.nara` inits then exits).
-    // Future multi-module loading can replace this with an explicit init
-    // entry; for single-module builds this reuses the existing entrypoint
-    // policy instead of inventing a second one.
-    if !prog.functions.iter().any(|f| f.name == "main") && !prog.globals.is_empty() {
+    // Libraries retain their initializer in a named ordinary function. It is
+    // deliberately not `<entrypoint>`: Naravm allows only one entrypoint when
+    // loading multiple modules, while a future loader can invoke this
+    // metadata function before exposing the library's other functions.
+    if !has_main && !prog.globals.is_empty() {
         e.reset_fn(std::collections::HashMap::new());
         // Stub function for init-only emission when no user function exists.
         let stub;
@@ -1246,10 +1253,12 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
                 }
                 free_fragment_regs(&mut e, &g.init, &g.result);
             }
-            // Void return for the init-only entrypoint (bare `ret`).
+            // Void return for the module initializer (bare `ret`).
             e.bytecode.push(0x00);
             if !e.diags.iter().any(|d| d.is_error()) && nara_resolve_jumps(&mut e) {
-                functions_out.push((entry_name_idx, std::mem::take(&mut e.bytecode)));
+                if let Some(name_idx) = module_init_name_idx {
+                    functions_out.push((name_idx, std::mem::take(&mut e.bytecode)));
+                }
             }
         }
     }
@@ -3135,6 +3144,31 @@ mod tests {
         for op in [0x26u8, 0x27, 0x28, 0x2du8] {
             assert!(bytes.contains(&op), "no {op:#x} in {bytes:?}");
         }
+    }
+
+    #[test]
+    fn naravm_recycles_registers_across_long_global_initializers() {
+        let lir = lir_of(
+            "let g = 1u64 + 2u64 + 3u64 + 4u64 + 5u64 + 6u64 + 7u64 + 8u64 + 9u64 + 10u64 + 11u64 + 12u64 + 13u64 + 14u64 + 15u64 + 16u64 + 17u64 + 18u64 + 19u64 + 20u64; function main() {}",
+        );
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+    }
+
+    #[test]
+    fn naravm_preserves_library_initializers_without_claiming_entrypoint() {
+        let lir = lir_of("let g = 7u64; function read(): u64 { return g; }");
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let bytes = artifact.unwrap().bytes.unwrap();
+        assert!(bytes
+            .windows(b"<module-init>".len())
+            .any(|w| w == b"<module-init>"));
+        assert!(
+            bytes.contains(&0x27),
+            "no module-state allocation in {bytes:?}"
+        );
     }
 
     #[test]

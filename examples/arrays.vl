@@ -1,7 +1,7 @@
 // Fixed-length heap arrays (`Array[T]`).
 //
-// `let scores: Array[u64] = Array.new(3);` is the preferred form: the
-// annotation supplies the element type (explicit `Array.new::[u64](3)`
+// `let scores: *Array[u64] = Array.new(3);` is the preferred form for writes:
+// the annotation supplies the element type (explicit `Array.new::[u64](3)`
 // works too). `[1, 2]` is an array literal, `a[i]` reads element `i`, and
 // `a[i] = v;` writes it. Indices are always `u64`; elements have the
 // array's `T`.

@@ -847,7 +847,13 @@ impl<'a> Parser<'a> {
     fn parse_array_type(&mut self, allowed: &[String], strict: bool) -> Option<(VlType, Span)> {
         let head = self.bump(); // `Array`
         self.bump(); // `[` (established by lookahead)
-        let (elem, _) = self.parse_type(allowed, strict)?;
+
+        // Always consume the enclosing `]`, even when the nested type already
+        // reported an error. Otherwise the declaration parser sees that
+        // bracket's following `}` as a new top-level item and cascades.
+        let elem = self.parse_type(allowed, strict);
+        let close = self.expect(&TokenKind::RBracket, "`]` after the element type")?;
+        let (elem, _) = elem?;
         if elem.is_void() {
             self.diags.push(
                 Diagnostic::error("`Array[void]` is not a value type")
@@ -856,7 +862,6 @@ impl<'a> Parser<'a> {
             );
             return None;
         }
-        let close = self.expect(&TokenKind::RBracket, "`]` after the element type")?;
         Some((
             VlType::Array(Box::new(elem)),
             Span::new(head.span.start, close.span.end),
@@ -2496,6 +2501,14 @@ mod tests {
         assert_eq!(errors.len(), 1, "{diags:?}");
         assert_eq!(errors[0].code.as_deref(), Some("E106"), "{diags:?}");
         assert!(mentions(&diags, "only one `*`"), "{diags:?}");
+    }
+
+    #[test]
+    fn invalid_nested_mutable_type_consumes_array_close() {
+        let (_prog, diags) = parse_src("function broken(a: *Array[*u64]) { a; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E106"), "{diags:?}");
     }
 
     #[test]
