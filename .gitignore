@@ -1,3 +1,5 @@
 /target
 editors/vscode/node_modules/
 editors/vscode/*.vsix
+editors/tree-sitter-vl/node_modules/
+editors/tree-sitter-vl/parser.so

@@ -1,0 +1,16 @@
+{
+  "grammars": [
+    {
+      "name": "vl",
+      "camelcase": "Vl",
+      "scope": "source.vl",
+      "file-types": ["vl"],
+      "injection-regex": "^vl$",
+      "path": "."
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT OR Apache-2.0"
+  }
+}

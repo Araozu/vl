@@ -28,8 +28,8 @@ directory to `runtimepath` during Lazy initialization:
 }
 ```
 
-For Tree-sitter, add the runtime path to the VL plugin as above and configure
-`nvim-treesitter` separately:
+For Tree-sitter, add the runtime path to the VL plugin as above and install
+`nvim-treesitter`:
 
 ```lua
 {
@@ -38,6 +38,7 @@ For Tree-sitter, add the runtime path to the VL plugin as above and configure
   opts = {
     highlight = { enable = true },
     indent = { enable = true },
+    ensure_installed = { "vl" },
     incremental_selection = {
       enable = true,
       keymaps = {
@@ -51,11 +52,21 @@ For Tree-sitter, add the runtime path to the VL plugin as above and configure
 }
 ```
 
-The parser must be installed separately and registered under the `vl` language
-name; this repository does not ship a generated parser yet. When a parser is
-available, the runtime automatically uses the queries in `queries/vl` for
-highlighting, indentation, and folds. Without one, the native Vim syntax and
-brace indentation continue to work.
+The VL plugin automatically registers its local generated parser with
+`nvim-treesitter`. Run `:TSInstall vl` after opening Neovim. The parser is
+generated for Tree-sitter ABI 15 and is built locally for the current platform;
+the repository intentionally does not commit a platform-specific `.so` file.
+The runtime uses the queries in `queries/vl` for highlighting, indentation, and
+folds. Without `nvim-treesitter`, native Vim syntax and brace indentation still
+work.
+
+The grammar source and reproducible generated parser sources live in
+`editors/tree-sitter-vl`. From that directory:
+
+```sh
+tree-sitter generate
+tree-sitter test
+```
 
 Run `:Lazy sync`, then open a `.vl` file. Verify detection with:
 

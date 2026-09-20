@@ -1,0 +1,253 @@
+===============================
+top-level declarations
+===============================
+
+use std.print;
+use std.fs.{open, read};
+val answer: u64 = 1 + 2 * 3;
+
+fun main[T extends Numeric](value: T): void {
+  val copy = value;
+  if (copy > 0) {
+    return;
+  } else {
+    while (copy != 0) break;
+  }
+}
+
+---
+
+(source_file
+  (use_declaration
+    (module_path
+      (identifier)
+      (identifier)))
+  (use_declaration
+    (module_path
+      (identifier)
+      (identifier)
+      (grouped_imports
+        (identifier)
+        (identifier))))
+  (variable_declaration
+    kind: (binding_keyword)
+    name: (identifier)
+    type: (type
+      (type_atom
+        (primitive_type)))
+    value: (expression
+      (binary_expression
+        (expression
+          (postfix_expression
+            (primary_expression
+              (literal
+                (integer_literal)))))
+        (expression
+          (binary_expression
+            (expression
+              (postfix_expression
+                (primary_expression
+                  (literal
+                    (integer_literal)))))
+            (expression
+              (postfix_expression
+                (primary_expression
+                  (literal
+                    (integer_literal))))))))))
+  (function_declaration
+    name: (identifier)
+    (type_parameters
+      (type_parameter
+        name: (type_identifier)
+        bound: (generic_bound)))
+    (parameters
+      (parameter
+        name: (identifier)
+        type: (type
+          (type_atom
+            (type_identifier)))))
+    return_type: (type
+      (type_atom
+        (primitive_type)))
+    body: (block
+      (statement
+        (variable_declaration
+          kind: (binding_keyword)
+          name: (identifier)
+          value: (expression
+            (postfix_expression
+              (primary_expression
+                (path
+                  (identifier)))))))
+      (statement
+        (if_statement
+          condition: (expression
+            (binary_expression
+              (expression
+                (postfix_expression
+                  (primary_expression
+                    (path
+                      (identifier)))))
+              (expression
+                (postfix_expression
+                  (primary_expression
+                    (literal
+                      (integer_literal)))))))
+          consequence: (branch
+            (block
+              (statement
+                (return_statement))))
+          alternative: (branch
+            (block
+              (statement
+                (while_statement
+                  condition: (expression
+                    (binary_expression
+                      (expression
+                        (postfix_expression
+                          (primary_expression
+                            (path
+                              (identifier)))))
+                      (expression
+                        (postfix_expression
+                          (primary_expression
+                            (literal
+                              (integer_literal)))))))
+                  body: (branch
+                    (statement
+                      (break_statement))))))))))))
+
+===============================
+objects, arrays, calls, casts
+===============================
+
+type Counter = object { value: u64, };
+fun main() {
+  var counter: *Counter = Counter { value = 1u64 };
+  counter.value = counter.value + 1u64;
+  val values = [1u64, 2u64, 3u64,];
+  values[0] = values[1] as u64;
+  print::[u64](values[0]);
+}
+
+---
+
+(source_file
+  (type_declaration
+    name: (type_identifier)
+    body: (object_type
+      (object_fields
+        (object_field
+          name: (identifier)
+          type: (type
+            (type_atom
+              (primitive_type)))))))
+  (function_declaration
+    name: (identifier)
+    body: (block
+      (statement
+        (variable_declaration
+          kind: (binding_keyword)
+          name: (identifier)
+          type: (type
+            (mutable_type
+              inner: (type_atom
+                (type_identifier))))
+          value: (expression
+            (postfix_expression
+              (primary_expression
+                (object_literal
+                  name: (type_identifier)
+                  (object_initializer
+                    name: (identifier)
+                    value: (expression
+                      (postfix_expression
+                        (primary_expression
+                          (literal
+                            (u64_literal))))))))))))
+      (statement
+        (assignment_statement
+          left: (assignable
+            (identifier)
+            (identifier))
+          right: (expression
+            (binary_expression
+              (expression
+                (postfix_expression
+                  (primary_expression
+                    (path
+                      (identifier)))
+                  (identifier)))
+              (expression
+                (postfix_expression
+                  (primary_expression
+                    (literal
+                      (u64_literal)))))))))
+      (statement
+        (variable_declaration
+          kind: (binding_keyword)
+          name: (identifier)
+          value: (expression
+            (postfix_expression
+              (primary_expression
+                (array_literal
+                  (expression
+                    (postfix_expression
+                      (primary_expression
+                        (literal
+                          (u64_literal)))))
+                  (expression
+                    (postfix_expression
+                      (primary_expression
+                        (literal
+                          (u64_literal)))))
+                  (expression
+                    (postfix_expression
+                      (primary_expression
+                        (literal
+                          (u64_literal)))))))))))
+      (statement
+        (assignment_statement
+          left: (assignable
+            (identifier)
+            (expression
+              (postfix_expression
+                (primary_expression
+                  (literal
+                    (integer_literal))))))
+          right: (expression
+            (cast_expression
+              (expression
+                (postfix_expression
+                  (primary_expression
+                    (path
+                      (identifier)))
+                  (expression
+                    (postfix_expression
+                      (primary_expression
+                        (literal
+                          (integer_literal)))))))
+              (type
+                (type_atom
+                  (primitive_type)))))))
+      (statement
+        (expression_statement
+          (expression
+            (postfix_expression
+              (primary_expression
+                (path
+                  (identifier)))
+              (type_arguments
+                (type
+                  (type_atom
+                    (primitive_type))))
+              (expression
+                (postfix_expression
+                  (primary_expression
+                    (path
+                      (identifier)))
+                  (expression
+                    (postfix_expression
+                      (primary_expression
+                        (literal
+                          (integer_literal))))))))))))))

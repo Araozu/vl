@@ -1,0 +1,15 @@
+{
+  "name": "tree-sitter-vl",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for the VL programming language",
+  "license": "MIT OR Apache-2.0",
+  "main": "bindings/node",
+  "scripts": {
+    "generate": "tree-sitter generate",
+    "test": "tree-sitter test",
+    "parse": "tree-sitter parse"
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "^0.26.1"
+  }
+}

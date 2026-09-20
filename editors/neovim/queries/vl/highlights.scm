@@ -4,21 +4,22 @@
 (comment) @comment
 (string) @string
 (integer_literal) @number
-(float_literal) @number.float
+(f64_literal) @number.float
 (boolean) @boolean
 
 (type_identifier) @type
 (primitive_type) @type.builtin
 (function_declaration name: (identifier) @function)
-(function_call function: (identifier) @function.call)
-(field_expression field: (identifier) @property)
+(type_declaration name: (type_identifier) @type.definition)
+(object_field name: (identifier) @property)
+(object_initializer name: (identifier) @property)
 
-(let_declaration "let" @keyword)
+(binding_keyword) @keyword
 (function_declaration "fun" @keyword)
 (type_declaration "type" @keyword)
 (object_type "object" @keyword)
 (if_statement "if" @keyword.conditional)
-(else_clause "else" @keyword.conditional)
+(if_statement "else" @keyword.conditional)
 (while_statement "while" @keyword.repeat)
 (return_statement "return" @keyword.return)
 (break_statement "break" @keyword)
@@ -39,4 +40,4 @@
 ("||") @operator
 ("as") @keyword
 
-(identifier) @variable
+(path (identifier) @variable)
