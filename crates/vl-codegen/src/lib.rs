@@ -5,8 +5,9 @@
 //! - [`NaraVmTarget`]: executable Naravm 0.2 vmfiles: `fun main()`,
 //!   when present, gets an ordinary callable body plus a single `<entrypoint>`
 //!   wrapper. Integer/float arithmetic, comparisons, and control flow
-//!   plus `std.print` / `std.println` / `std.print_u64` and user-function calls lower to
-//!   `calli`.
+//!   plus `std.print` / `std.println` / `std.print_u64`, the `std.string`
+//!   natives (`len`, `concat`, `eq`, `to_u64`, `hex_to_u64`), `std.math.mod_u64`,
+//!   `std.fmt.u64_to_s`, and user-function calls lower to `calli`.
 //!
 //! Rule: new targets = new types implementing [`Target`]. Never branch
 //! the LIR or the driver on target names.
@@ -38,6 +39,12 @@ pub trait Target {
 /// these VL types to target concepts (e.g. VL `String` -> Naravm blob).
 /// Fallible VM operations (`!File`, `!String` via `errno`/`0x30`) are modeled
 /// as plain returns for now; error handling is out of scope for VL.
+///
+/// The `std.string` / `std.math` / `std.fmt` entries below cover only the
+/// infallible-or-trapping VM natives (e.g. `byte_count`, `concat`, `mod_u64`).
+/// Natives that report errors through `rv10` (`byte_at`, `slice`) and the
+/// container bridges (`bytes`, `from_container`) stay out until VL has an
+/// error story; likewise `std.fs` / `std.process` stay broad-catalog-only.
 pub fn modules() -> Vec<vl_common::ModuleSpec> {
     use vl_common::VlType as T;
     vec![
@@ -58,7 +65,21 @@ pub fn modules() -> Vec<vl_common::ModuleSpec> {
         ),
         vl_common::ModuleSpec::new(
             &["std", "string"],
-            &[("len", &[("value", T::String)], T::U64)],
+            &[
+                ("len", &[("value", T::String)], T::U64),
+                ("concat", &[("a", T::String), ("b", T::String)], T::String),
+                ("eq", &[("a", T::String), ("b", T::String)], T::Bool),
+                ("to_u64", &[("value", T::String)], T::U64),
+                ("hex_to_u64", &[("value", T::String)], T::U64),
+            ],
+        ),
+        vl_common::ModuleSpec::new(
+            &["std", "math"],
+            &[("mod_u64", &[("a", T::U64), ("b", T::U64)], T::U64)],
+        ),
+        vl_common::ModuleSpec::new(
+            &["std", "fmt"],
+            &[("u64_to_s", &[("value", T::U64)], T::String)],
         ),
     ]
 }
@@ -67,16 +88,13 @@ pub fn modules() -> Vec<vl_common::ModuleSpec> {
 /// catalog remains useful to frontend/library tests; drivers should resolve
 /// against this target-specific view so accepted calls are actually emit-able.
 pub fn modules_for_target(target: &str) -> Vec<vl_common::ModuleSpec> {
-    use vl_common::VlType as T;
     match target {
-        "naravm" => vec![vl_common::ModuleSpec::new(
-            &["std"],
-            &[
-                ("print", &[("value", T::String)], T::Void),
-                ("println", &[("value", T::String)], T::Void),
-                ("print_u64", &[("value", T::U64)], T::Void),
-            ],
-        )],
+        "naravm" => {
+            let all = modules();
+            all.into_iter()
+                .filter(|m| m.path.as_string() != "std.fs")
+                .collect()
+        }
         _ => modules(),
     }
 }
@@ -102,7 +120,8 @@ pub fn lookup(name: &str) -> Option<Box<dyn Target>> {
 /// book for the supported subset). A module
 /// without `main` still compiles (a library); entrypoint presence is the
 /// VM/loader's check, not the compiler's. Calls to
-/// `std.print` / `std.println` / `std.print_u64` and to user functions lower
+/// `std.print` / `std.println` / `std.print_u64`, the `std.string` natives,
+/// `std.math.mod_u64`, `std.fmt.u64_to_s`, and to user functions lower
 /// to `calli`;
 /// `Array[T]` values lower to memory containers (`create`/`getvat`/`setvat`
 /// for value elements, `getrfat`/`setrfat` for reference elements);
@@ -140,6 +159,24 @@ enum NaraConstant {
     Value { value_idx: usize },
     String { offset: usize, len: usize },
     Function { module: usize, function: usize },
+}
+
+/// Map a VL-level extern identity to the Naravm native it lowers to.
+/// VL keeps dotted names (`std.string.concat`); the VM registers natives
+/// under `::` modules (`std::string::concat`). `None` means the callee is
+/// not a known VM native (user function or cross-module source call), in
+/// which case the LIR spelling is interned verbatim.
+fn nara_extern_target(module: &str, function: &str) -> Option<(&'static str, &'static str)> {
+    match (module, function) {
+        ("std.string", "len") => Some(("std::string", "byte_count")),
+        ("std.string", "concat") => Some(("std::string", "concat")),
+        ("std.string", "eq") => Some(("std::string", "eq")),
+        ("std.string", "to_u64") => Some(("std::string", "to_u64")),
+        ("std.string", "hex_to_u64") => Some(("std::string", "hex_to_u64")),
+        ("std.math", "mod_u64") => Some(("std::math", "mod_u64")),
+        ("std.fmt", "u64_to_s") => Some(("std::fmt", "u64_to_s")),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -823,10 +860,17 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
             .then_with(|| a.symbol.function.cmp(&b.symbol.function))
     });
     for import in ordered_imports {
-        let Some(module) = e.add_string(import.symbol.module.as_bytes(), Span::empty(0)) else {
+        // Known VM natives are interned under their native module/function
+        // names (`std::string::concat`); everything else keeps its LIR
+        // spelling (user functions, cross-module source calls).
+        let (vm_module, vm_function) =
+            nara_extern_target(&import.symbol.module, &import.symbol.function)
+                .map(|(m, f)| (m.to_owned(), f.to_owned()))
+                .unwrap_or_else(|| (import.symbol.module.clone(), import.symbol.function.clone()));
+        let Some(module) = e.add_string(vm_module.as_bytes(), Span::empty(0)) else {
             continue;
         };
-        let Some(function) = e.add_string(import.symbol.function.as_bytes(), Span::empty(0)) else {
+        let Some(function) = e.add_string(vm_function.as_bytes(), Span::empty(0)) else {
             continue;
         };
         if let Some(idx) = nara_push_fn_const(&mut e, module, function) {
@@ -1664,7 +1708,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                     ))
                     .with_label(*span, "unsupported call")
                     .with_note(
-                        "only `std.print`, `std.println`, `std.print_u64`, and user functions lower to Naravm calls",
+                        "only `std.print`, `std.println`, `std.print_u64`, the `std.string`/`std.math`/`std.fmt` natives, and user functions lower to Naravm calls",
                     )
                     .with_code("E404"),
                 );
@@ -2338,7 +2382,7 @@ fn nara_user_call(
             ))
             .with_label(span, "unsupported call")
             .with_note(
-                "only `std.print`, `std.println`, `std.print_u64`, and user functions lower to Naravm calls",
+                "only `std.print`, `std.println`, `std.print_u64`, the `std.string`/`std.math`/`std.fmt` natives, and user functions lower to Naravm calls",
             )
             .with_code("E404"),
         );
