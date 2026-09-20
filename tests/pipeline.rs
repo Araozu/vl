@@ -401,8 +401,10 @@ fn objects_compile_with_reference_field_semantics() {
 
 #[test]
 fn array_new_needs_no_import() {
-    let lir = frontend("function main() { let a = Array.new::[u64](2u64); a[0u64] = 1u64; }")
-        .expect("Array.new must compile without imports");
+    let lir = frontend(
+        "function main() { let a: *Array[u64] = Array.new::[u64](2u64); a[0u64] = 1u64; }",
+    )
+    .expect("Array.new must compile without imports");
     assert!(lir.dump().contains("new_array"));
 }
 
@@ -433,8 +435,8 @@ fn array_index_shapes_are_checked() {
         "{err:?}"
     );
 
-    let err =
-        frontend(r#"function main() { let a = [1u64]; a[0u64] = "s"; }"#).expect_err("must fail");
+    let err = frontend(r#"function main() { let a: *Array[u64] = [1u64]; a[0u64] = "s"; }"#)
+        .expect_err("must fail");
     assert!(
         err.iter().any(|d| d.message.contains("cannot store")),
         "{err:?}"
@@ -496,7 +498,7 @@ fn generic_main_is_rejected() {
 #[test]
 fn annotated_let_with_contextual_new_compiles() {
     let lir = frontend(
-        "use std; function first[T](a: Array[T]): T { return a[0]; } function main() { let scores: Array[u64] = Array.new(3); scores[0] = 10; let number = first(scores); std.print_u64(number); }",
+        "use std; function first[T](a: Array[T]): T { return a[0]; } function main() { let scores: *Array[u64] = Array.new(3); scores[0] = 10; let number = first(scores); std.print_u64(number); }",
     )
     .expect("annotated let must compile");
     let dump = lir.dump();

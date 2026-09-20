@@ -1400,7 +1400,7 @@ mod tests {
 
     #[test]
     fn arrays_lower_to_dedicated_instrs() {
-        let src = "function get(a: Array[u64]): u64 { a[0u64] = 1u64; return a[1u64]; } function main() { let a = Array.new::[u64](2u64); let b = [1u64, 2u64]; }";
+        let src = "function get(a: *Array[u64]): u64 { a[0u64] = 1u64; return a[1u64]; } function main() { let a: *Array[u64] = Array.new::[u64](2u64); let b = [1u64, 2u64]; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -1418,7 +1418,7 @@ mod tests {
 
     #[test]
     fn objects_lower_to_dedicated_instrs() {
-        let src = "type Counter = object { value: u64, }; function main() { let c = Counter { value = 1 }; c.value = c.value + 1; }";
+        let src = "type Counter = object { value: u64, }; function main() { let c: *Counter = Counter { value = 1u64 }; c.value = c.value + 1u64; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1433,7 +1433,7 @@ mod tests {
 
     #[test]
     fn object_let_alias_gets_an_independent_rebinding_home() {
-        let src = "type Counter = object { value: u64, }; function main() { let a = Counter { value = 1 }; let b = a; b = Counter { value = 2 }; a.value = 3; }";
+        let src = "type Counter = object { value: u64, }; function main() { let a: *Counter = Counter { value = 1u64 }; let b = a; b = Counter { value = 2u64 }; a.value = 3u64; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);

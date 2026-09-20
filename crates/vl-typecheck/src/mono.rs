@@ -273,7 +273,7 @@ fn infer_quiet(sig: &FuncSigTy, actuals: &[Ty]) -> Option<Vec<Ty>> {
 }
 
 fn collect_quiet(formal: &Ty, actual: &Ty, per_param: &mut HashMap<String, Vec<Ty>>) -> bool {
-    use super::is_integer;
+    use super::{can_coerce, is_integer};
     match (formal, actual) {
         (Ty::Param(p), t) => {
             per_param.entry(p.clone()).or_default().push(t.clone());
@@ -281,8 +281,14 @@ fn collect_quiet(formal: &Ty, actual: &Ty, per_param: &mut HashMap<String, Vec<T
         }
         (Ty::Array(f), Ty::Array(a)) => collect_quiet(f, a, per_param),
         (Ty::Mutable(f), Ty::Mutable(a)) => collect_quiet(f, a, per_param),
+        (Ty::Array(_), Ty::Mutable(inner)) => match &**inner {
+            Ty::Array(_) => collect_quiet(formal, inner, per_param),
+            _ => false,
+        },
+        (Ty::Mutable(f), _) => collect_quiet(f, actual, per_param),
         (f, a) if f == a => true,
         (f, Ty::Int) if is_integer(f) => true,
+        (f, a) if can_coerce(a, f) => true,
         _ => false,
     }
 }

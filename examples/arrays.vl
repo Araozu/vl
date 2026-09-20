@@ -18,11 +18,11 @@ function sum(a: Array[u64], n: u64): u64 {
 }
 
 function main() {
-    let scores: Array[u64] = Array.new(3);
+    let scores: *Array[u64] = Array.new(3);
     scores[0] = 10;
     scores[1] = 20;
     scores[2] = 30;
-    let b = [1, 2, 3];
+    let b: *Array[u64] = [1, 2, 3];
     b[0] = 5;
     std.print_u64(sum(scores, 3));
     std.print_u64(sum(b, 3));

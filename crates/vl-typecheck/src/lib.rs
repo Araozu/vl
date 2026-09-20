@@ -168,6 +168,17 @@ impl Ty {
             _ => false,
         }
     }
+
+    /// `void` through an optional outer `*` (`void` or `*void`).
+    /// `*void` is invalid (E106) but still counts as void for recovery.
+    pub fn is_void(&self) -> bool {
+        match self {
+            Ty::Void => true,
+            Ty::Mutable(inner) => inner.is_void(),
+            Ty::Array(elem) => elem.is_void(),
+            _ => false,
+        }
+    }
 }
 
 /// Substitute type parameters via `env` (`Param(name)` -> mapped type).
@@ -548,16 +559,21 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
         if let HirItem::Object { name, fields, .. } = item {
             let mut out_fields = Vec::with_capacity(fields.len());
             for (field, ty, span) in fields {
-                let field_ty = ty
+                let mut field_ty = ty
                     .as_ref()
                     .map(|v| Ty::from_vl_in(v, &HashMap::new()))
                     .unwrap_or(Ty::Error);
-                if field_ty == Ty::Void {
+                if ty_has_error(&field_ty) {
+                    // Parser already reported (unknown type); stay quiet.
+                } else if !validate_capability(&field_ty, *span, &mut cx.diags) {
+                    field_ty = Ty::Error;
+                } else if field_ty.is_void() {
                     cx.diags.push(
                         Diagnostic::error("an object field cannot be `void`")
                             .with_label(*span, "`void` is not a value type")
                             .with_code("E104"),
                     );
+                    field_ty = Ty::Error;
                 }
                 out_fields.push((field.clone(), field_ty));
             }
@@ -574,6 +590,8 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
             params,
             type_params,
             ret,
+            ret_span,
+            span,
             ..
         } = item
         {
@@ -587,18 +605,36 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
                 .iter()
                 .map(|p| (p.name.clone(), Ty::Param(p.name.clone())))
                 .collect();
-            let param_tys = params
-                .iter()
-                .map(|(_, _, t, _)| {
-                    t.as_ref()
-                        .map(|v| Ty::from_vl_in(v, &env))
-                        .unwrap_or(Ty::Error)
-                })
-                .collect::<Vec<_>>();
-            let ret_ty = ret
+            let mut param_tys = Vec::with_capacity(params.len());
+            for (pname, _, t, pspan) in params {
+                let mut pt = t
+                    .as_ref()
+                    .map(|v| Ty::from_vl_in(v, &env))
+                    .unwrap_or(Ty::Error);
+                if !ty_has_error(&pt) && !validate_capability(&pt, *pspan, &mut cx.diags) {
+                    pt = Ty::Error;
+                } else if !ty_has_error(&pt) && pt.is_void() {
+                    cx.diags.push(
+                        Diagnostic::error(format!("parameter `{pname}` cannot be `void`"))
+                            .with_label(*pspan, "`void` is not a value type")
+                            .with_code("E104"),
+                    );
+                    pt = Ty::Error;
+                }
+                // Note: HIR params carry the name span (type span is erased at
+                // lowering); capability diagnostics anchor there.
+                param_tys.push(pt);
+            }
+            let mut ret_ty = ret
                 .as_ref()
                 .map(|v| Ty::from_vl_in(v, &env))
                 .unwrap_or(Ty::Error);
+            if !ty_has_error(&ret_ty) {
+                let rsp = ret_span.unwrap_or(*span);
+                if !validate_capability(&ret_ty, rsp, &mut cx.diags) {
+                    ret_ty = Ty::Error;
+                }
+            }
             cx.typed.func_defs.insert(d.0);
             cx.typed.func_arity.insert(d.0, params.len());
             cx.typed.func_sigs.insert(
@@ -710,22 +746,33 @@ impl Checker {
                     .iter()
                     .filter_map(|p| p.bound.map(|b| (p.name.clone(), b)))
                     .collect();
-                let ret_ty = ret
+                let mut ret_ty = ret
                     .as_ref()
                     .map(|v| Ty::from_vl_in(v, &self.type_env))
                     .unwrap_or(Ty::Error);
                 self.record(*id, ret_ty.clone());
                 // Bad annotations were already reported by the parser
-                // (E104/E105); poison the scope quietly so no second error
-                // cascades. (An omitted return parses as `void`, never `None`.)
-                let poisoned_sig =
+                // (E104/E105) or by Pass 1 (E106); poison the scope quietly
+                // so no second error cascades. (An omitted return parses as
+                // `void`, never `None`.) Capability-invalid shapes (`*T`,
+                // `*u64` surviving as `Error` excluded) poison quietly here
+                // without re-reporting: Pass 1 already owns E106.
+                let mut poisoned_sig =
                     ty_has_error(&ret_ty) || params.iter().any(|(_, _, t, _)| t.is_none());
+                if !ty_has_error(&ret_ty) && !is_capability_valid(&ret_ty) {
+                    ret_ty = Ty::Error;
+                    poisoned_sig = true;
+                }
                 for (_, def, ty, _) in params {
                     if let Some(def) = def {
-                        let t = ty
+                        let mut t = ty
                             .as_ref()
                             .map(|v| Ty::from_vl_in(v, &self.type_env))
                             .unwrap_or(Ty::Error);
+                        if !ty_has_error(&t) && !is_capability_valid(&t) {
+                            t = Ty::Error;
+                            poisoned_sig = true;
+                        }
                         self.bindings.insert(def.0, t);
                         // Direct rebinding of a parameter already has its root
                         // cause (E205); remember it so `Assign` stays quiet.
@@ -779,10 +826,10 @@ impl Checker {
     }
 
     /// Check a `let` initializer against its optional annotation. Returns
-    /// the binding type (`Error` when poisoned). An `Array[T]` annotation on
-    /// a bare `Array.new(n)` supplies `T` contextually; every other shape
-    /// infers first (integer literals coerced by the annotation) and then
-    /// must be compatible with it.
+    /// the binding type (`Error` when poisoned). An `Array[T]`/`*Array[T]`
+    /// annotation on a bare `Array.new(n)` supplies `T` contextually; fresh
+    /// object/array literals adopt an expected mutable capability; every
+    /// other shape infers first and then must coerce directionally.
     fn let_type(&mut self, ty: &Option<VlType>, ty_span: &Option<Span>, value: &HirExpr) -> Ty {
         // Failed annotation (parser-reported): infer inner errors only.
         if ty.is_none() && ty_span.is_some() {
@@ -790,8 +837,30 @@ impl Checker {
             return Ty::Error;
         }
         let ann = ty.as_ref().map(|v| Ty::from_vl_in(v, &self.type_env));
+        if let Some(a) = &ann {
+            if ty_has_error(a) {
+                let _ = self.infer_expr(value);
+                return Ty::Error;
+            }
+            let asp = ty_span.unwrap_or(value.span());
+            if !validate_capability(a, asp, &mut self.diags) {
+                let _ = self.infer_expr(value);
+                return Ty::Error;
+            }
+            if a.is_void() {
+                self.diags.push(
+                    Diagnostic::error("a `let` binding cannot be `void`")
+                        .with_label(asp, "`void` is not a value")
+                        .with_code("E104"),
+                );
+                let _ = self.infer_expr(value);
+                return Ty::Error;
+            }
+        }
+        // Contextual bare `Array.new(n)`: `Array[T]` or `*Array[T]` annotation
+        // supplies the element type. Returns the (possibly mutable) array.
         if let (
-            Some(Ty::Array(elem)),
+            Some(a),
             HirExpr::Call {
                 name,
                 type_args,
@@ -802,43 +871,56 @@ impl Checker {
             },
         ) = (ann.as_ref(), value)
         {
-            if name == "Array.new" && type_args.is_empty() {
-                let mut arg_tys = Vec::with_capacity(args.len());
-                let mut poisoned = false;
-                for arg in args {
-                    let t = self.infer_expr(arg);
-                    if ty_has_error(&t) {
-                        poisoned = true;
+            let elem_opt: Option<&Ty> = match a {
+                Ty::Array(elem) => Some(elem),
+                Ty::Mutable(inner) => match &**inner {
+                    Ty::Array(elem) => Some(elem),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(elem) = elem_opt {
+                if name == "Array.new" && type_args.is_empty() {
+                    let mut arg_tys = Vec::with_capacity(args.len());
+                    let mut poisoned = false;
+                    for arg in args {
+                        let t = self.infer_expr(arg);
+                        if ty_has_error(&t) {
+                            poisoned = true;
+                        }
+                        arg_tys.push(t);
                     }
-                    arg_tys.push(t);
+                    if poisoned {
+                        return Ty::Error;
+                    }
+                    let arr = self.check_array_new_elem(
+                        name,
+                        *span,
+                        (*elem).clone(),
+                        args,
+                        &arg_tys,
+                        *call_id,
+                    );
+                    if ty_has_error(&arr) {
+                        return Ty::Error;
+                    }
+                    // Contextual capability: `*Array[T]` annotation makes the
+                    // fresh allocation mutable.
+                    if a.is_mutable_view() {
+                        return self.record(*call_id, a.clone());
+                    }
+                    return arr;
                 }
-                if poisoned {
-                    return Ty::Error;
-                }
-                return self.check_array_new_elem(
-                    name,
-                    *span,
-                    (**elem).clone(),
-                    args,
-                    &arg_tys,
-                    *call_id,
-                );
             }
         }
         let inferred = match &ann {
-            Some(a) => {
-                if ty_has_error(a) {
-                    let _ = self.infer_expr(value);
-                    return Ty::Error;
-                }
-                self.infer_expr_expected(value, a)
-            }
+            Some(a) => self.infer_expr_expected(value, a),
             None => self.infer_expr(value),
         };
         if ty_has_error(&inferred) {
             return Ty::Error;
         }
-        if inferred == Ty::Void {
+        if inferred == Ty::Void || inferred.is_void() {
             self.diags.push(
                 Diagnostic::error("cannot bind a `void` value")
                     .with_label(value.span(), "`void` is not a value")
@@ -848,17 +930,34 @@ impl Checker {
             return Ty::Error;
         }
         if let Some(a) = &ann {
-            if !types_compatible(&inferred, a) {
-                self.diags.push(
-                    Diagnostic::error(format!(
-                        "cannot initialize `{a}` binding with `{inferred}` value"
-                    ))
-                    .with_label(value.span(), format!("expected `{a}` here"))
-                    .with_code("E309"),
-                );
+            if !can_coerce(&inferred, a) {
+                // Focused capability diagnostics where the shapes match except
+                // for authority; generic shape mismatches stay E309.
+                if inferred.readonly_view() == a.readonly_view()
+                    && inferred.is_mutable_view() != a.is_mutable_view()
+                {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "cannot initialize `{a}` binding with read-only `{inferred}` value"
+                        ))
+                        .with_label(value.span(), "mutation authority is required here")
+                        .with_note(format!("a read-only view cannot be upgraded to `{a}`"))
+                        .with_code("E309"),
+                    );
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "cannot initialize `{a}` binding with `{inferred}` value"
+                        ))
+                        .with_label(value.span(), format!("expected `{a}` here"))
+                        .with_code("E309"),
+                    );
+                }
                 return Ty::Error;
             }
-            return inferred;
+            // Binding type is the declared type; the value keeps its actual
+            // capability (already recorded by inference).
+            return a.clone();
         }
         // Unannotated bindings holding an unresolved `int` (top level or
         // nested, e.g. `Array[Int]`) resolve through the target's default
@@ -955,15 +1054,34 @@ impl Checker {
                             );
                             return;
                         }
-                        if !types_compatible(&got, &self.fn_ret) {
-                            self.diags.push(
-                                Diagnostic::error(format!(
-                                    "function `{}` declares return `{}` but returns `{got}`",
-                                    self.fn_name, self.fn_ret
-                                ))
-                                .with_label(*span, "mismatched `return`")
-                                .with_code("E307"),
-                            );
+                        if !can_coerce(&got, &self.fn_ret) {
+                            // Capability upgrade through a return must never
+                            // launder a read-only view into a mutable result.
+                            if got.readonly_view() == self.fn_ret.readonly_view()
+                                && got.is_mutable_view() != self.fn_ret.is_mutable_view()
+                            {
+                                self.diags.push(
+                                    Diagnostic::error(format!(
+                                        "function `{}` declares return `{}` but returns read-only `{got}`",
+                                        self.fn_name, self.fn_ret
+                                    ))
+                                    .with_label(*span, "mutation authority is required here")
+                                    .with_note(format!(
+                                        "a read-only view cannot be upgraded to `{}`",
+                                        self.fn_ret
+                                    ))
+                                    .with_code("E307"),
+                                );
+                            } else {
+                                self.diags.push(
+                                    Diagnostic::error(format!(
+                                        "function `{}` declares return `{}` but returns `{got}`",
+                                        self.fn_name, self.fn_ret
+                                    ))
+                                    .with_label(*span, "mismatched `return`")
+                                    .with_code("E307"),
+                                );
+                            }
                         }
                     }
                 }
@@ -1022,14 +1140,29 @@ impl Checker {
                             self.record(*id, Ty::Error);
                             return;
                         }
-                        if !types_compatible(&got, &want) {
-                            self.diags.push(
-                                Diagnostic::error(format!(
-                                    "cannot assign `{got}` to `{want}` binding"
-                                ))
-                                .with_label(value.span(), format!("expected `{want}` here"))
-                                .with_code("E309"),
-                            );
+                        if !can_coerce(&got, &want) {
+                            if got.readonly_view() == want.readonly_view()
+                                && got.is_mutable_view() != want.is_mutable_view()
+                            {
+                                self.diags.push(
+                                    Diagnostic::error(format!(
+                                        "cannot assign read-only `{got}` to `{want}` binding"
+                                    ))
+                                    .with_label(value.span(), "mutation authority is required here")
+                                    .with_note(format!(
+                                        "a read-only view cannot be upgraded to `{want}`"
+                                    ))
+                                    .with_code("E309"),
+                                );
+                            } else {
+                                self.diags.push(
+                                    Diagnostic::error(format!(
+                                        "cannot assign `{got}` to `{want}` binding"
+                                    ))
+                                    .with_label(value.span(), format!("expected `{want}` here"))
+                                    .with_code("E309"),
+                                );
+                            }
                             self.record(*id, Ty::Error);
                             return;
                         }
@@ -1059,12 +1192,31 @@ impl Checker {
                     self.record(*id, Ty::Error);
                     return;
                 };
+                // Element writes need a mutable array view.
+                if !at.is_mutable_view() {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "cannot assign element through read-only view `{at}`"
+                        ))
+                        .with_label(
+                            array.span(),
+                            format!("this expression has read-only type `{at}`"),
+                        )
+                        .with_note(format!(
+                            "use a `*{at}` binding when this code must mutate it",
+                        ))
+                        .with_code("E310"),
+                    );
+                    let _ = self.infer_expr(value);
+                    self.record(*id, Ty::Error);
+                    return;
+                }
                 let vt = self.infer_expr_expected(value, &elem);
                 if ty_has_error(&vt) || ty_has_error(&elem) {
                     self.record(*id, Ty::Error);
                     return;
                 }
-                if !types_compatible(&it, &Ty::U64) {
+                if !same_type(&it, &Ty::U64) {
                     self.diags.push(
                         Diagnostic::error(format!("array index must be `u64`, got `{it}`"))
                             .with_label(index.span(), "expected `u64` here")
@@ -1073,14 +1225,27 @@ impl Checker {
                     self.record(*id, Ty::Error);
                     return;
                 }
-                if !types_compatible(&vt, &elem) {
-                    self.diags.push(
-                        Diagnostic::error(format!(
-                            "cannot store `{vt}` in `{at}` (elements are `{elem}`)"
-                        ))
-                        .with_label(value.span(), format!("expected `{elem}` here"))
-                        .with_code("E302"),
-                    );
+                if !can_coerce(&vt, &elem) {
+                    if vt.readonly_view() == elem.readonly_view()
+                        && vt.is_mutable_view() != elem.is_mutable_view()
+                    {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "cannot store read-only `{vt}` in mutable element `{elem}`"
+                            ))
+                            .with_label(value.span(), "mutation authority is required here")
+                            .with_note(format!("a read-only view cannot be upgraded to `{elem}`"))
+                            .with_code("E302"),
+                        );
+                    } else {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "cannot store `{vt}` in `{at}` (elements are `{elem}`)"
+                            ))
+                            .with_label(value.span(), format!("expected `{elem}` here"))
+                            .with_code("E302"),
+                        );
+                    }
                     self.record(*id, Ty::Error);
                     return;
                 }
@@ -1094,10 +1259,7 @@ impl Checker {
                 span,
             } => {
                 let bt = self.infer_expr(base);
-                let Some(object_name) = (match &bt {
-                    Ty::Object(name) => Some(name.clone()),
-                    _ => None,
-                }) else {
+                let Some(object_name) = object_base(&bt) else {
                     if !ty_has_error(&bt) {
                         self.diags.push(
                             Diagnostic::error(format!("cannot assign field `{field}` on `{bt}`"))
@@ -1109,6 +1271,25 @@ impl Checker {
                     self.record(*id, Ty::Error);
                     return;
                 };
+                // Field writes need a mutable object view.
+                if !bt.is_mutable_view() {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "cannot assign field `{field}` through read-only view `{bt}`"
+                        ))
+                        .with_label(
+                            base.span(),
+                            format!("this expression has read-only type `{bt}`"),
+                        )
+                        .with_note(format!(
+                            "use a `*{bt}` parameter or binding when this function must mutate it"
+                        ))
+                        .with_code("E310"),
+                    );
+                    let _ = self.infer_expr(value);
+                    self.record(*id, Ty::Error);
+                    return;
+                }
                 let Some(sig) = self.typed.objects.get(&object_name).cloned() else {
                     self.record(*id, Ty::Error);
                     return;
@@ -1123,16 +1304,45 @@ impl Checker {
                     self.record(*id, Ty::Error);
                     return;
                 };
+                // Poisoned field declarations (E106 already reported) stay
+                // quiet here to keep one root cause.
+                if ty_has_error(want) {
+                    let _ = self.infer_expr(value);
+                    self.record(*id, Ty::Error);
+                    return;
+                }
+                // Check the stored declaration type, not the projected read
+                // type: a mutable receiver does not upgrade a read-only field.
                 let got = self.infer_expr_expected(value, want);
-                if ty_has_error(&got) || !types_compatible(&got, want) {
+                if ty_has_error(&got) || !can_coerce(&got, want) {
                     if !ty_has_error(&got) {
-                        self.diags.push(
-                            Diagnostic::error(format!(
-                                "object field `{field}` expects `{want}`, got `{got}`"
-                            ))
-                            .with_label(value.span(), format!("expected `{want}` here"))
-                            .with_code("E302"),
-                        );
+                        // Focused capability message when shapes match except
+                        // authority; generic mismatch stays E302.
+                        if got.readonly_view() == want.readonly_view()
+                            && got.is_mutable_view() != want.is_mutable_view()
+                        {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "cannot assign read-only `{got}` to mutable field `{field}: {want}`"
+                                ))
+                                .with_label(
+                                    value.span(),
+                                    "mutation authority is required here",
+                                )
+                                .with_note(format!(
+                                    "a read-only view cannot be upgraded to `{want}`"
+                                ))
+                                .with_code("E302"),
+                            );
+                        } else {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "object field `{field}` expects `{want}`, got `{got}`"
+                                ))
+                                .with_label(value.span(), format!("expected `{want}` here"))
+                                .with_code("E302"),
+                            );
+                        }
                     }
                     self.record(*id, Ty::Error);
                 } else {
@@ -1216,15 +1426,20 @@ impl Checker {
             return self.record(id, Ty::Error);
         }
         for (i, (arg, got)) in args.iter().zip(arg_tys.iter()).enumerate() {
-            if ty_has_error(got) {
+            // Bare `Array.new(n)` without an element type defers its error
+            // until the formal is known (contextual `Array`/` *Array`
+            // supplies it); all other poisoned args stay quiet.
+            let is_bare_new = matches!(arg, HirExpr::Call { name, type_args, .. } if name == "Array.new" && type_args.is_empty());
+            if ty_has_error(got) && !is_bare_new {
                 continue;
             }
             let want = Ty::from_vl_in(&params[i].ty, &self.type_env);
             if ty_has_error(&want) {
                 continue;
             }
-            self.coerce_expr_literals(arg, &want);
-            let got = self.infer_expr(arg);
+            // Fresh literals adopt an expected mutable capability
+            // (`Foo {}` for `*Foo` params); existing values never upgrade.
+            let got = self.infer_expr_expected(arg, &want);
             if ty_has_error(&got) {
                 continue;
             }
@@ -1239,15 +1454,29 @@ impl Checker {
                 );
                 return self.record(id, Ty::Error);
             }
-            if !types_compatible(&got, &want) {
-                self.diags.push(
-                    Diagnostic::error(format!(
-                        "`{name}` parameter `{}` expects `{}`, got `{got}`",
-                        params[i].name, want
-                    ))
-                    .with_label(arg.span(), format!("expected `{want}` here"))
-                    .with_code("E306"),
-                );
+            if !can_coerce(&got, &want) {
+                if got.readonly_view() == want.readonly_view()
+                    && got.is_mutable_view() != want.is_mutable_view()
+                {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "cannot pass read-only `{got}` to mutable parameter `{}: {want}`",
+                            params[i].name
+                        ))
+                        .with_label(arg.span(), "mutation authority is required here")
+                        .with_note(format!("a read-only view cannot be upgraded to `{want}`"))
+                        .with_code("E306"),
+                    );
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "`{name}` parameter `{}` expects `{}`, got `{got}`",
+                            params[i].name, want
+                        ))
+                        .with_label(arg.span(), format!("expected `{want}` here"))
+                        .with_code("E306"),
+                    );
+                }
                 return self.record(id, Ty::Error);
             }
         }
@@ -1465,7 +1694,10 @@ impl Checker {
         if arg_tys.iter().any(ty_has_error) || ty_has_error(&elem) {
             return self.record(id, Ty::Error);
         }
-        if elem == Ty::Void {
+        if !validate_capability(&elem, span, &mut self.diags) {
+            return self.record(id, Ty::Error);
+        }
+        if elem == Ty::Void || elem.is_void() {
             self.diags.push(
                 Diagnostic::error("type argument cannot be `void`")
                     .with_label(span, "`void` is not a value type")
@@ -1492,7 +1724,7 @@ impl Checker {
         if ty_has_error(&ct) {
             return self.record(id, Ty::Error);
         }
-        if !types_compatible(&ct, &Ty::U64) {
+        if !same_type(&ct, &Ty::U64) {
             self.diags.push(
                 Diagnostic::error(format!(
                     "`{name}` parameter `count` expects `u64`, got `{ct}`"
@@ -1506,8 +1738,136 @@ impl Checker {
     }
 
     fn infer_expr_expected(&mut self, expr: &HirExpr, expected: &Ty) -> Ty {
+        // Contextual bare `Array.new(n)`: `Array[T]` or `*Array[T]` expected
+        // supplies the element type (returns/args as well as `let`).
+        if let HirExpr::Call {
+            name,
+            type_args,
+            args,
+            span,
+            id: call_id,
+            ..
+        } = expr
+        {
+            if name == "Array.new" && type_args.is_empty() {
+                let elem_opt: Option<&Ty> = match expected {
+                    Ty::Array(elem) => Some(elem),
+                    Ty::Mutable(inner) => match &**inner {
+                        Ty::Array(elem) => Some(elem),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(elem) = elem_opt {
+                    if !ty_has_error(expected) && !ty_has_error(elem) {
+                        let mut arg_tys = Vec::with_capacity(args.len());
+                        let mut poisoned = false;
+                        for arg in args {
+                            let t = self.infer_expr(arg);
+                            if ty_has_error(&t) {
+                                poisoned = true;
+                            }
+                            arg_tys.push(t);
+                        }
+                        if !poisoned {
+                            let arr = self.check_array_new_elem(
+                                name,
+                                *span,
+                                (*elem).clone(),
+                                args,
+                                &arg_tys,
+                                *call_id,
+                            );
+                            if !ty_has_error(&arr) && expected.is_mutable_view() {
+                                return self.record(*call_id, expected.clone());
+                            }
+                            return arr;
+                        }
+                    }
+                }
+            }
+        }
+        // Contextual array elements: `Array[*Foo]` or `*Array[*Foo]` expected
+        // infers each fresh element with its expected element type, so
+        // `[Foo {}]` becomes `Array[*Foo]` instead of failing. Variables and
+        // calls still never upgrade (fresh-only in the element check).
+        if let HirExpr::ArrayLiteral { id, elems, .. } = expr {
+            let expected_elem_opt: Option<&Ty> = match expected {
+                Ty::Array(elem) => Some(elem),
+                Ty::Mutable(inner) => match &**inner {
+                    Ty::Array(elem) => Some(elem),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(expected_elem) = expected_elem_opt {
+                if !ty_has_error(expected) && !ty_has_error(expected_elem) && !elems.is_empty() {
+                    // Only take this path when every element can coerce to the
+                    // expected element (otherwise fall through to the general
+                    // literal mismatch, which reports one E302).
+                    let mut elem_tys = Vec::with_capacity(elems.len());
+                    let mut ok = true;
+                    for e in elems {
+                        let t = self.infer_expr_expected(e, expected_elem);
+                        if ty_has_error(&t) {
+                            ok = false;
+                            break;
+                        }
+                        elem_tys.push(t);
+                    }
+                    if !ok {
+                        // Element errors already reported; stay quiet.
+                        return self.record(*id, Ty::Error);
+                    }
+                    {
+                        // Merge element types (handles `int` + mixed `*`).
+                        let mut acc = elem_tys[0].clone();
+                        let mut conflict = false;
+                        for t in &elem_tys[1..] {
+                            match common_type(&acc, t) {
+                                Some(c) => acc = c,
+                                None => {
+                                    conflict = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !conflict && can_coerce(&acc, expected_elem) {
+                            // Record elements already via recursion; record the
+                            // literal itself as the expected shape when fresh
+                            // (or as readonly Array when expected readonly).
+                            if expected.is_mutable_view() {
+                                // Fresh literal adopts mutable when element
+                                // shapes match (checked via can_coerce above).
+                                return self.record(*id, expected.clone());
+                            } else {
+                                return self.record(*id, Ty::Array(Box::new(acc)));
+                            }
+                        }
+                    }
+                    // Fall through to general handling on conflict (one E302).
+                }
+            }
+        }
         self.coerce_expr_literals(expr, expected);
-        self.infer_expr(expr)
+        let inferred = self.infer_expr(expr);
+        // Fresh allocations adopt an expected mutable capability
+        // (`Foo {}` with expected `*Foo` becomes `*Foo`). Existing
+        // expressions never upgrade: variables, fields, index results, and
+        // calls keep their capability.
+        if !ty_has_error(&inferred)
+            && !ty_has_error(expected)
+            && expected.is_mutable_view()
+            && is_fresh_allocation(expr)
+            && same_type(&inferred, &expected.readonly_view())
+        {
+            // String literals stay `String` even in a mutable context: there
+            // is no mutable string operation to justify manufacturing `*String`.
+            if inferred != Ty::String {
+                return self.record(expr.id(), expected.clone());
+            }
+        }
+        inferred
     }
 
     /// Give untyped integer literals the concrete type required by a use site.
@@ -1532,15 +1892,39 @@ impl Checker {
                 }
             }
             HirExpr::ArrayLiteral { id, elems, .. } => {
-                if let Ty::Array(elem) = expected {
+                // Fresh literals adopt expected capability: `*Array[T]`
+                // coerces elements to `T` like `Array[T]` does. The mutable
+                // wrapper is restored by `infer_expr_expected` after inference.
+                let elem_opt: Option<&Ty> = match expected {
+                    Ty::Array(elem) => Some(elem),
+                    Ty::Mutable(inner) => match &**inner {
+                        Ty::Array(elem) => Some(elem),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(elem) = elem_opt {
                     for e in elems {
                         self.coerce_expr_literals(e, elem);
                     }
+                    // Record the expected shape so contextual empty `[]`
+                    // honors it (`*Array[T]` included). Non-empty literals
+                    // re-infer below; the mutable wrapper is restored by the
+                    // fresh-allocation upgrade when the shapes match.
                     self.record(*id, expected.clone());
                 }
             }
             HirExpr::ObjectLiteral { id, fields, .. } => {
-                if let Ty::Object(name) = expected {
+                // `*Foo` in a fresh context coerces fields like `Foo`.
+                let obj_name: Option<&String> = match expected {
+                    Ty::Object(name) => Some(name),
+                    Ty::Mutable(inner) => match &**inner {
+                        Ty::Object(name) => Some(name),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(name) = obj_name {
                     if let Some(sig) = self.typed.objects.get(name).cloned() {
                         for (field, value) in fields {
                             if let Some((_, field_ty)) = sig.fields.iter().find(|(n, _)| n == field)
@@ -1548,7 +1932,9 @@ impl Checker {
                                 self.coerce_expr_literals(value, field_ty);
                             }
                         }
-                        self.record(*id, expected.clone());
+                        if matches!(expected, Ty::Object(_)) {
+                            self.record(*id, expected.clone());
+                        }
                     }
                 }
             }
@@ -1562,21 +1948,26 @@ impl Checker {
 
     /// Numeric in the current generic scope: concrete numerics plus `Param`
     /// with a `Numeric` bound. Unconstrained `T` stays opaque (no operators).
+    /// Mutable views inspect their read-only base (though `*u64` itself is
+    /// invalid and never reaches here valid).
     fn is_numeric_in_scope(&self, ty: &Ty) -> bool {
         match ty {
             Ty::Param(name) => self.type_bounds.get(name) == Some(&GenericBound::Numeric),
+            Ty::Mutable(inner) => self.is_numeric_in_scope(inner),
             _ => is_numeric(ty),
         }
     }
 
     /// Comparable in scope: concrete comparables plus `Param` with `Numeric`
-    /// (numbers compare) or `Comparable` bounds.
+    /// (numbers compare) or `Comparable` bounds. Mutable views read as their
+    /// base (`*String` compares as `String`).
     fn is_comparable_in_scope(&self, ty: &Ty) -> bool {
         match ty {
             Ty::Param(name) => matches!(
                 self.type_bounds.get(name),
                 Some(GenericBound::Numeric) | Some(GenericBound::Comparable)
             ),
+            Ty::Mutable(inner) => self.is_comparable_in_scope(inner),
             _ => is_comparable(ty),
         }
     }
@@ -1602,11 +1993,15 @@ impl Checker {
             HirExpr::ArrayLiteral { id, elems, .. } => {
                 if elems.is_empty() {
                     // Contextual empty: coercion already recorded the
-                    // annotation (`let e: Array[u64] = [];`); honor it.
-                    // A repeat visit after an error stays quiet.
+                    // annotation (`let e: Array[u64] = [];`, `*Array[T]`
+                    // likewise); honor it. A repeat visit after an error
+                    // stays quiet.
                     match self.typed.type_of_id(*id) {
                         Some(t) if ty_has_error(&t) => return self.record(*id, Ty::Error),
                         Some(t @ Ty::Array(_)) => return self.record(*id, t),
+                        Some(t @ Ty::Mutable(_)) if t.array_elem().is_some() => {
+                            return self.record(*id, t)
+                        }
                         _ => {}
                     }
                     // No element to infer from: point at the typed
@@ -1627,12 +2022,18 @@ impl Checker {
                     let t = self.infer_expr(elem);
                     if ty_has_error(&t) {
                         poisoned = true;
-                    } else if !poisoned && first == Ty::Int && is_integer(&t) {
-                        self.coerce_expr_literals(&elems[0], &t);
-                        first = t;
-                    } else if !poisoned && t == Ty::Int && is_integer(&first) {
-                        self.coerce_expr_literals(elem, &first);
-                    } else if !poisoned && t != first {
+                    } else if poisoned {
+                        // Already poisoned; stay quiet.
+                    } else if let Some(common) = common_type(&first, &t) {
+                        // `int` deferral and `*Foo`/`Foo` mixing both fold
+                        // here; coerce literals to the common lane.
+                        if first == Ty::Int && is_integer(&t) {
+                            self.coerce_expr_literals(&elems[0], &t);
+                        } else if t == Ty::Int && is_integer(&first) {
+                            self.coerce_expr_literals(elem, &first);
+                        }
+                        first = common;
+                    } else {
                         self.diags.push(
                             Diagnostic::error(format!(
                                 "array literal expects `{first}` elements, got `{t}`"
@@ -1713,17 +2114,42 @@ impl Checker {
                         poisoned = true;
                         continue;
                     };
+                    // Poisoned field declarations (E106 already reported) stay
+                    // quiet here to keep one root cause.
+                    if ty_has_error(want) {
+                        self.infer_expr(value);
+                        poisoned = true;
+                        continue;
+                    }
                     let got = self.infer_expr_expected(value, want);
                     if ty_has_error(&got) {
                         poisoned = true;
-                    } else if !types_compatible(&got, want) {
-                        self.diags.push(
-                            Diagnostic::error(format!(
-                                "object field `{field}` expects `{want}`, got `{got}`"
-                            ))
-                            .with_label(value.span(), format!("expected `{want}` here"))
-                            .with_code("E302"),
-                        );
+                    } else if !can_coerce(&got, want) {
+                        if got.readonly_view() == want.readonly_view()
+                            && got.is_mutable_view() != want.is_mutable_view()
+                        {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "cannot initialize mutable field `{field}: {want}` with read-only `{got}`"
+                                ))
+                                .with_label(
+                                    value.span(),
+                                    "mutation authority is required here",
+                                )
+                                .with_note(format!(
+                                    "a read-only view cannot be upgraded to `{want}`"
+                                ))
+                                .with_code("E302"),
+                            );
+                        } else {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "object field `{field}` expects `{want}`, got `{got}`"
+                                ))
+                                .with_label(value.span(), format!("expected `{want}` here"))
+                                .with_code("E302"),
+                            );
+                        }
                         poisoned = true;
                     }
                 }
@@ -1749,7 +2175,7 @@ impl Checker {
                     );
                     return self.record(*id, Ty::Error);
                 };
-                if !types_compatible(&it, &Ty::U64) {
+                if !same_type(&it, &Ty::U64) {
                     self.diags.push(
                         Diagnostic::error(format!("array index must be `u64`, got `{it}`"))
                             .with_label(index.span(), "expected `u64` here")
@@ -1757,7 +2183,9 @@ impl Checker {
                     );
                     return self.record(*id, Ty::Error);
                 }
-                self.record(*id, elem)
+                // Reading works through either capability; reference elements
+                // project transitively (`Array[*Foo][i]` -> `Foo`).
+                self.record(*id, project_capability(&bt, &elem))
             }
             HirExpr::Field {
                 id,
@@ -1766,10 +2194,7 @@ impl Checker {
                 span,
             } => {
                 let bt = self.infer_expr(base);
-                let Some(object_name) = (match &bt {
-                    Ty::Object(name) => Some(name.clone()),
-                    _ => None,
-                }) else {
+                let Some(object_name) = object_base(&bt) else {
                     if !ty_has_error(&bt) {
                         self.diags.push(
                             Diagnostic::error(format!("cannot access field `{name}` on `{bt}`"))
@@ -1790,7 +2215,9 @@ impl Checker {
                     );
                     return self.record(*id, Ty::Error);
                 };
-                self.record(*id, ty.clone())
+                // Transitive projection: `Parent.child` -> `Child`,
+                // `*Parent.child` -> `*Child`.
+                self.record(*id, project_capability(&bt, ty))
             }
             HirExpr::Var { id, def, span, .. } => {
                 // Unresolved names were already reported by `vl-semantic`;
@@ -1831,6 +2258,27 @@ impl Checker {
                 let mut arg_tys = Vec::with_capacity(args.len());
                 let mut poisoned = false;
                 for arg in args {
+                    // Bare `Array.new(n)` defers its element-type error until
+                    // the expected formal is known (per-argument contextual
+                    // handling supplies it for `Array`/`*Array` formals).
+                    // Infer its count argument for inner errors, then push a
+                    // quiet `Error` here; the later expected check either
+                    // succeeds contextually or reports one E303.
+                    if let HirExpr::Call {
+                        name: inner,
+                        type_args: inner_args,
+                        args: inner_call_args,
+                        ..
+                    } = arg
+                    {
+                        if inner == "Array.new" && inner_args.is_empty() {
+                            for a in inner_call_args {
+                                let _ = self.infer_expr(a);
+                            }
+                            arg_tys.push(Ty::Error);
+                            continue;
+                        }
+                    }
                     let t = self.infer_expr(arg);
                     if ty_has_error(&t) {
                         poisoned = true;
@@ -1917,15 +2365,17 @@ impl Checker {
                     return self.record(*id, Ty::Error);
                 }
                 for (i, original_got) in arg_tys.iter().enumerate() {
-                    if ty_has_error(original_got) {
+                    // Bare `Array.new` defers to expected-formal contextual
+                    // handling below; other poisoned args stay quiet.
+                    let is_bare_new = matches!(&args[i], HirExpr::Call { name, type_args, .. } if name == "Array.new" && type_args.is_empty());
+                    if ty_has_error(original_got) && !is_bare_new {
                         continue;
                     }
                     let want = &param_tys[i];
                     if ty_has_error(want) {
                         continue;
                     }
-                    self.coerce_expr_literals(&args[i], want);
-                    let got = self.infer_expr(&args[i]);
+                    let got = self.infer_expr_expected(&args[i], want);
                     if ty_has_error(&got) {
                         continue;
                     }
@@ -1940,15 +2390,34 @@ impl Checker {
                         );
                         return self.record(*id, Ty::Error);
                     }
-                    if !types_compatible(&got, want) {
-                        self.diags.push(
-                            Diagnostic::error(format!(
-                                "`{name}` parameter `{}` expects `{}`, got `{got}`",
-                                sig.param_names[i], want
-                            ))
-                            .with_label(args[i].span(), format!("expected `{want}` here"))
-                            .with_code("E306"),
-                        );
+                    if !can_coerce(&got, want) {
+                        if got.readonly_view() == want.readonly_view()
+                            && got.is_mutable_view() != want.is_mutable_view()
+                        {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "cannot pass read-only `{got}` to mutable parameter `{}: {want}`",
+                                    sig.param_names[i]
+                                ))
+                                .with_label(
+                                    args[i].span(),
+                                    "mutation authority is required here",
+                                )
+                                .with_note(format!(
+                                    "a read-only view cannot be upgraded to `{want}`"
+                                ))
+                                .with_code("E306"),
+                            );
+                        } else {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "`{name}` parameter `{}` expects `{}`, got `{got}`",
+                                    sig.param_names[i], want
+                                ))
+                                .with_label(args[i].span(), format!("expected `{want}` here"))
+                                .with_code("E306"),
+                            );
+                        }
                         return self.record(*id, Ty::Error);
                     }
                 }
@@ -2074,7 +2543,11 @@ impl Checker {
                         if ty_has_error(&lt) || ty_has_error(&rt) {
                             return self.record(*id, Ty::Error);
                         }
-                        if !types_compatible(&lt, &rt) || !self.is_comparable_in_scope(&lt) {
+                        // Read-only comparison: mutable views read as their
+                        // base (`*String` compares as `String`).
+                        let comparable = same_type(&lt, &rt)
+                            || same_type(&lt.readonly_view(), &rt.readonly_view());
+                        if !comparable || !self.is_comparable_in_scope(&lt) {
                             if matches!((&lt, &rt), (Ty::Param(_), _) | (_, Ty::Param(_)))
                                 && types_compatible(&lt, &rt)
                             {
@@ -2320,22 +2793,12 @@ fn ty_contains_int(ty: &Ty) -> bool {
 
 /// Structurally unify two solved constraint types, letting `int` defer to a
 /// concrete integer lane at any depth (`Array[Int]` + `Array[u8]` gives
-/// `Array[u8]`). Returns `None` on genuine conflict.
+/// `Array[u8]`), and picking the safe read-only side when mixing `*R` and
+/// `R` (`*Foo` + `Foo` gives `Foo`). Returns `None` on genuine conflict.
 pub(crate) fn unify_solved(a: &Ty, b: &Ty) -> Option<Ty> {
-    if a == b {
-        return Some(a.clone());
-    }
-    if *a == Ty::Int && is_integer(b) {
-        return Some(b.clone());
-    }
-    if *b == Ty::Int && is_integer(a) {
-        return Some(a.clone());
-    }
-    match (a, b) {
-        (Ty::Array(x), Ty::Array(y)) => unify_solved(x, y).map(|e| Ty::Array(Box::new(e))),
-        (Ty::Mutable(x), Ty::Mutable(y)) => unify_solved(x, y).map(|e| Ty::Mutable(Box::new(e))),
-        _ => None,
-    }
+    // Shared with array literals: safe common type covers `int` deferral,
+    // capability downgrade, and structural recursion.
+    common_type(a, b)
 }
 
 /// Central integer coercion: the single operation for literal defaulting,
@@ -2410,7 +2873,8 @@ impl ConstraintSet {
     /// Collect constraints from one formal-vs-actual pair. `Param` uses push
     /// a constraint; concrete formals must match exactly (an `Int` actual
     /// against an integer formal is coercible and contributes nothing — the
-    /// later per-argument coercion pass handles it). Reports one E306 on
+    /// later per-argument coercion pass handles it; a mutable actual against
+    /// a read-only formal downgrades likewise). Reports one E306 on
     /// concrete mismatch and returns false.
     fn collect(
         &mut self,
@@ -2427,10 +2891,31 @@ impl ConstraintSet {
             }
             (Ty::Array(f), Ty::Array(a)) => self.collect(f, a, name, span, diags),
             (Ty::Mutable(f), Ty::Mutable(a)) => self.collect(f, a, name, span, diags),
+            // Read-only array formal accepts a mutable array actual via
+            // downgrade for inference (`Array[T]` with `*Array[u64]` infers
+            // `T = u64`); the later per-argument check enforces downgrade.
+            (Ty::Array(_), Ty::Mutable(inner)) => match &**inner {
+                Ty::Array(_) => self.collect(formal, inner, name, span, diags),
+                _ => {
+                    diags.push(
+                        Diagnostic::error(format!("`{name}` expects `{formal}`, got `{actual}`"))
+                            .with_label(span, format!("expected `{formal}` here"))
+                            .with_code("E306"),
+                    );
+                    false
+                }
+            },
+            // Mutable formal infers from a readonly actual via its readonly
+            // view (`*Array[T]` with `[1u64]` infers `T = u64`); the later
+            // per-argument fresh upgrade makes the literal mutable.
+            (Ty::Mutable(f), _) => self.collect(f, actual, name, span, diags),
             (f, a) if f == a => true,
             // An untyped literal against a concrete integer lane coerces
             // later; it is not an inference conflict.
             (f, Ty::Int) if is_integer(f) => true,
+            // Read-only formal accepts a mutable actual via downgrade
+            // (`Foo` accepts `*Foo`); the later per-argument check enforces it.
+            (f, a) if can_coerce(a, f) => true,
             (f, a) => {
                 diags.push(
                     Diagnostic::error(format!("`{name}` expects `{f}`, got `{a}`"))
@@ -2643,10 +3128,200 @@ fn fallthrough_span(body: &[HirStmt]) -> Option<Span> {
 /// context type by [`Checker::coerce_expr_literals`] before this runs, so a
 /// lingering `Int` here means "no context supplied one" and must not match
 /// every integer lane.
+///
+/// Kept for symmetric operand checks (arithmetic, index). Boundary checks
+/// (initializer, assignment, argument, return, field, element) use
+/// [`can_coerce`] so `*R -> R` downgrades while `R -> *R` fails.
 fn types_compatible(got: &Ty, want: &Ty) -> bool {
-    got == want
-        || matches!((got, want), (Ty::Array(g), Ty::Array(w)) if types_compatible(g, w))
-        || matches!((got, want), (Ty::Mutable(g), Ty::Mutable(w)) if types_compatible(g, w))
+    same_type(got, want)
+}
+
+/// Invariant/equality check: exact structural equality, including capability.
+/// `Foo` vs `*Foo` are different; `*Foo` vs `*Foo` are the same.
+fn same_type(a: &Ty, b: &Ty) -> bool {
+    a == b
+}
+
+/// Directional capability coercion for typed boundaries (initializer,
+/// assignment, argument, return, object-field, array-element).
+/// Allows discarding mutation authority (`*R -> R` for the same reference
+/// shape) and forbids inventing it (`R -> *R`). Nested container arguments
+/// stay invariant: `Array[*Foo]` does not coerce to `Array[Foo]` as a whole
+/// (element boundaries coerce per element, and reads project).
+pub(crate) fn can_coerce(got: &Ty, want: &Ty) -> bool {
+    if same_type(got, want) {
+        return true;
+    }
+    // One implicit downgrade: `*R` supplies a read-only `R`.
+    if let Ty::Mutable(inner) = got {
+        return same_type(inner, want);
+    }
+    false
+}
+
+/// Safe common type for array literals and generic constraint merging.
+/// Picks the read-only side when mixing `*R` and `R`, defers `int` to a
+/// concrete integer lane, and recurses through `Array`. Returns `None` on
+/// genuine conflict.
+fn common_type(a: &Ty, b: &Ty) -> Option<Ty> {
+    if same_type(a, b) {
+        return Some(a.clone());
+    }
+    if *a == Ty::Int && is_integer(b) {
+        return Some(b.clone());
+    }
+    if *b == Ty::Int && is_integer(a) {
+        return Some(a.clone());
+    }
+    // Mixed capability at the top level: the safe common type is read-only.
+    // `*Foo` + `Foo` -> `Foo`; `*Array[T]` + `Array[T]` -> `Array[T]`.
+    if let Ty::Mutable(ai) = a {
+        if same_type(ai, b) {
+            return Some(b.clone());
+        }
+    }
+    if let Ty::Mutable(bi) = b {
+        if same_type(a, bi) {
+            return Some(a.clone());
+        }
+    }
+    match (a, b) {
+        (Ty::Array(x), Ty::Array(y)) => common_type(x, y).map(|e| Ty::Array(Box::new(e))),
+        (Ty::Mutable(x), Ty::Mutable(y)) => common_type(x, y).map(|e| Ty::Mutable(Box::new(e))),
+        _ => None,
+    }
+}
+
+/// Transitive read-only projection for field and element reads.
+/// A mutable receiver preserves the declared member capability;
+/// a read-only receiver downgrades a mutable member (`*Child` -> `Child`).
+fn project_capability(receiver: &Ty, member: &Ty) -> Ty {
+    if receiver.is_mutable_view() {
+        member.clone()
+    } else {
+        member.readonly_view()
+    }
+}
+
+/// Object name through an optional outer `*` (`Foo` or `*Foo` -> `Foo`).
+fn object_base(ty: &Ty) -> Option<String> {
+    match ty {
+        Ty::Object(name) => Some(name.clone()),
+        Ty::Mutable(inner) => match &**inner {
+            Ty::Object(name) => Some(name.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Compiler-known fresh allocations whose initial capability may be selected
+/// by an expected type: object literals, array literals (including `[]`),
+/// and `Array.new` constructions. String literals are excluded (they stay
+/// `String`); variables, fields, index results, and calls never upgrade.
+fn is_fresh_allocation(expr: &vl_hir::HirExpr) -> bool {
+    match expr {
+        vl_hir::HirExpr::ObjectLiteral { .. } => true,
+        vl_hir::HirExpr::ArrayLiteral { .. } => true,
+        vl_hir::HirExpr::Call { name, .. } if name == "Array.new" => true,
+        _ => false,
+    }
+}
+
+/// Validate a declared type's capability placement (E106). Rejects `*` over
+/// scalars/`void`, nested `**`, and `*T` over an unconstrained parameter.
+/// `Array` contents recurse. Returns true when valid; on failure reports one
+/// diagnostic and the caller poisons.
+fn validate_capability(ty: &Ty, span: Span, diags: &mut Vec<Diagnostic>) -> bool {
+    match ty {
+        Ty::Mutable(inner) => {
+            // Nested `**T` never valid.
+            if inner.is_mutable_view() {
+                diags.push(
+                    Diagnostic::error(format!("repeated capability qualifier `*{inner}`"))
+                        .with_label(span, "only one `*` is allowed here")
+                        .with_code("E106"),
+                );
+                return false;
+            }
+            match &**inner {
+                Ty::Param(name) => {
+                    diags.push(
+                        Diagnostic::error(format!("`*{name}` needs a reference-kind bound"))
+                            .with_label(span, "unconstrained `T` cannot grant mutation authority")
+                            .with_note("use `T` itself and supply `*Foo` as the argument")
+                            .with_code("E106"),
+                    );
+                    return false;
+                }
+                Ty::Void => {
+                    diags.push(
+                        Diagnostic::error("`*void` is not a valid type")
+                            .with_label(span, "`void` is not a value type")
+                            .with_code("E106"),
+                    );
+                    return false;
+                }
+                Ty::U64 | Ty::I64 | Ty::F64 | Ty::Bool | Ty::U8 | Ty::Int => {
+                    diags.push(
+                        Diagnostic::error(format!("`*{inner}` is not a reference type"))
+                            .with_label(span, "only reference types take `*`")
+                            .with_note("write `*Foo`, `*String`, `*File`, or `*Array[T]`")
+                            .with_code("E106"),
+                    );
+                    return false;
+                }
+                Ty::String | Ty::File | Ty::Object(_) | Ty::Array(_) | Ty::Error => {
+                    // Payload may still be malformed (`*Array[*u64]`).
+                    return validate_capability(inner, span, diags);
+                }
+                Ty::Mutable(_) => {
+                    diags.push(
+                        Diagnostic::error(format!("repeated capability qualifier `*{inner}`"))
+                            .with_label(span, "only one `*` is allowed here")
+                            .with_code("E106"),
+                    );
+                    return false;
+                }
+            }
+        }
+        Ty::Array(elem) => return validate_capability(elem, span, diags),
+        _ => {}
+    }
+    true
+}
+
+/// Quiet validity check for capability placement (no diagnostics).
+/// False for `*` over scalars/`void`, nested `**`, `*T`, and any `Array`
+/// containing such.
+fn is_capability_valid(ty: &Ty) -> bool {
+    match ty {
+        Ty::Mutable(inner) => {
+            if inner.is_mutable_view() {
+                return false;
+            }
+            match &**inner {
+                Ty::Param(_)
+                | Ty::Void
+                | Ty::U64
+                | Ty::I64
+                | Ty::F64
+                | Ty::Bool
+                | Ty::U8
+                | Ty::Int
+                | Ty::Mutable(_) => return false,
+                Ty::String | Ty::File | Ty::Object(_) | Ty::Error => {
+                    return is_capability_valid(inner);
+                }
+                Ty::Array(_) => {
+                    return is_capability_valid(inner);
+                }
+            }
+        }
+        Ty::Array(elem) => return is_capability_valid(elem),
+        _ => {}
+    }
+    true
 }
 
 fn is_numeric(ty: &Ty) -> bool {
@@ -2663,13 +3338,18 @@ fn is_comparable(ty: &Ty) -> bool {
 /// Does a concrete type satisfy a generic bound? `Numeric` covers the
 /// arithmetic lanes (`u64,i64,f64,u8`, plus undefaulted `int` defensively);
 /// `Comparable` covers those plus `bool` and `String` (equality).
+/// Mutable views read as their base (`*String` satisfies `Comparable` as
+/// `String`; `*Foo` does not become comparable).
 pub(crate) fn bound_satisfied(bound: GenericBound, ty: &Ty) -> bool {
-    match bound {
-        GenericBound::Numeric => matches!(ty, Ty::Int | Ty::U64 | Ty::I64 | Ty::F64 | Ty::U8),
-        GenericBound::Comparable => matches!(
-            ty,
-            Ty::Int | Ty::U64 | Ty::I64 | Ty::F64 | Ty::Bool | Ty::U8 | Ty::String
-        ),
+    match ty {
+        Ty::Mutable(inner) => bound_satisfied(bound, inner),
+        _ => match bound {
+            GenericBound::Numeric => matches!(ty, Ty::Int | Ty::U64 | Ty::I64 | Ty::F64 | Ty::U8),
+            GenericBound::Comparable => matches!(
+                ty,
+                Ty::Int | Ty::U64 | Ty::I64 | Ty::F64 | Ty::Bool | Ty::U8 | Ty::String
+            ),
+        },
     }
 }
 
@@ -2715,7 +3395,7 @@ mod tests {
     #[test]
     fn arrays_check_clean() {
         let (_, diags) = check_src(
-            "function sum(a: Array[u64]): u64 { return a[0u64]; } function main() { let a = Array.new::[u64](3u64); a[0u64] = 1u64; let b = [1u64, 2u64]; sum(a); sum(b); }",
+            "function sum(a: Array[u64]): u64 { return a[0u64]; } function main() { let a: *Array[u64] = Array.new::[u64](3u64); a[0u64] = 1u64; let b = [1u64, 2u64]; sum(a); sum(b); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -2723,7 +3403,7 @@ mod tests {
     #[test]
     fn objects_check_field_types_and_reference_operations() {
         let (_, diags) = check_src(
-            "type Counter = object { value: u64, }; function bump(c: Counter): Counter { c.value = c.value + 1; return c; } function main() { let c = Counter { value = 1 }; let d = bump(c); d.value = 3; }",
+            "type Counter = object { value: u64, }; function bump(c: *Counter): *Counter { c.value = c.value + 1u64; return c; } function main() { let c: *Counter = Counter { value = 1u64 }; let d = bump(c); d.value = 3u64; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -2800,7 +3480,8 @@ mod tests {
 
     #[test]
     fn annotated_let_accepts_empty_literal() {
-        let (_, diags) = check_src("function main() { let e: Array[u64] = []; e[0] = 1; e; }");
+        let (_, diags) =
+            check_src("function main() { let e: *Array[u64] = []; e[0u64] = 1u64; e; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
@@ -2892,7 +3573,8 @@ mod tests {
 
     #[test]
     fn index_assign_checks_shapes() {
-        let (_, diags) = check_src(r#"function main() { let a = [1u64]; a[0u64] = "s"; }"#);
+        let (_, diags) =
+            check_src(r#"function main() { let a: *Array[u64] = [1u64]; a[0u64] = "s"; }"#);
         assert!(
             diags.iter().any(|d| d.message.contains("cannot store")),
             "{diags:?}"
@@ -3787,8 +4469,186 @@ mod tests {
             Some(mfoo.clone()),
             "identical mutable views unify"
         );
-        // Mixed `*Foo` vs `Foo` stays a conflict here; directional
-        // coercion/common-type picks the safe read-only side later.
-        assert_eq!(unify_solved(&mfoo, &foo), None);
+        // Mixed `*Foo` vs `Foo` picks the safe read-only side.
+        assert_eq!(unify_solved(&mfoo, &foo), Some(foo.clone()));
+        assert_eq!(unify_solved(&foo, &mfoo), Some(foo.clone()));
+        assert!(can_coerce(&mfoo, &foo));
+        assert!(!can_coerce(&foo, &mfoo));
+        assert!(same_type(&mfoo, &mfoo));
+        assert!(!same_type(&mfoo, &foo));
+        assert_eq!(common_type(&mfoo, &foo), Some(foo.clone()));
+        assert_eq!(
+            project_capability(&foo, &mfoo),
+            foo,
+            "read-only receiver downgrades"
+        );
+        assert_eq!(
+            project_capability(&mfoo, &mfoo),
+            mfoo,
+            "mutable receiver preserves"
+        );
+    }
+
+    #[test]
+    fn mutable_downgrade_allowed_at_all_boundaries() {
+        // `*Foo -> Foo` succeeds everywhere; `Foo -> *Foo` fails everywhere.
+        let (_, diags) = check_src(
+            "type Foo = object { value: u64, }; function read(foo: Foo) {} function change(foo: *Foo) {} function main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = e; read(e); read(v); change(e); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+
+        for (src, code) in [
+            (
+                "type Foo = object { value: u64, }; function change(foo: *Foo) {} function main() { let v: Foo = Foo { value = 1u64 }; change(v); }",
+                "E306",
+            ),
+            (
+                "type Foo = object { value: u64, }; function main() { let v: Foo = Foo { value = 1u64 }; let bad: *Foo = v; }",
+                "E309",
+            ),
+            (
+                "type Foo = object { value: u64, }; function get(): Foo { let v: Foo = Foo { value = 1u64 }; return v; } function bad(): *Foo { let v: Foo = Foo { value = 1u64 }; return v; }",
+                "E307",
+            ),
+        ] {
+            let (_, diags) = check_src(src);
+            assert_eq!(
+                diags.iter().filter(|d| d.is_error()).count(),
+                1,
+                "{src}: {diags:?}"
+            );
+            assert_eq!(
+                diags[0].code.as_deref(),
+                Some(code),
+                "{src}: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_rebinding_uses_directional_coercion() {
+        let (_, diags) = check_src(
+            "type Foo = object { value: u64, }; function main() { let c: Foo = Foo { value = 1u64 }; c = Foo { value = 2u64 }; let m: *Foo = Foo { value = 1u64 }; m = Foo { value = 2u64 }; let p = 1u64; p = 2u64; let a: *Array[u64] = [1u64]; a = [2u64]; }",
+        );
+        // `m = Foo{}` upgrades a fresh readonly literal? No: fresh adopts
+        // `*Foo` via context, so all rebindings are downgrades or exact.
+        assert!(diags.is_empty(), "{diags:?}");
+
+        let (_, diags) = check_src(
+            "type Foo = object { value: u64, }; function main() { let m: *Foo = Foo { value = 1u64 }; let v: Foo = Foo { value = 1u64 }; m = v; }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert_eq!(diags[0].code.as_deref(), Some("E309"));
+    }
+
+    #[test]
+    fn readonly_writes_fail_mutable_writes_pass() {
+        let (_, diags) = check_src(
+            "type Foo = object { value: u64, }; function edit(m: *Foo) { m.value = 1u64; } function read(v: Foo) { v.value; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+
+        let (_, diags) = check_src(
+            "type Foo = object { value: u64, }; function bad(v: Foo) { v.value = 1u64; }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert_eq!(diags[0].code.as_deref(), Some("E310"));
+
+        let (_, diags) = check_src("function bad(a: Array[u64]) { a[0u64] = 1u64; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert_eq!(diags[0].code.as_deref(), Some("E310"));
+
+        let (_, diags) = check_src("function good(a: *Array[u64]) { a[0u64] = 1u64; }");
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn deep_projection_does_not_leak_mutability() {
+        let (_, diags) = check_src(
+            "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; function bad(p: Parent) { p.child.value = 1u64; }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert_eq!(diags[0].code.as_deref(), Some("E310"));
+
+        let (_, diags) = check_src(
+            "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; function good(p: *Parent) { p.child.value = 1u64; p.children[0u64].value = 1u64; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn mutable_returns_preserve_and_cannot_launder() {
+        let (_, diags) = check_src(
+            "type Foo = object { value: u64, }; function create(): *Foo { return Foo { value = 1u64 }; } function main() { let e = create(); let v: Foo = create(); e; v; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+
+        let (_, diags) = check_src(
+            "type Foo = object { value: u64, }; function inspect(v: Foo): Foo { return v; } function main() { let v: Foo = Foo { value = 1u64 }; let bad: *Foo = inspect(v); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+    }
+
+    #[test]
+    fn fresh_allocations_default_readonly_and_adopt_mutable() {
+        let (typed, diags) =
+            check_src("type Foo = object { value: u64, }; function main() { let v = Foo { value = 1u64 }; v; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.types.values().any(|t| *t == Ty::Object("Foo".into())));
+
+        let (typed, diags) = check_src(
+            "type Foo = object { value: u64, }; function main() { let e: *Foo = Foo { value = 1u64 }; e; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed
+            .types
+            .values()
+            .any(|t| *t == Ty::Mutable(Box::new(Ty::Object("Foo".into())))));
+
+        // Existing values never upgrade from context.
+        let (_, diags) = check_src(
+            "type Foo = object { value: u64, }; function get(): Foo { let v: Foo = Foo { value = 1u64 }; return v; } function main() { let bad: *Foo = get(); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+    }
+
+    #[test]
+    fn invalid_mutable_shapes_are_one_e106() {
+        // `*T` parses (needs substitution) and fails here with one E106 per
+        // invalid annotation.
+        let (_, diags) = check_src("function f[T](x: *T): T { return x; }");
+        assert_eq!(
+            diags.iter().filter(|d| d.is_error()).count(),
+            1,
+            "{diags:?}"
+        );
+        assert_eq!(diags[0].code.as_deref(), Some("E106"), "{diags:?}");
+
+        // `*u64` is rejected by the parser; type checking stays quiet (no
+        // cascade) when fed the poisoned HIR.
+        for src in [
+            "function f(x: *u64) { x; }",
+            "type Foo = object { value: *u64, }; function main() { let x = 1u64; x; }",
+        ] {
+            let (toks, _) = vl_lex::lex(src);
+            let (prog, pdiags) = vl_syntax::parse(&toks, src);
+            assert!(
+                pdiags.iter().any(|d| d.code.as_deref() == Some("E106")),
+                "{src}: {pdiags:?}"
+            );
+            let (res, _) = vl_semantic::resolve(&prog);
+            let hir = vl_hir::lower(&prog, &res);
+            let (_, tdiags) = check(&hir);
+            assert!(tdiags.iter().all(|d| !d.is_error()), "{src}: {tdiags:?}");
+        }
+    }
+
+    #[test]
+    fn as_cast_never_upgrades_capability() {
+        let (_, diags) = check_src(
+            "type Foo = object { value: u64, }; function main() { let v: Foo = Foo { value = 1u64 }; let x = v as u64; x; }",
+        );
+        // `Foo as u64` is an unsupported cast (E302), not a capability upgrade.
+        assert!(diags.iter().any(|d| d.code.as_deref() == Some("E302")));
     }
 }
