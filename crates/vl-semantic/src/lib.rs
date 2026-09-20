@@ -130,10 +130,22 @@ fn collect_interface_impl(
 ) -> (ModuleInterface, Vec<Diagnostic>) {
     let mut functions: Vec<vl_common::Export> = Vec::new();
     let mut generic_functions = Vec::new();
+    let mut objects: Vec<vl_common::ObjectExport> = Vec::new();
     let mut diags = Vec::new();
     let mut poisoned_exports = Vec::new();
     let mut global_dependent_exports = Vec::new();
     let mut seen = HashMap::<String, Span>::new();
+    // Local object names, so bare references in signatures and fields can
+    // be qualified to `<module>.<name>` on export. Importers only ever see
+    // the qualified spelling, which keeps nominal identity collision-free.
+    let local_objects = prog
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Object { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
     let global_names = prog
         .items
         .iter()
@@ -173,6 +185,40 @@ fn collect_interface_impl(
                 changed = true;
             }
         }
+    }
+    // Object layouts are public by default, like top-level functions.
+    // Duplicate object names are reported by resolution (E200); the
+    // interface keeps the first so importers see a stable catalog.
+    for item in &prog.items {
+        let Item::Object { name, fields, .. } = item else {
+            continue;
+        };
+        if objects
+            .iter()
+            .any(|export: &vl_common::ObjectExport| export.name == *name)
+        {
+            continue;
+        }
+        let qualified = format!("{}.{}", prog.module, name);
+        let mut out_fields = Vec::with_capacity(fields.len());
+        for field in fields {
+            let ty = field
+                .ty
+                .clone()
+                .map(|ty| qualify_export_ty(&ty, &prog.module, &local_objects));
+            out_fields.push(vl_common::ObjectFieldSig {
+                name: field.name.clone(),
+                // A missing field type was already reported by the parser;
+                // `void` stands in so the export keeps its shape while
+                // typechecking poisons uses quietly downstream.
+                ty: ty.unwrap_or(vl_common::VlType::Void),
+            });
+        }
+        objects.push(vl_common::ObjectExport {
+            name: name.clone(),
+            qualified,
+            fields: out_fields,
+        });
     }
     for item in &prog.items {
         let Item::Function {
@@ -228,31 +274,26 @@ fn collect_interface_impl(
             generic_functions.push(name.clone());
             continue;
         }
+        // Exported signatures qualify local object references
+        // (`Person` -> `vl.person.Person`) so importers resolve nominal
+        // identity without the provider's scope.
         let sig = vl_common::FuncSig {
             params: params
                 .iter()
                 .filter_map(|p| {
                     p.ty.clone().map(|ty| vl_common::ParamSig {
                         name: p.name.clone(),
-                        ty,
+                        ty: qualify_export_ty(&ty, &prog.module, &local_objects),
                     })
                 })
                 .collect(),
-            ret: ret.clone().unwrap_or(vl_common::VlType::Void),
+            ret: ret
+                .clone()
+                .map(|ty| qualify_export_ty(&ty, &prog.module, &local_objects))
+                .unwrap_or(vl_common::VlType::Void),
         };
         if sig.params.len() != params.len() {
             poisoned_exports.push(name.clone());
-            continue;
-        }
-        if sig.params.iter().any(|p| crosses_boundary(&p.ty)) || crosses_boundary(&sig.ret) {
-            poisoned_exports.push(name.clone());
-            diags.push(
-                Diagnostic::error(format!(
-                    "exported function `{name}` uses an object type across a module boundary"
-                ))
-                .with_label(*span, "unsupported cross-module signature")
-                .with_code("E208"),
-            );
             continue;
         }
         functions.push(vl_common::Export {
@@ -266,12 +307,41 @@ fn collect_interface_impl(
             origin: ModuleOrigin::Source,
             functions,
             generic_functions,
+            objects,
             parse_poisoned: false,
             poisoned_exports,
             global_dependent_exports,
         },
         diags,
     )
+}
+
+/// Rewrite bare references to this module's own object types into their
+/// fully qualified identity (`Person` -> `<module>.Person`). Already
+/// qualified names, primitives, and type parameters pass through; `Array`
+/// and `*` recurse. Unknown bare names are left alone for downstream
+/// poisoning (the parser already reported them).
+fn qualify_export_ty(
+    ty: &vl_common::VlType,
+    module: &str,
+    local_objects: &std::collections::HashSet<String>,
+) -> vl_common::VlType {
+    match ty {
+        vl_common::VlType::Object(name) if !name.contains('.') => {
+            if local_objects.contains(name) {
+                vl_common::VlType::Object(format!("{module}.{name}"))
+            } else {
+                ty.clone()
+            }
+        }
+        vl_common::VlType::Array(elem) => {
+            vl_common::VlType::Array(Box::new(qualify_export_ty(elem, module, local_objects)))
+        }
+        vl_common::VlType::Mutable(inner) => {
+            vl_common::VlType::Mutable(Box::new(qualify_export_ty(inner, module, local_objects)))
+        }
+        _ => ty.clone(),
+    }
 }
 
 fn collect_local_calls(stmts: &[Stmt], calls: &mut Vec<String>) {
@@ -1029,6 +1099,7 @@ impl Resolver {
                                 path: vl_common::ModulePath::new(vec![parent_key, leaf]),
                                 exports: vec![],
                                 generic_exports: vec![],
+                                objects: vec![],
                                 parse_poisoned: parent.parse_poisoned,
                                 poisoned_exports: vec![],
                                 global_dependent_exports: vec![],
@@ -1619,6 +1690,43 @@ mod tests {
                 .filter(|def| def.kind == DefKind::ImportedFunction)
                 .all(|def| def.sig.is_none()));
         }
+    }
+
+    #[test]
+    fn object_types_are_exported_qualified_without_e208() {
+        let (toks, _) = vl_lex::lex(
+            "type Person = object { name: String, age: u64, }; fun new(name: String, age: u64): *Person { return Person { name = name, age = age, }; } fun print_name(person: Person) { person.name; }",
+        );
+        let (provider, _) = vl_syntax::parse_with_module(&toks, "", "vl.person");
+        let (interface, diags) = collect_interface(&provider);
+        assert!(diags.is_empty(), "{diags:?}");
+        let person = interface
+            .objects
+            .iter()
+            .find(|o| o.name == "Person")
+            .expect("Person export");
+        assert_eq!(person.qualified, "vl.person.Person");
+        assert_eq!(person.fields.len(), 2);
+        let new = interface
+            .functions
+            .iter()
+            .find(|e| e.name == "new")
+            .expect("new export");
+        assert_eq!(
+            new.sig.ret,
+            vl_common::VlType::Mutable(Box::new(vl_common::VlType::Object(
+                "vl.person.Person".into()
+            )))
+        );
+        let print = interface
+            .functions
+            .iter()
+            .find(|e| e.name == "print_name")
+            .expect("print_name export");
+        assert_eq!(
+            print.sig.params[0].ty,
+            vl_common::VlType::Object("vl.person.Person".into())
+        );
     }
 
     #[test]
