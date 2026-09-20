@@ -18,8 +18,14 @@ cargo test --workspace
 echo "== driver smoke =="
 cargo run -q -- check examples/hello.vl
 cargo run -q -- build examples/arith.vl --emit lir | head -20
+cargo run -q -- check examples/capabilities.vl
+cargo run -q -- build examples/capabilities.vl --emit lir | head -20
 if cargo run -q -- check examples/err_undefined.vl; then
   echo "ERROR: err_undefined.vl should fail" >&2
+  exit 1
+fi
+if cargo run -q -- check examples/err_readonly_mutation.vl; then
+  echo "ERROR: err_readonly_mutation.vl should fail" >&2
   exit 1
 fi
 

@@ -986,9 +986,7 @@ mod tests {
             HirItem::Fn { body, .. } => {
                 // `let e = id::[*Foo](base)`: mutable turbofish survives.
                 match &body[1] {
-                    HirStmt::Let {
-                        def, value, ty: _, ..
-                    } => {
+                    HirStmt::Let { def, value, .. } => {
                         let let_def = def.clone().expect("e def");
                         match value {
                             HirExpr::Call {

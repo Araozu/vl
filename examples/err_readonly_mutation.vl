@@ -1,0 +1,10 @@
+type Counter = object {
+    value: u64,
+};
+
+function invalid(view: Counter, editable: *Counter) {
+    view.value = 1;
+    view = editable;
+    let readonly: Counter = editable;
+    let upgrade: *Counter = readonly;
+}

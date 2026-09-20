@@ -840,7 +840,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
         lower_fn_epilogue(&mut l, topped_return);
         out.functions.push(Function {
             name: m.clone(),
-            param_tys: inst.sig.param_tys.iter().map(|t| rt(t)).collect(),
+            param_tys: inst.sig.param_tys.iter().map(rt).collect(),
             ret: rt(&inst.sig.ret),
             instrs: l.instrs,
         });

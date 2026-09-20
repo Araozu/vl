@@ -1,0 +1,24 @@
+use std;
+
+type Counter = object {
+    value: u64,
+};
+
+function read(counter: Counter): u64 {
+    return counter.value;
+}
+
+function increment(counter: *Counter) {
+    counter.value = counter.value + 1;
+}
+
+function main() {
+    let counter: *Counter = Counter { value = 0 };
+    let view: Counter = counter;
+
+    increment(counter);
+    std.print_u64(read(view));
+    counter = Counter { value = 10 };
+    increment(counter);
+    std.print_u64(read(counter));
+}

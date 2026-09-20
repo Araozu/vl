@@ -87,6 +87,51 @@ fn arith_matches_golden_lir() {
 }
 
 #[test]
+fn capabilities_example_compiles_and_aliases() {
+    let src = std::fs::read_to_string("examples/capabilities.vl").unwrap();
+    // AST keeps source capabilities (`*Counter`).
+    {
+        let (toks, _) = vl_lex::lex(&src);
+        let (ast, diags) = vl_syntax::parse(&toks, &src);
+        assert!(diags.is_empty(), "{diags:?}");
+        let text = format!("{ast:?}");
+        assert!(text.contains("Mutable"), "{text}");
+    }
+    let lir = frontend(&src).expect("capabilities.vl must compile");
+    let dump = lir.dump();
+    // Mutable and read-only views erase to the same runtime ops.
+    assert!(dump.contains("object_get"), "{dump}");
+    assert!(dump.contains("object_set"), "{dump}");
+    assert!(!dump.contains('*'), "{dump}");
+    // AST keeps capabilities; LIR erases them (checked via dump above).
+    use vl_codegen::Target;
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+}
+
+#[test]
+fn err_readonly_mutation_fails() {
+    let src = std::fs::read_to_string("examples/err_readonly_mutation.vl").unwrap();
+    let err = frontend(&src).expect_err("err_readonly_mutation.vl must fail");
+    // One root cause per invalid operation: E310 (field), E205 (rebind),
+    // E309 (upgrade). The valid downgrade stays quiet.
+    assert_eq!(err.iter().filter(|d| d.is_error()).count(), 3, "{err:?}");
+    assert!(
+        err.iter().any(|d| d.code.as_deref() == Some("E310")),
+        "{err:?}"
+    );
+    assert!(
+        err.iter().any(|d| d.code.as_deref() == Some("E205")),
+        "{err:?}"
+    );
+    assert!(
+        err.iter().any(|d| d.code.as_deref() == Some("E309")),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn undefined_name_is_one_clean_error() {
     let src = std::fs::read_to_string("examples/err_undefined.vl").unwrap();
     let err = frontend(&src).expect_err("must fail");
