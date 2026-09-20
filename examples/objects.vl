@@ -11,8 +11,8 @@ fun bump(counter: *Counter): *Counter {
 }
 
 fun main() {
-    let counter: *Counter = Counter { value = 1, label = "count" };
-    let same = bump(counter);
+    var counter = Counter { value = 1, label = "count" }; // inferred *Counter
+    var same: *Counter = bump(counter);
     same.value = same.value + 1;
     std.print(same.label);
     std.print_u64(counter.value);

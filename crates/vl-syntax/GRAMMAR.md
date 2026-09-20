@@ -9,9 +9,9 @@ Parser recovers per-item (and per-stmt inside `fun`); one bad item hides no othe
 
 ```text
 program := item*
-item    := use_item | let_item | function_item | object_item
+item    := use_item | binding_item | function_item | object_item
 use_item := "use" path ("." "{" ident ("," ident)* "}")? ";"
-let_item := "let" ident (":" type)? "=" expr ";"
+binding_item := ("var" | "val") ident (":" type)? "=" expr ";"
 function_item := "fun" ident type_params? "(" params? ")" (":" type)? block
 type_params := "[" type_param ("," type_param)* "]"
 type_param := ident ("extends" ("Numeric" | "Comparable"))?
@@ -24,8 +24,8 @@ type     := mutable_type | type_atom
 mutable_type := "*" type_atom           ; one capability qualifier (`*Foo`, `*Array[T]`)
 type_atom := "u64" | "i64" | "f64" | "bool" | "u8" | "String" | "File" | ident | "Array" "[" type "]" | "void"
 block    := "{" stmt* "}"
-stmt     := let_stmt | assign_stmt | index_assign_stmt | field_assign_stmt | if_stmt | while_stmt | break_stmt | continue_stmt | return_stmt | expr_stmt
-let_stmt := "let" ident (":" type)? "=" expr ";"
+stmt     := binding_stmt | assign_stmt | index_assign_stmt | field_assign_stmt | if_stmt | while_stmt | break_stmt | continue_stmt | return_stmt | expr_stmt
+binding_stmt := ("var" | "val") ident (":" type)? "=" expr ";"
 assign_stmt := ident "=" expr ";"
 index_assign_stmt := assignable "[" expr "]" "=" expr ";"
 field_assign_stmt := assignable "." ident "=" expr ";"
@@ -56,16 +56,16 @@ literal  := int | i64 | u64 | f64 | u8 | bool
 path     := ident ("." ident)*
 ```
 
-Terminal names are `vl-lex` `TokenKind`s: `Let Fun Type Object If Else While Break
+Terminal names are `vl-lex` `TokenKind`s: `Var Val Fun Type Object If Else While Break
 Continue Return As Extends Eq EqEq Bang BangEq Lt LtEq Gt GtEq AmpAmp PipePipe
 Plus Minus Star Slash Semi LParen RParen LBrace RBrace LBracket RBracket Comma
 Dot Colon ColonColon Ident Int I64 U64 F64 U8 Bool String Invalid Eof`.
 
 ### Notes
 
-* Semicolons are mandatory everywhere: `let`, object declarations, `return`, `break`, `continue`,
+* Semicolons are mandatory everywhere: `var`/`val`, object declarations, `return`, `break`, `continue`,
   and expression-statements need `;` — including the last statement of a
-  fun body (`{ let d = x; }`). A bare trailing `d` without `;` is `E100`.
+  fun body (`{ val d = x; }`). A bare trailing `d` without `;` is `E100`.
 * There are no implicit returns: only `return expr;` yields a value
   (`return;` for `void`). A trailing `d;` is a discarded expression statement.
 * Unary is `-` / `!`, right-recursive: `- -5`, `!x` ok; `+x` → `E103`.
@@ -86,12 +86,12 @@ Dot Colon ColonColon Ident Int I64 U64 F64 U8 Bool String Invalid Eof`.
 ```text
 Program { items: Vec<Item> }
 Item ::= Use { path, names, span }
-       | Let { name, name_span, ty, ty_span, value: Expr, span }
+       | Let { kind: Var | Val, name, name_span, ty, ty_span, value: Expr, span }
        | Function { name, name_span, type_params: Vec<TypeParam>, params: Vec<Param>, ret: Option<VlType>, ret_span, body: Vec<Stmt>, span }
        | Object { name, name_span, fields: Vec<ObjectField>, span }
 TypeParam ::= { name, span, bound: Option<GenericBound> }
 Param ::= { name, name_span, ty: Option<VlType>, ty_span }
-Stmt ::= Let { name, name_span, ty, ty_span, value: Expr, span }
+Stmt ::= Let { kind: Var | Val, name, name_span, ty, ty_span, value: Expr, span }
        | Assign { name, name_span, value: Expr, span }
        | IndexAssign { array, index, value, span }
        | FieldAssign { base, field, field_span, value, span }
@@ -111,7 +111,11 @@ BinOp ::= Add | Sub | Mul | Div | Eq | Ne | Lt | Le | Gt | Ge | And | Or
 UnOp  ::= Neg | Not
 ```
 
-Spans (`vl_common::Span`, byte, half-open): `let` spans `let..;`, `fun` spans
+The implementation names the two binding nodes `Item::Let` and `Stmt::Let`
+for compatibility with older HIR/LIR code; their `kind` field is the source
+keyword and is always `BindingKind::Var` or `BindingKind::Val`.
+
+Spans (`vl_common::Span`, byte, half-open): `val` spans `val..;`, `fun` spans
 `fun..}`, `Binary` spans `lhs.start..rhs.end`, `Unary` spans `minus.start..rhs.end`.
 
 ## Errors (all `Severity::Error`)
@@ -119,8 +123,8 @@ Spans (`vl_common::Span`, byte, half-open): `let` spans `let..;`, `fun` spans
 | Code | When | Message shape |
 |---|---|---|
 | `E100` | `expect()` mismatch (missing `= ; ( ) { }`) | `expected {what}, found {describe}` + label `unexpected token here` |
-| `E101` | item doesn't start with `use`/`let`/`fun`/`type` | `expected an item (\`use\`, \`let\`, \`fun\` or \`type\`), found …` + label `items start with …` |
-| `E102` | missing name (after `let`/`fun`, or bad param) | `expected a name, found …` + label `expected identifier here` |
+| `E101` | item doesn't start with `use`/`var`/`val`/`fun`/`type` | `expected an item (\`use\`, \`var\`, \`val\`, \`fun\` or \`type\`), found …` + label `items start with …` |
+| `E102` | missing name (after `var`/`val`/`fun`, or bad param) | `expected a name, found …` + label `expected identifier here` |
 | `E103` | bad expression start | `expected an expression, found …` + label `expected value here` |
 | `E104` | missing param type / `void` param / expected type | `parameter \`{name}\` is missing a type` / `cannot be \`void\`` / `expected a type …` |
 | `E105` | unknown type | `unknown type …` |
@@ -128,14 +132,14 @@ Spans (`vl_common::Span`, byte, half-open): `let` spans `let..;`, `fun` spans
 
 `describe()`: `Ident(n)` → `` identifier `n` ``, `Int(v)` → `` integer `v` ``,
 keywords/symbols backticked, `Eof` → `end of file`.
-Missing `;` (`let x = 1`) → `E100`; `@` never reaches here (lexer `E000`).
+Missing `;` (`val x = 1`) → `E100`; `@` never reaches here (lexer `E000`).
 
 ## Recovery
 
 * `program` loop: failed `parse_item()` → `recover_to_item_boundary`: skip
-  until (and consuming) `;`/`}`, or stopping at `let`/`fun`/`type`/`Eof`.
+  until (and consuming) `;`/`}`, or stopping at `var`/`val`/`fun`/`type`/`Eof`.
 * `fun` body loop: failed `parse_stmt()` → `recover_to_stmt_boundary`: skip
-  until (and consuming) `;`, or stopping at `}`/`let`/`fun`/`if`/`while`/
+  until (and consuming) `;`, or stopping at `}`/`var`/`val`/`fun`/`if`/`while`/
   `break`/`continue`/`return`/`Eof`.
 * `parse_expr/term` return `None` upward on missing rhs, so `1 +` abandons
   the whole item/stmt and recovers at the boundary. Poison rule (AGENTS.md):
@@ -148,15 +152,15 @@ Missing `;` (`let x = 1`) → `E100`; `@` never reaches here (lexer `E000`).
 ## Examples
 
 ```text
-"let x = 1 + 2 * 3;"                → Item::Let, Binary(Add, 1, Binary(Mul, 2, 3))
-"fun main() { let d = x; }"    → Item::Function { params: [], body: [Let(d)] }
+"val x = 1 + 2 * 3;"                → Item::Let(Val), Binary(Add, 1, Binary(Mul, 2, 3))
+"fun main() { val d = x; }"    → Item::Function { params: [], body: [Let(Val, d)] }
 "fun add(a: i64, b: i64): i64 { return a + b; }" → Item::Function { body: [Return(Binary(Add))] }
 "fun main() { return; }"       → Item::Function { body: [Return(None)] }
-"let x = 1"                         → E100 (expected `;`), item dropped
+"val x = 1"                         → E100 (expected `;`), item dropped
 "fun main() { d }"             → E100 (expected `;`), stmt dropped
 "fun f(): i64 { return 1 }"    → E100 (expected `;`), stmt dropped
-"let x = - -5;"                     → Unary(Neg, Unary(Neg, 5))
-"d;" at top level                   → E101 (items start with use/let/fun/type)
+"val x = - -5;"                     → Unary(Neg, Unary(Neg, 5))
+"d;" at top level                   → E101 (items start with use/var/val/fun/type)
 ```
 
 ## Modules

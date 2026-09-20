@@ -21,7 +21,7 @@ The code in the first branch runs when the condition is `true`. An optional
 use std;
 
 fun main() {
-    let temperature = 25;
+    val temperature = 25;
 
     if (temperature > 30) {
         std.println("hot");
@@ -41,7 +41,7 @@ clearer and make it easier to add another statement later:
 use std;
 
 fun main() {
-    let ready = true;
+    val ready = true;
     if (ready) std.println("go");
 }
 ```
@@ -52,7 +52,7 @@ Several choices can be chained with `else if`:
 use std;
 
 fun main() {
-    let score = 85u64;
+    val score = 85u64;
     if (score >= 90u64) {
         std.println("A");
     } else if (score >= 80u64) {
@@ -76,7 +76,7 @@ stops.
 use std;
 
 fun main() {
-    let i = 1;
+    var i = 1;
     while (i <= 3) {
         std.print_u64(i);
         i = i + 1;
@@ -96,7 +96,7 @@ current iteration and checks the loop condition again.
 use std;
 
 fun main() {
-    let i = 0;
+    var i = 0;
     while (true) {
         i = i + 1;
         if (i == 3) {
@@ -120,8 +120,8 @@ both sides to be true; `||` requires at least one side to be true.
 
 ```vl
 fun main() {
-    let logged_in = true;
-    let has_permission = true;
+    val logged_in = true;
+    val has_permission = true;
     if (logged_in && has_permission) {
         // Open the settings view here.
     }

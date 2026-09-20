@@ -30,7 +30,7 @@ newline is then whitespace. An unterminated comment at EOF simply stops.
 ## Tokens
 
 ```text
-keyword    := "let" | "fun" | "type" | "object" | "if" | "else"
+keyword    := "var" | "val" | "fun" | "type" | "object" | "if" | "else"
             | "while" | "break" | "continue" | "return" | "as" | "extends"
 ident      := [a-zA-Z_] [a-zA-Z0-9_]*
 number     := digits ("." digits)? suffix?
@@ -58,7 +58,7 @@ bytes; no UTF-8 decoding is performed.
 
 | Spelling | `TokenKind` | Span |
 |---|---|---|
-| `let`, `fun`, `type`, `object`, `if`, `else`, `while`, `break`, `continue`, `return` | matching keyword | word span |
+| `var`, `val`, `fun`, `type`, `object`, `if`, `else`, `while`, `break`, `continue`, `return` | matching keyword | word span |
 | `as` | `As` | word span |
 | `extends` | `Extends` | word span |
 | `[a-zA-Z_][a-zA-Z0-9_]*` | `Ident(String)` | word span |
@@ -77,7 +77,7 @@ bytes; no UTF-8 decoding is performed.
 
 Notes:
 
-* Maximal munch applies to words and operators: `letx` is `Ident("letx")`,
+* Maximal munch applies to words and operators: `varx` is `Ident("varx")`,
   and `::`, `==`, `!=`, `<=`, `>=`, `&&`, and `||` are single tokens.
 * Identifier continuation in code is `b.is_ascii_alphanumeric() || b == b'_'`.
   For ASCII input this equals `[0-9A-Za-z_]`; non-ASCII bytes are errors.
@@ -88,7 +88,7 @@ Notes:
 * `*` (`Star`) has no fixed meaning here: it is multiplication in
   expressions (`a * b`) and a capability qualifier in types (`*Foo`).
   The parser decides by position; the lexer emits `Star` in both cases.
-  No `var`, `val`, `const`, `mut`, `&`, or dereference token exists.
+  No `let`, `const`, `mut`, `&`, or dereference token exists.
 
 ## Errors (all `Severity::Error`, all recover by skipping)
 
@@ -104,9 +104,9 @@ Lexing never stops early; later valid tokens and the final `Eof` are retained.
 ## Examples
 
 ```text
-"let x = 1 + 2;"  → Let Ident("x") Eq Int(1) Plus Int(2) Semi Eof, no diags
-"// hi\nlet a=1;" → Let Ident("a") Eq Int(1) Semi Eof
-"let x = @;"      → Let Ident("x") Eq Invalid Semi Eof + E000 on `@`
+"var x = 1 + 2;"  → Var Ident("x") Eq Int(1) Plus Int(2) Semi Eof, no diags
+"// hi\nvar a=1;" → Var Ident("a") Eq Int(1) Semi Eof
+"val x = @;"      → Val Ident("x") Eq Invalid Semi Eof + E000 on `@`
 "1u8"             → U8(1), no diags
 "a\\n"             → String([97, 10])
 "type Point = object { x: u64, };" → Type ... Object ... Colon ... Comma ...

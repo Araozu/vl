@@ -18,15 +18,15 @@ fun second[T](a: Array[T], fallback: T): T {
 }
 
 fun main() {
-    let nums: *Array[u64] = Array.new(3);
+    var nums: *Array[u64] = Array.new(3);
     nums[0] = 10;
     nums[1] = 20;
     nums[2] = 30;
-    let inferred = first(nums);
+    val inferred = first(nums);
     std.print_u64(inferred);
     std.print_u64(first::[u64](nums));
     std.print_u64(second(nums, 99));
-    let words = ["hi", "bye"];
+    val words = ["hi", "bye"];
     std.print(first(words));
     std.print(first::[String](words));
 }

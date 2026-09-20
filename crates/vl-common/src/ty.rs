@@ -94,7 +94,7 @@ impl FromStr for VlType {
 }
 
 impl VlType {
-    /// `void` is not a value: it cannot be a parameter, a `let` binding, a
+    /// `void` is not a value: it cannot be a parameter, a `var`/`val` binding, a
     /// call argument, or an operand. It may only appear as a function return
     /// (value discarded) or as a bare expression statement.
     /// Recurses through `Mutable`/`Array` so `*void` still counts as void.

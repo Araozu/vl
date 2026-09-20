@@ -21,7 +21,7 @@ fun add(a: i64, b: i64): i64 {
 }
 
 fun main() {
-    let total = add(2, 3);
+    val total = add(2, 3);
 }
 ```
 
@@ -36,6 +36,10 @@ The parts of the definition are:
 The caller supplies arguments in the same order as the parameters. The number
 and types of the arguments must match the definition. A `*Foo` argument
 downgrades to a `Foo` parameter; a `Foo` argument never upgrades to `*Foo`.
+
+At the call site, use `var` when a fresh reference should be mutable and
+rebindable, or `val` when the binding should be fixed. An explicit `Foo` or
+`*Foo` annotation controls the capability regardless of the binding keyword.
 
 ## Fixed parameters
 
@@ -102,8 +106,8 @@ fun create_foo(): *Foo {
 }
 
 fun main() {
-    let editable = create_foo();      // inferred *Foo
-    let view: Foo = create_foo();     // allowed downgrade
+    var editable = create_foo();      // inferred *Foo
+    val view: Foo = create_foo();     // allowed downgrade
 }
 ```
 
@@ -121,7 +125,7 @@ fun quadruple(value: i64): i64 {
 }
 
 fun main() {
-    let result = quadruple(5);
+    val result = quadruple(5);
 }
 ```
 

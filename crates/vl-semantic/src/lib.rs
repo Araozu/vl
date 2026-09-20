@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use vl_common::{Diagnostic, ModuleSpec, Span};
-use vl_syntax::{Expr, Item, Program, Stmt};
+use vl_syntax::{BindingKind, Expr, Item, Program, Stmt};
 
 /// A definition site: which item/scope and which binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +23,9 @@ pub struct Def {
     /// Compiler-owned extern signature. `Some` for `External` defs resolved
     /// from the module catalog; `None` for locals and poisoned imports.
     pub sig: Option<vl_common::FuncSig>,
+    /// Binding mode for value definitions. Functions and parameters leave
+    /// this unset because their fixed-binding rules are independent.
+    pub binding: Option<BindingKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,15 +44,17 @@ pub struct Resolution {
 }
 
 impl Resolution {
-    fn intern_def(&mut self, name: String, span: Span) -> DefId {
-        self.intern_def_as(name, span, DefKind::Local)
-    }
-
     fn intern_param(&mut self, name: String, span: Span) -> DefId {
-        self.intern_def_as(name, span, DefKind::Parameter)
+        self.intern_def_as(name, span, DefKind::Parameter, None)
     }
 
-    fn intern_def_as(&mut self, name: String, span: Span, kind: DefKind) -> DefId {
+    fn intern_def_as(
+        &mut self,
+        name: String,
+        span: Span,
+        kind: DefKind,
+        binding: Option<BindingKind>,
+    ) -> DefId {
         let id = DefId(self.defs.len() as u32);
         self.defs.push(Def {
             id: id.clone(),
@@ -57,6 +62,7 @@ impl Resolution {
             span,
             kind,
             sig: None,
+            binding,
         });
         id
     }
@@ -137,14 +143,17 @@ pub fn resolve_with_modules(
             Item::Use { .. } => {}
             Item::Object { .. } => {}
             Item::Let {
-                name, name_span, ..
+                name,
+                name_span,
+                kind,
+                ..
             } => {
-                r.declare_global(name.clone(), *name_span);
+                r.declare_global(name.clone(), *name_span, Some(*kind));
             }
             Item::Function {
                 name, name_span, ..
             } => {
-                r.declare_global(name.clone(), *name_span);
+                r.declare_global(name.clone(), *name_span, None);
             }
         }
     }
@@ -200,7 +209,7 @@ pub fn resolve_with_modules(
 }
 
 impl Resolver {
-    fn declare_global(&mut self, name: String, span: Span) {
+    fn declare_global(&mut self, name: String, span: Span, binding: Option<BindingKind>) {
         let global = &mut self.scopes[0];
         if let Some(prev) = global
             .get(&name)
@@ -214,11 +223,13 @@ impl Resolver {
             );
             return;
         }
-        let id = self.out.intern_def(name.clone(), span);
+        let id = self
+            .out
+            .intern_def_as(name.clone(), span, DefKind::Local, binding);
         global.insert(name, id);
     }
 
-    fn declare_local(&mut self, name: String, span: Span) {
+    fn declare_local(&mut self, name: String, span: Span, binding: BindingKind) {
         let top = self.scopes.last_mut().unwrap();
         if top.contains_key(&name) {
             self.diags.push(
@@ -226,7 +237,9 @@ impl Resolver {
                     .with_label(span, "shadowing definition"),
             );
         }
-        let id = self.out.intern_def(name.clone(), span);
+        let id = self
+            .out
+            .intern_def_as(name.clone(), span, DefKind::Local, Some(binding));
         top.insert(name, id);
     }
 
@@ -244,11 +257,12 @@ impl Resolver {
             Stmt::Let {
                 name,
                 name_span,
+                kind,
                 value,
                 ..
             } => {
                 self.resolve_expr(value);
-                self.declare_local(name.clone(), *name_span);
+                self.declare_local(name.clone(), *name_span, *kind);
             }
             Stmt::Assign {
                 name,
@@ -272,16 +286,29 @@ impl Resolver {
                             return;
                         }
                         if let Some(def) = self.out.defs.iter().find(|d| d.id == id) {
-                            if def.kind == DefKind::Parameter {
+                            if def.kind == DefKind::Parameter
+                                || def.binding == Some(BindingKind::Val)
+                            {
+                                let message = if def.kind == DefKind::Parameter {
+                                    format!("cannot rebind parameter `{name}`")
+                                } else {
+                                    format!("cannot rebind `val` binding `{name}`")
+                                };
+                                let label = if def.kind == DefKind::Parameter {
+                                    "parameters are fixed bindings"
+                                } else {
+                                    "`val` bindings are fixed"
+                                };
+                                let note = if def.kind == DefKind::Parameter {
+                                    "parameters cannot be assigned; use a local `var` when rebinding is needed"
+                                } else {
+                                    "`val` bindings cannot be assigned; use `var` when rebinding is needed"
+                                };
                                 self.diags.push(
-                                    Diagnostic::error(format!(
-                                        "cannot rebind parameter `{name}`"
-                                    ))
-                                    .with_label(*name_span, "parameters are fixed bindings")
-                                    .with_note(
-                                        "`*Foo` parameters permit field or index mutation, not assignment to the parameter; declare a local `let` when rebinding is needed",
-                                    )
-                                    .with_code("E205"),
+                                    Diagnostic::error(message)
+                                        .with_label(*name_span, label)
+                                        .with_note(note)
+                                        .with_code("E205"),
                                 );
                             }
                         }
@@ -290,7 +317,7 @@ impl Resolver {
                         self.diags.push(
                             Diagnostic::error(format!("cannot find `{name}` in this scope"))
                                 .with_label(*name_span, "undefined variable")
-                                .with_note("did you mean to `let`-bind it first?")
+                                .with_note("did you mean to `var`/`val`-bind it first?")
                                 .with_code("E201"),
                         );
                     }
@@ -400,7 +427,7 @@ impl Resolver {
                             path.join(".")
                         ))
                         .with_label(*span, "undefined variable")
-                        .with_note("did you mean to `let`-bind it first?")
+                        .with_note("did you mean to `var`/`val`-bind it first?")
                         .with_code("E201"),
                     );
                 }
@@ -419,7 +446,7 @@ impl Resolver {
                 // extern-call path (LIR desugars it to an allocation).
                 // A bare `Array.new(count)` carries no type argument: it
                 // resolves the same way with no signature, and typechecking
-                // either infers `T` from an annotated `let` or reports E303.
+                // either infers `T` from an annotated binding or reports E303.
                 if callee.len() == 2 && callee[0] == "Array" && callee[1] == "new" {
                     let [elem] = type_args.as_slice() else {
                         if type_args.len() > 1 {
@@ -649,6 +676,7 @@ impl Resolver {
             span,
             kind: DefKind::External,
             sig,
+            binding: None,
         });
         id
     }
@@ -713,26 +741,26 @@ mod tests {
 
     #[test]
     fn assignment_to_a_bound_local_resolves() {
-        let (_, diags) = resolve_src("fun main() { let x = 1; x = 2; }");
+        let (_, diags) = resolve_src("fun main() { var x = 1; x = 2; }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
     }
 
     #[test]
     fn unknown_object_literal_is_deferred_to_typechecking() {
-        let (_, diags) = resolve_src("fun main() { let x = Missing {}; }");
+        let (_, diags) = resolve_src("fun main() { val x = Missing {}; }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
     }
 
     #[test]
     fn undefined_variable_errors() {
-        let (_, diags) = resolve_src("let x = y;");
+        let (_, diags) = resolve_src("val x = y;");
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains('y'));
     }
 
     #[test]
     fn shadowing_is_a_warning_only() {
-        let (toks, _) = vl_lex::lex("fun f(x: i64): i64 { let x = 1; x; }");
+        let (toks, _) = vl_lex::lex("fun f(x: i64): i64 { val x = 1; x; }");
         let (prog, _) = vl_syntax::parse(&toks, "");
         let (_, diags) = resolve(&prog);
         assert!(diags.iter().all(|d| !d.is_error()));
@@ -806,13 +834,13 @@ mod tests {
     #[test]
     fn array_literal_index_and_index_assign_resolve() {
         let (_, diags) =
-            resolve_src("fun main() { let a = [1u64, 2u64]; a[0u64] = 3u64; let x = a[1u64]; }");
+            resolve_src("fun main() { val a = [1u64, 2u64]; a[0u64] = 3u64; val x = a[1u64]; }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
     }
 
     #[test]
     fn array_new_needs_no_import_and_carries_its_signature() {
-        let (res, diags) = resolve_src("fun main() { let a = Array.new::[u64](3u64); a; }");
+        let (res, diags) = resolve_src("fun main() { val a = Array.new::[u64](3u64); a; }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
         let def = res
             .defs
@@ -831,8 +859,8 @@ mod tests {
     #[test]
     fn array_new_without_type_arg_defers_to_typechecking() {
         // No turbofish: resolution succeeds with no signature; typechecking
-        // either infers `T` from an annotated `let` or reports E303.
-        let (res, diags) = resolve_src("fun main() { let a = Array.new(3); a; }");
+        // either infers `T` from an annotated binding or reports E303.
+        let (res, diags) = resolve_src("fun main() { val a = Array.new(3); a; }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
         let def = res
             .defs
@@ -844,21 +872,21 @@ mod tests {
 
     #[test]
     fn array_new_with_two_type_args_is_one_error() {
-        let (_, diags) = resolve_src("fun main() { let a = Array.new::[u64, u64](3); a; }");
+        let (_, diags) = resolve_src("fun main() { val a = Array.new::[u64, u64](3); a; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("exactly one type argument"));
     }
 
     #[test]
     fn u64array_callee_points_at_the_replacement() {
-        let (_, diags) = resolve_src("fun main() { let a = U64Array.new(3u64); a; }");
+        let (_, diags) = resolve_src("fun main() { val a = U64Array.new(3u64); a; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("U64Array"));
     }
 
     #[test]
     fn index_into_undefined_array_errors() {
-        let (_, diags) = resolve_src("fun main() { let x = missing[0u64]; x; }");
+        let (_, diags) = resolve_src("fun main() { val x = missing[0u64]; x; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E201")));
     }
 
@@ -881,6 +909,15 @@ mod tests {
     }
 
     #[test]
+    fn val_rebinding_is_one_e205() {
+        let (_, diags) = resolve_src("fun main() { val answer = 1u64; answer = 2u64; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E205"), "{diags:?}");
+        assert!(errors[0].message.contains("cannot rebind `val`"));
+    }
+
+    #[test]
     fn parameter_field_and_index_mutation_still_resolve() {
         let (_, diags) = resolve_src(
             "type Foo = object { value: u64, }; fun f(x: *Foo, a: *Array[u64]) { x.value = 1u64; a[0u64] = 1u64; }",
@@ -891,7 +928,7 @@ mod tests {
     #[test]
     fn local_rebinding_and_shadowing_still_allowed() {
         let (_, diags) = resolve_src(
-            "fun f(x: u64) { let x = 1u64; x = 2u64; } fun g() { let y = 1u64; y = 2u64; }",
+            "fun f(x: u64) { var x = 1u64; x = 2u64; } fun g() { var y = 1u64; y = 2u64; }",
         );
         // Shadowing is a warning; rebinding the local is fine.
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");

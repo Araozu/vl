@@ -17,19 +17,23 @@ to grow it or ask for its length.
 An array literal uses square brackets. All its elements must have the same
 type.
 
+An unannotated `var` array gets a `*Array[T]` view; an unannotated `val` array
+gets `Array[T]`. Add an explicit annotation when the intended capability
+should be independent of the binding keyword.
+
 ```vl
-let scores = [10, 20, 30];
-let words = ["one", "two"];
+val scores = [10, 20, 30];
+val words = ["one", "two"];
 ```
 
 For an array whose size is known but whose values will be filled in later, use
-the builtin `Array.new` constructor. The preferred form annotates the `let`
+the builtin `Array.new` constructor. The preferred form annotates the `var`
 so the element type comes from the annotation. Element writes require a
 `*Array[T]` view; reads work through either capability:
 
 ```vl
 fun main() {
-    let scores: *Array[u64] = Array.new(3);
+    var scores: *Array[u64] = Array.new(3);
     scores[0] = 10;
     scores[1] = 20;
     scores[2] = 30;
@@ -39,11 +43,11 @@ fun main() {
 The explicit turbofish form says the element type at the call instead:
 
 ```vl
-let scores = Array.new::[u64](3);
+val scores = Array.new::[u64](3);
 ```
 
 The new array is filled with zero values. An empty literal `[]` has no element
-type for VL to infer, so annotate it (`let e: Array[u64] = [];`) or use
+type for VL to infer, so annotate it (`val e: Array[u64] = [];`) or use
 `Array.new::[T](n)` when the array starts empty.
 
 ## Reading and writing elements
@@ -53,8 +57,8 @@ An index selects one element. Indexes start at zero, so the first element is
 
 ```vl
 fun main() {
-    let values: *Array[u64] = [4, 8, 15];
-    let first = values[0];
+    val values: *Array[u64] = [4, 8, 15];
+    val first = values[0];
     values[1] = first + 1;
 }
 ```
@@ -67,8 +71,8 @@ to `Array[T]`, never the reverse. Indexing projects element capabilities
 
 ```vl
 fun sum(values: Array[u64], count: u64): u64 {
-    let total = 0;
-    let i = 0;
+    var total = 0;
+    var i = 0;
     while (i < count) {
         total = total + values[i];
         i = i + 1;
@@ -100,10 +104,10 @@ fun first[T](values: Array[T]): T {
 }
 
 fun main() {
-    let numbers: *Array[u64] = [10, 20];
-    let number = first(numbers);
-    let words = ["hi", "bye"];
-    let word = first(words);
+    val numbers: *Array[u64] = [10, 20];
+    val number = first(numbers);
+    val words = ["hi", "bye"];
+    val word = first(words);
 }
 ```
 
@@ -118,8 +122,8 @@ fun first[T](values: Array[T]): T {
 }
 
 fun main() {
-    let numbers: *Array[u64] = [10, 20];
-    let number = first::[u64](numbers);
+    val numbers: *Array[u64] = [10, 20];
+    val number = first::[u64](numbers);
 }
 
 ```

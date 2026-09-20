@@ -5,6 +5,6 @@ type Counter = object {
 fun invalid(view: Counter, editable: *Counter) {
     view.value = 1;
     view = editable;
-    let readonly: Counter = editable;
-    let upgrade: *Counter = readonly;
+    val readonly: Counter = editable;
+    val upgrade: *Counter = readonly;
 }

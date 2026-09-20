@@ -1,6 +1,6 @@
 // Fixed-length heap arrays (`Array[T]`).
 //
-// `let scores: *Array[u64] = Array.new(3);` is the preferred form for writes:
+// `var scores: *Array[u64] = Array.new(3);` is the preferred form for writes:
 // the annotation supplies the element type (explicit `Array.new::[u64](3)`
 // works too). `[1, 2]` is an array literal, `a[i]` reads element `i`, and
 // `a[i] = v;` writes it. Indices are always `u64`; elements have the
@@ -8,8 +8,8 @@
 use std;
 
 fun sum(a: Array[u64], n: u64): u64 {
-    let total = 0;
-    let i = 0;
+    var total = 0;
+    var i = 0;
     while (i < n) {
         total = total + a[i];
         i = i + 1;
@@ -18,11 +18,11 @@ fun sum(a: Array[u64], n: u64): u64 {
 }
 
 fun main() {
-    let scores: *Array[u64] = Array.new(3);
+    var scores: *Array[u64] = Array.new(3);
     scores[0] = 10;
     scores[1] = 20;
     scores[2] = 30;
-    let b: *Array[u64] = [1, 2, 3];
+    var b: *Array[u64] = [1, 2, 3];
     b[0] = 5;
     std.print_u64(sum(scores, 3));
     std.print_u64(sum(b, 3));

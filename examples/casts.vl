@@ -11,9 +11,9 @@ fun take_u8(x: u8): u8 {
 }
 
 fun main() {
-    let v = 200u64;
-    let w = take_u8(v as u8);
+    val v = 200u64;
+    val w = take_u8(v as u8);
     std.print_u64(w as u64);
-    let lit = 10 as u8;
+    val lit = 10 as u8;
     std.print_u64(lit as u64);
 }

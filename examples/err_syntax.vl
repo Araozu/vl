@@ -1,2 +1,2 @@
 // Error demo: missing `;` and bad character.
-let x = 1 + @
+val x = 1 + @

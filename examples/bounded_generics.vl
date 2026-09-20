@@ -17,7 +17,7 @@ fun eq[T extends Comparable](a: T, b: T): bool {
 fun main() {
     std.print_u64(add(1u64, 2u64));
     std.print_u64(add::[u8](10u8, 20u8) as u64);
-    let ok = eq(add(1u64, 2u64), 3u64);
+    val ok = eq(add(1u64, 2u64), 3u64);
     if (ok) {
         std.print("bounded ok\n");
     } else {

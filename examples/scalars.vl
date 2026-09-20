@@ -1,8 +1,8 @@
 // Contextual integer literals and boolean conditional statements.
-let count = 255;
-let total = 1;
-let delta = -1;
-let ratio = 1.5f64;
+val count = 255;
+val total = 1;
+val delta = -1;
+val ratio = 1.5f64;
 
 fun main() {
     if (true) {

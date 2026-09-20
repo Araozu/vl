@@ -3,7 +3,7 @@
 //! Grammar (v0 surface):
 //! ```text
 //! program := item*
-//! item    := `use` ... | `let` ident (`:` type)? `=` expr `;` | `fun` ident type-params? `(` params? `)` (`:` type)? block | `type` ident `=` `object` `{` object-fields? `}` `;`
+//! item    := `use` ... | (`var` | `val`) ident (`:` type)? `=` expr `;` | `fun` ident type-params? `(` params? `)` (`:` type)? block | `type` ident `=` `object` `{` object-fields? `}` `;`
 //! type-params := `[` type-param (`,` type-param)* `]`
 //! type-param  := ident (`extends` (`Numeric` | `Comparable`))?
 //! object-fields := object-field (`,` object-field)* `,`?
@@ -14,7 +14,7 @@
 //! mutable_type := `*` type_atom
 //! type_atom := `u64` | `i64` | `f64` | `bool` | `u8` | `String` | `File` | object-name | `Array` `[` type `]` | type-param | `void` (`void` only as return)
 //! block   := `{` stmt* `}`
-//! stmt    := `let` ident (`:` type)? `=` expr `;` | ident `=` expr `;` | index `=` expr `;` | field `=` expr `;`
+//! stmt    := (`var` | `val`) ident (`:` type)? `=` expr `;` | ident `=` expr `;` | index `=` expr `;` | field `=` expr `;`
 //!          | `if` `(` expr `)` branch (`else` branch)?
 //!          | `while` `(` expr `)` branch | `break` `;` | `continue` `;`
 //!          | `return` expr? `;` | expr `;`
@@ -62,7 +62,7 @@
 //!
 //! Calls are callee-by-name (`ident(args)`). The callee is a plain variable use
 //! so forward references to `fun` items work.
-//! Semicolons are mandatory: every `let`, every `return`, and every
+//! Semicolons are mandatory: every binding, every `return`, and every
 //! expression statement ends with `;` (no bare trailing value like Rust).
 //! There are no implicit returns: a function yields a value only through an
 //! explicit `return expr;` (`return;` for `void`).
@@ -82,6 +82,13 @@ use vl_lex::{Token, TokenKind};
 pub struct Program {
     pub module: String,
     pub items: Vec<Item>,
+}
+
+/// Binding declaration mode. `var` permits rebinding; `val` fixes the name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingKind {
+    Var,
+    Val,
 }
 
 /// One typed function parameter: `name: type`.
@@ -128,9 +135,10 @@ pub enum Item {
         span: Span,
     },
     Let {
+        kind: BindingKind,
         name: String,
         name_span: Span,
-        /// Optional annotation (`let x: T = ...`). `None` with `ty_span`
+        /// Optional annotation (`var x: T = ...`). `None` with `ty_span`
         /// `None` means absent (infer); `None` with `Some` means invalid
         /// (already reported; downstream poisons quietly).
         ty: Option<VlType>,
@@ -156,6 +164,7 @@ pub enum Item {
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Let {
+        kind: BindingKind,
         name: String,
         name_span: Span,
         /// Optional annotation, same encoding as [`Item::Let`].
@@ -411,7 +420,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     return;
                 }
-                TokenKind::Let | TokenKind::Fun | TokenKind::Type => return,
+                TokenKind::Var | TokenKind::Val | TokenKind::Fun | TokenKind::Type => return,
                 _ => {
                     self.bump();
                 }
@@ -421,7 +430,8 @@ impl<'a> Parser<'a> {
 
     fn parse_item(&mut self) -> Option<Item> {
         match &self.peek().kind {
-            TokenKind::Let => self.parse_let_item(),
+            TokenKind::Var => self.parse_binding_item(BindingKind::Var),
+            TokenKind::Val => self.parse_binding_item(BindingKind::Val),
             TokenKind::Fun => self.parse_function_item(),
             TokenKind::Type => self.parse_object_item(),
             TokenKind::Ident(name) if name == "use" => self.parse_use_item(),
@@ -434,10 +444,13 @@ impl<'a> Parser<'a> {
                 let t = self.peek().clone();
                 self.diags.push(
                     Diagnostic::error(format!(
-                        "expected an item (`use`, `let`, `fun` or `type`), found {}",
+                        "expected an item (`use`, `var`, `val`, `fun` or `type`), found {}",
                         describe(&t.kind)
                     ))
-                    .with_label(t.span, "items start with `use`, `let`, `fun`, or `type`")
+                    .with_label(
+                        t.span,
+                        "items start with `use`, `var`, `val`, `fun`, or `type`",
+                    )
                     .with_code("E101"),
                 );
                 None
@@ -555,10 +568,10 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_let_item(&mut self) -> Option<Item> {
-        let let_tok = self.bump(); // `let`
+    fn parse_binding_item(&mut self, kind: BindingKind) -> Option<Item> {
+        let binding_tok = self.bump(); // `var` or `val`
         let (name, name_span) = self.parse_ident()?;
-        let (ty, ty_span) = self.parse_let_ann(&[]);
+        let (ty, ty_span) = self.parse_binding_ann(&[]);
         // A failed annotation whose follow is not `=` already reported once;
         // recover at the declaration boundary instead of adding a second error.
         if ty.is_none() && ty_span.is_some() && !matches!(self.peek().kind, TokenKind::Eq) {
@@ -568,20 +581,21 @@ impl<'a> Parser<'a> {
         let value = self.parse_expr()?;
         let semi = self.expect(&TokenKind::Semi, "`;`")?;
         Some(Item::Let {
+            kind,
             name,
             name_span,
             ty,
             ty_span,
             value,
-            span: Span::new(let_tok.span.start, semi.span.end),
+            span: Span::new(binding_tok.span.start, semi.span.end),
         })
     }
 
-    /// Parse an optional `let` annotation (`: type`). Absent means
+    /// Parse an optional binding annotation (`: type`). Absent means
     /// `(None, None)` (infer); a failed annotation reports and yields
     /// `(None, Some(span))` so downstream poisons quietly. `void` is
-    /// rejected: a `let` always binds a value.
-    fn parse_let_ann(&mut self, allowed: &[String]) -> (Option<VlType>, Option<Span>) {
+    /// rejected: a binding always binds a value.
+    fn parse_binding_ann(&mut self, allowed: &[String]) -> (Option<VlType>, Option<Span>) {
         if !matches!(self.peek().kind, TokenKind::Colon) {
             return (None, None);
         }
@@ -591,7 +605,7 @@ impl<'a> Parser<'a> {
             Some((ty, span)) => {
                 if ty.is_void() {
                     self.diags.push(
-                        Diagnostic::error("a `let` binding cannot be `void`")
+                        Diagnostic::error("a binding cannot be `void`")
                             .with_label(span, "`void` is not a value")
                             .with_code("E104"),
                     );
@@ -1117,10 +1131,15 @@ impl<'a> Parser<'a> {
                 span: Span::new(t.span.start, semi.span.end),
             });
         }
-        if matches!(self.peek().kind, TokenKind::Let) {
-            let let_tok = self.bump();
+        if matches!(self.peek().kind, TokenKind::Var | TokenKind::Val) {
+            let binding_tok = self.bump();
+            let kind = if matches!(binding_tok.kind, TokenKind::Var) {
+                BindingKind::Var
+            } else {
+                BindingKind::Val
+            };
             let (name, name_span) = self.parse_ident()?;
-            let (ty, ty_span) = self.parse_let_ann(allowed);
+            let (ty, ty_span) = self.parse_binding_ann(allowed);
             // Failed annotation already reported once; recover at the
             // statement boundary instead of adding a second error.
             if ty.is_none() && ty_span.is_some() && !matches!(self.peek().kind, TokenKind::Eq) {
@@ -1130,12 +1149,13 @@ impl<'a> Parser<'a> {
             let value = self.parse_expr()?;
             let semi = self.expect(&TokenKind::Semi, "`;`")?;
             Some(Stmt::Let {
+                kind,
                 name,
                 name_span,
                 ty,
                 ty_span,
                 value,
-                span: Span::new(let_tok.span.start, semi.span.end),
+                span: Span::new(binding_tok.span.start, semi.span.end),
             })
         } else if matches!(self.peek().kind, TokenKind::Ident(_)) {
             // Possible assignment to a variable, array element, or object
@@ -1270,7 +1290,8 @@ impl<'a> Parser<'a> {
                     return;
                 }
                 TokenKind::RBrace
-                | TokenKind::Let
+                | TokenKind::Var
+                | TokenKind::Val
                 | TokenKind::Fun
                 | TokenKind::If
                 | TokenKind::While
@@ -1769,7 +1790,8 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::U8(v) => format!("u8 literal `{v}`"),
         TokenKind::Bool(v) => format!("boolean `{v}`"),
         TokenKind::String(_) => "string literal".into(),
-        TokenKind::Let => "`let`".into(),
+        TokenKind::Var => "`var`".into(),
+        TokenKind::Val => "`val`".into(),
         TokenKind::Fun => "`fun`".into(),
         TokenKind::Type => "`type`".into(),
         TokenKind::Object => "`object`".into(),
@@ -1834,14 +1856,14 @@ mod tests {
 
     #[test]
     fn parses_arithmetic_with_precedence() {
-        let (prog, diags) = parse_src("let x = 1 + 2 * 3;");
+        let (prog, diags) = parse_src("val x = 1 + 2 * 3;");
         assert!(diags.is_empty());
         assert_eq!(prog.items.len(), 1);
     }
 
     #[test]
     fn missing_semi_is_an_error() {
-        let (_prog, diags) = parse_src("let x = 1");
+        let (_prog, diags) = parse_src("val x = 1");
         assert!(!diags.is_empty());
     }
 
@@ -1875,7 +1897,7 @@ mod tests {
     #[test]
     fn parses_object_declaration_literal_and_field_assign() {
         let (prog, diags) = parse_src(
-            "type Counter = object { value: u64, label: String, }; fun main() { let c = Counter { label = \"x\", value = 1 }; c.value = 2; }",
+            "type Counter = object { value: u64, label: String, }; fun main() { val c = Counter { label = \"x\", value = 1 }; c.value = 2; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(matches!(prog.items[0], Item::Object { ref fields, .. } if fields.len() == 2));
@@ -1978,17 +2000,17 @@ mod tests {
 
     #[test]
     fn call_binds_tighter_than_add() {
-        let (prog, diags) = parse_src("let x = f(1) + 2;");
+        let (prog, diags) = parse_src("val x = f(1) + 2;");
         assert!(diags.is_empty());
         match &prog.items[0] {
             Item::Let { value, .. } => assert!(matches!(value, Expr::Binary { .. })),
-            other => panic!("expected let, got {other:?}"),
+            other => panic!("expected val, got {other:?}"),
         }
     }
 
     #[test]
     fn parses_string_literal() {
-        let (prog, diags) = parse_src(r#"let s = "hello";"#);
+        let (prog, diags) = parse_src(r#"val s = "hello";"#);
         assert!(diags.is_empty());
         assert!(matches!(
             &prog.items[0],
@@ -2008,7 +2030,7 @@ mod tests {
     #[test]
     fn parses_while_break_continue_and_assign() {
         let (prog, diags) = parse_src(
-            "fun main() { let i = 0; while (i < 10) { i = i + 1; if (i == 2) { continue; } break; } }",
+            "fun main() { val i = 0; while (i < 10) { i = i + 1; if (i == 2) { continue; } break; } }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
@@ -2034,7 +2056,7 @@ mod tests {
 
     #[test]
     fn logical_operators_bind_looser_than_comparison() {
-        let (prog, diags) = parse_src("fun main() { let x = 1; x + 1 == 2 && !x; }");
+        let (prog, diags) = parse_src("fun main() { val x = 1; x + 1 == 2 && !x; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { body, .. } => match &body[1] {
@@ -2085,7 +2107,7 @@ mod tests {
     #[test]
     fn parses_array_literal_index_and_index_assign() {
         let (prog, diags) = parse_src(
-            "fun get(a: Array[u64]): u64 { a[0u64] = 1u64; return a[0u64]; } fun main() { let b = [1u64, 2u64,]; let e = []; }",
+            "fun get(a: Array[u64]): u64 { a[0u64] = 1u64; return a[0u64]; } fun main() { val b = [1u64, 2u64,]; val e = []; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
@@ -2237,7 +2259,7 @@ mod tests {
     #[test]
     fn annotated_lets_parse() {
         let (prog, diags) = parse_src(
-            "let scores: Array[u64] = Array.new::[u64](3); fun main() { let n: u64 = 1; n; }",
+            "val scores: Array[u64] = Array.new::[u64](3); fun main() { val n: u64 = 1; n; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
@@ -2245,61 +2267,87 @@ mod tests {
                 assert_eq!(*ty, Some(VlType::Array(Box::new(VlType::U64))));
                 assert!(ty_span.is_some());
             }
-            other => panic!("expected let, got {other:?}"),
+            other => panic!("expected val, got {other:?}"),
         }
         match &prog.items[1] {
             Item::Function { body, .. } => match &body[0] {
                 Stmt::Let { ty, .. } => assert_eq!(*ty, Some(VlType::U64)),
-                other => panic!("expected let, got {other:?}"),
+                other => panic!("expected val, got {other:?}"),
             },
             other => panic!("expected fn, got {other:?}"),
         }
     }
 
     #[test]
+    fn var_and_val_preserve_binding_kind() {
+        let (prog, diags) = parse_src("var mutable = 1u64; val fixed = 2u64;");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(matches!(
+            prog.items[0],
+            Item::Let {
+                kind: BindingKind::Var,
+                ..
+            }
+        ));
+        assert!(matches!(
+            prog.items[1],
+            Item::Let {
+                kind: BindingKind::Val,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn let_is_no_longer_a_binding_keyword() {
+        let (_prog, diags) = parse_src("let answer = 1u64;");
+        assert!(diags.iter().any(|d| d.code.as_deref() == Some("E101")));
+    }
+
+    #[test]
     fn unannotated_lets_stay_untyped() {
-        let (prog, diags) = parse_src("let x = 1; fun main() { let y = 2; y; }");
+        let (prog, diags) = parse_src("val x = 1; fun main() { val y = 2; y; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Let { ty, ty_span, .. } => {
                 assert_eq!(*ty, None);
                 assert_eq!(*ty_span, None);
             }
-            other => panic!("expected let, got {other:?}"),
+            other => panic!("expected val, got {other:?}"),
         }
     }
 
     #[test]
     fn void_let_is_an_error() {
-        let (_prog, diags) = parse_src("let x: void = 1;");
+        let (_prog, diags) = parse_src("val x: void = 1;");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E104")));
-        let (_prog, diags) = parse_src("fun main() { let x: void = 1; }");
+        let (_prog, diags) = parse_src("fun main() { val x: void = 1; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E104")));
     }
 
     #[test]
     fn unknown_let_type_is_an_error() {
-        let (_prog, diags) = parse_src("let x: Bogus = 1;");
+        let (_prog, diags) = parse_src("val x: Bogus = 1;");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E105")));
     }
 
     #[test]
     fn let_annotation_sees_type_params() {
         let (prog, diags) =
-            parse_src("fun f[T](x: T): T { let y: T = x; let z: Array[T] = [x]; return y; }");
+            parse_src("fun f[T](x: T): T { val y: T = x; val z: Array[T] = [x]; return y; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { body, .. } => {
                 match &body[0] {
                     Stmt::Let { ty, .. } => assert_eq!(*ty, Some(VlType::Param("T".into()))),
-                    other => panic!("expected let, got {other:?}"),
+                    other => panic!("expected val, got {other:?}"),
                 }
                 match &body[1] {
                     Stmt::Let { ty, .. } => assert_eq!(
                         *ty,
                         Some(VlType::Array(Box::new(VlType::Param("T".into()))))
                     ),
-                    other => panic!("expected let, got {other:?}"),
+                    other => panic!("expected val, got {other:?}"),
                 }
             }
             other => panic!("expected fn, got {other:?}"),
@@ -2338,7 +2386,7 @@ mod tests {
 
     #[test]
     fn lexical_poison_does_not_hide_later_function() {
-        let (toks, lex_diags) = vl_lex::lex("let broken = @; fun tail() {} ");
+        let (toks, lex_diags) = vl_lex::lex("val broken = @; fun tail() {} ");
         assert_eq!(lex_diags.len(), 1);
         let (prog, parse_diags) = parse(&toks, "");
         assert!(parse_diags.is_empty(), "{parse_diags:?}");
@@ -2351,12 +2399,12 @@ mod tests {
     #[test]
     fn parses_as_cast_with_precedence() {
         // `a + b as u8` is `(a + b) as u8`; `a == b as u8` is `a == (b as u8)`.
-        let (prog, diags) = parse_src("fun main() { let x = 1u64 + 2u64 as u8; x; }");
+        let (prog, diags) = parse_src("fun main() { val x = 1u64 + 2u64 as u8; x; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { body, .. } => match &body[0] {
                 Stmt::Let { value, .. } => assert!(matches!(value, Expr::Cast { .. })),
-                other => panic!("expected cast let, got {other:?}"),
+                other => panic!("expected cast val, got {other:?}"),
             },
             other => panic!("expected fn, got {other:?}"),
         }
@@ -2386,7 +2434,7 @@ mod tests {
     #[test]
     fn mutable_types_parse_in_every_position() {
         let (prog, diags) = parse_src(
-            "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; fun edit(parent: *Parent): *Parent { let x: *Child = parent.child; x; return parent; }",
+            "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; fun edit(parent: *Parent): *Parent { val x: *Child = parent.child; x; return parent; }",
         );
         // `*Child` in a field parses, but field projection semantics are
         // checked later; parsing itself must be clean here only when the
@@ -2456,7 +2504,7 @@ mod tests {
     #[test]
     fn mutable_type_arguments_parse() {
         let (prog, diags) = parse_src(
-            "type Foo = object { value: u64, }; fun id[T](x: T): T { return x; } fun main() { let e = id::[*Foo](id::[*Foo](e)); e; }",
+            "type Foo = object { value: u64, }; fun id[T](x: T): T { return x; } fun main() { val e = id::[*Foo](id::[*Foo](e)); e; }",
         );
         // `e` is undefined, but type arguments themselves must parse.
         assert!(diags.is_empty(), "{diags:?}");
@@ -2469,7 +2517,7 @@ mod tests {
                     ),
                     other => panic!("expected call, got {other:?}"),
                 },
-                other => panic!("expected let, got {other:?}"),
+                other => panic!("expected val, got {other:?}"),
             },
             other => panic!("expected fn, got {other:?}"),
         }
@@ -2481,7 +2529,7 @@ mod tests {
             "fun f(x: *u64) { x; }",
             "fun f(x: *bool) { x; }",
             "fun f(): *void { return; }",
-            "let x: *u64 = 1u64;",
+            "val x: *u64 = 1u64;",
         ] {
             let (_prog, diags) = parse_src(src);
             let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
@@ -2509,7 +2557,7 @@ mod tests {
 
     #[test]
     fn missing_inner_type_is_one_error_and_recovers() {
-        let (prog, diags) = parse_src("let x: *; fun tail() {}");
+        let (prog, diags) = parse_src("val x: *; fun tail() {}");
         let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
         assert_eq!(errors.len(), 1, "{diags:?}");
         assert_eq!(errors[0].code.as_deref(), Some("E106"), "{diags:?}");
@@ -2569,7 +2617,7 @@ mod tests {
     #[test]
     fn multiplication_next_to_mutable_annotation() {
         let (prog, diags) =
-            parse_src("type Foo = object { value: u64, }; fun main() { let x: *Foo = f; let y = a * b; x; y; }");
+            parse_src("type Foo = object { value: u64, }; fun main() { val x: *Foo = f; val y = a * b; x; y; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[1] {
             Item::Function { body, .. } => {

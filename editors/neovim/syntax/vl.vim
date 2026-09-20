@@ -2,7 +2,7 @@ if exists('b:current_syntax')
   finish
 endif
 
-syntax keyword vlDeclaration let fun use type object extends
+syntax keyword vlDeclaration var val fun use type object extends
 syntax keyword vlOperatorKeyword as
 syntax keyword vlConditional if else
 syntax keyword vlRepeat while

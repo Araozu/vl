@@ -28,7 +28,7 @@ while literals assign with `name = value`. A fresh literal adopts an expected
 type Counter = object { value: u64, label: String, };
 
 fun main() {
-    let counter: *Counter = Counter { label = "count", value = 0 };
+    var counter = Counter { label = "count", value = 0 };
     counter.value = counter.value + 1;
 }
 ```
@@ -50,11 +50,11 @@ fun bump(counter: *Counter): *Counter {
 }
 
 fun main() {
-    let editable: *Counter = Counter { value = 1, label = "count" };
-    let view: Counter = editable; // allowed downgrade
+    val editable: *Counter = Counter { value = 1, label = "count" };
+    val view: Counter = editable; // allowed downgrade
 
     editable.value = 2; // visible through `view`
-    let same = bump(editable);
+    var same = bump(editable);
     same.value = same.value + 1;
     // editable.value is now 4.
 }
@@ -75,8 +75,8 @@ fun bump(counter: *Counter): *Counter {
 }
 
 fun main() {
-    let first: *Counter = Counter { value = 1, label = "count" };
-    let second = bump(first);
+    val first: *Counter = Counter { value = 1, label = "count" };
+    var second = bump(first);
     second.value = second.value + 1;
     // first.value is now 3.
 }

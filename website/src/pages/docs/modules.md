@@ -47,8 +47,8 @@ Grouped imports select several exports from one module:
 use std.fs.{open, read};
 
 fun main() {
-    let file = open("data.txt");
-    let contents = read(file);
+    val file = open("data.txt");
+    val contents = read(file);
 }
 ```
 
@@ -61,8 +61,8 @@ Strings use double quotes. They are byte strings for now, which means they are
 not yet a full Unicode text type. A string may contain escaped characters:
 
 ```vl
-let greeting = "hello\nworld";
-let quote = "say \"hi\"";
+val greeting = "hello\nworld";
+val quote = "say \"hi\"";
 ```
 
 The supported escapes are `\\0`, `\\n`, `\\r`, `\\t`, `\\\\`, and `\\"`.
@@ -74,8 +74,8 @@ The standard library provides functions that operate on strings:
 use std.string;
 
 fun main() {
-    let message = "hello";
-    let size = string.len(message);
+    val message = "hello";
+    val size = string.len(message);
 }
 ```
 

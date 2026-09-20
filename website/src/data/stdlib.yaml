@@ -19,7 +19,7 @@
   import_example: |
     use std.println;
 
-    function main() {
+    fun main() {
         println("Hello, world!");
     }
   functions:
@@ -78,9 +78,9 @@
   import_example: |
     use std.fs.{open, read};
 
-    function main() {
-        let f = open("data.txt");
-        let s = read(f);
+    fun main() {
+        val f = open("data.txt");
+        val s = read(f);
     }
   functions:
     - name: open
@@ -97,7 +97,7 @@
         scope for now, so the language surface is a plain `File` return. The
         current Naravm target does not emit file-system calls yet.
       example: |
-        let f = open("data.txt");
+        val f = open("data.txt");
     - name: read
       params:
         - name: file
@@ -111,7 +111,7 @@
         Like `open`, fallible at the VM level but surfaced as a plain `String`
         return until VL gains error handling. Not yet emitted by Naravm.
       example: |
-        let s = read(f);
+        val s = read(f);
   outro: |
     `File` is a built-in VL reference/handle type mapping to the VM `ObjectFile`;
     it is distinct from user-defined `object` declarations. See [Basics](/docs/basics)
@@ -129,8 +129,8 @@
   import_example: |
     use std.string.{len};
 
-    function main() {
-        let n = len("hi");
+    fun main() {
+        val n = len("hi");
     }
   functions:
     - name: len
@@ -144,7 +144,7 @@
         Returns the length of a `String`. Checked during general module checking;
         the current Naravm target does not emit it yet.
       example: |
-        let n = len("hi");
+        val n = len("hi");
   outro: |
     VL strings are byte strings for now. See [Modules and strings](/docs/modules)
     for literal syntax and supported escapes.

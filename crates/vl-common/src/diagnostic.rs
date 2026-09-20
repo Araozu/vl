@@ -178,7 +178,7 @@ mod tests {
         let d = Diagnostic::error("unexpected character `@`")
             .with_label(Span::new(4, 5), "here")
             .with_note("identifiers use letters, digits and `_`");
-        let out = d.render("demo.vl", "let x = @;\n");
+        let out = d.render("demo.vl", "val x = @;\n");
         assert!(out.contains("unexpected character"));
         // Ariadne draws box graphics; guard against silent fallback.
         assert!(out.contains("─") || out.contains("│") || out.contains('|'));

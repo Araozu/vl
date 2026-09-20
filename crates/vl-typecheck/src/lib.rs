@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 
 use vl_common::Scalar;
 use vl_common::{Diagnostic, GenericBound, Span, VlType};
-use vl_hir::{HirBinOp, HirExpr, HirItem, HirProgram, HirStmt, HirUnOp};
+use vl_hir::{BindingKind, HirBinOp, HirExpr, HirItem, HirProgram, HirStmt, HirUnOp};
 
 mod mono;
 
@@ -551,7 +551,7 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
         type_env: HashMap::new(),
         type_bounds: HashMap::new(),
         pending_instances: Vec::new(),
-        param_defs: HashSet::new(),
+        fixed_defs: HashSet::new(),
     };
     // Pass 0: collect object layouts so field types and object literals can
     // refer to declarations in either order.
@@ -682,10 +682,8 @@ struct Checker {
     /// Concrete `(template DefId.0, args)` pairs awaiting the separate
     /// monomorphization pass ([`mono::expand`]).
     pending_instances: Vec<(u32, Vec<Ty>)>,
-    /// Parameter `DefId.0`s of the function being checked. Direct `Assign`
-    /// to one already has its root cause (E205 from resolution), so boundary
-    /// mismatches stay quiet here to keep one diagnostic.
-    param_defs: HashSet<u32>,
+    /// Fixed `val` bindings share the assignment-poisoning path with params.
+    fixed_defs: HashSet<u32>,
 }
 
 impl Checker {
@@ -700,16 +698,20 @@ impl Checker {
             HirItem::Let {
                 id,
                 def,
+                kind,
                 ty,
                 ty_span,
                 value,
                 ..
             } => {
-                let ty = self.let_type(ty, ty_span, value);
+                let ty = self.binding_type(*kind, ty, ty_span, value);
                 self.record(*id, ty.clone());
                 if let Some(def) = def {
                     self.bindings.insert(def.0, ty);
-                    self.typed.globals.push(format!("let#{}", id.0));
+                    if *kind == BindingKind::Val {
+                        self.fixed_defs.insert(def.0);
+                    }
+                    self.typed.globals.push(format!("{kind:?}#{}", id.0));
                 } else {
                     // Name resolution already reported this; stay quiet.
                 }
@@ -774,9 +776,7 @@ impl Checker {
                             poisoned_sig = true;
                         }
                         self.bindings.insert(def.0, t);
-                        // Direct rebinding of a parameter already has its root
-                        // cause (E205); remember it so `Assign` stays quiet.
-                        self.param_defs.insert(def.0);
+                        self.fixed_defs.insert(def.0);
                     }
                 }
                 // Explicit returns only: the body's tail value is discarded.
@@ -825,12 +825,18 @@ impl Checker {
         }
     }
 
-    /// Check a `let` initializer against its optional annotation. Returns
+    /// Check a binding initializer against its optional annotation. Returns
     /// the binding type (`Error` when poisoned). An `Array[T]`/`*Array[T]`
     /// annotation on a bare `Array.new(n)` supplies `T` contextually; fresh
     /// object/array literals adopt an expected mutable capability; every
     /// other shape infers first and then must coerce directionally.
-    fn let_type(&mut self, ty: &Option<VlType>, ty_span: &Option<Span>, value: &HirExpr) -> Ty {
+    fn binding_type(
+        &mut self,
+        kind: BindingKind,
+        ty: &Option<VlType>,
+        ty_span: &Option<Span>,
+        value: &HirExpr,
+    ) -> Ty {
         // Failed annotation (parser-reported): infer inner errors only.
         if ty.is_none() && ty_span.is_some() {
             let _ = self.infer_expr(value);
@@ -849,7 +855,7 @@ impl Checker {
             }
             if a.is_void() {
                 self.diags.push(
-                    Diagnostic::error("a `let` binding cannot be `void`")
+                    Diagnostic::error("a binding cannot be `void`")
                         .with_label(asp, "`void` is not a value")
                         .with_code("E104"),
                 );
@@ -962,7 +968,7 @@ impl Checker {
         // Unannotated bindings holding an unresolved `int` (top level or
         // nested, e.g. `Array[Int]`) resolve through the target's default
         // unsigned lane (`u64`): an `int` variable must not stay compatible
-        // with every integer type, or `let v = 300; take_u8(v);` would pass.
+        // with every integer type, or `var v = 300; take_u8(v);` would pass.
         if ty_contains_int(&inferred) {
             let defaulted = default_inferred_ty(inferred.clone());
             self.coerce_expr_literals(value, &defaulted);
@@ -970,18 +976,67 @@ impl Checker {
             if ty_has_error(&resolved) {
                 return Ty::Error;
             }
-            if ty_contains_int(&resolved) {
+            let inferred = if ty_contains_int(&resolved) {
                 // Non-coercible shape (unreachable for literals, which the
                 // arms above handle): record the default so no `Int` lingers
                 // for the LIR boundary.
-                return self.record(value.id(), defaulted);
-            }
-            return resolved;
+                self.record(value.id(), defaulted)
+            } else {
+                resolved
+            };
+            return self.finish_inferred_binding(kind, inferred, value);
         }
-        inferred
+        self.finish_inferred_binding(kind, inferred, value)
     }
 
-    /// Check a statement. There are no implicit returns: `let` initializers
+    /// Apply the default outer capability for an unannotated binding. Fresh
+    /// allocations can adopt mutable context; calls and existing values keep
+    /// their declared capability and therefore cannot be upgraded.
+    fn finish_inferred_binding(&mut self, kind: BindingKind, inferred: Ty, value: &HirExpr) -> Ty {
+        if !inferred.is_reference_type() {
+            return inferred;
+        }
+        let expected = match kind {
+            BindingKind::Var if !inferred.is_mutable_view() => {
+                Ty::Mutable(Box::new(inferred.clone()))
+            }
+            BindingKind::Val => inferred.readonly_view(),
+            BindingKind::Var => inferred.clone(),
+        };
+        if same_type(&inferred, &expected) {
+            return expected;
+        }
+        let contextual = self.infer_expr_expected(value, &expected);
+        if ty_has_error(&contextual) {
+            return Ty::Error;
+        }
+        if can_coerce(&contextual, &expected) {
+            return expected;
+        }
+        if contextual.readonly_view() == expected.readonly_view()
+            && contextual.is_mutable_view() != expected.is_mutable_view()
+        {
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "cannot initialize inferred `{expected}` binding with read-only `{contextual}` value"
+                ))
+                .with_label(value.span(), "mutation authority is required here")
+                .with_note(format!("a read-only view cannot be upgraded to `{expected}`"))
+                .with_code("E309"),
+            );
+        } else {
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "cannot initialize inferred `{expected}` binding with `{contextual}` value"
+                ))
+                .with_label(value.span(), format!("expected `{expected}` here"))
+                .with_code("E309"),
+            );
+        }
+        Ty::Error
+    }
+
+    /// Check a statement. There are no implicit returns: binding initializers
     /// and bare expression values are discarded and never satisfy a declared
     /// return type — only an explicit `return expr;` does.
     fn check_stmt(&mut self, stmt: &HirStmt) {
@@ -989,15 +1044,19 @@ impl Checker {
             HirStmt::Let {
                 id,
                 def,
+                kind,
                 ty,
                 ty_span,
                 value,
                 ..
             } => {
-                let ty = self.let_type(ty, ty_span, value);
+                let ty = self.binding_type(*kind, ty, ty_span, value);
                 self.record(*id, ty.clone());
                 if let Some(def) = def {
                     self.bindings.insert(def.0, ty);
+                    if *kind == BindingKind::Val {
+                        self.fixed_defs.insert(def.0);
+                    }
                 }
             }
             HirStmt::Expr(e) => {
@@ -1095,7 +1154,7 @@ impl Checker {
                 // Direct parameter rebinding already has its root cause (E205
                 // from resolution). Infer the RHS for inner errors, then poison
                 // quietly without a second boundary diagnostic.
-                if self.param_defs.contains(&def.0) {
+                if self.fixed_defs.contains(&def.0) {
                     let _ = self.infer_expr(value);
                     self.record(*id, Ty::Error);
                     return;
@@ -1657,8 +1716,8 @@ impl Checker {
     }
 
     /// `Array.new::[T](count)`: one `u64` argument, returns `Array[T]`.
-    /// A bare `Array.new(count)` only typechecks under an annotated `let`
-    /// (handled in [`Checker::let_type`](Self::let_type)); everywhere else
+    /// A bare `Array.new(count)` only typechecks under an annotated binding
+    /// (handled in [`Checker::binding_type`](Self::binding_type)); everywhere else
     /// it is E303 here. (Arity above one is enforced by `vl-semantic`.)
     fn check_array_new(
         &mut self,
@@ -1674,7 +1733,7 @@ impl Checker {
                 Diagnostic::error("`Array.new` needs an element type")
                     .with_label(
                         span,
-                        "write `Array.new::[T](count)`, or annotate the `let`: `let a: Array[T] = Array.new(count)`",
+                        "write `Array.new::[T](count)`, or annotate the binding: `val a: Array[T] = Array.new(count)`",
                     )
                     .with_code("E303"),
             );
@@ -1688,7 +1747,7 @@ impl Checker {
     }
 
     /// Core constructor check once the element type is known (explicitly or
-    /// from a `let` annotation). The count coerces integer literals to `u64`.
+    /// from a binding annotation). The count coerces integer literals to `u64`.
     fn check_array_new_elem(
         &mut self,
         name: &str,
@@ -1747,7 +1806,7 @@ impl Checker {
 
     fn infer_expr_expected(&mut self, expr: &HirExpr, expected: &Ty) -> Ty {
         // Contextual bare `Array.new(n)`: `Array[T]` or `*Array[T]` expected
-        // supplies the element type (returns/args as well as `let`).
+        // supplies the element type (returns/args as well as bindings).
         if let HirExpr::Call {
             name,
             type_args,
@@ -1869,11 +1928,7 @@ impl Checker {
             && is_fresh_allocation(expr)
             && same_type(&inferred, &expected.readonly_view())
         {
-            // String literals stay `String` even in a mutable context: there
-            // is no mutable string operation to justify manufacturing `*String`.
-            if inferred != Ty::String {
-                return self.record(expr.id(), expected.clone());
-            }
+            return self.record(expr.id(), expected.clone());
         }
         inferred
     }
@@ -2001,7 +2056,7 @@ impl Checker {
             HirExpr::ArrayLiteral { id, elems, .. } => {
                 if elems.is_empty() {
                     // Contextual empty: coercion already recorded the
-                    // annotation (`let e: Array[u64] = [];`, `*Array[T]`
+                    // annotation (`val e: Array[u64] = [];`, `*Array[T]`
                     // likewise); honor it. A repeat visit after an error
                     // stays quiet.
                     match self.typed.type_of_id(*id) {
@@ -2018,7 +2073,7 @@ impl Checker {
                         Diagnostic::error("cannot infer the element type of `[]`")
                             .with_label(
                                 expr.span(),
-                                "empty array literal needs a type: `let e: Array[T] = [];` or `Array.new::[T](n)`",
+                                "empty array literal needs a type: `val e: Array[T] = [];` or `Array.new::[T](n)`",
                             )
                             .with_code("E302"),
                     );
@@ -2057,7 +2112,7 @@ impl Checker {
                 // deference before generic constraint solving sees it
                 // (`same([1], [2u8])` must solve `T = Array[u8]`, not
                 // conflict `u64` vs `u8`). The `Int` is defaulted at use
-                // sites instead: `let`/discarded-statement defaulting,
+                // sites instead: binding/discarded-statement defaulting,
                 // `infer_expr_expected` coercion, and per-argument coercion
                 // after generic solving all coerce the elements then.
                 // One bad element poisons the whole literal (single root
@@ -3272,13 +3327,14 @@ fn object_base(ty: &Ty) -> Option<String> {
 
 /// Compiler-known fresh allocations whose initial capability may be selected
 /// by an expected type: object literals, array literals (including `[]`),
-/// and `Array.new` constructions. String literals are excluded (they stay
-/// `String`); variables, fields, index results, and calls never upgrade.
+/// `Array.new` constructions, and string literals. Variables, fields, index
+/// results, and calls never upgrade from a read-only view.
 fn is_fresh_allocation(expr: &vl_hir::HirExpr) -> bool {
     match expr {
         vl_hir::HirExpr::ObjectLiteral { .. } => true,
         vl_hir::HirExpr::ArrayLiteral { .. } => true,
         vl_hir::HirExpr::Call { name, .. } if name == "Array.new" => true,
+        vl_hir::HirExpr::String { .. } => true,
         _ => false,
     }
 }
@@ -3450,7 +3506,7 @@ mod tests {
     #[test]
     fn arrays_check_clean() {
         let (_, diags) = check_src(
-            "fun sum(a: Array[u64]): u64 { return a[0u64]; } fun main() { let a: *Array[u64] = Array.new::[u64](3u64); a[0u64] = 1u64; let b = [1u64, 2u64]; sum(a); sum(b); }",
+            "fun sum(a: Array[u64]): u64 { return a[0u64]; } fun main() { val a: *Array[u64] = Array.new::[u64](3u64); a[0u64] = 1u64; val b = [1u64, 2u64]; sum(a); sum(b); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -3458,7 +3514,7 @@ mod tests {
     #[test]
     fn objects_check_field_types_and_reference_operations() {
         let (_, diags) = check_src(
-            "type Counter = object { value: u64, }; fun bump(c: *Counter): *Counter { c.value = c.value + 1u64; return c; } fun main() { let c: *Counter = Counter { value = 1u64 }; let d = bump(c); d.value = 3u64; }",
+            "type Counter = object { value: u64, }; fun bump(c: *Counter): *Counter { c.value = c.value + 1u64; return c; } fun main() { val c: *Counter = Counter { value = 1u64 }; var d = bump(c); d.value = 3u64; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -3466,7 +3522,7 @@ mod tests {
     #[test]
     fn object_literal_field_count_is_one_diagnostic() {
         let (_, diags) = check_src(
-            "type Point = object { x: u64, }; fun main() { let p = Point { y = 1, z = 2 }; }",
+            "type Point = object { x: u64, }; fun main() { val p = Point { y = 1, z = 2 }; }",
         );
         let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
         assert_eq!(errors.len(), 1, "{diags:?}");
@@ -3475,7 +3531,7 @@ mod tests {
 
     #[test]
     fn unknown_object_literal_is_one_diagnostic() {
-        let (_, diags) = check_src("fun main() { let x = Missing {}; }");
+        let (_, diags) = check_src("fun main() { val x = Missing {}; }");
         let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
         assert_eq!(errors.len(), 1, "{diags:?}");
         assert!(
@@ -3486,7 +3542,7 @@ mod tests {
 
     #[test]
     fn integer_literals_coerce_in_array_context() {
-        let (_, diags) = check_src("fun main() { let a = [1, 2u64]; a; }");
+        let (_, diags) = check_src("fun main() { val a = [1, 2u64]; a; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
@@ -3500,7 +3556,7 @@ mod tests {
 
     #[test]
     fn empty_literal_needs_the_typed_constructor() {
-        let (_, diags) = check_src("fun main() { let e = []; e; }");
+        let (_, diags) = check_src("fun main() { val e = []; e; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(
             diags
@@ -3512,7 +3568,7 @@ mod tests {
 
     #[test]
     fn bare_array_new_without_annotation_is_one_error() {
-        let (_, diags) = check_src("fun main() { let a = Array.new(3); a; }");
+        let (_, diags) = check_src("fun main() { val a = Array.new(3); a; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(
             diags
@@ -3525,7 +3581,7 @@ mod tests {
     #[test]
     fn annotated_let_supplies_array_new_element() {
         let (typed, diags) =
-            check_src("fun main() { let scores: Array[u64] = Array.new(3); scores; }");
+            check_src("fun main() { val scores: Array[u64] = Array.new(3); scores; }");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed
             .types
@@ -3535,13 +3591,13 @@ mod tests {
 
     #[test]
     fn annotated_let_accepts_empty_literal() {
-        let (_, diags) = check_src("fun main() { let e: *Array[u64] = []; e[0u64] = 1u64; e; }");
+        let (_, diags) = check_src("fun main() { val e: *Array[u64] = []; e[0u64] = 1u64; e; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn annotated_let_rejects_mismatch() {
-        let (_, diags) = check_src("fun main() { let x: u64 = \"s\"; x; }");
+        let (_, diags) = check_src("fun main() { val x: u64 = \"s\"; x; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E309")),
@@ -3551,22 +3607,22 @@ mod tests {
 
     #[test]
     fn annotated_let_coerces_int_literals() {
-        let (_, diags) = check_src("fun main() { let x: u64 = 3; x; }");
+        let (_, diags) = check_src("fun main() { val x: u64 = 3; x; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn annotated_let_with_explicit_turbofish_checks() {
-        let (_, diags) = check_src("fun main() { let a: Array[u64] = Array.new::[u64](3); a; }");
+        let (_, diags) = check_src("fun main() { val a: Array[u64] = Array.new::[u64](3); a; }");
         assert!(diags.is_empty(), "{diags:?}");
-        let (_, diags) = check_src("fun main() { let a: Array[String] = Array.new::[u64](3); a; }");
+        let (_, diags) = check_src("fun main() { val a: Array[String] = Array.new::[u64](3); a; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
     }
 
     #[test]
     fn annotated_let_in_generic_body() {
         let (_, diags) = check_src(
-            "fun f[T](x: T): T { let y: T = x; let a: Array[T] = Array.new(1); return y; }",
+            "fun f[T](x: T): T { val y: T = x; val a: Array[T] = Array.new(1); return y; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -3574,7 +3630,7 @@ mod tests {
     #[test]
     fn failed_annotation_poisons_quietly() {
         // Parser reports E105; typecheck must not cascade.
-        let (toks, _) = vl_lex::lex("fun main() { let x: Bogus = 1; x; }");
+        let (toks, _) = vl_lex::lex("fun main() { val x: Bogus = 1; x; }");
         let (prog, pdiags) = vl_syntax::parse(&toks, "");
         assert!(pdiags.iter().any(|d| d.is_error()));
         let (res, _) = vl_semantic::resolve(&prog);
@@ -3585,7 +3641,7 @@ mod tests {
 
     #[test]
     fn array_new_arg_is_checked() {
-        let (_, diags) = check_src("fun main() { let a = Array.new::[u64](1.0f64); a; }");
+        let (_, diags) = check_src("fun main() { val a = Array.new::[u64](1.0f64); a; }");
         assert!(
             diags.iter().any(|d| d.message.contains("expects `u64`")),
             "{diags:?}"
@@ -3594,7 +3650,7 @@ mod tests {
 
     #[test]
     fn array_new_rejects_void_element() {
-        let (_, diags) = check_src("fun main() { let a = Array.new::[void](1u64); a; }");
+        let (_, diags) = check_src("fun main() { val a = Array.new::[void](1u64); a; }");
         assert!(
             diags.iter().any(|d| d.message.contains("cannot be `void`")),
             "{diags:?}"
@@ -3604,19 +3660,19 @@ mod tests {
     #[test]
     fn string_arrays_check_clean() {
         let (_, diags) = check_src(
-            "fun main() { let a = Array.new::[String](2u64); let b = [\"x\", \"y\"]; b[0u64]; }",
+            "fun main() { val a = Array.new::[String](2u64); val b = [\"x\", \"y\"]; b[0u64]; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn index_requires_array_and_u64() {
-        let (_, diags) = check_src(r#"fun main() { let s = "hi"; let x = s[0u64]; x; }"#);
+        let (_, diags) = check_src(r#"fun main() { val s = "hi"; val x = s[0u64]; x; }"#);
         assert!(
             diags.iter().any(|d| d.message.contains("cannot index")),
             "{diags:?}"
         );
-        let (_, diags) = check_src("fun main() { let a = [1u64]; let x = a[true]; x; }");
+        let (_, diags) = check_src("fun main() { val a = [1u64]; val x = a[true]; x; }");
         assert!(
             diags.iter().any(|d| d.message.contains("must be `u64`")),
             "{diags:?}"
@@ -3625,7 +3681,7 @@ mod tests {
 
     #[test]
     fn index_assign_checks_shapes() {
-        let (_, diags) = check_src(r#"fun main() { let a: *Array[u64] = [1u64]; a[0u64] = "s"; }"#);
+        let (_, diags) = check_src(r#"fun main() { val a: *Array[u64] = [1u64]; a[0u64] = "s"; }"#);
         assert!(
             diags.iter().any(|d| d.message.contains("cannot store")),
             "{diags:?}"
@@ -3635,7 +3691,7 @@ mod tests {
     #[test]
     fn arrays_are_not_numeric() {
         let (_, diags) =
-            check_src("fun main() { let a = [1u64]; let b = [2u64]; let c = a + b; c; }");
+            check_src("fun main() { val a = [1u64]; val b = [2u64]; val c = a + b; c; }");
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E302")),
             "{diags:?}"
@@ -3645,20 +3701,20 @@ mod tests {
     #[test]
     fn comparisons_and_logic_yield_bool() {
         let (typed, diags) =
-            check_src("fun main() { let a = 1; let ok = a < 2 && a == 1 || !false; ok; }");
+            check_src("fun main() { val a = 1; val ok = a < 2 && a == 1 || !false; ok; }");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.types.values().any(|t| *t == Ty::Bool));
     }
 
     #[test]
     fn untyped_integer_comparison_uses_concrete_context() {
-        let (_, diags) = check_src("fun main() { let x = 1 < 2u64; x; }");
+        let (_, diags) = check_src("fun main() { val x = 1 < 2u64; x; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn logical_operators_require_bool() {
-        let (_, diags) = check_src("fun main() { let x = 1 && true; x; }");
+        let (_, diags) = check_src("fun main() { val x = 1 && true; x; }");
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E304")),
             "{diags:?}"
@@ -3687,7 +3743,7 @@ mod tests {
 
     #[test]
     fn assignment_type_mismatch_errors() {
-        let (_, diags) = check_src(r#"fun main() { let x = 1; x = "s"; }"#);
+        let (_, diags) = check_src(r#"fun main() { var x = 1; x = "s"; }"#);
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E309")),
             "{diags:?}"
@@ -3696,33 +3752,43 @@ mod tests {
 
     #[test]
     fn assignment_with_matching_type_checks() {
-        let (_, diags) = check_src("fun main() { let x = 1; x = 2; }");
+        let (_, diags) = check_src("fun main() { var x = 1; x = 2; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn ints_check_clean() {
-        let (_, diags) = check_src("let x = 1 + 2 * 3;");
+        let (_, diags) = check_src("val x = 1 + 2 * 3;");
         assert!(diags.is_empty());
     }
 
     #[test]
     fn strings_check_as_string_type() {
-        let (typed, diags) = check_src(r#"let greeting = "hello";"#);
+        let (typed, diags) = check_src(r#"val greeting = "hello";"#);
         assert!(diags.is_empty());
         assert_eq!(typed.types.values().next(), Some(&Ty::String));
     }
 
     #[test]
     fn string_bindings_keep_their_type() {
-        let (typed, diags) = check_src(r#"let greeting = "hello"; let copy = greeting;"#);
+        let (typed, diags) = check_src(r#"val greeting = "hello"; val copy = greeting;"#);
         assert!(diags.is_empty());
         assert_eq!(typed.types.get(&3), Some(&Ty::String));
     }
 
     #[test]
+    fn var_string_literal_gets_mutable_view() {
+        let (typed, diags) = check_src(r#"var greeting = "hello";"#);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed
+            .types
+            .values()
+            .any(|t| *t == Ty::Mutable(Box::new(Ty::String))));
+    }
+
+    #[test]
     fn const_div_by_zero_errors() {
-        let (_, diags) = check_src("let x = 1 / 0;");
+        let (_, diags) = check_src("val x = 1 / 0;");
         assert!(diags.iter().any(|d| d.message.contains("division by zero")));
     }
 
@@ -3779,7 +3845,7 @@ mod tests {
 
     #[test]
     fn missing_return_is_an_error() {
-        let (_, diags) = check_src(r#"fun f(): i64 { let x = 1; }"#);
+        let (_, diags) = check_src(r#"fun f(): i64 { val x = 1; }"#);
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E307")),
             "{diags:?}"
@@ -3825,7 +3891,7 @@ mod tests {
 
     #[test]
     fn binding_void_errors() {
-        let (_, diags) = check_src("use std.print; fun main() { let x = print(\"hi\"); }");
+        let (_, diags) = check_src("use std.print; fun main() { val x = print(\"hi\"); }");
         assert!(
             diags.iter().any(|d| d.message.contains("void")),
             "{diags:?}"
@@ -3834,7 +3900,7 @@ mod tests {
 
     #[test]
     fn calling_a_let_binding_errors() {
-        let (_, diags) = check_src("let x = 1; fun main() { x(); }");
+        let (_, diags) = check_src("val x = 1; fun main() { x(); }");
         assert!(diags.iter().any(|d| d.message.contains("not a function")));
     }
 
@@ -3852,7 +3918,7 @@ mod tests {
 
     #[test]
     fn forward_global_type_is_not_invented() {
-        let (_, diags) = check_src("let x = later + 1; let later = \"s\";");
+        let (_, diags) = check_src("val x = later + 1; val later = \"s\";");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("forward global"));
     }
@@ -3860,9 +3926,9 @@ mod tests {
     #[test]
     fn every_numeric_zero_divisor_is_rejected() {
         for source in [
-            "let x = 1u64 / 0u64;",
-            "let x = 1u8 / 0u8;",
-            "let x = 1.0f64 / 0.0f64;",
+            "val x = 1u64 / 0u64;",
+            "val x = 1u8 / 0u8;",
+            "val x = 1.0f64 / 0.0f64;",
         ] {
             let (_, diags) = check_src(source);
             assert!(
@@ -3875,7 +3941,7 @@ mod tests {
     #[test]
     fn generic_identity_infers_and_specializes() {
         let (typed, diags) = check_src(
-            "fun id[T](x: T): T { return x; } fun main() { let a = id(1u64); let b = id::[String](\"s\"); a; b; }",
+            "fun id[T](x: T): T { return x; } fun main() { val a = id(1u64); val b = id::[String](\"s\"); a; b; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("id$u64"));
@@ -3888,7 +3954,7 @@ mod tests {
     #[test]
     fn generic_array_first_checks() {
         let (typed, diags) = check_src(
-            "fun first[T](a: Array[T]): T { return a[0u64]; } fun main() { let x = first([1u64, 2u64]); x; }",
+            "fun first[T](a: Array[T]): T { return a[0u64]; } fun main() { val x = first([1u64, 2u64]); x; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("first$u64"));
@@ -3897,7 +3963,7 @@ mod tests {
     #[test]
     fn inference_failure_asks_for_turbofish() {
         let (_, diags) = check_src(
-            "fun never[T](): T { let a = Array.new::[T](1u64); return a[0u64]; } fun main() { never(); }",
+            "fun never[T](): T { val a = Array.new::[T](1u64); return a[0u64]; } fun main() { never(); }",
         );
         assert!(
             diags.iter().any(|d| d.message.contains("cannot infer")),
@@ -4042,17 +4108,17 @@ mod tests {
     #[test]
     fn nested_unknown_type_argument_is_an_error() {
         // `Array(Error)` is poisoned: one `unknown type` error, no cascade.
-        let (_, diags) = check_src("fun main() { let a = Array.new::[Array[Bogus]](1u64); }");
+        let (_, diags) = check_src("fun main() { val a = Array.new::[Array[Bogus]](1u64); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("unknown type"), "{diags:?}");
     }
 
     #[test]
     fn u8_literal_range_is_checked() {
-        let (_, diags) = check_src("fun main() { let x: u8 = 300; x; }");
+        let (_, diags) = check_src("fun main() { val x: u8 = 300; x; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("out of range"), "{diags:?}");
-        let (_, diags) = check_src("fun main() { let x: u8 = 255; x; }");
+        let (_, diags) = check_src("fun main() { val x: u8 = 255; x; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
@@ -4061,7 +4127,7 @@ mod tests {
         // `let v = 300` resolves to `u64`, which must not pass a `u8`
         // parameter even though the literal would fit neither.
         let (_, diags) =
-            check_src("fun take(x: u8): u8 { return x; } fun main() { let v = 300; take(v); }");
+            check_src("fun take(x: u8): u8 { return x; } fun main() { val v = 300; take(v); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("expects `u8`"), "{diags:?}");
     }
@@ -4164,9 +4230,9 @@ mod tests {
     #[test]
     fn normalized_validation_accepts_clean_programs() {
         for src in [
-            "fun main() { let x = 1; x; }",
+            "fun main() { val x = 1; x; }",
             "fun id[T](x: T): T { return x; } fun main() { id(1u64); }",
-            "fun main() { let a = [1, 2]; a; }",
+            "fun main() { val a = [1, 2]; a; }",
             "fun main() { 1 + 2; }",
         ] {
             let (hir, typed, diags) = check_src_with_hir(src);
@@ -4177,7 +4243,7 @@ mod tests {
 
     #[test]
     fn normalized_validation_rejects_lingering_int() {
-        let (hir, mut typed, _) = check_src_with_hir("fun main() { let x = 1u64; x; }");
+        let (hir, mut typed, _) = check_src_with_hir("fun main() { val x = 1u64; x; }");
         // Inject a non-normalized `Int` where a concrete type belongs.
         typed.types.insert(0, Ty::Int);
         let errs = typed.validate_normalized(&hir, &[]);
@@ -4211,7 +4277,7 @@ mod tests {
         // Concrete `i64` does not coerce to `u64` even though both are
         // integers; only literals coerce.
         let (_, diags) = check_src(
-            "fun take(x: u64): u64 { return x; } fun main() { let v: i64 = 1i64; take(v); }",
+            "fun take(x: u64): u64 { return x; } fun main() { val v: i64 = 1i64; take(v); }",
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("expects `u64`"), "{diags:?}");
@@ -4261,7 +4327,7 @@ mod tests {
 
     #[test]
     fn unreachable_code_warns_without_failing() {
-        let (_, diags) = check_src("fun main() { return; let x = 1; x; }");
+        let (_, diags) = check_src("fun main() { return; val x = 1; x; }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("W001")),
@@ -4281,35 +4347,35 @@ mod tests {
 
     #[test]
     fn as_cast_same_type_checks() {
-        let (_, diags) = check_src("fun main() { let x = 1u64 as u64; x; }");
+        let (_, diags) = check_src("fun main() { val x = 1u64 as u64; x; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn as_cast_variable_between_integers_checks() {
         let (_, diags) = check_src(
-            "fun take(x: u8): u8 { return x; } fun main() { let v = 200u64; take(v as u8); }",
+            "fun take(x: u8): u8 { return x; } fun main() { val v = 200u64; take(v as u8); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn as_cast_literal_out_of_range_is_one_error() {
-        let (_, diags) = check_src("fun main() { let x = 300 as u8; x; }");
+        let (_, diags) = check_src("fun main() { val x = 300 as u8; x; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("out of range"), "{diags:?}");
     }
 
     #[test]
     fn as_cast_rejects_non_integer_target() {
-        let (_, diags) = check_src("fun main() { let x = 1u64 as String; x; }");
+        let (_, diags) = check_src("fun main() { val x = 1u64 as String; x; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("cannot cast"), "{diags:?}");
     }
 
     #[test]
     fn as_cast_rejects_non_integer_source() {
-        let (_, diags) = check_src("fun main() { let s = \"hi\"; let x = s as u8; x; }");
+        let (_, diags) = check_src("fun main() { val s = \"hi\"; val x = s as u8; x; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("cannot cast"), "{diags:?}");
     }
@@ -4318,7 +4384,7 @@ mod tests {
     fn implicit_variable_conversion_still_rejected() {
         // Without `as`, a `u64` variable must not flow into `u8`.
         let (_, diags) =
-            check_src("fun take(x: u8): u8 { return x; } fun main() { let v = 1u64; take(v); }");
+            check_src("fun take(x: u8): u8 { return x; } fun main() { val v = 1u64; take(v); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
     }
 
@@ -4394,7 +4460,7 @@ mod tests {
 
     #[test]
     fn as_cast_from_f64_is_rejected() {
-        let (_, diags) = check_src("fun main() { let x = 1.0f64 as u8; x; }");
+        let (_, diags) = check_src("fun main() { val x = 1.0f64 as u8; x; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("cannot cast"), "{diags:?}");
     }
@@ -4420,7 +4486,7 @@ mod tests {
 
     #[test]
     fn unannotated_all_int_array_defaults_to_u64() {
-        let (typed, diags) = check_src("fun main() { let a = [1, 2]; a; }");
+        let (typed, diags) = check_src("fun main() { val a = [1, 2]; a; }");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed
             .types
@@ -4440,7 +4506,7 @@ mod tests {
 
     #[test]
     fn validation_stands_down_with_prior_errors() {
-        let (hir, mut typed, _) = check_src_with_hir("fun main() { let x = 1u64; x; }");
+        let (hir, mut typed, _) = check_src_with_hir("fun main() { val x = 1u64; x; }");
         typed.types.insert(0, Ty::Error);
         // No prior errors: poison at the boundary is itself reported.
         let errs = typed.validate_normalized(&hir, &[]);
@@ -4536,21 +4602,21 @@ mod tests {
     fn mutable_downgrade_allowed_at_all_boundaries() {
         // `*Foo -> Foo` succeeds everywhere; `Foo -> *Foo` fails everywhere.
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; fun read(foo: Foo) {} fun change(foo: *Foo) {} fun main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = e; read(e); read(v); change(e); }",
+            "type Foo = object { value: u64, }; fun read(foo: Foo) {} fun change(foo: *Foo) {} fun main() { val e: *Foo = Foo { value = 1u64 }; val v: Foo = e; read(e); read(v); change(e); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
 
         for (src, code) in [
             (
-                "type Foo = object { value: u64, }; fun change(foo: *Foo) {} fun main() { let v: Foo = Foo { value = 1u64 }; change(v); }",
+                "type Foo = object { value: u64, }; fun change(foo: *Foo) {} fun main() { val v: Foo = Foo { value = 1u64 }; change(v); }",
                 "E306",
             ),
             (
-                "type Foo = object { value: u64, }; fun main() { let v: Foo = Foo { value = 1u64 }; let bad: *Foo = v; }",
+                "type Foo = object { value: u64, }; fun main() { val v: Foo = Foo { value = 1u64 }; val bad: *Foo = v; }",
                 "E309",
             ),
             (
-                "type Foo = object { value: u64, }; fun get(): Foo { let v: Foo = Foo { value = 1u64 }; return v; } fun bad(): *Foo { let v: Foo = Foo { value = 1u64 }; return v; }",
+                "type Foo = object { value: u64, }; fun get(): Foo { val v: Foo = Foo { value = 1u64 }; return v; } fun bad(): *Foo { val v: Foo = Foo { value = 1u64 }; return v; }",
                 "E307",
             ),
         ] {
@@ -4571,14 +4637,14 @@ mod tests {
     #[test]
     fn local_rebinding_uses_directional_coercion() {
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; fun main() { let c: Foo = Foo { value = 1u64 }; c = Foo { value = 2u64 }; let m: *Foo = Foo { value = 1u64 }; m = Foo { value = 2u64 }; let p = 1u64; p = 2u64; let a: *Array[u64] = [1u64]; a = [2u64]; }",
+            "type Foo = object { value: u64, }; fun main() { var c: Foo = Foo { value = 1u64 }; c = Foo { value = 2u64 }; var m: *Foo = Foo { value = 1u64 }; m = Foo { value = 2u64 }; var p = 1u64; p = 2u64; var a: *Array[u64] = [1u64]; a = [2u64]; }",
         );
         // `m = Foo{}` upgrades a fresh readonly literal? No: fresh adopts
         // `*Foo` via context, so all rebindings are downgrades or exact.
         assert!(diags.is_empty(), "{diags:?}");
 
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; fun main() { let m: *Foo = Foo { value = 1u64 }; let v: Foo = Foo { value = 1u64 }; m = v; }",
+            "type Foo = object { value: u64, }; fun main() { var m: *Foo = Foo { value = 1u64 }; val v: Foo = Foo { value = 1u64 }; m = v; }",
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert_eq!(diags[0].code.as_deref(), Some("E309"));
@@ -4621,12 +4687,12 @@ mod tests {
     #[test]
     fn mutable_returns_preserve_and_cannot_launder() {
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; fun create(): *Foo { return Foo { value = 1u64 }; } fun main() { let e = create(); let v: Foo = create(); e; v; }",
+            "type Foo = object { value: u64, }; fun create(): *Foo { return Foo { value = 1u64 }; } fun main() { val e = create(); val v: Foo = create(); e; v; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
 
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; fun inspect(v: Foo): Foo { return v; } fun main() { let v: Foo = Foo { value = 1u64 }; let bad: *Foo = inspect(v); }",
+            "type Foo = object { value: u64, }; fun inspect(v: Foo): Foo { return v; } fun main() { val v: Foo = Foo { value = 1u64 }; val bad: *Foo = inspect(v); }",
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
     }
@@ -4634,13 +4700,13 @@ mod tests {
     #[test]
     fn fresh_allocations_default_readonly_and_adopt_mutable() {
         let (typed, diags) = check_src(
-            "type Foo = object { value: u64, }; fun main() { let v = Foo { value = 1u64 }; v; }",
+            "type Foo = object { value: u64, }; fun main() { val v = Foo { value = 1u64 }; v; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.types.values().any(|t| *t == Ty::Object("Foo".into())));
 
         let (typed, diags) = check_src(
-            "type Foo = object { value: u64, }; fun main() { let e: *Foo = Foo { value = 1u64 }; e; }",
+            "type Foo = object { value: u64, }; fun main() { val e: *Foo = Foo { value = 1u64 }; e; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed
@@ -4650,9 +4716,41 @@ mod tests {
 
         // Existing values never upgrade from context.
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; fun get(): Foo { let v: Foo = Foo { value = 1u64 }; return v; } fun main() { let bad: *Foo = get(); }",
+            "type Foo = object { value: u64, }; fun get(): Foo { val v: Foo = Foo { value = 1u64 }; return v; } fun main() { val bad: *Foo = get(); }",
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+    }
+
+    #[test]
+    fn binding_keyword_controls_fresh_reference_capability() {
+        let (typed, diags) = check_src(
+            "type Foo = object { value: u64, }; fun main() { var fresh = Foo { value = 1u64 }; fresh.value = 2u64; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed
+            .types
+            .values()
+            .any(|t| *t == Ty::Mutable(Box::new(Ty::Object("Foo".into())))));
+
+        let (typed, diags) = check_src(
+            "type Foo = object { value: u64, }; fun main() { val view = Foo { value = 1u64 }; view; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.types.values().any(|t| *t == Ty::Object("Foo".into())));
+
+        let (typed, diags) = check_src(
+            "type Foo = object { value: u64, }; fun main() { var view: Foo = Foo { value = 1u64 }; view; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.types.values().any(|t| *t == Ty::Object("Foo".into())));
+
+        let (_, diags) = check_src(
+            "type Foo = object { value: u64, }; fun read(): Foo { return Foo { value = 1u64 }; } fun main() { var bad = read(); }",
+        );
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E309")),
+            "{diags:?}"
+        );
     }
 
     #[test]
@@ -4671,7 +4769,7 @@ mod tests {
         // cascade) when fed the poisoned HIR.
         for src in [
             "fun f(x: *u64) { x; }",
-            "type Foo = object { value: *u64, }; fun main() { let x = 1u64; x; }",
+            "type Foo = object { value: *u64, }; fun main() { val x = 1u64; x; }",
         ] {
             let (toks, _) = vl_lex::lex(src);
             let (prog, pdiags) = vl_syntax::parse(&toks, src);
@@ -4689,7 +4787,7 @@ mod tests {
     #[test]
     fn as_cast_never_upgrades_capability() {
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; fun main() { let v: Foo = Foo { value = 1u64 }; let x = v as u64; x; }",
+            "type Foo = object { value: u64, }; fun main() { val v: Foo = Foo { value = 1u64 }; val x = v as u64; x; }",
         );
         // `Foo as u64` is an unsupported cast (E302), not a capability upgrade.
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E302")));
@@ -4699,27 +4797,27 @@ mod tests {
     fn generic_mutable_inference_preserves_and_merges() {
         // Unconstrained `T` preserves `*Foo`.
         let (typed, diags) = check_src(
-            "type Foo = object { value: u64, }; fun identity[T](x: T): T { return x; } fun main() { let e: *Foo = Foo { value = 1u64 }; let same = identity(e); same; }",
+            "type Foo = object { value: u64, }; fun identity[T](x: T): T { return x; } fun main() { val e: *Foo = Foo { value = 1u64 }; val same = identity(e); same; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("identity$Mut_Object_Foo"));
 
         // Explicit turbofish accepts `*Foo`.
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; fun identity[T](x: T): T { return x; } fun main() { let e: *Foo = Foo { value = 1u64 }; let same = identity::[*Foo](e); same; }",
+            "type Foo = object { value: u64, }; fun identity[T](x: T): T { return x; } fun main() { val e: *Foo = Foo { value = 1u64 }; val same = identity::[*Foo](e); same; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
 
         // Mixed `*Foo` + `Foo` constraints choose read-only `Foo`.
         let (typed, diags) = check_src(
-            "type Foo = object { value: u64, }; fun same[T](a: T, b: T): T { return a; } fun main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = Foo { value = 2u64 }; let r = same(e, v); r; }",
+            "type Foo = object { value: u64, }; fun same[T](a: T, b: T): T { return a; } fun main() { val e: *Foo = Foo { value = 1u64 }; val v: Foo = Foo { value = 2u64 }; val r = same(e, v); r; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("same$Object_Foo"));
 
         // Mangling distinguishes `Foo` from `*Foo`.
         let (typed, diags) = check_src(
-            "type Foo = object { value: u64, }; fun identity[T](x: T): T { return x; } fun main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = Foo { value = 2u64 }; let a = identity(e); let b = identity(v); a; b; }",
+            "type Foo = object { value: u64, }; fun identity[T](x: T): T { return x; } fun main() { val e: *Foo = Foo { value = 1u64 }; val v: Foo = Foo { value = 2u64 }; val a = identity(e); val b = identity(v); a; b; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("identity$Mut_Object_Foo"));
@@ -4730,25 +4828,25 @@ mod tests {
     fn generic_mutable_forwarding_and_array_context() {
         // Forwarding preserves `*Foo` through `wrap[T]` -> `id[T]`.
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; fun id[T](x: T): T { return x; } fun wrap[T](x: T): T { return id(x); } fun main() { let e: *Foo = Foo { value = 1u64 }; let r = wrap(e); r.value = 1u64; }",
+            "type Foo = object { value: u64, }; fun id[T](x: T): T { return x; } fun wrap[T](x: T): T { return id(x); } fun main() { val e: *Foo = Foo { value = 1u64 }; var r = wrap(e); r.value = 1u64; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
 
         // `*Array[T]` is valid with a mutable formal.
         let (_, diags) = check_src(
-            "fun get[T](a: *Array[T]): T { return a[0u64]; } fun main() { let a: *Array[u64] = [1u64]; let x = get(a); x; }",
+            "fun get[T](a: *Array[T]): T { return a[0u64]; } fun main() { val a: *Array[u64] = [1u64]; val x = get(a); x; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
 
         // Read-only `Array[T]` formal accepts `*Array[u64]` via downgrade.
         let (_, diags) = check_src(
-            "fun first[T](a: Array[T]): T { return a[0u64]; } fun main() { let a: *Array[u64] = [1u64]; let x = first(a); x; }",
+            "fun first[T](a: Array[T]): T { return a[0u64]; } fun main() { val a: *Array[u64] = [1u64]; val x = first(a); x; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
 
         // Fresh array infers through a mutable generic formal.
         let (_, diags) = check_src(
-            "fun take[T](a: *Array[T]): u64 { return 1u64; } fun main() { let x = take([1u64]); x; }",
+            "fun take[T](a: *Array[T]): u64 { return 1u64; } fun main() { val x = take([1u64]); x; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -4757,7 +4855,7 @@ mod tests {
     fn generic_bounds_rechecked_after_substitution() {
         // `*Foo` does not satisfy `Numeric`.
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; fun add[T extends Numeric](a: T, b: T): T { return a + b; } fun main() { let e: *Foo = Foo { value = 1u64 }; let x = add(e, e); x; }",
+            "type Foo = object { value: u64, }; fun add[T extends Numeric](a: T, b: T): T { return a + b; } fun main() { val e: *Foo = Foo { value = 1u64 }; val x = add(e, e); x; }",
         );
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E303")),
@@ -4766,13 +4864,13 @@ mod tests {
 
         // `*String` satisfies `Comparable` via its base.
         let (_, diags) = check_src(
-            "fun eq[T extends Comparable](a: T, b: T): bool { return a == b; } fun f(s: *String): bool { return eq(s, s); } fun main() { let x = 1u64; x; }",
+            "fun eq[T extends Comparable](a: T, b: T): bool { return a == b; } fun f(s: *String): bool { return eq(s, s); } fun main() { val x = 1u64; x; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
 
         // Every monomorphized instance is normalized (no `Param`/`*T` leaks).
         let (hir, typed, diags) = check_src_with_hir(
-            "type Foo = object { value: u64, }; fun identity[T](x: T): T { return x; } fun main() { let e: *Foo = Foo { value = 1u64 }; let r = identity(e); r; }",
+            "type Foo = object { value: u64, }; fun identity[T](x: T): T { return x; } fun main() { val e: *Foo = Foo { value = 1u64 }; val r = identity(e); r; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.validate_normalized(&hir, &diags).is_empty());

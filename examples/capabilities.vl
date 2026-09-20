@@ -13,8 +13,8 @@ fun increment(counter: *Counter) {
 }
 
 fun main() {
-    let counter: *Counter = Counter { value = 0 };
-    let view: Counter = counter;
+    var counter = Counter { value = 0 }; // inferred *Counter
+    val view: Counter = counter;
 
     increment(counter);
     std.print_u64(read(view));

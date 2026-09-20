@@ -71,7 +71,7 @@
           }
         },
         {
-          "match": "\\b(let)(\\s+)([A-Za-z_][A-Za-z0-9_]*)",
+          "match": "\\b(var|val)(\\s+)([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": { "name": "storage.type.vl" },
             "3": { "name": "variable.other.readwrite.vl" }
@@ -83,7 +83,7 @@
       "patterns": [
         {
           "name": "storage.type.vl",
-          "match": "\\b(?:let|fun|type)\\b"
+          "match": "\\b(?:var|val|fun|type)\\b"
         },
         {
           "name": "keyword.control.vl",

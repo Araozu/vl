@@ -3,7 +3,7 @@ use std.string;
 use std.fs.{open, read};
 
 fun main() {
-    let f = open("data.txt");
-    let s = read(f);
-    let n = string.len(s);
+    val f = open("data.txt");
+    val s = read(f);
+    val n = string.len(s);
 }

@@ -195,7 +195,7 @@ use std;
 fun add(a: u64, b: u64): u64 { return a + b; }
 fun greet(name: String): String { return name; }
 fun fact(n: u64): u64 {
-    let r = 1u64;
+    var r = 1u64;
     if (n == 0u64) { r; } else { r = n * fact(n - 1u64); }
     return r;
 }
@@ -215,14 +215,14 @@ fun main() {
 
 #[test]
 fn strings_lower_to_byte_constants() {
-    let lir = frontend(r#"let greeting = "hi\n";"#).expect("String must compile");
+    let lir = frontend(r#"val greeting = "hi\n";"#).expect("String must compile");
     let dump = lir.dump();
     assert!(dump.contains("string [104, 105, 10]"), "{dump}");
 }
 
 #[test]
 fn unterminated_string_is_a_lex_error() {
-    let err = frontend("let x = \"not closed\nlet y = 1;").expect_err("must fail");
+    let err = frontend("val x = \"not closed\nlet y = 1;").expect_err("must fail");
     assert!(err
         .iter()
         .any(|d| d.message.contains("unterminated string")));
@@ -250,7 +250,7 @@ fn unknown_module_export_is_a_single_error() {
 
 #[test]
 fn scalar_literals_and_if_lower_to_typed_control_flow() {
-    let lir = frontend("fun main() { let x = 1u64; if (true) { x; } else { 255u8; } 1.5f64; }")
+    let lir = frontend("fun main() { val x = 1u64; if (true) { x; } else { 255u8; } 1.5f64; }")
         .expect("scalar literals and if must compile");
     let dump = lir.dump();
     assert!(dump.contains("const 1u64"), "{dump}");
@@ -312,7 +312,7 @@ fn while_countdown_lowers_to_jumps_copies_and_runs_on_naravm() {
 #[test]
 fn comparisons_and_short_circuit_logic_lower() {
     let lir = frontend(
-        "fun main() { let a = 1; if (a <= 2 && a != 3 || !(a > 9)) { a; } while (a >= 1) { a = a - 1; } }",
+        "fun main() { var a = 1; if (a <= 2 && a != 3 || !(a > 9)) { a; } while (a >= 1) { a = a - 1; } }",
     )
     .expect("comparisons must compile");
     let dump = lir.dump();
@@ -338,7 +338,7 @@ fn continue_outside_a_loop_is_one_error() {
 
 #[test]
 fn assignment_type_mismatch_is_one_error() {
-    let err = frontend(r#"fun main() { let x = 1; x = "s"; }"#).expect_err("must fail");
+    let err = frontend(r#"fun main() { var x = 1; x = "s"; }"#).expect_err("must fail");
     assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
     assert!(err.iter().any(|d| d.code.as_deref() == Some("E309")));
 }
@@ -371,7 +371,7 @@ fn explicit_return_compiles_and_lowers_to_ret() {
 
 #[test]
 fn missing_return_is_an_error() {
-    let err = frontend("fun f(): i64 { let x = 1; }").expect_err("must fail");
+    let err = frontend("fun f(): i64 { val x = 1; }").expect_err("must fail");
     assert!(
         err.iter().any(|d| d.code.as_deref() == Some("E307")),
         "{err:?}"
@@ -443,14 +443,14 @@ fn objects_compile_with_reference_field_semantics() {
 #[test]
 fn array_new_needs_no_import() {
     let lir =
-        frontend("fun main() { let a: *Array[u64] = Array.new::[u64](2u64); a[0u64] = 1u64; }")
+        frontend("fun main() { val a: *Array[u64] = Array.new::[u64](2u64); a[0u64] = 1u64; }")
             .expect("Array.new must compile without imports");
     assert!(lir.dump().contains("new_array"));
 }
 
 #[test]
 fn array_element_mismatch_is_one_error() {
-    let err = frontend("fun main() { let a = [1, 2.0f64]; a; }").expect_err("must fail");
+    let err = frontend("fun main() { val a = [1, 2.0f64]; a; }").expect_err("must fail");
     assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
     assert!(
         err.iter()
@@ -462,20 +462,20 @@ fn array_element_mismatch_is_one_error() {
 #[test]
 fn array_index_shapes_are_checked() {
     let err =
-        frontend(r#"fun main() { let s = "hi"; let x = s[0u64]; x; }"#).expect_err("must fail");
+        frontend(r#"fun main() { val s = "hi"; val x = s[0u64]; x; }"#).expect_err("must fail");
     assert!(
         err.iter().any(|d| d.message.contains("cannot index")),
         "{err:?}"
     );
 
     let err =
-        frontend("fun main() { let a = [1u64]; let x = a[true]; x; }").expect_err("must fail");
+        frontend("fun main() { val a = [1u64]; val x = a[true]; x; }").expect_err("must fail");
     assert!(
         err.iter().any(|d| d.message.contains("must be `u64`")),
         "{err:?}"
     );
 
-    let err = frontend(r#"fun main() { let a: *Array[u64] = [1u64]; a[0u64] = "s"; }"#)
+    let err = frontend(r#"fun main() { val a: *Array[u64] = [1u64]; a[0u64] = "s"; }"#)
         .expect_err("must fail");
     assert!(
         err.iter().any(|d| d.message.contains("cannot store")),
@@ -509,7 +509,7 @@ fn generics_example_compiles_to_instances_and_runs_on_naravm() {
 #[test]
 fn generic_inference_and_turbofish_agree() {
     let lir = frontend(
-        "fun first[T](a: Array[T]): T { return a[0u64]; } fun main() { let a = first([7u64]); let b = first::[u64]([8u64]); a; b; }",
+        "fun first[T](a: Array[T]): T { return a[0u64]; } fun main() { val a = first([7u64]); val b = first::[u64]([8u64]); a; b; }",
     )
     .expect("inferred and explicit calls must compile");
     let dump = lir.dump();
@@ -538,9 +538,9 @@ fn generic_main_is_rejected() {
 #[test]
 fn annotated_let_with_contextual_new_compiles() {
     let lir = frontend(
-        "use std; fun first[T](a: Array[T]): T { return a[0]; } fun main() { let scores: *Array[u64] = Array.new(3); scores[0] = 10; let number = first(scores); std.print_u64(number); }",
+        "use std; fun first[T](a: Array[T]): T { return a[0]; } fun main() { val scores: *Array[u64] = Array.new(3); scores[0] = 10; val number = first(scores); std.print_u64(number); }",
     )
-    .expect("annotated let must compile");
+    .expect("annotated val must compile");
     let dump = lir.dump();
     assert!(dump.contains("call first$u64"), "{dump}");
     assert!(dump.contains("new_array"), "{dump}");
@@ -555,7 +555,7 @@ fn annotated_let_with_contextual_new_compiles() {
 fn inference_needs_no_annotation() {
     // The turbofish is the escape hatch; plain calls must infer.
     let lir = frontend(
-        "fun first[T](a: Array[T]): T { return a[0]; } fun main() { let numbers = [10, 20]; let number = first(numbers); number; }",
+        "fun first[T](a: Array[T]): T { return a[0]; } fun main() { val numbers = [10, 20]; val number = first(numbers); number; }",
     )
     .expect("inference must work");
     assert!(lir.dump().contains("call first$u64"));
@@ -563,7 +563,7 @@ fn inference_needs_no_annotation() {
 
 #[test]
 fn annotated_let_mismatch_is_one_error() {
-    let err = frontend("fun main() { let x: u64 = \"s\"; x; }").expect_err("must fail");
+    let err = frontend("fun main() { val x: u64 = \"s\"; x; }").expect_err("must fail");
     assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
     assert!(
         err.iter().any(|d| d.code.as_deref() == Some("E309")),
@@ -575,7 +575,7 @@ fn annotated_let_mismatch_is_one_error() {
 fn as_casts_compile_to_cast_and_run_on_naravm() {
     use vl_codegen::Target;
     let lir = frontend(
-        "fun take(x: u8): u8 { return x; } fun main() { let v = 200u64; let w = take(v as u8); let lit = 10 as u8; w; lit; }",
+        "fun take(x: u8): u8 { return x; } fun main() { val v = 200u64; val w = take(v as u8); val lit = 10 as u8; w; lit; }",
     )
     .expect("casts must compile");
     let dump = lir.dump();
@@ -587,7 +587,7 @@ fn as_casts_compile_to_cast_and_run_on_naravm() {
 
 #[test]
 fn as_cast_out_of_range_is_one_error() {
-    let err = frontend("fun main() { let x = 300 as u8; x; }").expect_err("must fail");
+    let err = frontend("fun main() { val x = 300 as u8; x; }").expect_err("must fail");
     assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
     assert!(
         err.iter().any(|d| d.message.contains("out of range")),
@@ -599,7 +599,7 @@ fn as_cast_out_of_range_is_one_error() {
 fn constrained_generics_compile_to_instances_and_run_on_naravm() {
     use vl_codegen::Target;
     let lir = frontend(
-        "fun add[T extends Numeric](a: T, b: T): T { return a + b; } fun eq[T extends Comparable](a: T, b: T): bool { return a == b; } fun main() { let s = add(1u64, 2u64); let ok = eq(s, 3u64); ok; }",
+        "fun add[T extends Numeric](a: T, b: T): T { return a + b; } fun eq[T extends Comparable](a: T, b: T): bool { return a == b; } fun main() { val s = add(1u64, 2u64); val ok = eq(s, 3u64); ok; }",
     )
     .expect("constrained generics must compile");
     let dump = lir.dump();

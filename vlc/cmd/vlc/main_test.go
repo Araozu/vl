@@ -36,12 +36,12 @@ func TestStripANSI(t *testing.T) {
 
 func TestCompileSuccess(t *testing.T) {
 	s := server{compile: func(_ context.Context, source, filename string) ([]byte, string, error) {
-		if source != "function main() {}" || filename != "playground.vl" {
+		if source != "fun main() {}" || filename != "playground.vl" {
 			t.Fatalf("unexpected compiler input: %q %q", source, filename)
 		}
 		return []byte("nara"), "", nil
 	}}.routes()
-	req := httptest.NewRequest(http.MethodPost, "/v1/compile", strings.NewReader(`{"source":"function main() {}"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/compile", strings.NewReader(`{"source":"fun main() {}"}`))
 	res := httptest.NewRecorder()
 	s.ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
@@ -79,7 +79,7 @@ func TestCompilerAdapterInvokesRustCompiler(t *testing.T) {
 	binary := rustCompilerBinary(t)
 	c := compiler{binary: binary}
 
-	bytecode, diagnostics, err := c.compile(context.Background(), "function main() {}", "adapter.vl")
+	bytecode, diagnostics, err := c.compile(context.Background(), "fun main() {}", "adapter.vl")
 	if err != nil {
 		t.Fatalf("compile success: %v (%s)", err, diagnostics)
 	}
@@ -89,7 +89,7 @@ func TestCompilerAdapterInvokesRustCompiler(t *testing.T) {
 
 	_, diagnostics, err = c.compile(
 		context.Background(),
-		"function main() { let missing = nope; }",
+		"fun main() { val missing = nope; }",
 		"adapter-error.vl",
 	)
 	if err == nil {
@@ -123,7 +123,7 @@ func rustCompilerBinary(t *testing.T) string {
 }
 
 func TestCompileMutableViewSuccess(t *testing.T) {
-	src := "type Foo = object { value: u64, }; function bump(c: *Foo) { c.value = 1u64; } function main() { let c: *Foo = Foo { value = 1u64 }; bump(c); }"
+	src := "type Foo = object { value: u64, }; fun bump(c: *Foo) { c.value = 1u64; } fun main() { val c: *Foo = Foo { value = 1u64 }; bump(c); }"
 	s := server{compile: func(_ context.Context, source, filename string) ([]byte, string, error) {
 		if source != src {
 			t.Fatalf("unexpected compiler input: %q", source)
@@ -143,7 +143,7 @@ func TestCompileReadonlyMutationReturns422(t *testing.T) {
 	s := server{compile: func(context.Context, string, string) ([]byte, string, error) {
 		return nil, diag, &buildError{}
 	}}.routes()
-	req := httptest.NewRequest(http.MethodPost, "/v1/compile", strings.NewReader(`{"source":"type Counter = object { value: u64, }; function bad(v: Counter) { v.value = 1u64; }"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/compile", strings.NewReader(`{"source":"type Counter = object { value: u64, }; fun bad(v: Counter) { v.value = 1u64; }"}`))
 	res := httptest.NewRecorder()
 	s.ServeHTTP(res, req)
 	if res.Code != http.StatusUnprocessableEntity {

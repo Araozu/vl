@@ -9,8 +9,8 @@ availability: VL 0.1+
 # Basics
 
 This page introduces the pieces that appear in almost every VL program. VL is
-small and deliberately familiar: it uses braces for blocks, `let` for
-variables, `fun` for reusable work, and semicolons to finish statements.
+small and deliberately familiar: it uses braces for blocks, `var` and `val`
+for bindings, `fun` for reusable work, and semicolons to finish statements.
 
 ## Your first program
 
@@ -43,7 +43,7 @@ Comments are notes for people. VL ignores them when it compiles the program.
 
 ```vl
 // This is a whole-line comment.
-let answer = 40 + 2; // This comment starts after the statement.
+val answer = 40 + 2; // This comment starts after the statement.
 ```
 
 ## Values and types
@@ -62,6 +62,10 @@ operations make sense for it.
 | `String` | `"hello"` | A byte string (read-only view) |
 | `object` type | `Counter { value = 1 }` | Named GC data; `Foo` reads, `*Foo` mutates |
 
+`String` and `File` are reference types too, so `*String` and `*File` carry
+the mutable capability when their APIs expose mutable operations. A plain
+`String` or `File` is the read-only view.
+
 Integer literals are chosen from their context. For example, the parameter
 type tells VL what type the `1` and `2` should have here:
 
@@ -71,54 +75,60 @@ fun add(a: i64, b: i64): i64 {
 }
 
 fun main() {
-    let total = add(1, 2);
+    val total = add(1, 2);
 }
 ```
 
 Decimal literals need an explicit suffix such as `f64`. Values do not silently
 change from one numeric type to another; when a type matters, write it down.
-Integer literals adapt to their context (`let x: u8 = 3;` checks the range),
+Integer literals adapt to their context (`val x: u8 = 3;` checks the range),
 but variables never convert implicitly: a `u64` variable does not flow into a
 `u8` parameter.
 
 Explicit conversions use `as` (integers only in v0):
 
 ```vl
-let v = 200u64;
-let w = v as u8;
-let lit = 10 as u8;
+val v = 200u64;
+val w = v as u8;
+val lit = 10 as u8;
 ```
 
 Literals are range-checked at compile time (`300 as u8` fails); variable
 conversions are unchecked reinterpretations with no runtime cost (no trap, no
 wrap instruction).
 
-## Variables with `let`
+## Bindings with `var` and `val`
 
-`let` is the only binding keyword: there is no `var`, `val`, or `const`.
-Every local `let` is rebindable, and its type is fixed after declaration.
-A reference spelling controls mutation authority: `Foo` is a read-only view
-of a GC-managed `Foo`, while `*Foo` is a mutable view of the same allocation.
-Passing or assigning either spelling copies the GC reference.
+`var` creates a rebindable binding. `val` creates a fixed binding. Both can
+hold primitives or references, and the binding keyword is independent from the
+reference capability: `Foo` is a read-only view of a GC-managed `Foo`, while
+`*Foo` is a mutable view of the same allocation. Passing or assigning either
+spelling copies the GC reference.
+
+For a reference created directly in an unannotated `var`, VL infers the
+mutable capability. An unannotated `val` keeps the read-only view. An explicit
+annotation always wins, so `var view: Foo = ...` is rebindable but read-only,
+and `val editable: *Foo = ...` is fixed but can mutate its referent.
 
 ```vl
-let name = "Ada";
-let visits = 1;
-let welcome = visits == 1;
+val name = "Ada";
+var visits = 1;
+val welcome = visits == 1;
 ```
 
 A type can also be written down explicitly with an annotation. The value must
 have that type (integer literals adapt, so `3` works where `u64` is written).
 An annotation is required to give `Array.new` its element type without a
-turbofish. A fresh object or array adopts an expected `*` capability:
+turbofish. Fresh reference data adopts an expected `*` capability:
 
 ```vl
 type Foo = object { value: u64, };
 
-let retries: u64 = 3;
-let scores: *Array[u64] = Array.new(3);
-let view = Foo { value = 0 };
-let editable: *Foo = Foo { value = 0 };
+val retries: u64 = 3;
+var scores: *Array[u64] = Array.new(3);
+val view = Foo { value = 0 };
+var editable = Foo { value = 0 }; // inferred *Foo
+val fixed_editable: *Foo = Foo { value = 0 }; // fixed binding, mutable view
 ```
 
 Named object types use `type Name = object { ... };` declarations. Their fields
@@ -128,7 +138,7 @@ are comma-separated, and an object literal initializes every field:
 type Point = object { x: u64, y: u64, };
 
 fun main() {
-    let point: *Point = Point { x = 10, y = 20 };
+    var point = Point { x = 10, y = 20 }; // inferred *Point
     point.x = 11;
 }
 ```
@@ -147,9 +157,9 @@ binding, while a `Foo` value never upgrades into a `*Foo` binding (a
 type Counter = object { value: u64, };
 
 fun main() {
-    let count = 0;
+    var count = 0;
     count = count + 1;
-    let current: *Counter = Counter { value = 0 };
+    var current = Counter { value = 0 }; // inferred *Counter
     current = Counter { value = 10 };
 }
 ```
@@ -164,20 +174,20 @@ Arithmetic operators work on numbers: `+`, `-`, `*`, and `/`. Parentheses make
 the order explicit, just as they do in mathematics.
 
 ```vl
-let first = 1u64 + 2u64 * 3u64;       // 7
-let second = (1u64 + 2u64) * 3u64;    // 9
-let third = -second;
+val first = 1u64 + 2u64 * 3u64;       // 7
+val second = (1u64 + 2u64) * 3u64;    // 9
+val third = -second;
 ```
 
 Comparisons produce a `bool`:
 
 ```vl
-let age = 21u64;
-let left = 1u64;
-let right = 2u64;
-let old_enough = age >= 18u64;
-let same = left == right;
-let different = left != right;
+val age = 21u64;
+val left = 1u64;
+val right = 2u64;
+val old_enough = age >= 18u64;
+val same = left == right;
+val different = left != right;
 ```
 
 Boolean values can be combined with `&&` (and), `||` (or), and `!` (not).
@@ -193,7 +203,7 @@ other statements. A function body is a list of statements inside braces.
 use std;
 
 fun main() {
-    let message = "ready";
+    val message = "ready";
     std.println(message);
 }
 ```

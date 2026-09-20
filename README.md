@@ -116,8 +116,8 @@ colours) and sets the exit code. Never add another reporting library.
 ## Language v0 (`examples/`)
 
 ```text
-let x = 1 + 2 * 3;
-fun main() { let d = x - 1; }
+val x = 1 + 2 * 3;
+fun main() { val d = x - 1; }
 ```
 
 Integer literals are untyped and coerce to contextual `u64`, `i64`, or `u8`;
@@ -139,9 +139,12 @@ reflection to them.
 Functions can declare type parameters (`fun first[T](a: Array[T]): T`);
 calls infer them (`first(a)`) or pass them explicitly (`first::[u64](a)`)
 (see `examples/generics.vl`).
-The language also supports double-quoted byte strings, `+ - * /`, unary `-`
+`var` bindings are rebindable and `val` bindings are fixed. An unannotated
+`var` receiving fresh reference data infers a mutable view (`*Foo`), while an
+unannotated `val` infers a read-only view (`Foo`); explicit `Foo`/`*Foo`
+annotations always win. The language also supports double-quoted byte strings, `+ - * /`, unary `-`
 and `!`, comparisons (`== != < <= > >=`), short-circuit `&&` / `||`, parens,
-`let` plus `=` reassignment, user-defined functions with typed boundaries
+`var`/`val` bindings plus `=` reassignment for `var`, user-defined functions with typed boundaries
 (`fun add(a: i64, b: i64): i64 { return a + b; }`; an omitted return
 type means `void`), explicit `return` (`return <expr>;` for values,
 `return;` for `void`; there are no implicit returns — a trailing expression

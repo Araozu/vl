@@ -486,8 +486,8 @@ impl Lowerer<'_> {
     }
 }
 
-/// Bind a `let` value in its own local home. Rebinding one local must not
-/// change another that received the same value (`let b = a; a = 2;` leaves
+/// Bind a `var`/`val` value in its own local home. Rebinding one local must not
+/// change another that received the same value (`var b = a; a = 2;` leaves
 /// `b` alone for values and references alike). Capabilities are already
 /// erased, so all types alias the same way here.
 fn bind_local(l: &mut Lowerer, def: Option<&vl_hir::DefId>, value: &HirExpr, reg: Reg) {
@@ -620,7 +620,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
         .collect::<Vec<_>>();
     objects.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // Stable global IDs in source order: top-level `let` with a definition.
+    // Stable global IDs in source order: top-level bindings with definitions.
     // Poisoned initializers still reserve an ID so later indices stay stable,
     // but their bodies are empty (backends never run them because lowering
     // is blocked on prior errors).
@@ -636,7 +636,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                 ..
             } => {
                 // Top-level name for debugging; HIR `Let` has no name field
-                // here, so use the definition span? Use `let#id` fallback and
+                // here, so use the definition span? Use `binding#id` fallback and
                 // try to recover the name from... HIR Item::Let has no name?
                 // Actually HirItem::Let has no `name` in this version? Check:
                 // it has `def` only. Use `g{id}`.
@@ -1176,7 +1176,7 @@ impl Lowerer<'_> {
     /// Assignment writes in place: evaluate the RHS then `Copy` it into the
     /// already-bound register (locals) or `GlobalStore` it (globals). The
     /// bindings map is unchanged, so branches and loops that assign keep
-    /// working without phi nodes; branch-local `let`s are still pruned by
+    /// working without phi nodes; branch-local bindings are still pruned by
     /// the caller restoring the incoming map.
     fn lower_assign(
         &mut self,
@@ -1465,7 +1465,7 @@ impl Lowerer<'_> {
             id: end_label,
             span,
         });
-        // Drop loop-local `let`s; in-place `Copy` writes to shared registers
+        // Drop loop-local bindings; in-place `Copy` writes to shared registers
         // stay visible, so assignments inside the loop persist.
         self.bindings.retain(|k, _| incoming.contains_key(k));
         self.loop_stack.pop();
@@ -1540,7 +1540,7 @@ mod tests {
 
     #[test]
     fn arrays_lower_to_dedicated_instrs() {
-        let src = "fun get(a: *Array[u64]): u64 { a[0u64] = 1u64; return a[1u64]; } fun main() { let a: *Array[u64] = Array.new::[u64](2u64); let b = [1u64, 2u64]; }";
+        let src = "fun get(a: *Array[u64]): u64 { a[0u64] = 1u64; return a[1u64]; } fun main() { val a: *Array[u64] = Array.new::[u64](2u64); val b = [1u64, 2u64]; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -1558,7 +1558,7 @@ mod tests {
 
     #[test]
     fn objects_lower_to_dedicated_instrs() {
-        let src = "type Counter = object { value: u64, }; fun main() { let c: *Counter = Counter { value = 1u64 }; c.value = c.value + 1u64; }";
+        let src = "type Counter = object { value: u64, }; fun main() { val c: *Counter = Counter { value = 1u64 }; c.value = c.value + 1u64; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1573,7 +1573,7 @@ mod tests {
 
     #[test]
     fn object_let_alias_gets_an_independent_rebinding_home() {
-        let src = "type Counter = object { value: u64, }; fun main() { let a: *Counter = Counter { value = 1u64 }; let b = a; b = Counter { value = 2u64 }; a.value = 3u64; }";
+        let src = "type Counter = object { value: u64, }; fun main() { val a: *Counter = Counter { value = 1u64 }; var b = a; b = Counter { value = 2u64 }; a.value = 3u64; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1589,7 +1589,7 @@ mod tests {
 
     #[test]
     fn generic_templates_emit_only_instances() {
-        let src = "fun id[T](x: T): T { return x; } fun main() { let a = id(1u64); a; }";
+        let src = "fun id[T](x: T): T { return x; } fun main() { val a = id(1u64); a; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -1607,7 +1607,7 @@ mod tests {
 
     #[test]
     fn while_emits_labels_and_back_edge() {
-        let src = "fun main() { let i = 0; while (i < 10) { i = i + 1; } }";
+        let src = "fun main() { var i = 0; while (i < 10) { i = i + 1; } }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1623,7 +1623,7 @@ mod tests {
 
     #[test]
     fn logical_and_short_circuits_without_an_and_instr() {
-        let src = "fun main() { let x = true && false; x; }";
+        let src = "fun main() { val x = true && false; x; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1651,7 +1651,7 @@ mod tests {
 
     #[test]
     fn lowers_add_chain() {
-        let src = "let x = 1 + 2;";
+        let src = "val x = 1 + 2;";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1699,7 +1699,7 @@ mod tests {
 
     #[test]
     fn globals_record_their_value_type() {
-        let src = r#"let x = 1u64;"#;
+        let src = r#"val x = 1u64;"#;
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1714,7 +1714,7 @@ mod tests {
 
     #[test]
     fn local_reads_use_the_declared_value() {
-        let src = "fun f(): u64 { let x = 7; return x + 1; }";
+        let src = "fun f(): u64 { val x = 7; return x + 1; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1729,7 +1729,7 @@ mod tests {
 
     #[test]
     fn bare_tail_values_are_discarded_without_implicit_return() {
-        let src = "fun main() { let x = 7; x + 1; }";
+        let src = "fun main() { val x = 7; x + 1; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1769,7 +1769,7 @@ mod tests {
 
     #[test]
     fn casts_lower_to_cast_instr_with_target_type() {
-        let src = "fun main() { let v = 200u64; let x = v as u8; x; }";
+        let src = "fun main() { val v = 200u64; val x = v as u8; x; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -1802,7 +1802,7 @@ mod tests {
 
     #[test]
     fn capabilities_erase_to_identical_runtime_layouts() {
-        let src = "type Foo = object { value: u64, }; fun read(v: Foo): u64 { return v.value; } fun edit(m: *Foo): u64 { return m.value; } fun main() { let e: *Foo = Foo { value = 1u64 }; read(e); }";
+        let src = "type Foo = object { value: u64, }; fun read(v: Foo): u64 { return v.value; } fun edit(m: *Foo): u64 { return m.value; } fun main() { val e: *Foo = Foo { value = 1u64 }; read(e); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -1824,7 +1824,7 @@ mod tests {
 
     #[test]
     fn globals_use_stable_ids_and_explicit_ops() {
-        let src = "let a = 1u64; let b = 2u64; fun main() { let x = a + b; a = 3u64; x; }";
+        let src = "var a = 1u64; val b = 2u64; fun main() { val x = a + b; a = 3u64; x; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1846,9 +1846,9 @@ mod tests {
 
     #[test]
     fn primitive_rebinding_keeps_independent_homes() {
-        // `let b = a; a = 2;` must not change `b`: every `let` gets its own
+        // `var b = a; a = 2;` must not change `b`: every binding gets its own
         // home `copy`, for values and references alike.
-        let src = "fun main() { let a = 1u64; let b = a; a = 2u64; b; }";
+        let src = "fun main() { var a = 1u64; val b = a; a = 2u64; b; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -1864,7 +1864,7 @@ mod tests {
 
     #[test]
     fn no_capability_survives_lir() {
-        let src = "type Foo = object { value: u64, }; fun main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = e; e.value = 2u64; v.value; }";
+        let src = "type Foo = object { value: u64, }; fun main() { val e: *Foo = Foo { value = 1u64 }; val v: Foo = e; e.value = 2u64; v.value; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");

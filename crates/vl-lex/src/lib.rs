@@ -17,7 +17,8 @@ pub enum TokenKind {
     U8(u8),
     Bool(bool),
     String(Vec<u8>),
-    Let,
+    Var,
+    Val,
     Fun,
     Type,
     Object,
@@ -365,7 +366,8 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 }
                 let word = &src[start..i];
                 let kind = match word {
-                    "let" => TokenKind::Let,
+                    "var" => TokenKind::Var,
+                    "val" => TokenKind::Val,
                     "fun" => TokenKind::Fun,
                     "type" => TokenKind::Type,
                     "object" => TokenKind::Object,
@@ -391,7 +393,9 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 diags.push(
                     Diagnostic::error(format!("unexpected character `{c}`"))
                         .with_label(Span::new(i, end), "unexpected here")
-                        .with_note("identifiers use letters, digits and `_`; see `let`, `fun`")
+                        .with_note(
+                            "identifiers use letters, digits and `_`; see `var`, `val`, `fun`",
+                        )
                         .with_code("E000"),
                 );
                 tokens.push(Token::new(TokenKind::Invalid, Span::new(i, end)));
@@ -409,11 +413,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lexes_let_binding() {
-        let (toks, diags) = lex("let x = 1 + 2;");
+    fn lexes_var_binding() {
+        let (toks, diags) = lex("var x = 1 + 2;");
         assert!(diags.is_empty());
-        assert!(matches!(toks[0].kind, TokenKind::Let));
+        assert!(matches!(toks[0].kind, TokenKind::Var));
         assert!(matches!(toks[1].kind, TokenKind::Ident(_)));
+    }
+
+    #[test]
+    fn lexes_val_binding() {
+        let (toks, diags) = lex("val x = 1;");
+        assert!(diags.is_empty());
+        assert!(matches!(toks[0].kind, TokenKind::Val));
     }
 
     #[test]
@@ -440,7 +451,7 @@ mod tests {
 
     #[test]
     fn bad_char_is_a_diagnostic_not_a_panic() {
-        let (toks, diags) = lex("let x = @;");
+        let (toks, diags) = lex("var x = @;");
         assert_eq!(diags.len(), 1);
         assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Eof)));
     }
@@ -457,9 +468,9 @@ mod tests {
 
     #[test]
     fn unterminated_string_stops_at_newline() {
-        let (toks, diags) = lex("\"not closed\nlet x = 1;");
+        let (toks, diags) = lex("\"not closed\nvar x = 1;");
         assert!(diags.iter().any(|d| d.message.contains("unterminated")));
-        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Let)));
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Var)));
     }
 
     #[test]
@@ -473,7 +484,7 @@ mod tests {
 
     #[test]
     fn non_ascii_input_is_an_error_not_a_panic() {
-        let (_toks, diags) = lex("let café = 1;");
+        let (_toks, diags) = lex("var café = 1;");
         assert!(!diags.is_empty());
     }
 
@@ -487,7 +498,7 @@ mod tests {
 
     #[test]
     fn invalid_numeric_literal_is_poisoned_for_parser_recovery() {
-        let (toks, diags) = lex("let x = 999999999999999999999999; let y = 2;");
+        let (toks, diags) = lex("var x = 999999999999999999999999; var y = 2;");
         assert_eq!(diags.len(), 1);
         assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Invalid)));
     }
@@ -574,7 +585,7 @@ mod tests {
     #[test]
     fn star_is_shared_between_types_and_multiplication() {
         // `*Foo` in a type and `a * b` in an expression share one token.
-        let (toks, diags) = lex("let x: *Foo = a * b;");
+        let (toks, diags) = lex("val x: *Foo = a * b;");
         assert!(diags.is_empty(), "{diags:?}");
         let kinds: Vec<&TokenKind> = toks.iter().map(|t| &t.kind).collect();
         // Colon, Star, Ident(Foo) for the annotation ...

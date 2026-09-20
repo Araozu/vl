@@ -227,7 +227,7 @@
       "patterns": [
         {
           "name": "keyword.declaration.vl",
-          "match": "\\b(?:let|fun|use|type|object|as|extends)\\b"
+          "match": "\\b(?:var|val|fun|use|type|object|as|extends)\\b"
         },
         {
           "name": "keyword.control.conditional.vl",

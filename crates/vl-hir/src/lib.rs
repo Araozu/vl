@@ -22,6 +22,8 @@ use vl_syntax::{
     UnOp as AstUnOp,
 };
 
+pub use vl_syntax::BindingKind;
+
 /// One generic type parameter with its optional bound
 /// (`T` vs `T extends Numeric`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +52,7 @@ pub enum HirItem {
     Let {
         id: HirId,
         def: Option<DefId>,
+        kind: BindingKind,
         /// Optional annotation (`None` = infer; a failed annotation parses
         /// as `None` with `ty_span` set and poisons quietly downstream).
         ty: Option<VlType>,
@@ -79,6 +82,7 @@ pub enum HirStmt {
     Let {
         id: HirId,
         def: Option<DefId>,
+        kind: BindingKind,
         /// Optional annotation, same encoding as [`HirItem::Let`].
         ty: Option<VlType>,
         ty_span: Option<Span>,
@@ -282,7 +286,7 @@ impl<'a> Lowerer<'a> {
         self.res.def_of(span).map(|d| d.id.clone())
     }
 
-    /// Definition-site lookup (`let` names, `fun` names, params).
+    /// Definition-site lookup (`var`/`val` names, `fun` names, params).
     fn def_at_site(&self, span: Span) -> Option<DefId> {
         self.res.def_at(span).map(|d| d.id.clone())
     }
@@ -324,6 +328,7 @@ impl<'a> Lowerer<'a> {
                 value,
                 span,
                 name_span,
+                kind,
                 ty,
                 ty_span,
                 ..
@@ -332,6 +337,7 @@ impl<'a> Lowerer<'a> {
                 HirItem::Let {
                     id: self.id(),
                     def,
+                    kind: *kind,
                     ty: ty.clone(),
                     ty_span: *ty_span,
                     value: self.lower_expr(value),
@@ -384,6 +390,7 @@ impl<'a> Lowerer<'a> {
                 value,
                 span,
                 name_span,
+                kind,
                 ty,
                 ty_span,
                 ..
@@ -392,6 +399,7 @@ impl<'a> Lowerer<'a> {
                 HirStmt::Let {
                     id: self.id(),
                     def,
+                    kind: *kind,
                     ty: ty.clone(),
                     ty_span: *ty_span,
                     value: self.lower_expr(value),
@@ -645,7 +653,7 @@ mod tests {
 
     #[test]
     fn arrays_lower() {
-        let src = "fun main() { let a = [1u64, 2u64]; a[0u64] = 3u64; let x = a[1u64]; }";
+        let src = "fun main() { var a = [1u64, 2u64]; a[0u64] = 3u64; val x = a[1u64]; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -712,7 +720,7 @@ mod tests {
 
     #[test]
     fn annotated_lets_carry_their_types() {
-        let src = "let scores: Array[u64] = Array.new::[u64](3); fun main() { let n: u64 = 1; n; }";
+        let src = "val scores: Array[u64] = Array.new::[u64](3); fun main() { val n: u64 = 1; n; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -724,12 +732,12 @@ mod tests {
                 assert!(matches!(ty, Some(VlType::Array(_))));
                 assert!(ty_span.is_some());
             }
-            other => panic!("expected let, got {other:?}"),
+            other => panic!("expected val, got {other:?}"),
         }
         match &hir.items[1] {
             HirItem::Fn { body, .. } => match &body[0] {
                 HirStmt::Let { ty, .. } => assert_eq!(*ty, Some(VlType::U64)),
-                other => panic!("expected let, got {other:?}"),
+                other => panic!("expected val, got {other:?}"),
             },
             other => panic!("expected fn, got {other:?}"),
         }
@@ -737,7 +745,7 @@ mod tests {
 
     #[test]
     fn assign_links_the_resolved_binding() {
-        let src = "fun main() { let x = 1; x = 2; }";
+        let src = "fun main() { var x = 1; x = 2; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, rdiags) = vl_semantic::resolve(&prog);
@@ -772,8 +780,8 @@ mod tests {
 
     #[test]
     fn neg_desugars_to_sub() {
-        let (toks, _) = vl_lex::lex("let x = -1;");
-        let (prog, _) = vl_syntax::parse(&toks, "let x = -1;");
+        let (toks, _) = vl_lex::lex("val x = -1;");
+        let (prog, _) = vl_syntax::parse(&toks, "val x = -1;");
         let (res, _) = vl_semantic::resolve(&prog);
         let hir = lower(&prog, &res);
         assert_eq!(hir.items.len(), 1);
@@ -805,7 +813,7 @@ mod tests {
 
     #[test]
     fn objects_lower_with_field_reads_and_writes() {
-        let src = "type Counter = object { value: u64, }; fun main() { let c = Counter { value = 1 }; c.value = c.value + 1; }";
+        let src = "type Counter = object { value: u64, }; fun main() { var c = Counter { value = 1 }; c.value = c.value + 1; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -861,7 +869,7 @@ mod tests {
 
     #[test]
     fn casts_and_bounds_lower() {
-        let src = "fun add[T extends Numeric](a: T, b: T): T { let c = a as u64; return a + b; } fun main() { add(1u64, 2u64); }";
+        let src = "fun add[T extends Numeric](a: T, b: T): T { val c = a as u64; return a + b; } fun main() { add(1u64, 2u64); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -888,7 +896,7 @@ mod tests {
 
     #[test]
     fn mutable_types_survive_lowering() {
-        let src = "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; fun edit(parent: *Parent): *Parent { let x: *Child = parent.child; x; return parent; }";
+        let src = "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; fun edit(parent: *Parent): *Parent { val x: *Child = parent.child; x; return parent; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -922,7 +930,7 @@ mod tests {
                     *ret,
                     Some(VlType::Mutable(Box::new(VlType::Object("Parent".into()))))
                 );
-                // `let x` binds a fresh local; its initializer reads `parent`.
+                // A binding introduces a fresh local; its initializer reads `parent`.
                 let param_def = params[0].1.clone().expect("param def");
                 let param = res.defs.iter().find(|d| d.id == param_def).expect("param");
                 assert_eq!(param.kind, vl_semantic::DefKind::Parameter);
@@ -933,7 +941,7 @@ mod tests {
                             *ty,
                             Some(VlType::Mutable(Box::new(VlType::Object("Child".into()))))
                         );
-                        let local_def = def.clone().expect("let def must survive");
+                        let local_def = def.clone().expect("val def must survive");
                         let local = res
                             .defs
                             .iter()
@@ -956,7 +964,7 @@ mod tests {
                             other => panic!("expected field read, got {other:?}"),
                         }
                     }
-                    other => panic!("expected let, got {other:?}"),
+                    other => panic!("expected val, got {other:?}"),
                 }
                 // `x;` reads the local, `return parent;` reads the parameter.
                 match &body[1] {
@@ -973,7 +981,7 @@ mod tests {
 
     #[test]
     fn mutable_call_type_args_and_assign_kinds_survive() {
-        let src = "type Foo = object { value: u64, }; fun id[T](x: T): T { return x; } fun main() { let base = Foo { value = 1u64 }; let e = id::[*Foo](base); let arr = [1u64]; let c = base as Foo; e = base; e.value = 1u64; arr[0u64] = 2u64; }";
+        let src = "type Foo = object { value: u64, }; fun id[T](x: T): T { return x; } fun main() { val base = Foo { value = 1u64 }; var e = id::[*Foo](base); var arr = [1u64]; val c = base as Foo; e = base; e.value = 1u64; arr[0u64] = 2u64; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -982,7 +990,7 @@ mod tests {
         let hir = lower(&prog, &res);
         match &hir.items[2] {
             HirItem::Fn { body, .. } => {
-                // `let e = id::[*Foo](base)`: mutable turbofish survives.
+                // `var e = id::[*Foo](base)`: mutable turbofish survives.
                 match &body[1] {
                     HirStmt::Let { def, value, .. } => {
                         let let_def = def.clone().expect("e def");
@@ -1008,7 +1016,7 @@ mod tests {
                                                 assert_eq!(*def, *base_def);
                                             }
                                             other => {
-                                                panic!("expected base let, got {other:?}")
+                                                panic!("expected base val, got {other:?}")
                                             }
                                         }
                                     }
@@ -1025,9 +1033,9 @@ mod tests {
                             other => panic!("expected assign, got {other:?}"),
                         }
                     }
-                    other => panic!("expected let e, got {other:?}"),
+                    other => panic!("expected val e, got {other:?}"),
                 }
-                // `let c = base as Foo` preserves the cast target exactly.
+                // `val c = base as Foo` preserves the cast target exactly.
                 match &body[3] {
                     HirStmt::Let { value, .. } => match value {
                         HirExpr::Cast { target, .. } => {
@@ -1035,7 +1043,7 @@ mod tests {
                         }
                         other => panic!("expected cast, got {other:?}"),
                     },
-                    other => panic!("expected let c, got {other:?}"),
+                    other => panic!("expected val c, got {other:?}"),
                 }
                 assert!(matches!(&body[4], HirStmt::Assign { .. }));
                 assert!(matches!(&body[5], HirStmt::FieldAssign { .. }));
@@ -1047,7 +1055,7 @@ mod tests {
 
     #[test]
     fn mutable_cast_and_top_let_targets_survive() {
-        let src = "type Foo = object { value: u64, }; let g: *Foo = Foo { value = 1u64 }; fun main() { let c = g as Foo; c; }";
+        let src = "type Foo = object { value: u64, }; val g: *Foo = Foo { value = 1u64 }; fun main() { val c = g as Foo; c; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -1062,7 +1070,7 @@ mod tests {
                 );
                 assert!(def.is_some());
             }
-            other => panic!("expected top let, got {other:?}"),
+            other => panic!("expected top val, got {other:?}"),
         }
     }
 }

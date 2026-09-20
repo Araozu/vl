@@ -1,2 +1,2 @@
 // Error demo: `y` is never bound.
-let x = y + 1;
+val x = y + 1;

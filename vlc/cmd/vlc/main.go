@@ -169,6 +169,7 @@ func (s server) compileHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), compileTimeout)
 	defer cancel()
 	bytecode, diagnostics, err := s.compile(ctx, req.Source, filename)
+	diagnostics = stripANSI(diagnostics)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
