@@ -10,7 +10,9 @@
 //! object-field := ident `:` type
 //! params  := param (`,` param)*
 //! param   := ident `:` type
-//! type    := `u64` | `i64` | `f64` | `bool` | `u8` | `String` | `File` | object-name | `Array` `[` type `]` | type-param | `void` (`void` only as return)
+//! type    := mutable_type | type_atom
+//! mutable_type := `*` type_atom
+//! type_atom := `u64` | `i64` | `f64` | `bool` | `u8` | `String` | `File` | object-name | `Array` `[` type `]` | type-param | `void` (`void` only as return)
 //! block   := `{` stmt* `}`
 //! stmt    := `let` ident (`:` type)? `=` expr `;` | ident `=` expr `;` | index `=` expr `;` | field `=` expr `;`
 //!          | `if` `(` expr `)` branch (`else` branch)?
@@ -494,18 +496,31 @@ impl<'a> Parser<'a> {
             let (field_name, field_span) = self.parse_ident()?;
             self.expect(&TokenKind::Colon, "`:` after field name")?;
             let fallback = self.peek().clone();
+            let type_failed;
             let (ty, ty_span) = match self.parse_type(&[], true) {
-                Some((ty, span)) if !ty.is_void() => (Some(ty), Some(span)),
+                Some((ty, span)) if !ty.is_void() => {
+                    type_failed = false;
+                    (Some(ty), Some(span))
+                }
                 Some((_ty, span)) => {
                     self.diags.push(
                         Diagnostic::error("an object field cannot be `void`")
                             .with_label(span, "`void` is not a value type")
                             .with_code("E104"),
                     );
+                    type_failed = true;
                     (None, Some(span))
                 }
-                None => (None, Some(fallback.span)),
+                None => {
+                    type_failed = true;
+                    (None, Some(fallback.span))
+                }
             };
+            // Failed type already reported once; only keep the poisoned field
+            // when the follow (`,` or `}`) is present, else recover.
+            if type_failed && !matches!(self.peek().kind, TokenKind::Comma | TokenKind::RBrace) {
+                return None;
+            }
             if fields.iter().any(|f: &ObjectField| f.name == field_name) {
                 self.diags.push(
                     Diagnostic::error(format!("duplicate object field `{field_name}`"))
@@ -547,6 +562,11 @@ impl<'a> Parser<'a> {
         let let_tok = self.bump(); // `let`
         let (name, name_span) = self.parse_ident()?;
         let (ty, ty_span) = self.parse_let_ann(&[]);
+        // A failed annotation whose follow is not `=` already reported once;
+        // recover at the declaration boundary instead of adding a second error.
+        if ty.is_none() && ty_span.is_some() && !matches!(self.peek().kind, TokenKind::Eq) {
+            return None;
+        }
         self.expect(&TokenKind::Eq, "`=`")?;
         let value = self.parse_expr()?;
         let semi = self.expect(&TokenKind::Semi, "`;`")?;
@@ -594,7 +614,148 @@ impl<'a> Parser<'a> {
     /// positions where the scope is known) or silently becomes a `Param`
     /// (`false`, for turbofish type arguments in expression position, where
     /// the scope is not threaded through — typechecking reports it).
+    ///
+    /// Mutable views (`*Foo`, `*Array[T]`) parse here in every type position.
+    /// The `*` is a capability qualifier, not a pointer: multiplication stays
+    /// in expression parsing. `**T` is an immediate error; `*` over a scalar,
+    /// `void`, or missing inner type is one E106 with recovery at the
+    /// declaration boundary. `*T` over an unconstrained parameter parses
+    /// fine and is rejected later by type checking.
     fn parse_type(&mut self, allowed: &[String], strict: bool) -> Option<(VlType, Span)> {
+        if matches!(self.peek().kind, TokenKind::Star) {
+            return self.parse_mutable_type(allowed, strict);
+        }
+        self.parse_type_atom(allowed, strict)
+    }
+
+    /// Parse `*type_atom` (one capability qualifier). Called only when the
+    /// leading `*` was observed; the inner type must be a `type_atom`, so
+    /// `**Foo` fails immediately without recursing through `type`.
+    fn parse_mutable_type(&mut self, allowed: &[String], strict: bool) -> Option<(VlType, Span)> {
+        let star = self.bump(); // `*`
+                                // `**T`: consume the second `*` plus one atom for recovery, report once.
+        if matches!(self.peek().kind, TokenKind::Star) {
+            let second = self.bump();
+            let end = self.consume_one_type_atom_for_recovery(allowed);
+            let span = Span::new(star.span.start, end.unwrap_or(second.span).end);
+            self.diags.push(
+                Diagnostic::error("repeated capability qualifier `**`")
+                    .with_label(span, "only one `*` is allowed here")
+                    .with_note("write `*Foo`, not `**Foo`")
+                    .with_code("E106"),
+            );
+            return None;
+        }
+        // Missing inner type (`*;`, `*,`, `*)`, ...): one error, recover at
+        // the declaration boundary without consuming the boundary token.
+        if !matches!(self.peek().kind, TokenKind::Ident(_)) {
+            let t = self.peek().clone();
+            let span = Span::new(star.span.start, star.span.end.max(t.span.start));
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "expected a type after `*`, found {}",
+                    describe(&t.kind)
+                ))
+                .with_label(span, "expected a reference type here, e.g. `*Foo`")
+                .with_code("E106"),
+            );
+            return None;
+        }
+        match self.parse_type_atom(allowed, strict) {
+            None => None, // Inner already reported (unknown type, bad Array); stay quiet.
+            Some((inner, inner_span)) => {
+                let span = Span::new(star.span.start, inner_span.end);
+                // Obvious invalid shapes fail now with one focused error.
+                // `*T` over a parameter needs substitution context, so it
+                // parses and is rejected by type checking (E106 there).
+                match &inner {
+                    VlType::U64 | VlType::I64 | VlType::F64 | VlType::Bool | VlType::U8 => {
+                        self.diags.push(
+                            Diagnostic::error(format!("`*{inner}` is not a reference type"))
+                                .with_label(span, "only reference types take `*`")
+                                .with_note("write `*Foo`, `*String`, `*File`, or `*Array[T]`")
+                                .with_code("E106"),
+                        );
+                        None
+                    }
+                    VlType::Void => {
+                        self.diags.push(
+                            Diagnostic::error("`*void` is not a valid type")
+                                .with_label(span, "`void` is not a value type")
+                                .with_code("E106"),
+                        );
+                        None
+                    }
+                    VlType::Mutable(_) => {
+                        self.diags.push(
+                            Diagnostic::error("repeated capability qualifier")
+                                .with_label(span, "only one `*` is allowed here")
+                                .with_code("E106"),
+                        );
+                        None
+                    }
+                    _ => Some((VlType::Mutable(Box::new(inner)), span)),
+                }
+            }
+        }
+    }
+
+    /// Consume one `type_atom` without diagnostics for `**T` recovery.
+    /// Returns the end span of what was consumed, if anything.
+    /// Never consumes declaration boundaries (`;`, `}`, `)`, `,`, `]`).
+    fn consume_one_type_atom_for_recovery(&mut self, allowed: &[String]) -> Option<Span> {
+        let t = self.peek().clone();
+        match t.kind {
+            TokenKind::Ident(name) => {
+                let start = t.span;
+                // `Array[...]` with balanced brackets.
+                if name == "Array"
+                    && !allowed.iter().any(|a| a == "Array")
+                    && matches!(
+                        self.toks.get(self.pos + 1).map(|t| &t.kind),
+                        Some(TokenKind::LBracket)
+                    )
+                {
+                    self.bump(); // `Array`
+                    self.bump(); // `[`
+                    let mut depth = 1usize;
+                    let mut end = t.span;
+                    while !self.at_eof() && depth > 0 {
+                        // Stop before declaration boundaries so recovery
+                        // keeps them for the outer boundary logic.
+                        match &self.peek().kind {
+                            TokenKind::Semi
+                            | TokenKind::RBrace
+                            | TokenKind::RParen
+                            | TokenKind::Comma
+                            | TokenKind::Eof => break,
+                            _ => {}
+                        }
+                        let tok = self.bump();
+                        end = tok.span;
+                        match tok.kind {
+                            TokenKind::LBracket => depth += 1,
+                            TokenKind::RBracket => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Some(end);
+                }
+                self.bump();
+                Some(start)
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse one `type_atom` (no leading `*`): primitives, `String`/`File`,
+    /// object names, `Array[type]`, type parameters, `void`.
+    fn parse_type_atom(&mut self, allowed: &[String], strict: bool) -> Option<(VlType, Span)> {
         let t = self.peek().clone();
         match t.kind {
             TokenKind::Ident(name) => {
@@ -672,7 +833,7 @@ impl<'a> Parser<'a> {
                     Diagnostic::error(format!("expected a type, found {}", describe(&t.kind)))
                         .with_label(
                             t.span,
-                            "expected a built-in type, an object type, Array[T], or void",
+                            "expected a built-in type, an object type, Array[T], `*T`, or void",
                         )
                         .with_code("E104"),
                 );
@@ -743,12 +904,21 @@ impl<'a> Parser<'a> {
                     ty_span: Some(ty_span),
                 })
             }
-            None => Some(Param {
-                name,
-                name_span,
-                ty: None,
-                ty_span: None,
-            }),
+            None => {
+                // Failed type already reported once; only keep the poisoned
+                // parameter when the follow (` , ` or `)`) is present, else
+                // recover at the declaration boundary.
+                if matches!(self.peek().kind, TokenKind::Comma | TokenKind::RParen) {
+                    Some(Param {
+                        name,
+                        name_span,
+                        ty: None,
+                        ty_span: None,
+                    })
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -870,7 +1040,14 @@ impl<'a> Parser<'a> {
             self.bump(); // `:`
             match self.parse_type(&allowed, true) {
                 Some((ty, span)) => (Some(ty), Some(span)),
-                None => (None, None),
+                None => {
+                    // Failed return type already reported once; only continue
+                    // to the body when `{` follows, else recover.
+                    if !matches!(self.peek().kind, TokenKind::LBrace) {
+                        return None;
+                    }
+                    (None, None)
+                }
             }
         } else {
             (Some(VlType::Void), None)
@@ -942,6 +1119,11 @@ impl<'a> Parser<'a> {
             let let_tok = self.bump();
             let (name, name_span) = self.parse_ident()?;
             let (ty, ty_span) = self.parse_let_ann(allowed);
+            // Failed annotation already reported once; recover at the
+            // statement boundary instead of adding a second error.
+            if ty.is_none() && ty_span.is_some() && !matches!(self.peek().kind, TokenKind::Eq) {
+                return None;
+            }
             self.expect(&TokenKind::Eq, "`=`")?;
             let value = self.parse_expr()?;
             let semi = self.expect(&TokenKind::Semi, "`;`")?;
@@ -2198,5 +2380,221 @@ mod tests {
     fn unknown_bound_is_an_error() {
         let (_prog, diags) = parse_src("function f[T extends Bogus](x: T): T { return x; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E105")));
+    }
+
+    #[test]
+    fn mutable_types_parse_in_every_position() {
+        let (prog, diags) = parse_src(
+            "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; function edit(parent: *Parent): *Parent { let x: *Child = parent.child; x; return parent; }",
+        );
+        // `*Child` in a field parses, but field projection semantics are
+        // checked later; parsing itself must be clean here only when the
+        // object names are known. `Child`/`Parent` are known, so no diags.
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[1] {
+            Item::Object { fields, .. } => {
+                assert_eq!(
+                    fields[0].ty,
+                    Some(VlType::Mutable(Box::new(VlType::Object("Child".into()))))
+                );
+                assert_eq!(
+                    fields[1].ty,
+                    Some(VlType::Mutable(Box::new(VlType::Array(Box::new(
+                        VlType::Mutable(Box::new(VlType::Object("Child".into())))
+                    )))))
+                );
+            }
+            other => panic!("expected object, got {other:?}"),
+        }
+        match &prog.items[2] {
+            Item::Function { params, ret, .. } => {
+                assert_eq!(
+                    params[0].ty,
+                    Some(VlType::Mutable(Box::new(VlType::Object("Parent".into()))))
+                );
+                assert_eq!(
+                    *ret,
+                    Some(VlType::Mutable(Box::new(VlType::Object("Parent".into()))))
+                );
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mutable_array_spellings_parse() {
+        let (prog, diags) = parse_src(
+            "type Foo = object { value: u64, }; function f(a: *Array[u64], b: Array[*Foo], c: *Array[*Foo]) { a; b; c; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[1] {
+            Item::Function { params, .. } => {
+                assert_eq!(
+                    params[0].ty,
+                    Some(VlType::Mutable(Box::new(VlType::Array(Box::new(
+                        VlType::U64
+                    )))))
+                );
+                assert_eq!(
+                    params[1].ty,
+                    Some(VlType::Array(Box::new(VlType::Mutable(Box::new(
+                        VlType::Object("Foo".into())
+                    )))))
+                );
+                assert_eq!(
+                    params[2].ty,
+                    Some(VlType::Mutable(Box::new(VlType::Array(Box::new(
+                        VlType::Mutable(Box::new(VlType::Object("Foo".into())))
+                    )))))
+                );
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mutable_type_arguments_parse() {
+        let (prog, diags) = parse_src(
+            "type Foo = object { value: u64, }; function id[T](x: T): T { return x; } function main() { let e = id::[*Foo](id::[*Foo](e)); e; }",
+        );
+        // `e` is undefined, but type arguments themselves must parse.
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[2] {
+            Item::Function { body, .. } => match &body[0] {
+                Stmt::Let { value, .. } => match value {
+                    Expr::Call { type_args, .. } => assert_eq!(
+                        *type_args,
+                        vec![VlType::Mutable(Box::new(VlType::Object("Foo".into())))]
+                    ),
+                    other => panic!("expected call, got {other:?}"),
+                },
+                other => panic!("expected let, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mutable_scalar_is_one_focused_error() {
+        for src in [
+            "function f(x: *u64) { x; }",
+            "function f(x: *bool) { x; }",
+            "function f(): *void { return; }",
+            "let x: *u64 = 1u64;",
+        ] {
+            let (_prog, diags) = parse_src(src);
+            let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{src}: {diags:?}");
+            assert_eq!(errors[0].code.as_deref(), Some("E106"), "{src}: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn nested_star_is_one_focused_error() {
+        let (_prog, diags) = parse_src("function f(x: **Foo) { x; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E106"), "{diags:?}");
+        assert!(mentions(&diags, "only one `*`"), "{diags:?}");
+    }
+
+    #[test]
+    fn missing_inner_type_is_one_error_and_recovers() {
+        let (prog, diags) = parse_src("let x: *; function tail() {}");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E106"), "{diags:?}");
+        assert!(
+            prog.items
+                .iter()
+                .any(|i| matches!(i, Item::Function { name, .. } if name == "tail")),
+            "later items must still parse: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_mutable_param_recovers_to_next_item() {
+        let (prog, diags) = parse_src("function broken(x: *) {} function tail() {}");
+        assert_eq!(
+            diags.iter().filter(|d| d.is_error()).count(),
+            1,
+            "{diags:?}"
+        );
+        assert!(
+            prog.items
+                .iter()
+                .any(|i| matches!(i, Item::Function { name, .. } if name == "tail")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_inner_type_reports_once_without_cascade() {
+        let (_prog, diags) = parse_src("function f(x: *Missing) { x; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E105"), "{diags:?}");
+    }
+
+    #[test]
+    fn star_param_defers_to_typechecking() {
+        // `*T` needs substitution context; parsing accepts it.
+        let (prog, diags) = parse_src("function f[T](x: *T): *T { return x; }");
+        // Hmm: `return x;` where x: *T — parsing is fine; no parse error.
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { params, ret, .. } => {
+                assert_eq!(
+                    params[0].ty,
+                    Some(VlType::Mutable(Box::new(VlType::Param("T".into()))))
+                );
+                assert_eq!(
+                    *ret,
+                    Some(VlType::Mutable(Box::new(VlType::Param("T".into()))))
+                );
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiplication_next_to_mutable_annotation() {
+        let (prog, diags) =
+            parse_src("type Foo = object { value: u64, }; function main() { let x: *Foo = f; let y = a * b; x; y; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[1] {
+            Item::Function { body, .. } => {
+                assert!(matches!(
+                    &body[0],
+                    Stmt::Let {
+                        ty: Some(VlType::Mutable(_)),
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    &body[1],
+                    Stmt::Let {
+                        value: Expr::Binary { op: BinOp::Mul, .. },
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mutable_spans_cover_the_qualifier() {
+        let (prog, diags) =
+            parse_src("type Foo = object { value: u64, }; function f(x: *Foo) { x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[1] {
+            Item::Function { params, .. } => {
+                let span = params[0].ty_span.expect("mutable type has a span");
+                // `*Foo` is 4 bytes; the span must include the `*`.
+                assert_eq!(span.end - span.start, 4, "{span:?}");
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
     }
 }

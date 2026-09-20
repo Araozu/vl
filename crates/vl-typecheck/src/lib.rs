@@ -1245,18 +1245,10 @@ impl Checker {
         let ty = Ty::from_vl_in(v, &self.type_env);
         if ty_has_error(&ty) {
             // from_vl_in only fails on unbound `Param` (void-in-Array is a
-            // parser error; everything else converts).
-            if let VlType::Param(name) = v {
-                self.diags.push(
-                    Diagnostic::error(format!("unknown type `{name}`"))
-                        .with_label(span, "no type parameter with this name is in scope")
-                        .with_note(
-                            "declare it on the function (`function f[T]`) or use a concrete type",
-                        )
-                        .with_code("E105"),
-                );
-            } else if let VlType::Array(_) = v {
-                // An unbound parameter nested inside `Array[...]`.
+            // parser error; everything else converts). Recurse through
+            // `Array` and `*` so `Array[Missing]` and `*Missing` report E105
+            // here instead of leaking to an E500 downstream.
+            if Self::vl_has_unbound_param(v) {
                 self.diags.push(
                     Diagnostic::error(format!("unknown type `{v}`"))
                         .with_label(span, "no type parameter with this name is in scope")
@@ -1268,6 +1260,17 @@ impl Checker {
             }
         }
         ty
+    }
+
+    /// True when a type argument mentions an unbound `Param` at any depth
+    /// (including through `Array[T]` and `*T`).
+    fn vl_has_unbound_param(v: &VlType) -> bool {
+        match v {
+            VlType::Param(_) => true,
+            VlType::Array(elem) => Self::vl_has_unbound_param(elem),
+            VlType::Mutable(inner) => Self::vl_has_unbound_param(inner),
+            _ => false,
+        }
     }
 
     /// Resolve a call's type arguments to `Ty`s. Explicit (`::[T]`) converts

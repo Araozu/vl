@@ -563,4 +563,36 @@ mod tests {
         assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::As)));
         assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Extends)));
     }
+
+    #[test]
+    fn star_is_shared_between_types_and_multiplication() {
+        // `*Foo` in a type and `a * b` in an expression share one token.
+        let (toks, diags) = lex("let x: *Foo = a * b;");
+        assert!(diags.is_empty(), "{diags:?}");
+        let kinds: Vec<&TokenKind> = toks.iter().map(|t| &t.kind).collect();
+        // Colon, Star, Ident(Foo) for the annotation ...
+        let colon = kinds
+            .iter()
+            .position(|k| matches!(k, TokenKind::Colon))
+            .expect("colon in annotation");
+        assert!(matches!(kinds[colon + 1], TokenKind::Star));
+        assert!(matches!(kinds[colon + 2], TokenKind::Ident(name) if name == "Foo"));
+        // ... and exactly one more Star between the two operands.
+        let stars = kinds
+            .iter()
+            .filter(|k| matches!(k, TokenKind::Star))
+            .count();
+        assert_eq!(stars, 2, "{kinds:?}");
+        let mul = kinds
+            .iter()
+            .position(|k| matches!(k, TokenKind::Ident(name) if name == "a"))
+            .expect("operand a");
+        assert!(matches!(kinds[mul + 1], TokenKind::Star));
+        assert!(matches!(kinds[mul + 2], TokenKind::Ident(name) if name == "b"));
+        // No dedicated mut/deref token exists.
+        assert!(!kinds.iter().any(|k| {
+            let s = format!("{k:?}");
+            s.contains("Mut") || s.contains("Amp") || s.contains("Deref")
+        }));
+    }
 }

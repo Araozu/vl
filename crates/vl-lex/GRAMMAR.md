@@ -85,6 +85,10 @@ Notes:
   happens during type checking.
 * All spans are byte offsets, half-open `[start, end)` (`vl_common::Span`).
 * `Eof` is always appended, even when errors occurred.
+* `*` (`Star`) has no fixed meaning here: it is multiplication in
+  expressions (`a * b`) and a capability qualifier in types (`*Foo`).
+  The parser decides by position; the lexer emits `Star` in both cases.
+  No `var`, `val`, `const`, `mut`, `&`, or dereference token exists.
 
 ## Errors (all `Severity::Error`, all recover by skipping)
 

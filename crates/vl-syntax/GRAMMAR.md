@@ -20,7 +20,9 @@ object_fields := object_field ("," object_field)* ","?
 object_field := ident ":" type
 params   := param ("," param)*          ; no trailing comma
 param    := ident ":" type
-type     := "u64" | "i64" | "f64" | "bool" | "u8" | "String" | "File" | ident | "Array" "[" type "]" | "void"
+type     := mutable_type | type_atom
+mutable_type := "*" type_atom           ; one capability qualifier (`*Foo`, `*Array[T]`)
+type_atom := "u64" | "i64" | "f64" | "bool" | "u8" | "String" | "File" | ident | "Array" "[" type "]" | "void"
 block    := "{" stmt* "}"
 stmt     := let_stmt | assign_stmt | index_assign_stmt | field_assign_stmt | if_stmt | while_stmt | break_stmt | continue_stmt | return_stmt | expr_stmt
 let_stmt := "let" ident (":" type)? "=" expr ";"
@@ -75,6 +77,10 @@ Dot Colon ColonColon Ident Int I64 U64 F64 U8 Bool String Invalid Eof`.
 * Assignment statements are recognized from identifier-led postfix expressions;
   field and index writes may therefore chain postfix operations, while a
   parenthesized assignment base remains an expression-statement parse error.
+* `*` in a type is a capability qualifier (`*Foo`, `*Array[T]`,
+  `Array[*Foo]`); `*` in an expression stays multiplication (`a * b`).
+  `mutable_type` goes through `type_atom` (not `type`), so `**Foo` is an
+  immediate `E106`. Type spans include the leading `*`.
 
 ## AST
 
@@ -117,8 +123,9 @@ Spans (`vl_common::Span`, byte, half-open): `let` spans `let..;`, `function` spa
 | `E101` | item doesn't start with `use`/`let`/`function`/`type` | `expected an item (\`use\`, \`let\`, \`function\` or \`type\`), found …` + label `items start with …` |
 | `E102` | missing name (after `let`/`function`, or bad param) | `expected a name, found …` + label `expected identifier here` |
 | `E103` | bad expression start | `expected an expression, found …` + label `expected value here` |
-| `E104` | missing param type / `void` param | `parameter \`{name}\` is missing a type` / `cannot be \`void\`` |
+| `E104` | missing param type / `void` param / expected type | `parameter \`{name}\` is missing a type` / `cannot be \`void\`` / `expected a type …` |
 | `E105` | unknown type | `unknown type …` |
+| `E106` | invalid mutable-view type (`*u64`, `*void`, `**Foo`, missing inner) | `` `*u64` is not a reference type `` / `` `*void` is not valid `` / `repeated capability qualifier` / `expected a type after `*`` |
 
 `describe()`: `Ident(n)` → `` identifier `n` ``, `Int(v)` → `` integer `v` ``,
 keywords/symbols backticked, `Eof` → `end of file`.
@@ -134,6 +141,10 @@ Missing `;` (`let x = 1`) → `E100`; `@` never reaches here (lexer `E000`).
 * `parse_expr/term` return `None` upward on missing rhs, so `1 +` abandons
   the whole item/stmt and recovers at the boundary. Poison rule (AGENTS.md):
   failed nodes are dropped, no cascading diag downstream.
+* Malformed types (`*;`, `**Foo`, `*u64`) report one `E106`/`E104` and
+  recover at the declaration boundary (`,`, `)`, `=`, `{`, `;`, `}`):
+  a failed annotation with a missing follow drops the item/stmt so later
+  items/statements still parse.
 
 ## Examples
 
