@@ -15,6 +15,7 @@
 (object_initializer name: (identifier) @property)
 
 (binding_keyword) @keyword
+(use_declaration "use" @keyword.import)
 (function_declaration "fun" @keyword)
 (type_declaration "type" @keyword)
 (object_type "object" @keyword)
