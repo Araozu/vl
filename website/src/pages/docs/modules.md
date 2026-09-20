@@ -20,7 +20,7 @@ Each `.vl` file is a module named after its filename without the extension. A
 ```vl
 use std;
 
-function main() {
+fun main() {
     std.println("hello");
 }
 ```
@@ -36,7 +36,7 @@ without writing its module name:
 ```vl
 use std.println;
 
-function main() {
+fun main() {
     println("hello");
 }
 ```
@@ -46,7 +46,7 @@ Grouped imports select several exports from one module:
 ```vl
 use std.fs.{open, read};
 
-function main() {
+fun main() {
     let file = open("data.txt");
     let contents = read(file);
 }
@@ -73,7 +73,7 @@ The standard library provides functions that operate on strings:
 ```vl
 use std.string;
 
-function main() {
+fun main() {
     let message = "hello";
     let size = string.len(message);
 }
@@ -86,13 +86,13 @@ A small program can combine an import, a function, and a string:
 ```vl
 use std;
 
-function greet(name: String) {
+fun greet(name: String) {
     std.println("Hello, ");
     std.println(name);
     std.println("!");
 }
 
-function main() {
+fun main() {
     greet("Ada");
 }
 ```

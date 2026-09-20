@@ -28,7 +28,7 @@ so the element type comes from the annotation. Element writes require a
 `*Array[T]` view; reads work through either capability:
 
 ```vl
-function main() {
+fun main() {
     let scores: *Array[u64] = Array.new(3);
     scores[0] = 10;
     scores[1] = 20;
@@ -52,7 +52,7 @@ An index selects one element. Indexes start at zero, so the first element is
 `values[0]` and the last element of a three-element array is `values[2]`.
 
 ```vl
-function main() {
+fun main() {
     let values: *Array[u64] = [4, 8, 15];
     let first = values[0];
     values[1] = first + 1;
@@ -66,7 +66,7 @@ to `Array[T]`, never the reverse. Indexing projects element capabilities
 (`Array[*Foo][i]` reads as `Foo`):
 
 ```vl
-function sum(values: Array[u64], count: u64): u64 {
+fun sum(values: Array[u64], count: u64): u64 {
     let total = 0;
     let i = 0;
     while (i < count) {
@@ -78,7 +78,7 @@ function sum(values: Array[u64], count: u64): u64 {
 ```
 
 ```vl
-function fill(values: *Array[u64]) {
+fun fill(values: *Array[u64]) {
     values[0] = 1;
 }
 ```
@@ -95,11 +95,11 @@ parameter is a placeholder for a real type chosen at the call site.
 `first[T]` below works for an array of any `T`:
 
 ```vl
-function first[T](values: Array[T]): T {
+fun first[T](values: Array[T]): T {
     return values[0];
 }
 
-function main() {
+fun main() {
     let numbers: *Array[u64] = [10, 20];
     let number = first(numbers);
     let words = ["hi", "bye"];
@@ -113,11 +113,11 @@ unclear, provide the type explicitly with the
 turbofish form `::[T]` (including capabilities, e.g. `::[*Foo]`):
 
 ```vl
-function first[T](values: Array[T]): T {
+fun first[T](values: Array[T]): T {
     return values[0];
 }
 
-function main() {
+fun main() {
     let numbers: *Array[u64] = [10, 20];
     let number = first::[u64](numbers);
 }
@@ -137,11 +137,11 @@ An unconstrained `T` is fully opaque: it cannot use operators. Bounds unlock
 useful algorithms without full subtyping:
 
 ```vl
-function add[T extends Numeric](a: T, b: T): T {
+fun add[T extends Numeric](a: T, b: T): T {
     return a + b;
 }
 
-function eq[T extends Comparable](a: T, b: T): bool {
+fun eq[T extends Comparable](a: T, b: T): bool {
     return a == b;
 }
 ```

@@ -1540,7 +1540,7 @@ mod tests {
 
     #[test]
     fn arrays_lower_to_dedicated_instrs() {
-        let src = "function get(a: *Array[u64]): u64 { a[0u64] = 1u64; return a[1u64]; } function main() { let a: *Array[u64] = Array.new::[u64](2u64); let b = [1u64, 2u64]; }";
+        let src = "fun get(a: *Array[u64]): u64 { a[0u64] = 1u64; return a[1u64]; } fun main() { let a: *Array[u64] = Array.new::[u64](2u64); let b = [1u64, 2u64]; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -1558,7 +1558,7 @@ mod tests {
 
     #[test]
     fn objects_lower_to_dedicated_instrs() {
-        let src = "type Counter = object { value: u64, }; function main() { let c: *Counter = Counter { value = 1u64 }; c.value = c.value + 1u64; }";
+        let src = "type Counter = object { value: u64, }; fun main() { let c: *Counter = Counter { value = 1u64 }; c.value = c.value + 1u64; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1573,7 +1573,7 @@ mod tests {
 
     #[test]
     fn object_let_alias_gets_an_independent_rebinding_home() {
-        let src = "type Counter = object { value: u64, }; function main() { let a: *Counter = Counter { value = 1u64 }; let b = a; b = Counter { value = 2u64 }; a.value = 3u64; }";
+        let src = "type Counter = object { value: u64, }; fun main() { let a: *Counter = Counter { value = 1u64 }; let b = a; b = Counter { value = 2u64 }; a.value = 3u64; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1589,7 +1589,7 @@ mod tests {
 
     #[test]
     fn generic_templates_emit_only_instances() {
-        let src = "function id[T](x: T): T { return x; } function main() { let a = id(1u64); a; }";
+        let src = "fun id[T](x: T): T { return x; } fun main() { let a = id(1u64); a; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -1607,7 +1607,7 @@ mod tests {
 
     #[test]
     fn while_emits_labels_and_back_edge() {
-        let src = "function main() { let i = 0; while (i < 10) { i = i + 1; } }";
+        let src = "fun main() { let i = 0; while (i < 10) { i = i + 1; } }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1623,7 +1623,7 @@ mod tests {
 
     #[test]
     fn logical_and_short_circuits_without_an_and_instr() {
-        let src = "function main() { let x = true && false; x; }";
+        let src = "fun main() { let x = true && false; x; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1638,7 +1638,7 @@ mod tests {
 
     #[test]
     fn not_emits_a_not_instr() {
-        let src = "function main() { !true; }";
+        let src = "fun main() { !true; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1665,8 +1665,7 @@ mod tests {
 
     #[test]
     fn lowers_call_and_parameter_registers() {
-        let src =
-            "function add(a: i64, b: i64): i64 { return a + b; } function main() { add(1, 2); }";
+        let src = "fun add(a: i64, b: i64): i64 { return a + b; } fun main() { add(1, 2); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1682,7 +1681,7 @@ mod tests {
 
     #[test]
     fn function_signatures_carry_param_and_return_types() {
-        let src = r#"function greet(name: String, n: u64): String { return name; } function main() { greet("hi", 1u64); }"#;
+        let src = r#"fun greet(name: String, n: u64): String { return name; } fun main() { greet("hi", 1u64); }"#;
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1715,7 +1714,7 @@ mod tests {
 
     #[test]
     fn local_reads_use_the_declared_value() {
-        let src = "function f(): u64 { let x = 7; return x + 1; }";
+        let src = "fun f(): u64 { let x = 7; return x + 1; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1730,7 +1729,7 @@ mod tests {
 
     #[test]
     fn bare_tail_values_are_discarded_without_implicit_return() {
-        let src = "function main() { let x = 7; x + 1; }";
+        let src = "fun main() { let x = 7; x + 1; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1746,7 +1745,7 @@ mod tests {
 
     #[test]
     fn explicit_return_emits_ret_and_skips_default() {
-        let src = "function f(): i64 { return 1; } function m() { return; }";
+        let src = "fun f(): i64 { return 1; } fun m() { return; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -1770,7 +1769,7 @@ mod tests {
 
     #[test]
     fn casts_lower_to_cast_instr_with_target_type() {
-        let src = "function main() { let v = 200u64; let x = v as u8; x; }";
+        let src = "fun main() { let v = 200u64; let x = v as u8; x; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -1788,7 +1787,7 @@ mod tests {
     fn emitted_types_are_normalized() {
         // No `int`/`Param` survives to LIR in monomorphic code: `1 + 2`
         // defaults to `u64` and validates clean.
-        let src = "function main() { 1 + 2; }";
+        let src = "fun main() { 1 + 2; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1803,7 +1802,7 @@ mod tests {
 
     #[test]
     fn capabilities_erase_to_identical_runtime_layouts() {
-        let src = "type Foo = object { value: u64, }; function read(v: Foo): u64 { return v.value; } function edit(m: *Foo): u64 { return m.value; } function main() { let e: *Foo = Foo { value = 1u64 }; read(e); }";
+        let src = "type Foo = object { value: u64, }; fun read(v: Foo): u64 { return v.value; } fun edit(m: *Foo): u64 { return m.value; } fun main() { let e: *Foo = Foo { value = 1u64 }; read(e); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -1825,7 +1824,7 @@ mod tests {
 
     #[test]
     fn globals_use_stable_ids_and_explicit_ops() {
-        let src = "let a = 1u64; let b = 2u64; function main() { let x = a + b; a = 3u64; x; }";
+        let src = "let a = 1u64; let b = 2u64; fun main() { let x = a + b; a = 3u64; x; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1849,7 +1848,7 @@ mod tests {
     fn primitive_rebinding_keeps_independent_homes() {
         // `let b = a; a = 2;` must not change `b`: every `let` gets its own
         // home `copy`, for values and references alike.
-        let src = "function main() { let a = 1u64; let b = a; a = 2u64; b; }";
+        let src = "fun main() { let a = 1u64; let b = a; a = 2u64; b; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -1865,7 +1864,7 @@ mod tests {
 
     #[test]
     fn no_capability_survives_lir() {
-        let src = "type Foo = object { value: u64, }; function main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = e; e.value = 2u64; v.value; }";
+        let src = "type Foo = object { value: u64, }; fun main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = e; e.value = 2u64; v.value; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");

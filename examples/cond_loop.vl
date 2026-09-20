@@ -2,7 +2,7 @@
 // Run it: `cargo run -- build examples/cond_loop.vl --out cond.nara`
 use std;
 
-function main() {
+fun main() {
     let i = 5;
     while (i > 0) {
         if (i == 3) {

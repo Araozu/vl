@@ -474,7 +474,7 @@ impl Resolver {
                     }
                     return;
                 }
-                // Callee is a plain name use so `function` items resolve
+                // Callee is a plain name use so `fun` items resolve
                 // (including forward references via the global pre-pass).
                 match self.lookup_path(callee, *callee_span) {
                     Some(id) => {
@@ -489,7 +489,7 @@ impl Resolver {
                                 callee.join(".")
                             ))
                             .with_label(*callee_span, "undefined function")
-                            .with_note("did you mean to `function`-define it first?")
+                            .with_note("did you mean to `fun`-define it first?")
                             .with_code("E201"),
                         );
                     }
@@ -694,32 +694,32 @@ mod tests {
 
     #[test]
     fn break_outside_a_loop_is_an_error() {
-        let (_, diags) = resolve_src("function main() { break; }");
+        let (_, diags) = resolve_src("fun main() { break; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("outside of a loop"));
     }
 
     #[test]
     fn break_inside_while_resolves() {
-        let (_, diags) = resolve_src("function main() { while (true) { break; } }");
+        let (_, diags) = resolve_src("fun main() { while (true) { break; } }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
     }
 
     #[test]
     fn assignment_to_an_undefined_name_errors() {
-        let (_, diags) = resolve_src("function main() { x = 1; }");
+        let (_, diags) = resolve_src("fun main() { x = 1; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E201")));
     }
 
     #[test]
     fn assignment_to_a_bound_local_resolves() {
-        let (_, diags) = resolve_src("function main() { let x = 1; x = 2; }");
+        let (_, diags) = resolve_src("fun main() { let x = 1; x = 2; }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
     }
 
     #[test]
     fn unknown_object_literal_is_deferred_to_typechecking() {
-        let (_, diags) = resolve_src("function main() { let x = Missing {}; }");
+        let (_, diags) = resolve_src("fun main() { let x = Missing {}; }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
     }
 
@@ -732,7 +732,7 @@ mod tests {
 
     #[test]
     fn shadowing_is_a_warning_only() {
-        let (toks, _) = vl_lex::lex("function f(x: i64): i64 { let x = 1; x; }");
+        let (toks, _) = vl_lex::lex("fun f(x: i64): i64 { let x = 1; x; }");
         let (prog, _) = vl_syntax::parse(&toks, "");
         let (_, diags) = resolve(&prog);
         assert!(diags.iter().all(|d| !d.is_error()));
@@ -740,48 +740,47 @@ mod tests {
 
     #[test]
     fn call_callee_and_args_resolve() {
-        let (_, diags) = resolve_src(
-            "function add(a: i64, b: i64): i64 { a + b; } function main() { add(1, 2); }",
-        );
+        let (_, diags) =
+            resolve_src("fun add(a: i64, b: i64): i64 { a + b; } fun main() { add(1, 2); }");
         assert!(diags.iter().all(|d| !d.is_error()));
     }
 
     #[test]
     fn undefined_callee_errors() {
-        let (_, diags) = resolve_src("function main() { nope(1); }");
+        let (_, diags) = resolve_src("fun main() { nope(1); }");
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("nope"));
     }
 
     #[test]
     fn forward_call_resolves_via_global_prepass() {
-        let (_, diags) = resolve_src("function main() { helper(); } function helper(): i64 { 1; }");
+        let (_, diags) = resolve_src("fun main() { helper(); } fun helper(): i64 { 1; }");
         assert!(diags.iter().all(|d| !d.is_error()));
     }
 
     #[test]
     fn duplicate_parameters_are_an_error() {
-        let (_, diags) = resolve_src("function f(x: i64, x: i64): i64 { x; }");
+        let (_, diags) = resolve_src("fun f(x: i64, x: i64): i64 { x; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("duplicate parameter"));
     }
 
     #[test]
     fn poisoned_module_alias_suppresses_qualified_use_cascade() {
-        let (_, diags) = resolve_src("use missing.module; function main() { module.foo(); }");
+        let (_, diags) = resolve_src("use missing.module; fun main() { module.foo(); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("cannot find module"));
     }
 
     #[test]
     fn single_export_use_brings_bare_name_into_scope() {
-        let (_, diags) = resolve_src("use std.string.len; function main() { len(\"s\"); }");
+        let (_, diags) = resolve_src("use std.string.len; fun main() { len(\"s\"); }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
     }
 
     #[test]
     fn bare_import_carries_its_signature() {
-        let (res, diags) = resolve_src("use std.string.len; function main() { len(\"s\"); }");
+        let (res, diags) = resolve_src("use std.string.len; fun main() { len(\"s\"); }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
         let def = res.defs.iter().find(|d| d.name == "len").expect("len def");
         let sig = def.sig.as_ref().expect("extern sig");
@@ -791,7 +790,7 @@ mod tests {
 
     #[test]
     fn single_export_use_of_std_print_resolves() {
-        let (toks, _) = vl_lex::lex("use std.print; function main() { print(\"hi\"); }");
+        let (toks, _) = vl_lex::lex("use std.print; fun main() { print(\"hi\"); }");
         let (prog, _) = vl_syntax::parse(&toks, "");
         let (_, diags) = resolve_with_modules(&prog, &vl_codegen_modules());
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
@@ -799,22 +798,21 @@ mod tests {
 
     #[test]
     fn single_export_use_with_unknown_export_is_one_error() {
-        let (_, diags) = resolve_src("use std.string.bogus; function main() { bogus(); }");
+        let (_, diags) = resolve_src("use std.string.bogus; fun main() { bogus(); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("no export `bogus`"));
     }
 
     #[test]
     fn array_literal_index_and_index_assign_resolve() {
-        let (_, diags) = resolve_src(
-            "function main() { let a = [1u64, 2u64]; a[0u64] = 3u64; let x = a[1u64]; }",
-        );
+        let (_, diags) =
+            resolve_src("fun main() { let a = [1u64, 2u64]; a[0u64] = 3u64; let x = a[1u64]; }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
     }
 
     #[test]
     fn array_new_needs_no_import_and_carries_its_signature() {
-        let (res, diags) = resolve_src("function main() { let a = Array.new::[u64](3u64); a; }");
+        let (res, diags) = resolve_src("fun main() { let a = Array.new::[u64](3u64); a; }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
         let def = res
             .defs
@@ -834,7 +832,7 @@ mod tests {
     fn array_new_without_type_arg_defers_to_typechecking() {
         // No turbofish: resolution succeeds with no signature; typechecking
         // either infers `T` from an annotated `let` or reports E303.
-        let (res, diags) = resolve_src("function main() { let a = Array.new(3); a; }");
+        let (res, diags) = resolve_src("fun main() { let a = Array.new(3); a; }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
         let def = res
             .defs
@@ -846,30 +844,30 @@ mod tests {
 
     #[test]
     fn array_new_with_two_type_args_is_one_error() {
-        let (_, diags) = resolve_src("function main() { let a = Array.new::[u64, u64](3); a; }");
+        let (_, diags) = resolve_src("fun main() { let a = Array.new::[u64, u64](3); a; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("exactly one type argument"));
     }
 
     #[test]
     fn u64array_callee_points_at_the_replacement() {
-        let (_, diags) = resolve_src("function main() { let a = U64Array.new(3u64); a; }");
+        let (_, diags) = resolve_src("fun main() { let a = U64Array.new(3u64); a; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("U64Array"));
     }
 
     #[test]
     fn index_into_undefined_array_errors() {
-        let (_, diags) = resolve_src("function main() { let x = missing[0u64]; x; }");
+        let (_, diags) = resolve_src("fun main() { let x = missing[0u64]; x; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E201")));
     }
 
     #[test]
     fn direct_parameter_rebinding_is_one_e205() {
         for src in [
-            "function f(x: u64) { x = 1u64; }",
-            "type Foo = object { value: u64, }; function f(x: Foo, y: Foo) { x = y; }",
-            "type Foo = object { value: u64, }; function f(x: *Foo, y: *Foo) { x = y; }",
+            "fun f(x: u64) { x = 1u64; }",
+            "type Foo = object { value: u64, }; fun f(x: Foo, y: Foo) { x = y; }",
+            "type Foo = object { value: u64, }; fun f(x: *Foo, y: *Foo) { x = y; }",
         ] {
             let (_, diags) = resolve_src(src);
             let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
@@ -885,7 +883,7 @@ mod tests {
     #[test]
     fn parameter_field_and_index_mutation_still_resolve() {
         let (_, diags) = resolve_src(
-            "type Foo = object { value: u64, }; function f(x: *Foo, a: *Array[u64]) { x.value = 1u64; a[0u64] = 1u64; }",
+            "type Foo = object { value: u64, }; fun f(x: *Foo, a: *Array[u64]) { x.value = 1u64; a[0u64] = 1u64; }",
         );
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
     }
@@ -893,7 +891,7 @@ mod tests {
     #[test]
     fn local_rebinding_and_shadowing_still_allowed() {
         let (_, diags) = resolve_src(
-            "function f(x: u64) { let x = 1u64; x = 2u64; } function g() { let y = 1u64; y = 2u64; }",
+            "fun f(x: u64) { let x = 1u64; x = 2u64; } fun g() { let y = 1u64; y = 2u64; }",
         );
         // Shadowing is a warning; rebinding the local is fine.
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
@@ -901,7 +899,7 @@ mod tests {
 
     #[test]
     fn unresolved_assign_target_is_one_e201() {
-        let (_, diags) = resolve_src("function main() { missing = 1u64; }");
+        let (_, diags) = resolve_src("fun main() { missing = 1u64; }");
         let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].code.as_deref(), Some("E201"));
@@ -909,7 +907,7 @@ mod tests {
 
     #[test]
     fn parameter_assign_keeps_target_mapping_for_hir() {
-        let (res, diags) = resolve_src("function f(x: u64) { x = 1u64; }");
+        let (res, diags) = resolve_src("fun f(x: u64) { x = 1u64; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         // Target mapping retained so HIR stays structurally complete.
         let uses = res.uses.len();
@@ -920,7 +918,7 @@ mod tests {
 
     #[test]
     fn duplicate_parameter_suppresses_e205() {
-        let (_, diags) = resolve_src("function f(x: u64, x: u64) { x = 1u64; }");
+        let (_, diags) = resolve_src("fun f(x: u64, x: u64) { x = 1u64; }");
         let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
         assert_eq!(errors.len(), 1, "{diags:?}");
         assert_eq!(errors[0].code.as_deref(), Some("E200"), "{diags:?}");

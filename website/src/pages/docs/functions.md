@@ -16,18 +16,18 @@ and give a large program smaller parts that are easier to understand.
 This function receives two numbers and returns their sum:
 
 ```vl
-function add(a: i64, b: i64): i64 {
+fun add(a: i64, b: i64): i64 {
     return a + b;
 }
 
-function main() {
+fun main() {
     let total = add(2, 3);
 }
 ```
 
 The parts of the definition are:
 
-1. `function` starts a function definition.
+1. `fun` starts a function definition.
 2. `add` is its name.
 3. `a: i64` and `b: i64` are typed parameters.
 4. `: i64` says that the function returns an `i64`.
@@ -46,11 +46,11 @@ rebind the parameter itself:
 ```vl
 type Foo = object { value: u64, };
 
-function inspect(item: Foo) {
+fun inspect(item: Foo) {
     // item = other; // error: parameters cannot be rebound
 }
 
-function update(item: *Foo) {
+fun update(item: *Foo) {
     item.value = 1; // allowed: mutates the referent
     // item = other; // error: the binding is still fixed
 }
@@ -64,11 +64,11 @@ early, or let it reach the closing brace.
 ```vl
 use std;
 
-function announce(message: String) {
+fun announce(message: String) {
     std.println(message);
 }
 
-function main() {
+fun main() {
     announce("Starting");
 }
 ```
@@ -82,7 +82,7 @@ function with a return type must use `return value;` on every path that reaches
 the end of the function.
 
 ```vl
-function larger(a: i64, b: i64): i64 {
+fun larger(a: i64, b: i64): i64 {
     if (a > b) {
         return a;
     }
@@ -97,11 +97,11 @@ mutable or read-only binding; a `Foo` result can never initialize `*Foo`:
 ```vl
 type Foo = object { value: u64, };
 
-function create_foo(): *Foo {
+fun create_foo(): *Foo {
     return Foo { value = 0 };
 }
 
-function main() {
+fun main() {
     let editable = create_foo();      // inferred *Foo
     let view: Foo = create_foo();     // allowed downgrade
 }
@@ -112,15 +112,15 @@ function main() {
 Calls can be nested, and a function can call another function or itself.
 
 ```vl
-function double(value: i64): i64 {
+fun double(value: i64): i64 {
     return value + value;
 }
 
-function quadruple(value: i64): i64 {
+fun quadruple(value: i64): i64 {
     return double(double(value));
 }
 
-function main() {
+fun main() {
     let result = quadruple(5);
 }
 ```
@@ -134,7 +134,7 @@ Recursion is when a function calls itself. A recursive function needs a base
 case so that it eventually stops calling itself.
 
 ```vl
-function countdown(n: u64) {
+fun countdown(n: u64) {
     if (n == 0) {
         return;
     }
@@ -151,7 +151,7 @@ VL checks calls before building the program. These calls are invalid because
 one has the wrong number of arguments and the other has the wrong type:
 
 ```vl
-function add(a: i64, b: i64): i64 {
+fun add(a: i64, b: i64): i64 {
     return a + b;
 }
 

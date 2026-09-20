@@ -1,12 +1,12 @@
 // Function declarations and nested calls.
-function add(a: i64, b: i64): i64 {
+fun add(a: i64, b: i64): i64 {
     return a + b;
 }
 
-function twice(x: i64): i64 {
+fun twice(x: i64): i64 {
     return add(x, x);
 }
 
-function main() {
+fun main() {
     twice(add(1, 2));
 }

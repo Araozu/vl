@@ -32,7 +32,7 @@ fn snippet_without_main_compiles_to_lir_and_naravm() {
     use vl_codegen::Target;
     // No `main`: snippets and libraries must compile. Entrypoint presence
     // is validated by the VM/loader, not the compiler.
-    let lir = frontend("function add(a: u64, b: u64): u64 { return a + b; }")
+    let lir = frontend("fun add(a: u64, b: u64): u64 { return a + b; }")
         .expect("snippet without main must compile");
     let dump = lir.dump();
     assert!(dump.contains("fn add:"), "{dump}");
@@ -46,7 +46,7 @@ fn snippet_without_main_compiles_to_lir_and_naravm() {
 #[test]
 fn println_compiles_and_runs_on_naravm() {
     use vl_codegen::Target;
-    let lir = frontend("use std; function main() { std.println(\"hi\"); std.print(\"x\\n\"); }")
+    let lir = frontend("use std; fun main() { std.println(\"hi\"); std.print(\"x\\n\"); }")
         .expect("println must compile");
     let dump = lir.dump();
     assert!(dump.contains("call std.println"), "{dump}");
@@ -59,8 +59,8 @@ fn println_compiles_and_runs_on_naravm() {
 
 #[test]
 fn println_arg_types_are_checked() {
-    let err = frontend("use std; function main() { std.println(1); }")
-        .expect_err("println expects String");
+    let err =
+        frontend("use std; fun main() { std.println(1); }").expect_err("println expects String");
     assert!(
         err.iter().any(|d| d.message.contains("expects `String`")),
         "{err:?}"
@@ -192,14 +192,14 @@ fn naravm_emits_mixed_params_string_return_and_recursion() {
     let lir = frontend(
         r#"
 use std;
-function add(a: u64, b: u64): u64 { return a + b; }
-function greet(name: String): String { return name; }
-function fact(n: u64): u64 {
+fun add(a: u64, b: u64): u64 { return a + b; }
+fun greet(name: String): String { return name; }
+fun fact(n: u64): u64 {
     let r = 1u64;
     if (n == 0u64) { r; } else { r = n * fact(n - 1u64); }
     return r;
 }
-function main() {
+fun main() {
     std.print(greet("hi\n"));
     std.print_u64(add(fact(3u64), 1u64));
 }
@@ -240,7 +240,7 @@ fn module_imports_resolve_without_importing_descendants() {
 
 #[test]
 fn unknown_module_export_is_a_single_error() {
-    let (toks, _) = vl_lex::lex("use std.string.{missing}; function main() { missing(); }");
+    let (toks, _) = vl_lex::lex("use std.string.{missing}; fun main() { missing(); }");
     let (ast, _) = vl_syntax::parse(&toks, "");
     let (_, diags) = vl_semantic::resolve(&ast);
     assert!(diags
@@ -250,9 +250,8 @@ fn unknown_module_export_is_a_single_error() {
 
 #[test]
 fn scalar_literals_and_if_lower_to_typed_control_flow() {
-    let lir =
-        frontend("function main() { let x = 1u64; if (true) { x; } else { 255u8; } 1.5f64; }")
-            .expect("scalar literals and if must compile");
+    let lir = frontend("fun main() { let x = 1u64; if (true) { x; } else { 255u8; } 1.5f64; }")
+        .expect("scalar literals and if must compile");
     let dump = lir.dump();
     assert!(dump.contains("const 1u64"), "{dump}");
     assert!(dump.contains("const 1.5f64"), "{dump}");
@@ -262,7 +261,7 @@ fn scalar_literals_and_if_lower_to_typed_control_flow() {
 
 #[test]
 fn if_requires_a_boolean_condition() {
-    let err = frontend("function main() { if (1) { 2; } }").expect_err("if condition must be bool");
+    let err = frontend("fun main() { if (1) { 2; } }").expect_err("if condition must be bool");
     assert!(
         err.iter().any(|d| d.message.contains("must be bool")),
         "{err:?}"
@@ -271,15 +270,14 @@ fn if_requires_a_boolean_condition() {
 
 #[test]
 fn unbraced_conditional_branches_compile() {
-    let lir = frontend("function main() { if (true) 1u64; else 2u64; }")
+    let lir = frontend("fun main() { if (true) 1u64; else 2u64; }")
         .expect("unbraced branches must compile");
     assert!(lir.dump().contains("branch_if_false"));
 }
 
 #[test]
 fn extern_call_arg_types_are_checked() {
-    let err =
-        frontend("use std; function main() { std.print(1); }").expect_err("print expects String");
+    let err = frontend("use std; fun main() { std.print(1); }").expect_err("print expects String");
     assert!(
         err.iter().any(|d| d.message.contains("expects `String`")),
         "{err:?}"
@@ -288,7 +286,7 @@ fn extern_call_arg_types_are_checked() {
 
 #[test]
 fn extern_call_arity_is_checked() {
-    let err = frontend("use std; function main() { std.print(\"a\", \"b\"); }")
+    let err = frontend("use std; fun main() { std.print(\"a\", \"b\"); }")
         .expect_err("print expects one arg");
     assert!(
         err.iter().any(|d| d.message.contains("expects 1")),
@@ -314,7 +312,7 @@ fn while_countdown_lowers_to_jumps_copies_and_runs_on_naravm() {
 #[test]
 fn comparisons_and_short_circuit_logic_lower() {
     let lir = frontend(
-        "function main() { let a = 1; if (a <= 2 && a != 3 || !(a > 9)) { a; } while (a >= 1) { a = a - 1; } }",
+        "fun main() { let a = 1; if (a <= 2 && a != 3 || !(a > 9)) { a; } while (a >= 1) { a = a - 1; } }",
     )
     .expect("comparisons must compile");
     let dump = lir.dump();
@@ -327,27 +325,27 @@ fn comparisons_and_short_circuit_logic_lower() {
 
 #[test]
 fn break_outside_a_loop_is_one_error() {
-    let err = frontend("function main() { break; }").expect_err("must fail");
+    let err = frontend("fun main() { break; }").expect_err("must fail");
     assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
     assert!(err[0].message.contains("outside of a loop"));
 }
 
 #[test]
 fn continue_outside_a_loop_is_one_error() {
-    let err = frontend("function main() { continue; }").expect_err("must fail");
+    let err = frontend("fun main() { continue; }").expect_err("must fail");
     assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
 }
 
 #[test]
 fn assignment_type_mismatch_is_one_error() {
-    let err = frontend(r#"function main() { let x = 1; x = "s"; }"#).expect_err("must fail");
+    let err = frontend(r#"fun main() { let x = 1; x = "s"; }"#).expect_err("must fail");
     assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
     assert!(err.iter().any(|d| d.code.as_deref() == Some("E309")));
 }
 
 #[test]
 fn while_condition_must_be_bool() {
-    let err = frontend("function main() { while (1) { 2; } }").expect_err("must fail");
+    let err = frontend("fun main() { while (1) { 2; } }").expect_err("must fail");
     assert!(err
         .iter()
         .any(|d| d.message.contains("while condition must be bool")));
@@ -355,7 +353,7 @@ fn while_condition_must_be_bool() {
 
 #[test]
 fn missing_annotations_are_an_error() {
-    let err = frontend("function add(a, b) { return a + b; }").expect_err("must fail");
+    let err = frontend("fun add(a, b) { return a + b; }").expect_err("must fail");
     assert!(
         err.iter().any(|d| d.code.as_deref() == Some("E104")),
         "{err:?}"
@@ -364,10 +362,8 @@ fn missing_annotations_are_an_error() {
 
 #[test]
 fn explicit_return_compiles_and_lowers_to_ret() {
-    let lir = frontend(
-        "function add(a: i64, b: i64): i64 { return a + b; } function main() { add(1, 2); }",
-    )
-    .expect("explicit return must compile");
+    let lir = frontend("fun add(a: i64, b: i64): i64 { return a + b; } fun main() { add(1, 2); }")
+        .expect("explicit return must compile");
     let dump = lir.dump();
     assert!(dump.contains("add"), "{dump}");
     assert!(dump.contains("ret"), "{dump}");
@@ -375,7 +371,7 @@ fn explicit_return_compiles_and_lowers_to_ret() {
 
 #[test]
 fn missing_return_is_an_error() {
-    let err = frontend("function f(): i64 { let x = 1; }").expect_err("must fail");
+    let err = frontend("fun f(): i64 { let x = 1; }").expect_err("must fail");
     assert!(
         err.iter().any(|d| d.code.as_deref() == Some("E307")),
         "{err:?}"
@@ -384,7 +380,7 @@ fn missing_return_is_an_error() {
 
 #[test]
 fn trailing_expr_is_not_an_implicit_return() {
-    let err = frontend(r#"function f(): i64 { 1; }"#).expect_err("must fail");
+    let err = frontend(r#"fun f(): i64 { 1; }"#).expect_err("must fail");
     assert!(
         err.iter()
             .any(|d| d.message.contains("not all paths return")),
@@ -394,7 +390,7 @@ fn trailing_expr_is_not_an_implicit_return() {
 
 #[test]
 fn bare_return_in_value_function_is_an_error() {
-    let err = frontend("function f(): i64 { return; }").expect_err("must fail");
+    let err = frontend("fun f(): i64 { return; }").expect_err("must fail");
     assert!(
         err.iter().any(|d| d.message.contains("returns nothing")),
         "{err:?}"
@@ -403,7 +399,7 @@ fn bare_return_in_value_function_is_an_error() {
 
 #[test]
 fn value_return_in_void_function_is_an_error() {
-    let err = frontend("function main() { return 1; }").expect_err("must fail");
+    let err = frontend("fun main() { return 1; }").expect_err("must fail");
     assert!(
         err.iter().any(|d| d.message.contains("returns `void`")),
         "{err:?}"
@@ -446,16 +442,15 @@ fn objects_compile_with_reference_field_semantics() {
 
 #[test]
 fn array_new_needs_no_import() {
-    let lir = frontend(
-        "function main() { let a: *Array[u64] = Array.new::[u64](2u64); a[0u64] = 1u64; }",
-    )
-    .expect("Array.new must compile without imports");
+    let lir =
+        frontend("fun main() { let a: *Array[u64] = Array.new::[u64](2u64); a[0u64] = 1u64; }")
+            .expect("Array.new must compile without imports");
     assert!(lir.dump().contains("new_array"));
 }
 
 #[test]
 fn array_element_mismatch_is_one_error() {
-    let err = frontend("function main() { let a = [1, 2.0f64]; a; }").expect_err("must fail");
+    let err = frontend("fun main() { let a = [1, 2.0f64]; a; }").expect_err("must fail");
     assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
     assert!(
         err.iter()
@@ -466,21 +461,21 @@ fn array_element_mismatch_is_one_error() {
 
 #[test]
 fn array_index_shapes_are_checked() {
-    let err = frontend(r#"function main() { let s = "hi"; let x = s[0u64]; x; }"#)
-        .expect_err("must fail");
+    let err =
+        frontend(r#"fun main() { let s = "hi"; let x = s[0u64]; x; }"#).expect_err("must fail");
     assert!(
         err.iter().any(|d| d.message.contains("cannot index")),
         "{err:?}"
     );
 
     let err =
-        frontend("function main() { let a = [1u64]; let x = a[true]; x; }").expect_err("must fail");
+        frontend("fun main() { let a = [1u64]; let x = a[true]; x; }").expect_err("must fail");
     assert!(
         err.iter().any(|d| d.message.contains("must be `u64`")),
         "{err:?}"
     );
 
-    let err = frontend(r#"function main() { let a: *Array[u64] = [1u64]; a[0u64] = "s"; }"#)
+    let err = frontend(r#"fun main() { let a: *Array[u64] = [1u64]; a[0u64] = "s"; }"#)
         .expect_err("must fail");
     assert!(
         err.iter().any(|d| d.message.contains("cannot store")),
@@ -490,7 +485,7 @@ fn array_index_shapes_are_checked() {
 
 #[test]
 fn bare_return_in_void_function_compiles() {
-    frontend("function main() { return; }").expect("bare return in void must compile");
+    frontend("fun main() { return; }").expect("bare return in void must compile");
 }
 
 #[test]
@@ -514,7 +509,7 @@ fn generics_example_compiles_to_instances_and_runs_on_naravm() {
 #[test]
 fn generic_inference_and_turbofish_agree() {
     let lir = frontend(
-        "function first[T](a: Array[T]): T { return a[0u64]; } function main() { let a = first([7u64]); let b = first::[u64]([8u64]); a; b; }",
+        "fun first[T](a: Array[T]): T { return a[0u64]; } fun main() { let a = first([7u64]); let b = first::[u64]([8u64]); a; b; }",
     )
     .expect("inferred and explicit calls must compile");
     let dump = lir.dump();
@@ -524,15 +519,15 @@ fn generic_inference_and_turbofish_agree() {
 
 #[test]
 fn bracket_call_suggests_turbofish() {
-    let err = frontend("function main() { f[T](1u64); }").expect_err("must fail");
+    let err = frontend("fun main() { f[T](1u64); }").expect_err("must fail");
     let rendered =
-        vl_common::diagnostic::render_all(&err, "bracket.vl", "function main() { f[T](1u64); }");
+        vl_common::diagnostic::render_all(&err, "bracket.vl", "fun main() { f[T](1u64); }");
     assert!(rendered.contains("f::[T]"), "{rendered}");
 }
 
 #[test]
 fn generic_main_is_rejected() {
-    let err = frontend("function main[T]() { return; }").expect_err("must fail");
+    let err = frontend("fun main[T]() { return; }").expect_err("must fail");
     assert!(
         err.iter()
             .any(|d| d.message.contains("must not declare type parameters")),
@@ -543,7 +538,7 @@ fn generic_main_is_rejected() {
 #[test]
 fn annotated_let_with_contextual_new_compiles() {
     let lir = frontend(
-        "use std; function first[T](a: Array[T]): T { return a[0]; } function main() { let scores: *Array[u64] = Array.new(3); scores[0] = 10; let number = first(scores); std.print_u64(number); }",
+        "use std; fun first[T](a: Array[T]): T { return a[0]; } fun main() { let scores: *Array[u64] = Array.new(3); scores[0] = 10; let number = first(scores); std.print_u64(number); }",
     )
     .expect("annotated let must compile");
     let dump = lir.dump();
@@ -560,7 +555,7 @@ fn annotated_let_with_contextual_new_compiles() {
 fn inference_needs_no_annotation() {
     // The turbofish is the escape hatch; plain calls must infer.
     let lir = frontend(
-        "function first[T](a: Array[T]): T { return a[0]; } function main() { let numbers = [10, 20]; let number = first(numbers); number; }",
+        "fun first[T](a: Array[T]): T { return a[0]; } fun main() { let numbers = [10, 20]; let number = first(numbers); number; }",
     )
     .expect("inference must work");
     assert!(lir.dump().contains("call first$u64"));
@@ -568,7 +563,7 @@ fn inference_needs_no_annotation() {
 
 #[test]
 fn annotated_let_mismatch_is_one_error() {
-    let err = frontend("function main() { let x: u64 = \"s\"; x; }").expect_err("must fail");
+    let err = frontend("fun main() { let x: u64 = \"s\"; x; }").expect_err("must fail");
     assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
     assert!(
         err.iter().any(|d| d.code.as_deref() == Some("E309")),
@@ -580,7 +575,7 @@ fn annotated_let_mismatch_is_one_error() {
 fn as_casts_compile_to_cast_and_run_on_naravm() {
     use vl_codegen::Target;
     let lir = frontend(
-        "function take(x: u8): u8 { return x; } function main() { let v = 200u64; let w = take(v as u8); let lit = 10 as u8; w; lit; }",
+        "fun take(x: u8): u8 { return x; } fun main() { let v = 200u64; let w = take(v as u8); let lit = 10 as u8; w; lit; }",
     )
     .expect("casts must compile");
     let dump = lir.dump();
@@ -592,7 +587,7 @@ fn as_casts_compile_to_cast_and_run_on_naravm() {
 
 #[test]
 fn as_cast_out_of_range_is_one_error() {
-    let err = frontend("function main() { let x = 300 as u8; x; }").expect_err("must fail");
+    let err = frontend("fun main() { let x = 300 as u8; x; }").expect_err("must fail");
     assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
     assert!(
         err.iter().any(|d| d.message.contains("out of range")),
@@ -604,7 +599,7 @@ fn as_cast_out_of_range_is_one_error() {
 fn constrained_generics_compile_to_instances_and_run_on_naravm() {
     use vl_codegen::Target;
     let lir = frontend(
-        "function add[T extends Numeric](a: T, b: T): T { return a + b; } function eq[T extends Comparable](a: T, b: T): bool { return a == b; } function main() { let s = add(1u64, 2u64); let ok = eq(s, 3u64); ok; }",
+        "fun add[T extends Numeric](a: T, b: T): T { return a + b; } fun eq[T extends Comparable](a: T, b: T): bool { return a == b; } fun main() { let s = add(1u64, 2u64); let ok = eq(s, 3u64); ok; }",
     )
     .expect("constrained generics must compile");
     let dump = lir.dump();
@@ -617,20 +612,17 @@ fn constrained_generics_compile_to_instances_and_run_on_naravm() {
 
 #[test]
 fn unconstrained_generic_operator_is_one_error() {
-    let err = frontend(
-        "function add[T](a: T, b: T): T { return a + b; } function main() { add(1u64, 2u64); }",
-    )
-    .expect_err("must fail");
+    let err =
+        frontend("fun add[T](a: T, b: T): T { return a + b; } fun main() { add(1u64, 2u64); }")
+            .expect_err("must fail");
     assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
     assert!(err.iter().any(|d| d.message.contains("Numeric")), "{err:?}");
 }
 
 #[test]
 fn generic_array_literal_int_defers_to_u8() {
-    let lir = frontend(
-        "function same[T](a: T, b: T): T { return a; } function main() { same([1], [2u8]); }",
-    )
-    .expect("nested int must defer to u8");
+    let lir = frontend("fun same[T](a: T, b: T): T { return a; } fun main() { same([1], [2u8]); }")
+        .expect("nested int must defer to u8");
     let dump = lir.dump();
     assert!(dump.contains("call same$Array_u8"), "{dump}");
     assert!(dump.contains("const 1u8"), "{dump}");
@@ -638,7 +630,7 @@ fn generic_array_literal_int_defers_to_u8() {
 
 #[test]
 fn lir_boundary_holds_no_unresolved_types() {
-    let (toks, _) = vl_lex::lex("function main() { 1 + 2; }");
+    let (toks, _) = vl_lex::lex("fun main() { 1 + 2; }");
     let (ast, _) = vl_syntax::parse(&toks, "");
     let (res, _) = vl_semantic::resolve(&ast);
     let hir = vl_hir::lower(&ast, &res);

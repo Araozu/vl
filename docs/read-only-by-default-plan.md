@@ -36,11 +36,11 @@ Function parameters use the existing `name: type` syntax and are always fixed
 bindings:
 
 ```vl
-function inspect(item: Foo) {
+fun inspect(item: Foo) {
     item = other; // error: parameters cannot be rebound
 }
 
-function update(item: *Foo) {
+fun update(item: *Foo) {
     item.value = 1; // allowed
     item = other;   // error: the parameter binding is still fixed
 }
@@ -137,8 +137,8 @@ read-only view into a mutable one.
 Examples:
 
 ```vl
-function read(foo: Foo) {}
-function change(foo: *Foo) {}
+fun read(foo: Foo) {}
+fun change(foo: *Foo) {}
 
 let editable: *Foo = Foo {};
 let view: Foo = editable;
@@ -158,16 +158,16 @@ Parameters and results state the maximum capability that crosses the function
 boundary:
 
 ```vl
-function inspect(foo: Foo): Foo {
+fun inspect(foo: Foo): Foo {
     return foo;
 }
 
-function edit(foo: *Foo): *Foo {
+fun edit(foo: *Foo): *Foo {
     foo.value = 1;
     return foo;
 }
 
-function create_foo(): *Foo {
+fun create_foo(): *Foo {
     return Foo {};
 }
 ```
@@ -209,10 +209,10 @@ Expected mutable contexts also include mutable parameters, mutable returns,
 mutable object fields, and mutable array element types:
 
 ```vl
-function consume(foo: *Foo) {}
+fun consume(foo: *Foo) {}
 consume(Foo {}); // fresh literal is *Foo in this context
 
-function create(): *Foo {
+fun create(): *Foo {
     return Foo {}; // return context selects *Foo
 }
 ```
@@ -221,7 +221,7 @@ This contextual choice applies only to compiler-known fresh allocations. An
 existing expression keeps its capability:
 
 ```vl
-function get_view(): Foo;
+fun get_view(): Foo;
 let bad: *Foo = get_view(); // error, never upgraded by context
 ```
 
@@ -258,12 +258,12 @@ Apply the same rule at each later projection. This makes read-only views
 transitive without changing the stored field type:
 
 ```vl
-function inspect(parent: Parent) {
+fun inspect(parent: Parent) {
     parent.child.value = 1;       // error
     parent.children[0].value = 1; // error
 }
 
-function edit(parent: *Parent) {
+fun edit(parent: *Parent) {
     parent.child.value = 1;       // allowed
     parent.children[0].value = 1; // allowed
 }
@@ -279,12 +279,12 @@ upgrade a field declared with a read-only type.
 mutable view:
 
 ```vl
-function sum(values: Array[u64], count: u64): u64 {
+fun sum(values: Array[u64], count: u64): u64 {
     // Reading is allowed.
     return values[0];
 }
 
-function fill(values: *Array[u64]) {
+fun fill(values: *Array[u64]) {
     values[0] = 1; // allowed
 }
 ```
@@ -306,7 +306,7 @@ available through the current access path is narrowed.
 Reference capability is part of a type argument:
 
 ```vl
-function identity[T](value: T): T {
+fun identity[T](value: T): T {
     return value;
 }
 
@@ -403,8 +403,8 @@ type_atom     := "u64" | "i64" | "f64" | "bool" | "u8"
 param         := ident ":" type
 let_item      := "let" ident (":" type)? "=" expr ";"
 let_stmt      := "let" ident (":" type)? "=" expr ";"
-function_item := "function" ident type_params? "(" params? ")"
-                 (":" type)? block
+function_item := "fun" ident type_params? "(" params? ")"
+               (":" type)? block
 ```
 
 The recursive `type` inside `Array[...]` permits `Array[*Foo]`. Parsing
@@ -798,7 +798,7 @@ writes need explicit mutable views.
 Before:
 
 ```vl
-function bump(counter: Counter): Counter {
+fun bump(counter: Counter): Counter {
     counter.value = counter.value + 1;
     return counter;
 }
@@ -809,7 +809,7 @@ let counter = Counter { value = 1, label = "count" };
 After:
 
 ```vl
-function bump(counter: *Counter): *Counter {
+fun bump(counter: *Counter): *Counter {
     counter.value = counter.value + 1;
     return counter;
 }
@@ -838,13 +838,13 @@ scores[0] = 10;
 Read-only algorithms remain unstarred:
 
 ```vl
-function sum(scores: Array[u64], count: u64): u64;
+fun sum(scores: Array[u64], count: u64): u64;
 ```
 
 Mutating algorithms become explicit:
 
 ```vl
-function fill(scores: *Array[u64]);
+fun fill(scores: *Array[u64]);
 ```
 
 Update every affected file under `examples/`, inline Rust test source,
@@ -1024,15 +1024,15 @@ type Counter = object {
     value: u64,
 };
 
-function read(counter: Counter): u64 {
+fun read(counter: Counter): u64 {
     return counter.value;
 }
 
-function increment(counter: *Counter) {
+fun increment(counter: *Counter) {
     counter.value = counter.value + 1;
 }
 
-function main() {
+fun main() {
     let counter: *Counter = Counter { value = 0 };
     let view: Counter = counter;
 
@@ -1048,7 +1048,7 @@ function main() {
 It should reject each invalid operation independently:
 
 ```vl
-function invalid(view: Counter, editable: *Counter) {
+fun invalid(view: Counter, editable: *Counter) {
     view.value = 1;       // error: read-only view
     view = editable;      // error: parameters cannot be rebound
 

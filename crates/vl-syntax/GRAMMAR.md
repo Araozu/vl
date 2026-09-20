@@ -3,7 +3,7 @@
 Source: `crates/vl-syntax/src/lib.rs`. Recursive descent, tokens → AST.
 Signature: `parse(toks: &[Token], _src: &str) -> (Program, Vec<Diagnostic>)`.
 Input tokens come from `vl-lex` (`crates/vl-lex/GRAMMAR.md`); output is `Program`.
-Parser recovers per-item (and per-stmt inside `function`); one bad item hides no others.
+Parser recovers per-item (and per-stmt inside `fun`); one bad item hides no others.
 
 ## Grammar (as implemented)
 
@@ -12,7 +12,7 @@ program := item*
 item    := use_item | let_item | function_item | object_item
 use_item := "use" path ("." "{" ident ("," ident)* "}")? ";"
 let_item := "let" ident (":" type)? "=" expr ";"
-function_item := "function" ident type_params? "(" params? ")" (":" type)? block
+function_item := "fun" ident type_params? "(" params? ")" (":" type)? block
 type_params := "[" type_param ("," type_param)* "]"
 type_param := ident ("extends" ("Numeric" | "Comparable"))?
 object_item := "type" ident "=" "object" "{" object_fields? "}" ";"
@@ -36,7 +36,7 @@ break_stmt := "break" ";"
 continue_stmt := "continue" ";"
 return_stmt := "return" expr? ";"
 branch   := block | stmt
-expr_stmt := expr ";"                   ; mandatory, TS-style; value discarded (no implicit return)
+expr_stmt := expr ";"                   ; mandatory; value discarded (no implicit return)
 expr     := or
 or       := and ("||" and)*
 and      := equality ("&&" equality)*
@@ -56,7 +56,7 @@ literal  := int | i64 | u64 | f64 | u8 | bool
 path     := ident ("." ident)*
 ```
 
-Terminal names are `vl-lex` `TokenKind`s: `Let Function Type Object If Else While Break
+Terminal names are `vl-lex` `TokenKind`s: `Let Fun Type Object If Else While Break
 Continue Return As Extends Eq EqEq Bang BangEq Lt LtEq Gt GtEq AmpAmp PipePipe
 Plus Minus Star Slash Semi LParen RParen LBrace RBrace LBracket RBracket Comma
 Dot Colon ColonColon Ident Int I64 U64 F64 U8 Bool String Invalid Eof`.
@@ -65,15 +65,14 @@ Dot Colon ColonColon Ident Int I64 U64 F64 U8 Bool String Invalid Eof`.
 
 * Semicolons are mandatory everywhere: `let`, object declarations, `return`, `break`, `continue`,
   and expression-statements need `;` — including the last statement of a
-  function body (`{ let d = x; }`). A bare trailing `d` without `;` is `E100`.
+  fun body (`{ let d = x; }`). A bare trailing `d` without `;` is `E100`.
 * There are no implicit returns: only `return expr;` yields a value
   (`return;` for `void`). A trailing `d;` is a discarded expression statement.
 * Unary is `-` / `!`, right-recursive: `- -5`, `!x` ok; `+x` → `E103`.
   Casts use `as` and bind between arithmetic and equality: `a + b as u8`
   is `(a + b) as u8`, while `a == b as u8` is `a == (b as u8)`.
 * Parens are transparent in the AST: `(e)` returns inner `Expr`, span drops parens.
-* Calls are callee-by-name (`ident(args)`), TypeScript-style, so forward
-  references to `function` items work.
+* Calls are callee-by-name (`ident(args)`), so forward references to `fun` items work.
 * Assignment statements are recognized from identifier-led postfix expressions;
   field and index writes may therefore chain postfix operations, while a
   parenthesized assignment base remains an expression-statement parse error.
@@ -112,16 +111,16 @@ BinOp ::= Add | Sub | Mul | Div | Eq | Ne | Lt | Le | Gt | Ge | And | Or
 UnOp  ::= Neg | Not
 ```
 
-Spans (`vl_common::Span`, byte, half-open): `let` spans `let..;`, `function` spans
-`function..}`, `Binary` spans `lhs.start..rhs.end`, `Unary` spans `minus.start..rhs.end`.
+Spans (`vl_common::Span`, byte, half-open): `let` spans `let..;`, `fun` spans
+`fun..}`, `Binary` spans `lhs.start..rhs.end`, `Unary` spans `minus.start..rhs.end`.
 
 ## Errors (all `Severity::Error`)
 
 | Code | When | Message shape |
 |---|---|---|
 | `E100` | `expect()` mismatch (missing `= ; ( ) { }`) | `expected {what}, found {describe}` + label `unexpected token here` |
-| `E101` | item doesn't start with `use`/`let`/`function`/`type` | `expected an item (\`use\`, \`let\`, \`function\` or \`type\`), found …` + label `items start with …` |
-| `E102` | missing name (after `let`/`function`, or bad param) | `expected a name, found …` + label `expected identifier here` |
+| `E101` | item doesn't start with `use`/`let`/`fun`/`type` | `expected an item (\`use\`, \`let\`, \`fun\` or \`type\`), found …` + label `items start with …` |
+| `E102` | missing name (after `let`/`fun`, or bad param) | `expected a name, found …` + label `expected identifier here` |
 | `E103` | bad expression start | `expected an expression, found …` + label `expected value here` |
 | `E104` | missing param type / `void` param / expected type | `parameter \`{name}\` is missing a type` / `cannot be \`void\`` / `expected a type …` |
 | `E105` | unknown type | `unknown type …` |
@@ -134,9 +133,9 @@ Missing `;` (`let x = 1`) → `E100`; `@` never reaches here (lexer `E000`).
 ## Recovery
 
 * `program` loop: failed `parse_item()` → `recover_to_item_boundary`: skip
-  until (and consuming) `;`/`}`, or stopping at `let`/`function`/`type`/`Eof`.
-* `function` body loop: failed `parse_stmt()` → `recover_to_stmt_boundary`: skip
-  until (and consuming) `;`, or stopping at `}`/`let`/`function`/`if`/`while`/
+  until (and consuming) `;`/`}`, or stopping at `let`/`fun`/`type`/`Eof`.
+* `fun` body loop: failed `parse_stmt()` → `recover_to_stmt_boundary`: skip
+  until (and consuming) `;`, or stopping at `}`/`let`/`fun`/`if`/`while`/
   `break`/`continue`/`return`/`Eof`.
 * `parse_expr/term` return `None` upward on missing rhs, so `1 +` abandons
   the whole item/stmt and recovers at the boundary. Poison rule (AGENTS.md):
@@ -150,14 +149,14 @@ Missing `;` (`let x = 1`) → `E100`; `@` never reaches here (lexer `E000`).
 
 ```text
 "let x = 1 + 2 * 3;"                → Item::Let, Binary(Add, 1, Binary(Mul, 2, 3))
-"function main() { let d = x; }"    → Item::Function { params: [], body: [Let(d)] }
-"function add(a: i64, b: i64): i64 { return a + b; }" → Item::Function { body: [Return(Binary(Add))] }
-"function main() { return; }"       → Item::Function { body: [Return(None)] }
+"fun main() { let d = x; }"    → Item::Function { params: [], body: [Let(d)] }
+"fun add(a: i64, b: i64): i64 { return a + b; }" → Item::Function { body: [Return(Binary(Add))] }
+"fun main() { return; }"       → Item::Function { body: [Return(None)] }
 "let x = 1"                         → E100 (expected `;`), item dropped
-"function main() { d }"             → E100 (expected `;`), stmt dropped
-"function f(): i64 { return 1 }"    → E100 (expected `;`), stmt dropped
+"fun main() { d }"             → E100 (expected `;`), stmt dropped
+"fun f(): i64 { return 1 }"    → E100 (expected `;`), stmt dropped
 "let x = - -5;"                     → Unary(Neg, Unary(Neg, 5))
-"d;" at top level                   → E101 (items start with use/let/function/type)
+"d;" at top level                   → E101 (items start with use/let/fun/type)
 ```
 
 ## Modules

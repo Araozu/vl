@@ -111,7 +111,7 @@
     },
     "function-definition": {
       "name": "meta.function.definition.vl",
-      "begin": "\\b(function)\\s+([A-Za-z_][A-Za-z0-9_]*)(?=\\s*[\\[(])",
+      "begin": "\\b(fun)\\s+([A-Za-z_][A-Za-z0-9_]*)(?=\\s*[\\[(])",
       "beginCaptures": {
         "1": { "name": "keyword.declaration.vl" },
         "2": { "name": "entity.name.function.vl" }
@@ -227,7 +227,7 @@
       "patterns": [
         {
           "name": "keyword.declaration.vl",
-          "match": "\\b(?:let|function|use|type|object|as|extends)\\b"
+          "match": "\\b(?:let|fun|use|type|object|as|extends)\\b"
         },
         {
           "name": "keyword.control.conditional.vl",

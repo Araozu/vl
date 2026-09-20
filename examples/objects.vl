@@ -5,12 +5,12 @@ type Counter = object {
     label: String,
 };
 
-function bump(counter: *Counter): *Counter {
+fun bump(counter: *Counter): *Counter {
     counter.value = counter.value + 1;
     return counter;
 }
 
-function main() {
+fun main() {
     let counter: *Counter = Counter { value = 1, label = "count" };
     let same = bump(counter);
     same.value = same.value + 1;

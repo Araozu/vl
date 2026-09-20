@@ -13,7 +13,7 @@ use std::str::FromStr;
 ///
 /// `Array[T]` is a fixed-length heap array of `T` (a reference type backed by
 /// the target's memory container). `Param(name)` is a use of an enclosing
-/// generic function's type parameter (e.g. `T` in `function id[T](x: T): T`).
+/// generic function's type parameter (e.g. `T` in `fun id[T](x: T): T`).
 ///
 /// `Mutable(inner)` is a mutable view of a GC-managed reference (`*Foo`,
 /// `*Array[T]`). It is a capability qualifier, not a machine pointer: passing
@@ -87,7 +87,7 @@ impl FromStr for VlType {
             "void" => Ok(VlType::Void),
             // `Array` needs an element type (`Array[T]`); `T` alone is a type
             // parameter, which only the parser can resolve against an
-            // enclosing `function f[T]` scope.
+            // enclosing `fun f[T]` scope.
             other => Err(ParseTyError(other.to_string())),
         }
     }

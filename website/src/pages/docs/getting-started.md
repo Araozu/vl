@@ -10,8 +10,8 @@ availability: VL 0.1+
 
 This guide takes you from a checkout to a running VL program. VL currently
 builds for Naravm, and every executable starts at one required, zero-argument
-entrypoint: `function main()`. (A missing return type means `void`, so this is
-`function main(): void`.)
+entrypoint: `fun main()`. (A missing return type means `void`, so this is
+`fun main(): void`.)
 
 ## Before you begin
 
@@ -26,7 +26,7 @@ Create `hello.vl` with one import and one entrypoint:
 ```vl
 use std.println;
 
-function main() {
+fun main() {
     println("Hello, world!");
 }
 ```

@@ -282,7 +282,7 @@ impl<'a> Lowerer<'a> {
         self.res.def_of(span).map(|d| d.id.clone())
     }
 
-    /// Definition-site lookup (`let` names, `function` names, params).
+    /// Definition-site lookup (`let` names, `fun` names, params).
     fn def_at_site(&self, span: Span) -> Option<DefId> {
         self.res.def_at(span).map(|d| d.id.clone())
     }
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn not_lowers_to_explicit_unary() {
-        let (toks, _) = vl_lex::lex("function main() { !true; }");
+        let (toks, _) = vl_lex::lex("fun main() { !true; }");
         let (prog, _) = vl_syntax::parse(&toks, "");
         let (res, _) = vl_semantic::resolve(&prog);
         let hir = lower(&prog, &res);
@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn arrays_lower() {
-        let src = "function main() { let a = [1u64, 2u64]; a[0u64] = 3u64; let x = a[1u64]; }";
+        let src = "fun main() { let a = [1u64, 2u64]; a[0u64] = 3u64; let x = a[1u64]; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn generics_plumb_type_params_and_args() {
-        let src = "function first[T](a: Array[T]): T { return a[0u64]; } function main() { first([1u64]); first::[u64]([2u64]); }";
+        let src = "fun first[T](a: Array[T]): T { return a[0u64]; } fun main() { first([1u64]); first::[u64]([2u64]); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -712,8 +712,7 @@ mod tests {
 
     #[test]
     fn annotated_lets_carry_their_types() {
-        let src =
-            "let scores: Array[u64] = Array.new::[u64](3); function main() { let n: u64 = 1; n; }";
+        let src = "let scores: Array[u64] = Array.new::[u64](3); fun main() { let n: u64 = 1; n; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -738,7 +737,7 @@ mod tests {
 
     #[test]
     fn assign_links_the_resolved_binding() {
-        let src = "function main() { let x = 1; x = 2; }";
+        let src = "fun main() { let x = 1; x = 2; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, rdiags) = vl_semantic::resolve(&prog);
@@ -754,7 +753,7 @@ mod tests {
 
     #[test]
     fn while_and_break_lower() {
-        let src = "function main() { while (true) { break; } }";
+        let src = "fun main() { while (true) { break; } }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, rdiags) = vl_semantic::resolve(&prog);
@@ -783,8 +782,7 @@ mod tests {
 
     #[test]
     fn call_links_callee_def() {
-        let src =
-            "function add(a: i64, b: i64): i64 { return a + b; } function main() { add(1, 2); }";
+        let src = "fun add(a: i64, b: i64): i64 { return a + b; } fun main() { add(1, 2); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -807,7 +805,7 @@ mod tests {
 
     #[test]
     fn objects_lower_with_field_reads_and_writes() {
-        let src = "type Counter = object { value: u64, }; function main() { let c = Counter { value = 1 }; c.value = c.value + 1; }";
+        let src = "type Counter = object { value: u64, }; fun main() { let c = Counter { value = 1 }; c.value = c.value + 1; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -824,7 +822,7 @@ mod tests {
 
     #[test]
     fn return_lowers_with_value() {
-        let src = "function f(): i64 { return 1; } function m() { return; }";
+        let src = "fun f(): i64 { return 1; } fun m() { return; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -847,7 +845,7 @@ mod tests {
 
     #[test]
     fn unresolved_call_poisoned_not_panic() {
-        let src = "function main() { nope(1); }";
+        let src = "fun main() { nope(1); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -863,7 +861,7 @@ mod tests {
 
     #[test]
     fn casts_and_bounds_lower() {
-        let src = "function add[T extends Numeric](a: T, b: T): T { let c = a as u64; return a + b; } function main() { add(1u64, 2u64); }";
+        let src = "fun add[T extends Numeric](a: T, b: T): T { let c = a as u64; return a + b; } fun main() { add(1u64, 2u64); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -890,7 +888,7 @@ mod tests {
 
     #[test]
     fn mutable_types_survive_lowering() {
-        let src = "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; function edit(parent: *Parent): *Parent { let x: *Child = parent.child; x; return parent; }";
+        let src = "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; fun edit(parent: *Parent): *Parent { let x: *Child = parent.child; x; return parent; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -975,7 +973,7 @@ mod tests {
 
     #[test]
     fn mutable_call_type_args_and_assign_kinds_survive() {
-        let src = "type Foo = object { value: u64, }; function id[T](x: T): T { return x; } function main() { let base = Foo { value = 1u64 }; let e = id::[*Foo](base); let arr = [1u64]; let c = base as Foo; e = base; e.value = 1u64; arr[0u64] = 2u64; }";
+        let src = "type Foo = object { value: u64, }; fun id[T](x: T): T { return x; } fun main() { let base = Foo { value = 1u64 }; let e = id::[*Foo](base); let arr = [1u64]; let c = base as Foo; e = base; e.value = 1u64; arr[0u64] = 2u64; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -1049,7 +1047,7 @@ mod tests {
 
     #[test]
     fn mutable_cast_and_top_let_targets_survive() {
-        let src = "type Foo = object { value: u64, }; let g: *Foo = Foo { value = 1u64 }; function main() { let c = g as Foo; c; }";
+        let src = "type Foo = object { value: u64, }; let g: *Foo = Foo { value = 1u64 }; fun main() { let c = g as Foo; c; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");

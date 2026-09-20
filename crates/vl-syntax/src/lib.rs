@@ -1,9 +1,9 @@
 //! vl-syntax: recursive-descent parser, tokens -> AST.
 //!
-//! Grammar (v0, TypeScript-like surface):
+//! Grammar (v0 surface):
 //! ```text
 //! program := item*
-//! item    := `use` ... | `let` ident (`:` type)? `=` expr `;` | `function` ident type-params? `(` params? `)` (`:` type)? block | `type` ident `=` `object` `{` object-fields? `}` `;`
+//! item    := `use` ... | `let` ident (`:` type)? `=` expr `;` | `fun` ident type-params? `(` params? `)` (`:` type)? block | `type` ident `=` `object` `{` object-fields? `}` `;`
 //! type-params := `[` type-param (`,` type-param)* `]`
 //! type-param  := ident (`extends` (`Numeric` | `Comparable`))?
 //! object-fields := object-field (`,` object-field)* `,`?
@@ -48,20 +48,20 @@
 //! assignment mutates the shared object visible through every alias.
 //!
 //! Generic functions declare type parameters after the name
-//! (`function first[T](a: Array[T]): T { ... }`, optionally bounded as
-//! `function add[T extends Numeric](a: T, b: T): T`). Calls infer them from
+//! (`fun first[T](a: Array[T]): T { ... }`, optionally bounded as
+//! `fun add[T extends Numeric](a: T, b: T): T`). Calls infer them from
 //! the value arguments (`first(a)`) or pass them explicitly with a turbofish
 //! (`first::[u64](a)`). `f[T](args)` without `::` is *not* a generic call —
 //! it parses as indexing `f[T]` (which is not callable), and the parser says
 //! so explicitly.
 //!
-//! Explicit numeric conversions use TypeScript-like `as` (`value as u8`):
+//! Explicit numeric conversions use `as` (`value as u8`):
 //! integer-to-integer casts with no runtime cost (literals are range-checked
 //! at compile time; variable conversions are unchecked reinterpretations).
 //! Implicit cross-integer conversions stay narrow (literals only).
 //!
-//! Calls are callee-by-name (`ident(args)`), TypeScript-style. The callee
-//! is a plain variable use so forward references to `function` items work.
+//! Calls are callee-by-name (`ident(args)`). The callee is a plain variable use
+//! so forward references to `fun` items work.
 //! Semicolons are mandatory: every `let`, every `return`, and every
 //! expression statement ends with `;` (no bare trailing value like Rust).
 //! There are no implicit returns: a function yields a value only through an
@@ -95,7 +95,7 @@ pub struct Param {
     pub ty_span: Option<Span>,
 }
 
-/// One declared type parameter: `T` in `function first[T](...)`, optionally
+/// One declared type parameter: `T` in `fun first[T](...)`, optionally
 /// bounded (`T extends Numeric`). Bounds enable operators on otherwise-opaque
 /// `T` without full subtyping.
 #[derive(Debug, Clone)]
@@ -262,7 +262,7 @@ pub enum Expr {
         rhs: Box<Expr>,
         span: Span,
     },
-    /// Explicit numeric conversion (`value as u8`, TypeScript-like).
+    /// Explicit numeric conversion (`value as u8`).
     /// Integer-to-integer only in v0; literals are range-checked at compile
     /// time, variable conversions are unchecked (no runtime cost).
     Cast {
@@ -411,7 +411,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     return;
                 }
-                TokenKind::Let | TokenKind::Function | TokenKind::Type => return,
+                TokenKind::Let | TokenKind::Fun | TokenKind::Type => return,
                 _ => {
                     self.bump();
                 }
@@ -422,7 +422,7 @@ impl<'a> Parser<'a> {
     fn parse_item(&mut self) -> Option<Item> {
         match &self.peek().kind {
             TokenKind::Let => self.parse_let_item(),
-            TokenKind::Function => self.parse_function_item(),
+            TokenKind::Fun => self.parse_function_item(),
             TokenKind::Type => self.parse_object_item(),
             TokenKind::Ident(name) if name == "use" => self.parse_use_item(),
             TokenKind::Eof => None,
@@ -434,13 +434,10 @@ impl<'a> Parser<'a> {
                 let t = self.peek().clone();
                 self.diags.push(
                     Diagnostic::error(format!(
-                        "expected an item (`use`, `let`, `function` or `type`), found {}",
+                        "expected an item (`use`, `let`, `fun` or `type`), found {}",
                         describe(&t.kind)
                     ))
-                    .with_label(
-                        t.span,
-                        "items start with `use`, `let`, `function`, or `type`",
-                    )
+                    .with_label(t.span, "items start with `use`, `let`, `fun`, or `type`")
                     .with_code("E101"),
                 );
                 None
@@ -942,7 +939,7 @@ impl<'a> Parser<'a> {
             self.diags.push(
                 Diagnostic::error("expected at least one type parameter")
                     .with_label(t.span, "empty `[]` here")
-                    .with_note("write `function f[T](...)` or drop the brackets")
+                    .with_note("write `fun f[T](...)` or drop the brackets")
                     .with_code("E104"),
             );
             return Some(params);
@@ -1038,8 +1035,8 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&TokenKind::RParen, "`)`")?;
-        // An omitted return type means `void`: `function main() { ... }` is
-        // `function main() { ... }`. Only a failed `: type` parse
+        // An omitted return type means `void`: `fun main() { ... }` is
+        // `fun main() { ... }`. Only a failed `: type` parse
         // leaves `ret` as `None` (already reported; downstream stays quiet).
         let (ret, ret_span) = if matches!(self.peek().kind, TokenKind::Colon) {
             self.bump(); // `:`
@@ -1274,7 +1271,7 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::RBrace
                 | TokenKind::Let
-                | TokenKind::Function
+                | TokenKind::Fun
                 | TokenKind::If
                 | TokenKind::While
                 | TokenKind::Break
@@ -1773,7 +1770,7 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::Bool(v) => format!("boolean `{v}`"),
         TokenKind::String(_) => "string literal".into(),
         TokenKind::Let => "`let`".into(),
-        TokenKind::Function => "`function`".into(),
+        TokenKind::Fun => "`fun`".into(),
         TokenKind::Type => "`type`".into(),
         TokenKind::Object => "`object`".into(),
         TokenKind::If => "`if`".into(),
@@ -1850,20 +1847,20 @@ mod tests {
 
     #[test]
     fn expression_statement_requires_semi() {
-        let (_prog, diags) = parse_src("function main() { d }");
+        let (_prog, diags) = parse_src("fun main() { d }");
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn function_keyword_parses_with_semi_body() {
-        let (prog, diags) = parse_src("function main() { d; }");
+        let (prog, diags) = parse_src("fun main() { d; }");
         assert!(diags.is_empty());
         assert_eq!(prog.items.len(), 1);
     }
 
     #[test]
     fn typed_params_and_void_return_parse() {
-        let (prog, diags) = parse_src("function add(a: i64, b: i64): i64 { return a + b; }");
+        let (prog, diags) = parse_src("fun add(a: i64, b: i64): i64 { return a + b; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { params, ret, .. } => {
@@ -1878,7 +1875,7 @@ mod tests {
     #[test]
     fn parses_object_declaration_literal_and_field_assign() {
         let (prog, diags) = parse_src(
-            "type Counter = object { value: u64, label: String, }; function main() { let c = Counter { label = \"x\", value = 1 }; c.value = 2; }",
+            "type Counter = object { value: u64, label: String, }; fun main() { let c = Counter { label = \"x\", value = 1 }; c.value = 2; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(matches!(prog.items[0], Item::Object { ref fields, .. } if fields.len() == 2));
@@ -1900,7 +1897,7 @@ mod tests {
     #[test]
     fn generic_type_parameter_shadows_object_name() {
         let (prog, diags) =
-            parse_src("type T = object { value: u64, }; function id[T](x: T): T { return x; }");
+            parse_src("type T = object { value: u64, }; fun id[T](x: T): T { return x; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[1] {
             Item::Function { params, ret, .. } => {
@@ -1920,13 +1917,13 @@ mod tests {
 
     #[test]
     fn missing_param_type_is_an_error() {
-        let (_prog, diags) = parse_src("function add(a): i64 { return a; }");
+        let (_prog, diags) = parse_src("fun add(a): i64 { return a; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E104")));
     }
 
     #[test]
     fn omitted_return_type_defaults_to_void() {
-        let (prog, diags) = parse_src("function main() { 1; }");
+        let (prog, diags) = parse_src("fun main() { 1; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { ret, .. } => assert_eq!(*ret, Some(VlType::Void)),
@@ -1936,19 +1933,19 @@ mod tests {
 
     #[test]
     fn void_param_is_an_error() {
-        let (_prog, diags) = parse_src("function f(x: void): void { return; }");
+        let (_prog, diags) = parse_src("fun f(x: void): void { return; }");
         assert!(diags.iter().any(|d| d.message.contains("cannot be `void`")));
     }
 
     #[test]
     fn unknown_type_is_an_error() {
-        let (_prog, diags) = parse_src("function f(x: bogus): void { return; }");
+        let (_prog, diags) = parse_src("fun f(x: bogus): void { return; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E105")));
     }
 
     #[test]
     fn call_with_no_args_parses() {
-        let (prog, diags) = parse_src("function main() { foo(); }");
+        let (prog, diags) = parse_src("fun main() { foo(); }");
         assert!(diags.is_empty());
         match &prog.items[0] {
             Item::Function { body, .. } => match &body[0] {
@@ -1964,7 +1961,7 @@ mod tests {
 
     #[test]
     fn call_with_args_and_nesting_parses() {
-        let (prog, diags) = parse_src("function main() { add(1, mul(2, 3)); }");
+        let (prog, diags) = parse_src("fun main() { add(1, mul(2, 3)); }");
         assert!(diags.is_empty());
         match &prog.items[0] {
             Item::Function { body, .. } => match &body[0] {
@@ -2001,8 +1998,7 @@ mod tests {
 
     #[test]
     fn parses_module_use_and_qualified_call() {
-        let (prog, diags) =
-            parse_src("use std.string.{len}; function main() { string.len(\"s\"); }");
+        let (prog, diags) = parse_src("use std.string.{len}; fun main() { string.len(\"s\"); }");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(
             matches!(&prog.items[0], Item::Use { path, names: Some(names), .. } if path == &vec![String::from("std"), String::from("string")] && names.len() == 1)
@@ -2012,7 +2008,7 @@ mod tests {
     #[test]
     fn parses_while_break_continue_and_assign() {
         let (prog, diags) = parse_src(
-            "function main() { let i = 0; while (i < 10) { i = i + 1; if (i == 2) { continue; } break; } }",
+            "fun main() { let i = 0; while (i < 10) { i = i + 1; if (i == 2) { continue; } break; } }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
@@ -2038,7 +2034,7 @@ mod tests {
 
     #[test]
     fn logical_operators_bind_looser_than_comparison() {
-        let (prog, diags) = parse_src("function main() { let x = 1; x + 1 == 2 && !x; }");
+        let (prog, diags) = parse_src("fun main() { let x = 1; x + 1 == 2 && !x; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { body, .. } => match &body[1] {
@@ -2059,7 +2055,7 @@ mod tests {
 
     #[test]
     fn parses_unbraced_conditional_branches() {
-        let (prog, diags) = parse_src("function main() { if (true) 1; else 2; }");
+        let (prog, diags) = parse_src("fun main() { if (true) 1; else 2; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { body, .. } => assert!(matches!(body[0], Stmt::If { .. })),
@@ -2069,7 +2065,7 @@ mod tests {
 
     #[test]
     fn nested_function_recovery_makes_progress() {
-        let (toks, _) = vl_lex::lex("function main() { function nested() {} } function tail() {}");
+        let (toks, _) = vl_lex::lex("fun main() { fun nested() {} } fun tail() {}");
         let (prog, diags) = parse(&toks, "");
         assert!(!diags.is_empty());
         assert!(prog
@@ -2081,7 +2077,7 @@ mod tests {
     #[test]
     fn shadowing_is_a_warning_only_placeholder() {
         // (resolver test covers shadowing; parser just needs a valid body)
-        let (prog, diags) = parse_src("function f(x: i64): i64 { return x; }");
+        let (prog, diags) = parse_src("fun f(x: i64): i64 { return x; }");
         assert!(diags.is_empty(), "{diags:?}");
         assert_eq!(prog.items.len(), 1);
     }
@@ -2089,7 +2085,7 @@ mod tests {
     #[test]
     fn parses_array_literal_index_and_index_assign() {
         let (prog, diags) = parse_src(
-            "function get(a: Array[u64]): u64 { a[0u64] = 1u64; return a[0u64]; } function main() { let b = [1u64, 2u64,]; let e = []; }",
+            "fun get(a: Array[u64]): u64 { a[0u64] = 1u64; return a[0u64]; } fun main() { let b = [1u64, 2u64,]; let e = []; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
@@ -2130,7 +2126,7 @@ mod tests {
     #[test]
     fn parses_nested_array_types() {
         let (prog, diags) =
-            parse_src("function f(a: Array[Array[u64]]): Array[String] { return [\"s\"]; }");
+            parse_src("fun f(a: Array[Array[u64]]): Array[String] { return [\"s\"]; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { params, ret, .. } => {
@@ -2148,20 +2144,20 @@ mod tests {
 
     #[test]
     fn bare_array_without_element_is_an_error() {
-        let (_prog, diags) = parse_src("function f(a: Array): void { return; }");
+        let (_prog, diags) = parse_src("fun f(a: Array): void { return; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E104")));
     }
 
     #[test]
     fn u64array_is_removed_with_a_hint() {
-        let (_prog, diags) = parse_src("function f(a: U64Array): void { return; }");
+        let (_prog, diags) = parse_src("fun f(a: U64Array): void { return; }");
         assert!(mentions(&diags, "Array[u64]"), "{diags:?}");
     }
 
     #[test]
     fn parses_generic_function_and_turbofish_call() {
         let (prog, diags) = parse_src(
-            "function first[T](a: Array[T]): T { return a[0u64]; } function main() { first([1u64]); first::[u64]([1u64]); }",
+            "fun first[T](a: Array[T]): T { return a[0u64]; } fun main() { first([1u64]); first::[u64]([1u64]); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
@@ -2208,13 +2204,13 @@ mod tests {
 
     #[test]
     fn duplicate_type_params_are_an_error() {
-        let (_prog, diags) = parse_src("function f[T, T](x: T): T { return x; }");
+        let (_prog, diags) = parse_src("fun f[T, T](x: T): T { return x; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E200")));
     }
 
     #[test]
     fn type_param_shadowing_primitive_is_an_error() {
-        let (_prog, diags) = parse_src("function f[u64](x: u64): u64 { return x; }");
+        let (_prog, diags) = parse_src("fun f[u64](x: u64): u64 { return x; }");
         assert!(diags
             .iter()
             .any(|d| d.message.contains("shadows a primitive")));
@@ -2222,26 +2218,26 @@ mod tests {
 
     #[test]
     fn unknown_type_param_in_signature_is_an_error() {
-        let (_prog, diags) = parse_src("function f[T](x: U): U { return x; }");
+        let (_prog, diags) = parse_src("fun f[T](x: U): U { return x; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E105")));
     }
 
     #[test]
     fn bracket_call_without_turbofish_is_an_index_error() {
-        let (_prog, diags) = parse_src("function main() { f[T](1u64); }");
+        let (_prog, diags) = parse_src("fun main() { f[T](1u64); }");
         assert!(mentions(&diags, "f::[T]"), "{diags:?}");
     }
 
     #[test]
     fn turbofish_without_call_is_an_error() {
-        let (_prog, diags) = parse_src("function main() { f::[u64]; }");
+        let (_prog, diags) = parse_src("fun main() { f::[u64]; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E103")));
     }
 
     #[test]
     fn annotated_lets_parse() {
         let (prog, diags) = parse_src(
-            "let scores: Array[u64] = Array.new::[u64](3); function main() { let n: u64 = 1; n; }",
+            "let scores: Array[u64] = Array.new::[u64](3); fun main() { let n: u64 = 1; n; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
@@ -2262,7 +2258,7 @@ mod tests {
 
     #[test]
     fn unannotated_lets_stay_untyped() {
-        let (prog, diags) = parse_src("let x = 1; function main() { let y = 2; y; }");
+        let (prog, diags) = parse_src("let x = 1; fun main() { let y = 2; y; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Let { ty, ty_span, .. } => {
@@ -2277,7 +2273,7 @@ mod tests {
     fn void_let_is_an_error() {
         let (_prog, diags) = parse_src("let x: void = 1;");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E104")));
-        let (_prog, diags) = parse_src("function main() { let x: void = 1; }");
+        let (_prog, diags) = parse_src("fun main() { let x: void = 1; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E104")));
     }
 
@@ -2290,7 +2286,7 @@ mod tests {
     #[test]
     fn let_annotation_sees_type_params() {
         let (prog, diags) =
-            parse_src("function f[T](x: T): T { let y: T = x; let z: Array[T] = [x]; return y; }");
+            parse_src("fun f[T](x: T): T { let y: T = x; let z: Array[T] = [x]; return y; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { body, .. } => {
@@ -2312,13 +2308,13 @@ mod tests {
 
     #[test]
     fn unclosed_index_is_an_error() {
-        let (_prog, diags) = parse_src("function main() { a[0u64; }");
+        let (_prog, diags) = parse_src("fun main() { a[0u64; }");
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn return_with_value_and_bare_return_parse() {
-        let (prog, diags) = parse_src("function f(): i64 { return 1; } function g() { return; }");
+        let (prog, diags) = parse_src("fun f(): i64 { return 1; } fun g() { return; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { body, .. } => {
@@ -2336,13 +2332,13 @@ mod tests {
 
     #[test]
     fn return_requires_semi() {
-        let (_prog, diags) = parse_src("function f(): i64 { return 1 }");
+        let (_prog, diags) = parse_src("fun f(): i64 { return 1 }");
         assert!(!diags.is_empty());
     }
 
     #[test]
     fn lexical_poison_does_not_hide_later_function() {
-        let (toks, lex_diags) = vl_lex::lex("let broken = @; function tail() {} ");
+        let (toks, lex_diags) = vl_lex::lex("let broken = @; fun tail() {} ");
         assert_eq!(lex_diags.len(), 1);
         let (prog, parse_diags) = parse(&toks, "");
         assert!(parse_diags.is_empty(), "{parse_diags:?}");
@@ -2355,7 +2351,7 @@ mod tests {
     #[test]
     fn parses_as_cast_with_precedence() {
         // `a + b as u8` is `(a + b) as u8`; `a == b as u8` is `a == (b as u8)`.
-        let (prog, diags) = parse_src("function main() { let x = 1u64 + 2u64 as u8; x; }");
+        let (prog, diags) = parse_src("fun main() { let x = 1u64 + 2u64 as u8; x; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { body, .. } => match &body[0] {
@@ -2369,7 +2365,7 @@ mod tests {
     #[test]
     fn parses_bounded_type_params() {
         let (prog, diags) =
-            parse_src("function add[T extends Numeric](a: T, b: T): T { return a + b; }");
+            parse_src("fun add[T extends Numeric](a: T, b: T): T { return a + b; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { type_params, .. } => {
@@ -2383,14 +2379,14 @@ mod tests {
 
     #[test]
     fn unknown_bound_is_an_error() {
-        let (_prog, diags) = parse_src("function f[T extends Bogus](x: T): T { return x; }");
+        let (_prog, diags) = parse_src("fun f[T extends Bogus](x: T): T { return x; }");
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E105")));
     }
 
     #[test]
     fn mutable_types_parse_in_every_position() {
         let (prog, diags) = parse_src(
-            "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; function edit(parent: *Parent): *Parent { let x: *Child = parent.child; x; return parent; }",
+            "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; fun edit(parent: *Parent): *Parent { let x: *Child = parent.child; x; return parent; }",
         );
         // `*Child` in a field parses, but field projection semantics are
         // checked later; parsing itself must be clean here only when the
@@ -2429,7 +2425,7 @@ mod tests {
     #[test]
     fn mutable_array_spellings_parse() {
         let (prog, diags) = parse_src(
-            "type Foo = object { value: u64, }; function f(a: *Array[u64], b: Array[*Foo], c: *Array[*Foo]) { a; b; c; }",
+            "type Foo = object { value: u64, }; fun f(a: *Array[u64], b: Array[*Foo], c: *Array[*Foo]) { a; b; c; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[1] {
@@ -2460,7 +2456,7 @@ mod tests {
     #[test]
     fn mutable_type_arguments_parse() {
         let (prog, diags) = parse_src(
-            "type Foo = object { value: u64, }; function id[T](x: T): T { return x; } function main() { let e = id::[*Foo](id::[*Foo](e)); e; }",
+            "type Foo = object { value: u64, }; fun id[T](x: T): T { return x; } fun main() { let e = id::[*Foo](id::[*Foo](e)); e; }",
         );
         // `e` is undefined, but type arguments themselves must parse.
         assert!(diags.is_empty(), "{diags:?}");
@@ -2482,9 +2478,9 @@ mod tests {
     #[test]
     fn mutable_scalar_is_one_focused_error() {
         for src in [
-            "function f(x: *u64) { x; }",
-            "function f(x: *bool) { x; }",
-            "function f(): *void { return; }",
+            "fun f(x: *u64) { x; }",
+            "fun f(x: *bool) { x; }",
+            "fun f(): *void { return; }",
             "let x: *u64 = 1u64;",
         ] {
             let (_prog, diags) = parse_src(src);
@@ -2496,7 +2492,7 @@ mod tests {
 
     #[test]
     fn nested_star_is_one_focused_error() {
-        let (_prog, diags) = parse_src("function f(x: **Foo) { x; }");
+        let (_prog, diags) = parse_src("fun f(x: **Foo) { x; }");
         let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
         assert_eq!(errors.len(), 1, "{diags:?}");
         assert_eq!(errors[0].code.as_deref(), Some("E106"), "{diags:?}");
@@ -2505,7 +2501,7 @@ mod tests {
 
     #[test]
     fn invalid_nested_mutable_type_consumes_array_close() {
-        let (_prog, diags) = parse_src("function broken(a: *Array[*u64]) { a; }");
+        let (_prog, diags) = parse_src("fun broken(a: *Array[*u64]) { a; }");
         let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
         assert_eq!(errors.len(), 1, "{diags:?}");
         assert_eq!(errors[0].code.as_deref(), Some("E106"), "{diags:?}");
@@ -2513,7 +2509,7 @@ mod tests {
 
     #[test]
     fn missing_inner_type_is_one_error_and_recovers() {
-        let (prog, diags) = parse_src("let x: *; function tail() {}");
+        let (prog, diags) = parse_src("let x: *; fun tail() {}");
         let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
         assert_eq!(errors.len(), 1, "{diags:?}");
         assert_eq!(errors[0].code.as_deref(), Some("E106"), "{diags:?}");
@@ -2527,7 +2523,7 @@ mod tests {
 
     #[test]
     fn malformed_mutable_param_recovers_to_next_item() {
-        let (prog, diags) = parse_src("function broken(x: *) {} function tail() {}");
+        let (prog, diags) = parse_src("fun broken(x: *) {} fun tail() {}");
         assert_eq!(
             diags.iter().filter(|d| d.is_error()).count(),
             1,
@@ -2543,7 +2539,7 @@ mod tests {
 
     #[test]
     fn unknown_inner_type_reports_once_without_cascade() {
-        let (_prog, diags) = parse_src("function f(x: *Missing) { x; }");
+        let (_prog, diags) = parse_src("fun f(x: *Missing) { x; }");
         let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
         assert_eq!(errors.len(), 1, "{diags:?}");
         assert_eq!(errors[0].code.as_deref(), Some("E105"), "{diags:?}");
@@ -2552,7 +2548,7 @@ mod tests {
     #[test]
     fn star_param_defers_to_typechecking() {
         // `*T` needs substitution context; parsing accepts it.
-        let (prog, diags) = parse_src("function f[T](x: *T): *T { return x; }");
+        let (prog, diags) = parse_src("fun f[T](x: *T): *T { return x; }");
         // Hmm: `return x;` where x: *T — parsing is fine; no parse error.
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
@@ -2573,7 +2569,7 @@ mod tests {
     #[test]
     fn multiplication_next_to_mutable_annotation() {
         let (prog, diags) =
-            parse_src("type Foo = object { value: u64, }; function main() { let x: *Foo = f; let y = a * b; x; y; }");
+            parse_src("type Foo = object { value: u64, }; fun main() { let x: *Foo = f; let y = a * b; x; y; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[1] {
             Item::Function { body, .. } => {
@@ -2598,8 +2594,7 @@ mod tests {
 
     #[test]
     fn mutable_spans_cover_the_qualifier() {
-        let (prog, diags) =
-            parse_src("type Foo = object { value: u64, }; function f(x: *Foo) { x; }");
+        let (prog, diags) = parse_src("type Foo = object { value: u64, }; fun f(x: *Foo) { x; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[1] {
             Item::Function { params, .. } => {

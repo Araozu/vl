@@ -10,14 +10,14 @@ availability: VL 0.1+
 
 This page introduces the pieces that appear in almost every VL program. VL is
 small and deliberately familiar: it uses braces for blocks, `let` for
-variables, `function` for reusable work, and semicolons to finish statements.
+variables, `fun` for reusable work, and semicolons to finish statements.
 
 ## Your first program
 
 ```vl
 use std;
 
-function main() {
+fun main() {
     std.println("Hello, VL!");
 }
 ```
@@ -25,7 +25,7 @@ function main() {
 Read this from top to bottom:
 
 1. `use std;` makes the standard library module available.
-2. `function main()` defines the starting point of the program.
+2. `fun main()` defines the starting point of the program.
 3. Braces mark the function body.
 4. `std.println(...)` calls a function.
 5. The semicolon marks the end of the call.
@@ -33,9 +33,9 @@ Read this from top to bottom:
 `std.println` writes the string and appends a `"\n"` for you. A plain
 `std.print` also exists and writes the string exactly as given.
 
-Every runnable program needs a zero-argument `function main()` that returns
-`void`. A missing return type means `void`, so `function main()` and
-`function main(): void` mean the same thing.
+Every runnable program needs a zero-argument `fun main()` that returns
+`void`. A missing return type means `void`, so `fun main()` and
+`fun main(): void` mean the same thing.
 
 ## Comments
 
@@ -66,11 +66,11 @@ Integer literals are chosen from their context. For example, the parameter
 type tells VL what type the `1` and `2` should have here:
 
 ```vl
-function add(a: i64, b: i64): i64 {
+fun add(a: i64, b: i64): i64 {
     return a + b;
 }
 
-function main() {
+fun main() {
     let total = add(1, 2);
 }
 ```
@@ -81,7 +81,7 @@ Integer literals adapt to their context (`let x: u8 = 3;` checks the range),
 but variables never convert implicitly: a `u64` variable does not flow into a
 `u8` parameter.
 
-Explicit conversions use TypeScript-like `as` (integers only in v0):
+Explicit conversions use `as` (integers only in v0):
 
 ```vl
 let v = 200u64;
@@ -127,7 +127,7 @@ are comma-separated, and an object literal initializes every field:
 ```vl
 type Point = object { x: u64, y: u64, };
 
-function main() {
+fun main() {
     let point: *Point = Point { x = 10, y = 20 };
     point.x = 11;
 }
@@ -146,7 +146,7 @@ binding, while a `Foo` value never upgrades into a `*Foo` binding (a
 ```vl
 type Counter = object { value: u64, };
 
-function main() {
+fun main() {
     let count = 0;
     count = count + 1;
     let current: *Counter = Counter { value = 0 };
@@ -192,7 +192,7 @@ other statements. A function body is a list of statements inside braces.
 ```vl
 use std;
 
-function main() {
+fun main() {
     let message = "ready";
     std.println(message);
 }

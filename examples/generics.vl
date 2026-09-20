@@ -1,23 +1,23 @@
 // Generic functions over `Array[T]`.
 //
-// Type parameters are declared after the function name (`[T]`), inferred
+// Type parameters are declared after the fun name (`[T]`), inferred
 // from the value arguments at call sites (`first(b)`), or passed explicitly
 // with a turbofish (`first::[u64](b)`). `f[T](...)` without `::` is indexing,
 // not a generic call. Each concrete call monomorphizes (`first$u64`, ...).
 use std;
 
-function first[T](a: Array[T]): T {
+fun first[T](a: Array[T]): T {
     return a[0];
 }
 
-function second[T](a: Array[T], fallback: T): T {
+fun second[T](a: Array[T], fallback: T): T {
     if (1 < 2) {
         return a[1];
     }
     return fallback;
 }
 
-function main() {
+fun main() {
     let nums: *Array[u64] = Array.new(3);
     nums[0] = 10;
     nums[1] = 20;

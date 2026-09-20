@@ -2,7 +2,7 @@ if exists('b:current_syntax')
   finish
 endif
 
-syntax keyword vlDeclaration let function use type object extends
+syntax keyword vlDeclaration let fun use type object extends
 syntax keyword vlOperatorKeyword as
 syntax keyword vlConditional if else
 syntax keyword vlRepeat while
@@ -11,7 +11,7 @@ syntax keyword vlBoolean true false
 syntax keyword vlBuiltinType u64 i64 f64 u8 bool void String File Array Numeric Comparable
 
 syntax match vlTypeName '\<[A-Z][A-Za-z0-9_]*\>'
-syntax match vlFunction '\<function\>\s\+\zs[A-Za-z_][A-Za-z0-9_]*'
+syntax match vlFunction '\<fun\>\s\+\zs[A-Za-z_][A-Za-z0-9_]*'
 syntax match vlTypeDefinition '\<type\>\s\+\zs[A-Za-z_][A-Za-z0-9_]*'
 syntax match vlFunctionCall '\<[A-Za-z_][A-Za-z0-9_]*\>\ze\s*\%(::\s*\[[^]]*\]\s*\)\?('
 syntax match vlProperty '\.\zs[A-Za-z_][A-Za-z0-9_]*\>'

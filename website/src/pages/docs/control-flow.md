@@ -20,7 +20,7 @@ The code in the first branch runs when the condition is `true`. An optional
 ```vl
 use std;
 
-function main() {
+fun main() {
     let temperature = 25;
 
     if (temperature > 30) {
@@ -40,7 +40,7 @@ clearer and make it easier to add another statement later:
 ```vl
 use std;
 
-function main() {
+fun main() {
     let ready = true;
     if (ready) std.println("go");
 }
@@ -51,7 +51,7 @@ Several choices can be chained with `else if`:
 ```vl
 use std;
 
-function main() {
+fun main() {
     let score = 85u64;
     if (score >= 90u64) {
         std.println("A");
@@ -75,7 +75,7 @@ stops.
 ```vl
 use std;
 
-function main() {
+fun main() {
     let i = 1;
     while (i <= 3) {
         std.print_u64(i);
@@ -95,7 +95,7 @@ current iteration and checks the loop condition again.
 ```vl
 use std;
 
-function main() {
+fun main() {
     let i = 0;
     while (true) {
         i = i + 1;
@@ -119,7 +119,7 @@ Use parentheses to make a complicated condition easy to read. `&&` requires
 both sides to be true; `||` requires at least one side to be true.
 
 ```vl
-function main() {
+fun main() {
     let logged_in = true;
     let has_permission = true;
     if (logged_in && has_permission) {

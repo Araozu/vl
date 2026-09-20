@@ -1,5 +1,5 @@
 use std;
 
-function main() {
+fun main() {
     std.print("Hello, world!\n");
 }

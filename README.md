@@ -81,7 +81,7 @@ colours) and sets the exit code. Never add another reporting library.
 
 ```text
 let x = 1 + 2 * 3;
-function main() { let d = x - 1; }
+fun main() { let d = x - 1; }
 ```
 
 Integer literals are untyped and coerce to contextual `u64`, `i64`, or `u8`;
@@ -100,13 +100,13 @@ heap object, and `p.field = value;` mutates it through every mutable `*Foo` alia
 comma-separated and every field must be initialized. Objects are nominal data
 types; VL does not currently attach methods, inheritance, or runtime type
 reflection to them.
-Functions can declare type parameters (`function first[T](a: Array[T]): T`);
+Functions can declare type parameters (`fun first[T](a: Array[T]): T`);
 calls infer them (`first(a)`) or pass them explicitly (`first::[u64](a)`)
 (see `examples/generics.vl`).
 The language also supports double-quoted byte strings, `+ - * /`, unary `-`
 and `!`, comparisons (`== != < <= > >=`), short-circuit `&&` / `||`, parens,
 `let` plus `=` reassignment, user-defined functions with typed boundaries
-(`function add(a: i64, b: i64): i64 { return a + b; }`; an omitted return
+(`fun add(a: i64, b: i64): i64 { return a + b; }`; an omitted return
 type means `void`), explicit `return` (`return <expr>;` for values,
 `return;` for `void`; there are no implicit returns — a trailing expression
 is discarded, never returned),
@@ -114,7 +114,7 @@ calls between user functions (nestable, order-independent, recursive;
 arity and argument types are checked, `void` results only as bare statements),
 `if`/`else` conditionals with mandatory parentheses, and `while` loops
 with `break` / `continue`. A runnable program defines a zero-argument
-`function main()` returning `void` as its entrypoint; `main` is optional at
+`fun main()` returning `void` as its entrypoint; `main` is optional at
 compile time (snippets and libraries compile without one — entrypoint
 presence is validated by the VM/loader, not the compiler). Other functions compile
 to their own Nara functions on the Naravm target (see `examples/calls.vl`).

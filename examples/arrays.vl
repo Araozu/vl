@@ -7,7 +7,7 @@
 // array's `T`.
 use std;
 
-function sum(a: Array[u64], n: u64): u64 {
+fun sum(a: Array[u64], n: u64): u64 {
     let total = 0;
     let i = 0;
     while (i < n) {
@@ -17,7 +17,7 @@ function sum(a: Array[u64], n: u64): u64 {
     return total;
 }
 
-function main() {
+fun main() {
     let scores: *Array[u64] = Array.new(3);
     scores[0] = 10;
     scores[1] = 20;

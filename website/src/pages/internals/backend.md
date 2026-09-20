@@ -42,7 +42,7 @@ Defines the `Target` trait and registers `naravm`, `dummy`, and `stackvm`.
 `naravm` serializes Naravm 0.2 vmfiles; the other targets are inspection
 backends.
 
-The Naravm backend compiles every `function` item: `function main()` (which
+The Naravm backend compiles every `fun` item: `fun main()` (which
 takes no parameters) becomes the `<entrypoint>` function and each other user
 function becomes its own Nara function: integer (`u64`/`i64`/`u8`) and `f64`
 arithmetic, integer equality and ordering (`i64` ordering is emulated by

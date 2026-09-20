@@ -19,7 +19,7 @@ Compile a source file:
 ```sh
 curl -X POST http://localhost:8080/v1/compile \
   -H 'content-type: application/json' \
-  -d '{"source":"use std.print; function main() { print(\"hello\\n\"); }"}'
+  -d '{"source":"use std.print; fun main() { print(\"hello\\n\"); }"}'
 ```
 
 The production service is deployed as `https://vlc.nara-lang.org`. Its

@@ -6,7 +6,7 @@
 //! - [`DummyTarget`]: human-readable pseudo-assembly, used by tests and
 //!   `--emit asm` until a real target lands.
 //! - [`StackVmTarget`]: stack-machine text format sketch (still TBD).
-//! - [`NaraVmTarget`]: executable Naravm 0.2 vmfiles: `function main()`,
+//! - [`NaraVmTarget`]: executable Naravm 0.2 vmfiles: `fun main()`,
 //!   when present, becomes the `<entrypoint>` function plus one Nara function
 //!   per other user function. Integer/float arithmetic, comparisons, and control flow
 //!   plus `std.print` / `std.println` / `std.print_u64` and user-function calls lower to
@@ -298,7 +298,7 @@ impl Target for StackVmTarget {
 
 // --------------------------------------------------------- Naravm ---
 
-/// Naravm 0.2 executable vmfile backend: compiles `function main()`, when
+/// Naravm 0.2 executable vmfile backend: compiles `fun main()`, when
 /// present, to the `<entrypoint>` function plus one Nara function per other
 /// user function (see the internals book for the supported subset). A module
 /// without `main` still compiles (a library); entrypoint presence is the
@@ -1580,7 +1580,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             if ctx.is_main {
                 e.diags.push(
                     Diagnostic::error(
-                        "Naravm backend only supports `function main()` with no parameters",
+                        "Naravm backend only supports `fun main()` with no parameters",
                     )
                     .with_label(*span, "parameter here")
                     .with_code("E403"),
@@ -3110,7 +3110,7 @@ mod tests {
         // condition, but its machine register must survive the back edge.
         // Freeing it mid-loop used to let a temporary clobber it, hanging
         // `sum` forever.
-        let lir = lir_of("function sum(a: Array[u64], n: u64): u64 { let t = 0u64; let i = 0u64; while (i < n) { t = t + a[i]; i = i + 1u64; } return t; } function main() {}");
+        let lir = lir_of("fun sum(a: Array[u64], n: u64): u64 { let t = 0u64; let i = 0u64; while (i < n) { t = t + a[i]; i = i + 1u64; } return t; } fun main() {}");
         let f = lir.functions.iter().find(|f| f.name == "sum").unwrap();
         let uses = nara_last_use(f);
         let n = match f.instrs[1] {
@@ -3133,7 +3133,7 @@ mod tests {
     #[test]
     fn naravm_emits_arrays_with_container_ops() {
         let lir = lir_of(
-            "use std; function get(a: Array[u64]): u64 { return a[0u64]; } function main() { let a = Array.new::[u64](2u64); a[0u64] = 1u64; a[1u64] = 2u64; let b = [3u64, 4u64]; std.print_u64(get(a) + b[1u64]); }",
+            "use std; fun get(a: Array[u64]): u64 { return a[0u64]; } fun main() { let a = Array.new::[u64](2u64); a[0u64] = 1u64; a[1u64] = 2u64; let b = [3u64, 4u64]; std.print_u64(get(a) + b[1u64]); }",
         );
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
@@ -3149,7 +3149,7 @@ mod tests {
     #[test]
     fn naravm_recycles_registers_across_long_global_initializers() {
         let lir = lir_of(
-            "let g = 1u64 + 2u64 + 3u64 + 4u64 + 5u64 + 6u64 + 7u64 + 8u64 + 9u64 + 10u64 + 11u64 + 12u64 + 13u64 + 14u64 + 15u64 + 16u64 + 17u64 + 18u64 + 19u64 + 20u64; function main() {}",
+            "let g = 1u64 + 2u64 + 3u64 + 4u64 + 5u64 + 6u64 + 7u64 + 8u64 + 9u64 + 10u64 + 11u64 + 12u64 + 13u64 + 14u64 + 15u64 + 16u64 + 17u64 + 18u64 + 19u64 + 20u64; fun main() {}",
         );
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
@@ -3158,7 +3158,7 @@ mod tests {
 
     #[test]
     fn naravm_preserves_library_initializers_without_claiming_entrypoint() {
-        let lir = lir_of("let g = 7u64; function read(): u64 { return g; }");
+        let lir = lir_of("let g = 7u64; fun read(): u64 { return g; }");
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
         let bytes = artifact.unwrap().bytes.unwrap();
@@ -3174,7 +3174,7 @@ mod tests {
     #[test]
     fn naravm_passes_arrays_through_calls() {
         let lir = lir_of(
-            "function fill(a: Array[u64]): Array[u64] { a[0u64] = 7u64; return a; } function main() { let a = fill(Array.new::[u64](1u64)); }",
+            "fun fill(a: Array[u64]): Array[u64] { a[0u64] = 7u64; return a; } fun main() { let a = fill(Array.new::[u64](1u64)); }",
         );
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
@@ -3184,7 +3184,7 @@ mod tests {
     #[test]
     fn naravm_emits_string_arrays_with_ref_ops() {
         let lir = lir_of(
-            "function main() { let a = Array.new::[String](2u64); a[0u64] = \"hi\"; let x = a[0u64]; x; }",
+            "fun main() { let a = Array.new::[String](2u64); a[0u64] = \"hi\"; let x = a[0u64]; x; }",
         );
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
@@ -3199,7 +3199,7 @@ mod tests {
     #[test]
     fn naravm_emits_objects_with_mixed_lane_field_ops() {
         let lir = lir_of(
-            "use std; type Counter = object { value: u64, label: String, }; function main() { let c = Counter { value = 1, label = \"count\" }; c.value = 2; std.print(c.label); }",
+            "use std; type Counter = object { value: u64, label: String, }; fun main() { let c = Counter { value = 1, label = \"count\" }; c.value = 2; std.print(c.label); }",
         );
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
@@ -3262,7 +3262,7 @@ mod tests {
     #[test]
     fn naravm_emits_monomorphized_instances() {
         let lir = lir_of(
-            "function id[T](x: T): T { return x; } function main() { let a = id(1u64); let b = id::[String](\"s\"); a; b; }",
+            "fun id[T](x: T): T { return x; } fun main() { let a = id(1u64); let b = id::[String](\"s\"); a; b; }",
         );
         let names: Vec<&str> = lir.functions.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains(&"id$u64"), "{names:?}");
@@ -3279,7 +3279,7 @@ mod tests {
 
     #[test]
     fn dummy_and_stackvm_emit_array_instrs() {
-        let lir = lir_of("function main() { let a = [1u64]; a[0u64] = 2u64; let x = a[0u64]; }");
+        let lir = lir_of("fun main() { let a = [1u64]; a[0u64] = 2u64; let x = a[0u64]; }");
         let (art, diags) = DummyTarget.emit(&lir);
         assert!(diags.is_empty());
         let text = art.unwrap().text;
@@ -3299,7 +3299,7 @@ mod tests {
     #[test]
     fn countdown_while_emits_runnable_naravm() {
         let lir = lir_of(
-            "use std; function main() { let i = 3u64; while (i > 0u64) { std.print_u64(i); i = i - 1u64; } }",
+            "use std; fun main() { let i = 3u64; while (i > 0u64) { std.print_u64(i); i = i - 1u64; } }",
         );
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
@@ -3314,9 +3314,9 @@ mod tests {
     #[test]
     fn naravm_supports_signed_ordering_and_logic() {
         for src in [
-            "function main() { let a = 0 - 5; if (a < 3) { a; } }",
-            "function main() { if (true && !false) { 1; } }",
-            "function main() { let i = 0; while (i < 3) { i = i + 1; if (i == 2) { continue; } } }",
+            "fun main() { let a = 0 - 5; if (a < 3) { a; } }",
+            "fun main() { if (true && !false) { 1; } }",
+            "fun main() { let i = 0; while (i < 3) { i = i + 1; if (i == 2) { continue; } } }",
         ] {
             let lir = lir_of(src);
             let (artifact, diags) = NaraVmTarget.emit(&lir);
@@ -3327,7 +3327,7 @@ mod tests {
 
     #[test]
     fn naravm_rejects_float_ordering_with_e404() {
-        let lir = lir_of("function main() { if (1.5f64 < 2.5f64) { 1; } }");
+        let lir = lir_of("fun main() { if (1.5f64 < 2.5f64) { 1; } }");
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(artifact.is_none());
         assert!(
@@ -3341,14 +3341,14 @@ mod tests {
         let lir = lir_of(
             r#"
 use std;
-function add(a: u64, b: u64): u64 { return a + b; }
-function greet(name: String, n: u64): String { return name; }
-function fact(n: u64): u64 {
+fun add(a: u64, b: u64): u64 { return a + b; }
+fun greet(name: String, n: u64): String { return name; }
+fun fact(n: u64): u64 {
     let r = 1u64;
     if (n == 0u64) { r; } else { r = n * fact(n - 1u64); }
     return r;
 }
-function main() {
+fun main() {
     std.print(greet("hi\n", 1u64));
     std.print_u64(add(fact(3u64), 1u64));
 }
@@ -3403,7 +3403,7 @@ function main() {
 
     #[test]
     fn dummy_emits_control_flow() {
-        let lir = lir_of("function main() { let i = 0; while (i < 1) { i = i + 1; } }");
+        let lir = lir_of("fun main() { let i = 0; while (i < 1) { i = i + 1; } }");
         let (art, diags) = DummyTarget.emit(&lir);
         assert!(diags.is_empty());
         let text = art.unwrap().text;
@@ -3412,7 +3412,7 @@ function main() {
 
     #[test]
     fn dummy_emits_text() {
-        let lir = lir_of("function main() { 1 + 2; }");
+        let lir = lir_of("fun main() { 1 + 2; }");
         let (art, diags) = DummyTarget.emit(&lir);
         assert!(diags.is_empty());
         assert!(art.unwrap().text.contains("add"));
@@ -3425,9 +3425,8 @@ function main() {
 
     #[test]
     fn backends_emit_calls_and_parameters() {
-        let lir = lir_of(
-            "function add(a: i64, b: i64): i64 { return a + b; } function main() { add(1, 2); }",
-        );
+        let lir =
+            lir_of("fun add(a: i64, b: i64): i64 { return a + b; } fun main() { add(1, 2); }");
         let (art, diags) = DummyTarget.emit(&lir);
         assert!(diags.is_empty());
         let text = art.unwrap().text;
@@ -3441,7 +3440,7 @@ function main() {
 
     #[test]
     fn naravm_rejects_constant_pool_indices_that_do_not_fit() {
-        let mut src = String::from("function main() {");
+        let mut src = String::from("fun main() {");
         for i in 0..252 {
             src.push_str(&format!("let s{i} = \"s{i}\";"));
         }
@@ -3457,7 +3456,7 @@ function main() {
 
     #[test]
     fn naravm_accepts_bare_print_from_single_export_use() {
-        let src = "use std.print; function main() { print(\"hi\\n\"); }";
+        let src = "use std.print; fun main() { print(\"hi\\n\"); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, rdiags) = vl_semantic::resolve_with_modules(&prog, &modules());
@@ -3474,7 +3473,7 @@ function main() {
 
     #[test]
     fn naravm_emits_println_as_print_plus_newline() {
-        let lir = lir_of("use std; function main() { std.println(\"hi\"); }");
+        let lir = lir_of("use std; fun main() { std.println(\"hi\"); }");
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
         let bytes = artifact.unwrap().bytes.unwrap();
@@ -3487,7 +3486,7 @@ function main() {
 
     #[test]
     fn naravm_accepts_bare_println_from_single_export_use() {
-        let src = "use std.println; function main() { println(\"hi\"); }";
+        let src = "use std.println; fun main() { println(\"hi\"); }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, rdiags) = vl_semantic::resolve_with_modules(&prog, &modules());
@@ -3567,7 +3566,7 @@ function main() {
     #[test]
     fn object_and_array_mutation_via_mutable_params() {
         let lir = lir_of(
-            "type Foo = object { value: u64, }; function bump(c: *Foo) { c.value = 1u64; } function fill(a: *Array[u64]) { a[0u64] = 1u64; } function main() { let c: *Foo = Foo { value = 1u64 }; bump(c); }",
+            "type Foo = object { value: u64, }; fun bump(c: *Foo) { c.value = 1u64; } fun fill(a: *Array[u64]) { a[0u64] = 1u64; } fun main() { let c: *Foo = Foo { value = 1u64 }; bump(c); }",
         );
         let (art, diags) = DummyTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
@@ -3584,7 +3583,7 @@ function main() {
     #[test]
     fn shared_mutable_global_across_functions() {
         let lir = lir_of(
-            "type Foo = object { value: u64, }; let g: *Foo = Foo { value = 1u64 }; function bump() { g.value = 2u64; } function read(): u64 { return g.value; } function main() { bump(); let x = read(); x; }",
+            "type Foo = object { value: u64, }; let g: *Foo = Foo { value = 1u64 }; fun bump() { g.value = 2u64; } fun read(): u64 { return g.value; } fun main() { bump(); let x = read(); x; }",
         );
         // Both functions load the same stable global ID.
         let loads: Vec<u32> = lir
@@ -3615,7 +3614,7 @@ function main() {
     #[test]
     fn global_rebinding_value_and_ref() {
         let lir = lir_of(
-            "let n = 1u64; type Foo = object { value: u64, }; let g: *Foo = Foo { value = 1u64 }; function main() { n = 2u64; g = Foo { value = 3u64 }; n; g; }",
+            "let n = 1u64; type Foo = object { value: u64, }; let g: *Foo = Foo { value = 1u64 }; fun main() { n = 2u64; g = Foo { value = 3u64 }; n; g; }",
         );
         let stores = lir
             .functions
@@ -3637,7 +3636,7 @@ function main() {
         // Reserved rf3F never allocated for temps; recursion + nested calls
         // keep globals working (verified by successful emission + calli).
         let lir = lir_of(
-            "let n = 0u64; function inner(): u64 { return n; } function outer(): u64 { return inner() + inner(); } function fact(n: u64): u64 { if (n == 0u64) { return 1u64; } return n * fact(n - 1u64); } function main() { let a = outer(); let b = fact(3u64); a + b; }",
+            "let n = 0u64; fun inner(): u64 { return n; } fun outer(): u64 { return inner() + inner(); } fun fact(n: u64): u64 { if (n == 0u64) { return 1u64; } return n * fact(n - 1u64); } fun main() { let a = outer(); let b = fact(3u64); a + b; }",
         );
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");

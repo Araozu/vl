@@ -7,7 +7,7 @@
 //! VM representation, which backends map to separately.
 //!
 //! Generics are purely a frontend concern: `Array[T]` checks element types,
-//! generic functions (`function first[T](a: Array[T]): T`) check once with
+//! generic functions (`fun first[T](a: Array[T]): T`) check once with
 //! their parameters opaque (`Ty::Param`) and monomorphize per concrete
 //! call (`first$u64`, ...). LIR and backends only ever see concrete types.
 //!
@@ -488,7 +488,7 @@ fn template_stmt_ids(s: &HirStmt, out: &mut HashSet<u32>) {
     }
 }
 
-/// All `HirId.0` values of one function template (the item id plus every
+/// All `HirId.0` values of one fun template (the item id plus every
 /// node in its body), used to validate instance bodies after substitution.
 fn template_ids_for(prog: &HirProgram, def: u32) -> HashSet<u32> {
     let mut out = HashSet::new();
@@ -512,7 +512,7 @@ fn template_ids_for(prog: &HirProgram, def: u32) -> HashSet<u32> {
     out
 }
 
-/// All `HirId.0` values inside generic function templates (bodies, params,
+/// All `HirId.0` values inside generic fun templates (bodies, params,
 /// and the item id itself). Their recorded types may contain `Param`, so the
 /// monomorphic validation loop skips them (instances are validated after
 /// substitution instead).
@@ -1500,9 +1500,7 @@ impl Checker {
                 self.diags.push(
                     Diagnostic::error(format!("unknown type `{v}`"))
                         .with_label(span, "no type parameter with this name is in scope")
-                        .with_note(
-                            "declare it on the function (`function f[T]`) or use a concrete type",
-                        )
+                        .with_note("declare it on the function (`fun f[T]`) or use a concrete type")
                         .with_code("E105"),
                 );
             }
@@ -2651,7 +2649,7 @@ impl Checker {
         }
     }
 
-    /// Explicit numeric conversion (`value as u8`, TypeScript-like).
+    /// Explicit numeric conversion (`value as u8`).
     ///
     /// Semantics (v0, integers only):
     /// - Target must be `u64`, `i64`, or `u8` (float/String/array casts are
@@ -3452,7 +3450,7 @@ mod tests {
     #[test]
     fn arrays_check_clean() {
         let (_, diags) = check_src(
-            "function sum(a: Array[u64]): u64 { return a[0u64]; } function main() { let a: *Array[u64] = Array.new::[u64](3u64); a[0u64] = 1u64; let b = [1u64, 2u64]; sum(a); sum(b); }",
+            "fun sum(a: Array[u64]): u64 { return a[0u64]; } fun main() { let a: *Array[u64] = Array.new::[u64](3u64); a[0u64] = 1u64; let b = [1u64, 2u64]; sum(a); sum(b); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -3460,7 +3458,7 @@ mod tests {
     #[test]
     fn objects_check_field_types_and_reference_operations() {
         let (_, diags) = check_src(
-            "type Counter = object { value: u64, }; function bump(c: *Counter): *Counter { c.value = c.value + 1u64; return c; } function main() { let c: *Counter = Counter { value = 1u64 }; let d = bump(c); d.value = 3u64; }",
+            "type Counter = object { value: u64, }; fun bump(c: *Counter): *Counter { c.value = c.value + 1u64; return c; } fun main() { let c: *Counter = Counter { value = 1u64 }; let d = bump(c); d.value = 3u64; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -3468,7 +3466,7 @@ mod tests {
     #[test]
     fn object_literal_field_count_is_one_diagnostic() {
         let (_, diags) = check_src(
-            "type Point = object { x: u64, }; function main() { let p = Point { y = 1, z = 2 }; }",
+            "type Point = object { x: u64, }; fun main() { let p = Point { y = 1, z = 2 }; }",
         );
         let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
         assert_eq!(errors.len(), 1, "{diags:?}");
@@ -3477,7 +3475,7 @@ mod tests {
 
     #[test]
     fn unknown_object_literal_is_one_diagnostic() {
-        let (_, diags) = check_src("function main() { let x = Missing {}; }");
+        let (_, diags) = check_src("fun main() { let x = Missing {}; }");
         let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
         assert_eq!(errors.len(), 1, "{diags:?}");
         assert!(
@@ -3488,21 +3486,21 @@ mod tests {
 
     #[test]
     fn integer_literals_coerce_in_array_context() {
-        let (_, diags) = check_src("function main() { let a = [1, 2u64]; a; }");
+        let (_, diags) = check_src("fun main() { let a = [1, 2u64]; a; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn integer_literals_coerce_at_concrete_boundaries() {
         let (_, diags) = check_src(
-            "function take(a: u64, b: i64, c: u8): u64 { return a; } function main(): u64 { take(1, 2, 3); return 4; }",
+            "fun take(a: u64, b: i64, c: u8): u64 { return a; } fun main(): u64 { take(1, 2, 3); return 4; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn empty_literal_needs_the_typed_constructor() {
-        let (_, diags) = check_src("function main() { let e = []; e; }");
+        let (_, diags) = check_src("fun main() { let e = []; e; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(
             diags
@@ -3514,7 +3512,7 @@ mod tests {
 
     #[test]
     fn bare_array_new_without_annotation_is_one_error() {
-        let (_, diags) = check_src("function main() { let a = Array.new(3); a; }");
+        let (_, diags) = check_src("fun main() { let a = Array.new(3); a; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(
             diags
@@ -3527,7 +3525,7 @@ mod tests {
     #[test]
     fn annotated_let_supplies_array_new_element() {
         let (typed, diags) =
-            check_src("function main() { let scores: Array[u64] = Array.new(3); scores; }");
+            check_src("fun main() { let scores: Array[u64] = Array.new(3); scores; }");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed
             .types
@@ -3537,14 +3535,13 @@ mod tests {
 
     #[test]
     fn annotated_let_accepts_empty_literal() {
-        let (_, diags) =
-            check_src("function main() { let e: *Array[u64] = []; e[0u64] = 1u64; e; }");
+        let (_, diags) = check_src("fun main() { let e: *Array[u64] = []; e[0u64] = 1u64; e; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn annotated_let_rejects_mismatch() {
-        let (_, diags) = check_src("function main() { let x: u64 = \"s\"; x; }");
+        let (_, diags) = check_src("fun main() { let x: u64 = \"s\"; x; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E309")),
@@ -3554,24 +3551,22 @@ mod tests {
 
     #[test]
     fn annotated_let_coerces_int_literals() {
-        let (_, diags) = check_src("function main() { let x: u64 = 3; x; }");
+        let (_, diags) = check_src("fun main() { let x: u64 = 3; x; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn annotated_let_with_explicit_turbofish_checks() {
-        let (_, diags) =
-            check_src("function main() { let a: Array[u64] = Array.new::[u64](3); a; }");
+        let (_, diags) = check_src("fun main() { let a: Array[u64] = Array.new::[u64](3); a; }");
         assert!(diags.is_empty(), "{diags:?}");
-        let (_, diags) =
-            check_src("function main() { let a: Array[String] = Array.new::[u64](3); a; }");
+        let (_, diags) = check_src("fun main() { let a: Array[String] = Array.new::[u64](3); a; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
     }
 
     #[test]
     fn annotated_let_in_generic_body() {
         let (_, diags) = check_src(
-            "function f[T](x: T): T { let y: T = x; let a: Array[T] = Array.new(1); return y; }",
+            "fun f[T](x: T): T { let y: T = x; let a: Array[T] = Array.new(1); return y; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -3579,7 +3574,7 @@ mod tests {
     #[test]
     fn failed_annotation_poisons_quietly() {
         // Parser reports E105; typecheck must not cascade.
-        let (toks, _) = vl_lex::lex("function main() { let x: Bogus = 1; x; }");
+        let (toks, _) = vl_lex::lex("fun main() { let x: Bogus = 1; x; }");
         let (prog, pdiags) = vl_syntax::parse(&toks, "");
         assert!(pdiags.iter().any(|d| d.is_error()));
         let (res, _) = vl_semantic::resolve(&prog);
@@ -3590,7 +3585,7 @@ mod tests {
 
     #[test]
     fn array_new_arg_is_checked() {
-        let (_, diags) = check_src("function main() { let a = Array.new::[u64](1.0f64); a; }");
+        let (_, diags) = check_src("fun main() { let a = Array.new::[u64](1.0f64); a; }");
         assert!(
             diags.iter().any(|d| d.message.contains("expects `u64`")),
             "{diags:?}"
@@ -3599,7 +3594,7 @@ mod tests {
 
     #[test]
     fn array_new_rejects_void_element() {
-        let (_, diags) = check_src("function main() { let a = Array.new::[void](1u64); a; }");
+        let (_, diags) = check_src("fun main() { let a = Array.new::[void](1u64); a; }");
         assert!(
             diags.iter().any(|d| d.message.contains("cannot be `void`")),
             "{diags:?}"
@@ -3609,19 +3604,19 @@ mod tests {
     #[test]
     fn string_arrays_check_clean() {
         let (_, diags) = check_src(
-            "function main() { let a = Array.new::[String](2u64); let b = [\"x\", \"y\"]; b[0u64]; }",
+            "fun main() { let a = Array.new::[String](2u64); let b = [\"x\", \"y\"]; b[0u64]; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn index_requires_array_and_u64() {
-        let (_, diags) = check_src(r#"function main() { let s = "hi"; let x = s[0u64]; x; }"#);
+        let (_, diags) = check_src(r#"fun main() { let s = "hi"; let x = s[0u64]; x; }"#);
         assert!(
             diags.iter().any(|d| d.message.contains("cannot index")),
             "{diags:?}"
         );
-        let (_, diags) = check_src("function main() { let a = [1u64]; let x = a[true]; x; }");
+        let (_, diags) = check_src("fun main() { let a = [1u64]; let x = a[true]; x; }");
         assert!(
             diags.iter().any(|d| d.message.contains("must be `u64`")),
             "{diags:?}"
@@ -3630,8 +3625,7 @@ mod tests {
 
     #[test]
     fn index_assign_checks_shapes() {
-        let (_, diags) =
-            check_src(r#"function main() { let a: *Array[u64] = [1u64]; a[0u64] = "s"; }"#);
+        let (_, diags) = check_src(r#"fun main() { let a: *Array[u64] = [1u64]; a[0u64] = "s"; }"#);
         assert!(
             diags.iter().any(|d| d.message.contains("cannot store")),
             "{diags:?}"
@@ -3641,7 +3635,7 @@ mod tests {
     #[test]
     fn arrays_are_not_numeric() {
         let (_, diags) =
-            check_src("function main() { let a = [1u64]; let b = [2u64]; let c = a + b; c; }");
+            check_src("fun main() { let a = [1u64]; let b = [2u64]; let c = a + b; c; }");
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E302")),
             "{diags:?}"
@@ -3651,20 +3645,20 @@ mod tests {
     #[test]
     fn comparisons_and_logic_yield_bool() {
         let (typed, diags) =
-            check_src("function main() { let a = 1; let ok = a < 2 && a == 1 || !false; ok; }");
+            check_src("fun main() { let a = 1; let ok = a < 2 && a == 1 || !false; ok; }");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.types.values().any(|t| *t == Ty::Bool));
     }
 
     #[test]
     fn untyped_integer_comparison_uses_concrete_context() {
-        let (_, diags) = check_src("function main() { let x = 1 < 2u64; x; }");
+        let (_, diags) = check_src("fun main() { let x = 1 < 2u64; x; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn logical_operators_require_bool() {
-        let (_, diags) = check_src("function main() { let x = 1 && true; x; }");
+        let (_, diags) = check_src("fun main() { let x = 1 && true; x; }");
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E304")),
             "{diags:?}"
@@ -3673,7 +3667,7 @@ mod tests {
 
     #[test]
     fn not_requires_bool() {
-        let (_, diags) = check_src("function main() { !1; }");
+        let (_, diags) = check_src("fun main() { !1; }");
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E304")),
             "{diags:?}"
@@ -3682,7 +3676,7 @@ mod tests {
 
     #[test]
     fn while_condition_must_be_bool() {
-        let (_, diags) = check_src("function main() { while (1) { 2; } }");
+        let (_, diags) = check_src("fun main() { while (1) { 2; } }");
         assert!(
             diags
                 .iter()
@@ -3693,7 +3687,7 @@ mod tests {
 
     #[test]
     fn assignment_type_mismatch_errors() {
-        let (_, diags) = check_src(r#"function main() { let x = 1; x = "s"; }"#);
+        let (_, diags) = check_src(r#"fun main() { let x = 1; x = "s"; }"#);
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E309")),
             "{diags:?}"
@@ -3702,7 +3696,7 @@ mod tests {
 
     #[test]
     fn assignment_with_matching_type_checks() {
-        let (_, diags) = check_src("function main() { let x = 1; x = 2; }");
+        let (_, diags) = check_src("fun main() { let x = 1; x = 2; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
@@ -3734,17 +3728,15 @@ mod tests {
 
     #[test]
     fn call_with_correct_types_checks_clean() {
-        let (_, diags) = check_src(
-            "function add(a: i64, b: i64): i64 { return a + b; } function main() { add(1, 2); }",
-        );
+        let (_, diags) =
+            check_src("fun add(a: i64, b: i64): i64 { return a + b; } fun main() { add(1, 2); }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn call_with_wrong_arity_errors_once() {
-        let (_, diags) = check_src(
-            "function add(a: i64, b: i64): i64 { return a + b; } function main() { add(1); }",
-        );
+        let (_, diags) =
+            check_src("fun add(a: i64, b: i64): i64 { return a + b; } fun main() { add(1); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("expects 2"));
     }
@@ -3752,7 +3744,7 @@ mod tests {
     #[test]
     fn call_with_wrong_param_type_errors() {
         let (_, diags) = check_src(
-            r#"function add(a: i64, b: i64): i64 { return a + b; } function main() { add(1, "s"); }"#,
+            r#"fun add(a: i64, b: i64): i64 { return a + b; } fun main() { add(1, "s"); }"#,
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("expects `i64`"), "{diags:?}");
@@ -3760,7 +3752,7 @@ mod tests {
 
     #[test]
     fn return_mismatch_errors() {
-        let (_, diags) = check_src(r#"function f(): i64 { return "s"; }"#);
+        let (_, diags) = check_src(r#"fun f(): i64 { return "s"; }"#);
         assert!(
             diags.iter().any(|d| d.message.contains("declares return")),
             "{diags:?}"
@@ -3770,7 +3762,7 @@ mod tests {
     #[test]
     fn trailing_expr_is_not_a_return() {
         // No implicit returns: a bare tail value does not satisfy `: i64`.
-        let (_, diags) = check_src(r#"function f(): i64 { "s"; }"#);
+        let (_, diags) = check_src(r#"fun f(): i64 { "s"; }"#);
         assert!(
             diags
                 .iter()
@@ -3781,13 +3773,13 @@ mod tests {
 
     #[test]
     fn explicit_return_satisfies_declared_type() {
-        let (_, diags) = check_src(r#"function f(): i64 { return 1; }"#);
+        let (_, diags) = check_src(r#"fun f(): i64 { return 1; }"#);
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn missing_return_is_an_error() {
-        let (_, diags) = check_src(r#"function f(): i64 { let x = 1; }"#);
+        let (_, diags) = check_src(r#"fun f(): i64 { let x = 1; }"#);
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E307")),
             "{diags:?}"
@@ -3796,7 +3788,7 @@ mod tests {
 
     #[test]
     fn bare_return_in_value_function_errors() {
-        let (_, diags) = check_src(r#"function f(): i64 { return; }"#);
+        let (_, diags) = check_src(r#"fun f(): i64 { return; }"#);
         assert!(
             diags.iter().any(|d| d.message.contains("returns nothing")),
             "{diags:?}"
@@ -3805,7 +3797,7 @@ mod tests {
 
     #[test]
     fn value_return_in_void_function_errors() {
-        let (_, diags) = check_src(r#"function main() { return 1; }"#);
+        let (_, diags) = check_src(r#"fun main() { return 1; }"#);
         assert!(
             diags.iter().any(|d| d.message.contains("returns `void`")),
             "{diags:?}"
@@ -3814,26 +3806,26 @@ mod tests {
 
     #[test]
     fn bare_return_in_void_function_checks() {
-        let (_, diags) = check_src(r#"function main() { return; }"#);
+        let (_, diags) = check_src(r#"fun main() { return; }"#);
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn return_inside_branch_satisfies_declared_type() {
         let (_, diags) =
-            check_src(r#"function f(x: bool): i64 { if (x) { return 1; } else { return 2; } }"#);
+            check_src(r#"fun f(x: bool): i64 { if (x) { return 1; } else { return 2; } }"#);
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn void_function_accepts_any_tail() {
-        let (_, diags) = check_src("function main() { 1 + 2; }");
+        let (_, diags) = check_src("fun main() { 1 + 2; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn binding_void_errors() {
-        let (_, diags) = check_src("use std.print; function main() { let x = print(\"hi\"); }");
+        let (_, diags) = check_src("use std.print; fun main() { let x = print(\"hi\"); }");
         assert!(
             diags.iter().any(|d| d.message.contains("void")),
             "{diags:?}"
@@ -3842,14 +3834,14 @@ mod tests {
 
     #[test]
     fn calling_a_let_binding_errors() {
-        let (_, diags) = check_src("let x = 1; function main() { x(); }");
+        let (_, diags) = check_src("let x = 1; fun main() { x(); }");
         assert!(diags.iter().any(|d| d.message.contains("not a function")));
     }
 
     #[test]
     fn unresolved_callee_poisoned_quietly() {
         // E201 comes from resolve; typecheck must not add a second error.
-        let (toks, _) = vl_lex::lex("function main() { nope(1); }");
+        let (toks, _) = vl_lex::lex("fun main() { nope(1); }");
         let (prog, _) = vl_syntax::parse(&toks, "");
         let (res, rdiags) = vl_semantic::resolve(&prog);
         assert!(rdiags.iter().any(|d| d.is_error()));
@@ -3883,7 +3875,7 @@ mod tests {
     #[test]
     fn generic_identity_infers_and_specializes() {
         let (typed, diags) = check_src(
-            "function id[T](x: T): T { return x; } function main() { let a = id(1u64); let b = id::[String](\"s\"); a; b; }",
+            "fun id[T](x: T): T { return x; } fun main() { let a = id(1u64); let b = id::[String](\"s\"); a; b; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("id$u64"));
@@ -3896,7 +3888,7 @@ mod tests {
     #[test]
     fn generic_array_first_checks() {
         let (typed, diags) = check_src(
-            "function first[T](a: Array[T]): T { return a[0u64]; } function main() { let x = first([1u64, 2u64]); x; }",
+            "fun first[T](a: Array[T]): T { return a[0u64]; } fun main() { let x = first([1u64, 2u64]); x; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("first$u64"));
@@ -3905,7 +3897,7 @@ mod tests {
     #[test]
     fn inference_failure_asks_for_turbofish() {
         let (_, diags) = check_src(
-            "function never[T](): T { let a = Array.new::[T](1u64); return a[0u64]; } function main() { never(); }",
+            "fun never[T](): T { let a = Array.new::[T](1u64); return a[0u64]; } fun main() { never(); }",
         );
         assert!(
             diags.iter().any(|d| d.message.contains("cannot infer")),
@@ -3915,18 +3907,16 @@ mod tests {
 
     #[test]
     fn conflicting_inference_is_one_error() {
-        let (_, diags) = check_src(
-            "function same[T](a: T, b: T): T { return a; } function main() { same(1u64, 2i64); }",
-        );
+        let (_, diags) =
+            check_src("fun same[T](a: T, b: T): T { return a; } fun main() { same(1u64, 2i64); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("conflicting types"), "{diags:?}");
     }
 
     #[test]
     fn explicit_arity_mismatch_is_one_error() {
-        let (_, diags) = check_src(
-            "function id[T](x: T): T { return x; } function main() { id::[u64, i64](1u64); }",
-        );
+        let (_, diags) =
+            check_src("fun id[T](x: T): T { return x; } fun main() { id::[u64, i64](1u64); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("type argument"), "{diags:?}");
     }
@@ -3934,7 +3924,7 @@ mod tests {
     #[test]
     fn turbofish_on_monomorphic_fn_is_an_error() {
         let (_, diags) = check_src(
-            "function add(a: i64, b: i64): i64 { return a + b; } function main() { add::[u64](1, 2); }",
+            "fun add(a: i64, b: i64): i64 { return a + b; } fun main() { add::[u64](1, 2); }",
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("not generic"), "{diags:?}");
@@ -3942,9 +3932,8 @@ mod tests {
 
     #[test]
     fn unbound_type_argument_is_an_error() {
-        let (_, diags) = check_src(
-            "function id[T](x: T): T { return x; } function main() { id::[Bogus](1u64); }",
-        );
+        let (_, diags) =
+            check_src("fun id[T](x: T): T { return x; } fun main() { id::[Bogus](1u64); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("unknown type"), "{diags:?}");
     }
@@ -3952,7 +3941,7 @@ mod tests {
     #[test]
     fn generic_to_generic_forwarding_monomorphizes() {
         let (typed, diags) = check_src(
-            "function id[T](x: T): T { return x; } function wrap[T](x: T): T { return id::[T](x); } function main() { wrap(1u64); }",
+            "fun id[T](x: T): T { return x; } fun wrap[T](x: T): T { return id::[T](x); } fun main() { wrap(1u64); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("wrap$u64"));
@@ -3967,7 +3956,7 @@ mod tests {
     #[test]
     fn generic_recursion_terminates() {
         let (typed, diags) = check_src(
-            "function count[T](a: Array[T], n: u64): u64 { if (n == 0u64) { return 0u64; } return count(a, n - 1u64); } function main() { count([1u64], 2u64); }",
+            "fun count[T](a: Array[T], n: u64): u64 { if (n == 0u64) { return 0u64; } return count(a, n - 1u64); } fun main() { count([1u64], 2u64); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("count$u64"));
@@ -3976,7 +3965,7 @@ mod tests {
     #[test]
     fn wrong_value_arg_in_instance_is_an_error() {
         let (_, diags) = check_src(
-            "function first[T](a: Array[T]): T { return a[0u64]; } function main() { first::[u64]([\"s\"]); }",
+            "fun first[T](a: Array[T]): T { return a[0u64]; } fun main() { first::[u64]([\"s\"]); }",
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(
@@ -3987,8 +3976,7 @@ mod tests {
 
     #[test]
     fn uninstantiated_generic_emits_no_instance() {
-        let (typed, diags) =
-            check_src("function dead[T](x: T): T { return x; } function main() { 1u64; }");
+        let (typed, diags) = check_src("fun dead[T](x: T): T { return x; } fun main() { 1u64; }");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.is_empty());
     }
@@ -3997,9 +3985,8 @@ mod tests {
     fn partial_return_path_is_an_error() {
         // Every reachable path must return: a single `if` branch is not
         // enough, even though a value `return` is present.
-        let (_, diags) = check_src(
-            "function f(x: bool): u64 { if (x) { return 1u64; } } function main() { f(true); }",
-        );
+        let (_, diags) =
+            check_src("fun f(x: bool): u64 { if (x) { return 1u64; } } fun main() { f(true); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(
             diags
@@ -4019,9 +4006,8 @@ mod tests {
     #[test]
     fn while_body_return_does_not_satisfy() {
         // A `while` body may never run, so its `return` never counts.
-        let (_, diags) = check_src(
-            "function f(x: bool): u64 { while (x) { return 1u64; } } function main() { f(true); }",
-        );
+        let (_, diags) =
+            check_src("fun f(x: bool): u64 { while (x) { return 1u64; } } fun main() { f(true); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E307")),
@@ -4033,7 +4019,7 @@ mod tests {
     fn bare_return_in_value_function_is_one_error() {
         // The invalid bare `return` is the single error: no second
         // missing-return diagnostic follows it.
-        let (_, diags) = check_src("function f(): i64 { return; } function main() { }");
+        let (_, diags) = check_src("fun f(): i64 { return; } fun main() { }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("returns nothing"), "{diags:?}");
     }
@@ -4044,8 +4030,7 @@ mod tests {
         // terminate with exactly one E303 diagnostic, not hang the compiler.
         // The void body keeps the return check quiet so the budget error is
         // the one root cause (single-root-error rule).
-        let (_, diags) =
-            check_src("function grow[T](x: T) { grow([x]); } function main() { grow(1u64); }");
+        let (_, diags) = check_src("fun grow[T](x: T) { grow([x]); } fun main() { grow(1u64); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert_eq!(diags[0].code.as_deref(), Some("E303"), "{diags:?}");
         assert!(
@@ -4057,17 +4042,17 @@ mod tests {
     #[test]
     fn nested_unknown_type_argument_is_an_error() {
         // `Array(Error)` is poisoned: one `unknown type` error, no cascade.
-        let (_, diags) = check_src("function main() { let a = Array.new::[Array[Bogus]](1u64); }");
+        let (_, diags) = check_src("fun main() { let a = Array.new::[Array[Bogus]](1u64); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("unknown type"), "{diags:?}");
     }
 
     #[test]
     fn u8_literal_range_is_checked() {
-        let (_, diags) = check_src("function main() { let x: u8 = 300; x; }");
+        let (_, diags) = check_src("fun main() { let x: u8 = 300; x; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("out of range"), "{diags:?}");
-        let (_, diags) = check_src("function main() { let x: u8 = 255; x; }");
+        let (_, diags) = check_src("fun main() { let x: u8 = 255; x; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
@@ -4075,9 +4060,8 @@ mod tests {
     fn int_binding_does_not_escape_to_u8_param() {
         // `let v = 300` resolves to `u64`, which must not pass a `u8`
         // parameter even though the literal would fit neither.
-        let (_, diags) = check_src(
-            "function take(x: u8): u8 { return x; } function main() { let v = 300; take(v); }",
-        );
+        let (_, diags) =
+            check_src("fun take(x: u8): u8 { return x; } fun main() { let v = 300; take(v); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("expects `u8`"), "{diags:?}");
     }
@@ -4087,12 +4071,12 @@ mod tests {
         // All-literal inference defaults to `u64`, so a generic result
         // crossing a narrower boundary mismatches instead of truncating.
         let (typed, diags) = check_src(
-            "function id[T](x: T): T { return x; } function f(): u64 { return id(300); } function main() { f(); }",
+            "fun id[T](x: T): T { return x; } fun f(): u64 { return id(300); } fun main() { f(); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("id$u64"));
         let (_, diags) = check_src(
-            "function id[T](x: T): T { return x; } function f(): u8 { return id(300); } function main() { f(); }",
+            "fun id[T](x: T): T { return x; } fun f(): u8 { return id(300); } fun main() { f(); }",
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("declares return"), "{diags:?}");
@@ -4104,7 +4088,7 @@ mod tests {
         // position: both orders infer `T = u64`.
         for call in ["same(1u64, 2)", "same(1, 2u64)"] {
             let (typed, diags) = check_src(&format!(
-                "function same[T](a: T, b: T): T {{ return a; }} function main() {{ {call}; }}"
+                "fun same[T](a: T, b: T): T {{ return a; }} fun main() {{ {call}; }}"
             ));
             assert!(diags.is_empty(), "{call}: {diags:?}");
             assert!(typed.instances.contains_key("same$u64"), "{call}");
@@ -4113,14 +4097,13 @@ mod tests {
 
     #[test]
     fn explicit_generic_call_contextualizes_empty_array_argument() {
-        let (_, diags) =
-            check_src("function take[T](a: *Array[T]) {} function main() { take::[u64]([]); }");
+        let (_, diags) = check_src("fun take[T](a: *Array[T]) {} fun main() { take::[u64]([]); }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn turbofish_on_extern_is_an_error() {
-        let (_, diags) = check_src("use std.print; function main() { print::[u64](\"hi\"); }");
+        let (_, diags) = check_src("use std.print; fun main() { print::[u64](\"hi\"); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("not generic"), "{diags:?}");
     }
@@ -4128,7 +4111,7 @@ mod tests {
     /// Build a `main` calling `id` once per nesting depth `0..count`
     /// (`1u64`, `[1u64]`, `[[1u64]]`, ...), each a distinct instance.
     fn nested_id_calls(count: usize) -> String {
-        let mut src = String::from("function id[T](x: T): T { return x; } function main() { ");
+        let mut src = String::from("fun id[T](x: T): T { return x; } fun main() { ");
         for depth in 0..count {
             src.push_str("id(");
             for _ in 0..depth {
@@ -4181,10 +4164,10 @@ mod tests {
     #[test]
     fn normalized_validation_accepts_clean_programs() {
         for src in [
-            "function main() { let x = 1; x; }",
-            "function id[T](x: T): T { return x; } function main() { id(1u64); }",
-            "function main() { let a = [1, 2]; a; }",
-            "function main() { 1 + 2; }",
+            "fun main() { let x = 1; x; }",
+            "fun id[T](x: T): T { return x; } fun main() { id(1u64); }",
+            "fun main() { let a = [1, 2]; a; }",
+            "fun main() { 1 + 2; }",
         ] {
             let (hir, typed, diags) = check_src_with_hir(src);
             assert!(diags.iter().all(|d| !d.is_error()), "{src}: {diags:?}");
@@ -4194,7 +4177,7 @@ mod tests {
 
     #[test]
     fn normalized_validation_rejects_lingering_int() {
-        let (hir, mut typed, _) = check_src_with_hir("function main() { let x = 1u64; x; }");
+        let (hir, mut typed, _) = check_src_with_hir("fun main() { let x = 1u64; x; }");
         // Inject a non-normalized `Int` where a concrete type belongs.
         typed.types.insert(0, Ty::Int);
         let errs = typed.validate_normalized(&hir, &[]);
@@ -4206,9 +4189,8 @@ mod tests {
     fn normalized_validation_skips_generic_templates() {
         // `Param` inside a generic body is expected and must not trip the
         // boundary check; instances themselves are concrete.
-        let (hir, typed, diags) = check_src_with_hir(
-            "function id[T](x: T): T { return x; } function main() { id(1u64); }",
-        );
+        let (hir, typed, diags) =
+            check_src_with_hir("fun id[T](x: T): T { return x; } fun main() { id(1u64); }");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.validate_normalized(&hir, &diags).is_empty());
         assert!(typed.instances.contains_key("id$u64"));
@@ -4216,7 +4198,7 @@ mod tests {
 
     #[test]
     fn untyped_arithmetic_defaults_to_u64() {
-        let (typed, diags) = check_src("function main() { 1 + 2; }");
+        let (typed, diags) = check_src("fun main() { 1 + 2; }");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.types.values().any(|t| *t == Ty::U64));
         assert!(!typed.types.values().any(|t| *t == Ty::Int));
@@ -4228,8 +4210,9 @@ mod tests {
     fn implicit_cross_integer_stays_narrow() {
         // Concrete `i64` does not coerce to `u64` even though both are
         // integers; only literals coerce.
-        let (_, diags) =
-            check_src("function take(x: u64): u64 { return x; } function main() { let v: i64 = 1i64; take(v); }");
+        let (_, diags) = check_src(
+            "fun take(x: u64): u64 { return x; } fun main() { let v: i64 = 1i64; take(v); }",
+        );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("expects `u64`"), "{diags:?}");
     }
@@ -4249,7 +4232,7 @@ mod tests {
     #[test]
     fn nested_array_constraints_solve() {
         let (typed, diags) = check_src(
-            "function first2[T](a: Array[Array[T]]): T { return a[0u64][0u64]; } function main() { first2([[1u64]]); }",
+            "fun first2[T](a: Array[Array[T]]): T { return a[0u64][0u64]; } fun main() { first2([[1u64]]); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("first2$u64"));
@@ -4257,9 +4240,8 @@ mod tests {
 
     #[test]
     fn all_int_constraints_default_to_u64() {
-        let (typed, diags) = check_src(
-            "function same[T](a: T, b: T): T { return a; } function main() { same(1, 2); }",
-        );
+        let (typed, diags) =
+            check_src("fun same[T](a: T, b: T): T { return a; } fun main() { same(1, 2); }");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("same$u64"));
     }
@@ -4270,8 +4252,7 @@ mod tests {
     fn flow_breaks_do_not_satisfy_returns() {
         // `break` inside `while` diverges the loop body but the function
         // still falls through.
-        let (_, diags) =
-            check_src("function f(): u64 { while (true) { break; } } function main() { f(); }");
+        let (_, diags) = check_src("fun f(): u64 { while (true) { break; } } fun main() { f(); }");
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E307")),
             "{diags:?}"
@@ -4280,7 +4261,7 @@ mod tests {
 
     #[test]
     fn unreachable_code_warns_without_failing() {
-        let (_, diags) = check_src("function main() { return; let x = 1; x; }");
+        let (_, diags) = check_src("fun main() { return; let x = 1; x; }");
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("W001")),
@@ -4291,7 +4272,7 @@ mod tests {
     #[test]
     fn if_both_branches_return_satisfies() {
         let (_, diags) = check_src(
-            "function f(x: bool): u64 { if (x) { return 1u64; } else { return 2u64; } } function main() { f(true); }",
+            "fun f(x: bool): u64 { if (x) { return 1u64; } else { return 2u64; } } fun main() { f(true); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -4300,35 +4281,35 @@ mod tests {
 
     #[test]
     fn as_cast_same_type_checks() {
-        let (_, diags) = check_src("function main() { let x = 1u64 as u64; x; }");
+        let (_, diags) = check_src("fun main() { let x = 1u64 as u64; x; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn as_cast_variable_between_integers_checks() {
         let (_, diags) = check_src(
-            "function take(x: u8): u8 { return x; } function main() { let v = 200u64; take(v as u8); }",
+            "fun take(x: u8): u8 { return x; } fun main() { let v = 200u64; take(v as u8); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn as_cast_literal_out_of_range_is_one_error() {
-        let (_, diags) = check_src("function main() { let x = 300 as u8; x; }");
+        let (_, diags) = check_src("fun main() { let x = 300 as u8; x; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("out of range"), "{diags:?}");
     }
 
     #[test]
     fn as_cast_rejects_non_integer_target() {
-        let (_, diags) = check_src("function main() { let x = 1u64 as String; x; }");
+        let (_, diags) = check_src("fun main() { let x = 1u64 as String; x; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("cannot cast"), "{diags:?}");
     }
 
     #[test]
     fn as_cast_rejects_non_integer_source() {
-        let (_, diags) = check_src("function main() { let s = \"hi\"; let x = s as u8; x; }");
+        let (_, diags) = check_src("fun main() { let s = \"hi\"; let x = s as u8; x; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("cannot cast"), "{diags:?}");
     }
@@ -4336,9 +4317,8 @@ mod tests {
     #[test]
     fn implicit_variable_conversion_still_rejected() {
         // Without `as`, a `u64` variable must not flow into `u8`.
-        let (_, diags) = check_src(
-            "function take(x: u8): u8 { return x; } function main() { let v = 1u64; take(v); }",
-        );
+        let (_, diags) =
+            check_src("fun take(x: u8): u8 { return x; } fun main() { let v = 1u64; take(v); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
     }
 
@@ -4347,7 +4327,7 @@ mod tests {
     #[test]
     fn unconstrained_param_rejects_arithmetic() {
         let (_, diags) = check_src(
-            "function add[T](a: T, b: T): T { return a + b; } function main() { add(1u64, 2u64); }",
+            "fun add[T](a: T, b: T): T { return a + b; } fun main() { add(1u64, 2u64); }",
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("Numeric"), "{diags:?}");
@@ -4356,7 +4336,7 @@ mod tests {
     #[test]
     fn numeric_bound_allows_arithmetic() {
         let (typed, diags) = check_src(
-            "function add[T extends Numeric](a: T, b: T): T { return a + b; } function main() { add(1u64, 2u64); add(1i64, 2i64); }",
+            "fun add[T extends Numeric](a: T, b: T): T { return a + b; } fun main() { add(1u64, 2u64); add(1i64, 2i64); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("add$u64"));
@@ -4366,7 +4346,7 @@ mod tests {
     #[test]
     fn comparable_bound_allows_equality() {
         let (_, diags) = check_src(
-            "function eq[T extends Comparable](a: T, b: T): bool { return a == b; } function main() { eq(1u64, 2u64); eq(\"a\", \"b\"); }",
+            "fun eq[T extends Comparable](a: T, b: T): bool { return a == b; } fun main() { eq(1u64, 2u64); eq(\"a\", \"b\"); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -4374,7 +4354,7 @@ mod tests {
     #[test]
     fn bound_violation_is_one_error() {
         let (_, diags) = check_src(
-            "function add[T extends Numeric](a: T, b: T): T { return a + b; } function main() { add(\"a\", \"b\"); }",
+            "fun add[T extends Numeric](a: T, b: T): T { return a + b; } fun main() { add(\"a\", \"b\"); }",
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("does not satisfy"), "{diags:?}");
@@ -4384,7 +4364,7 @@ mod tests {
     #[test]
     fn unconstrained_forwarding_to_bounded_is_an_error() {
         let (_, diags) = check_src(
-            "function add[T extends Numeric](a: T, b: T): T { return a + b; } function wrap[T](x: T): T { return add(x, x); } function main() { wrap(1u64); }",
+            "fun add[T extends Numeric](a: T, b: T): T { return a + b; } fun wrap[T](x: T): T { return add(x, x); } fun main() { wrap(1u64); }",
         );
         assert!(
             diags.iter().any(|d| d.message.contains("satisfy")),
@@ -4395,7 +4375,7 @@ mod tests {
     #[test]
     fn numeric_implies_comparable_forwarding() {
         let (_, diags) = check_src(
-            "function eq[T extends Comparable](a: T, b: T): bool { return a == b; } function wrap[T extends Numeric](x: T): bool { return eq(x, x); } function main() { wrap(1u64); }",
+            "fun eq[T extends Comparable](a: T, b: T): bool { return a == b; } fun wrap[T extends Numeric](x: T): bool { return eq(x, x); } fun main() { wrap(1u64); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -4405,7 +4385,7 @@ mod tests {
         // `Numeric` includes `f64`: allowing `x as u8` for `x: T` would copy
         // IEEE-754 bits into an integer lane once `T = f64`.
         let (_, diags) = check_src(
-            "function get[T extends Numeric](x: T): u8 { return x as u8; } function main() { get(1.5f64); }",
+            "fun get[T extends Numeric](x: T): u8 { return x as u8; } fun main() { get(1.5f64); }",
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("generic"), "{diags:?}");
@@ -4414,7 +4394,7 @@ mod tests {
 
     #[test]
     fn as_cast_from_f64_is_rejected() {
-        let (_, diags) = check_src("function main() { let x = 1.0f64 as u8; x; }");
+        let (_, diags) = check_src("fun main() { let x = 1.0f64 as u8; x; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("cannot cast"), "{diags:?}");
     }
@@ -4423,9 +4403,8 @@ mod tests {
     fn nested_int_literal_defers_to_concrete_element() {
         // Array literals keep `Array[Int]` until solving: `T` solves to
         // `Array[u8]` (not a `u64`-vs-`u8` conflict) and the `1` coerces.
-        let (typed, diags) = check_src(
-            "function same[T](a: T, b: T): T { return a; } function main() { same([1], [2u8]); }",
-        );
+        let (typed, diags) =
+            check_src("fun same[T](a: T, b: T): T { return a; } fun main() { same([1], [2u8]); }");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("same$Array_u8"));
     }
@@ -4433,7 +4412,7 @@ mod tests {
     #[test]
     fn nested_int_conflict_still_conflicts() {
         let (_, diags) = check_src(
-            "function same[T](a: T, b: T): T { return a; } function main() { same([1u64], [2u8]); }",
+            "fun same[T](a: T, b: T): T { return a; } fun main() { same([1u64], [2u8]); }",
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("conflicting types"), "{diags:?}");
@@ -4441,7 +4420,7 @@ mod tests {
 
     #[test]
     fn unannotated_all_int_array_defaults_to_u64() {
-        let (typed, diags) = check_src("function main() { let a = [1, 2]; a; }");
+        let (typed, diags) = check_src("fun main() { let a = [1, 2]; a; }");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed
             .types
@@ -4453,7 +4432,7 @@ mod tests {
     #[test]
     fn instance_bodies_validate_after_substitution() {
         let (hir, typed, diags) = check_src_with_hir(
-            "function add[T extends Numeric](a: T, b: T): T { return a + b; } function main() { add(1u64, 2u64); }",
+            "fun add[T extends Numeric](a: T, b: T): T { return a + b; } fun main() { add(1u64, 2u64); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.validate_normalized(&hir, &diags).is_empty());
@@ -4461,7 +4440,7 @@ mod tests {
 
     #[test]
     fn validation_stands_down_with_prior_errors() {
-        let (hir, mut typed, _) = check_src_with_hir("function main() { let x = 1u64; x; }");
+        let (hir, mut typed, _) = check_src_with_hir("fun main() { let x = 1u64; x; }");
         typed.types.insert(0, Ty::Error);
         // No prior errors: poison at the boundary is itself reported.
         let errs = typed.validate_normalized(&hir, &[]);
@@ -4557,21 +4536,21 @@ mod tests {
     fn mutable_downgrade_allowed_at_all_boundaries() {
         // `*Foo -> Foo` succeeds everywhere; `Foo -> *Foo` fails everywhere.
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; function read(foo: Foo) {} function change(foo: *Foo) {} function main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = e; read(e); read(v); change(e); }",
+            "type Foo = object { value: u64, }; fun read(foo: Foo) {} fun change(foo: *Foo) {} fun main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = e; read(e); read(v); change(e); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
 
         for (src, code) in [
             (
-                "type Foo = object { value: u64, }; function change(foo: *Foo) {} function main() { let v: Foo = Foo { value = 1u64 }; change(v); }",
+                "type Foo = object { value: u64, }; fun change(foo: *Foo) {} fun main() { let v: Foo = Foo { value = 1u64 }; change(v); }",
                 "E306",
             ),
             (
-                "type Foo = object { value: u64, }; function main() { let v: Foo = Foo { value = 1u64 }; let bad: *Foo = v; }",
+                "type Foo = object { value: u64, }; fun main() { let v: Foo = Foo { value = 1u64 }; let bad: *Foo = v; }",
                 "E309",
             ),
             (
-                "type Foo = object { value: u64, }; function get(): Foo { let v: Foo = Foo { value = 1u64 }; return v; } function bad(): *Foo { let v: Foo = Foo { value = 1u64 }; return v; }",
+                "type Foo = object { value: u64, }; fun get(): Foo { let v: Foo = Foo { value = 1u64 }; return v; } fun bad(): *Foo { let v: Foo = Foo { value = 1u64 }; return v; }",
                 "E307",
             ),
         ] {
@@ -4592,14 +4571,14 @@ mod tests {
     #[test]
     fn local_rebinding_uses_directional_coercion() {
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; function main() { let c: Foo = Foo { value = 1u64 }; c = Foo { value = 2u64 }; let m: *Foo = Foo { value = 1u64 }; m = Foo { value = 2u64 }; let p = 1u64; p = 2u64; let a: *Array[u64] = [1u64]; a = [2u64]; }",
+            "type Foo = object { value: u64, }; fun main() { let c: Foo = Foo { value = 1u64 }; c = Foo { value = 2u64 }; let m: *Foo = Foo { value = 1u64 }; m = Foo { value = 2u64 }; let p = 1u64; p = 2u64; let a: *Array[u64] = [1u64]; a = [2u64]; }",
         );
         // `m = Foo{}` upgrades a fresh readonly literal? No: fresh adopts
         // `*Foo` via context, so all rebindings are downgrades or exact.
         assert!(diags.is_empty(), "{diags:?}");
 
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; function main() { let m: *Foo = Foo { value = 1u64 }; let v: Foo = Foo { value = 1u64 }; m = v; }",
+            "type Foo = object { value: u64, }; fun main() { let m: *Foo = Foo { value = 1u64 }; let v: Foo = Foo { value = 1u64 }; m = v; }",
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert_eq!(diags[0].code.as_deref(), Some("E309"));
@@ -4608,34 +4587,33 @@ mod tests {
     #[test]
     fn readonly_writes_fail_mutable_writes_pass() {
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; function edit(m: *Foo) { m.value = 1u64; } function read(v: Foo) { v.value; }",
+            "type Foo = object { value: u64, }; fun edit(m: *Foo) { m.value = 1u64; } fun read(v: Foo) { v.value; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
 
-        let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; function bad(v: Foo) { v.value = 1u64; }",
-        );
+        let (_, diags) =
+            check_src("type Foo = object { value: u64, }; fun bad(v: Foo) { v.value = 1u64; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert_eq!(diags[0].code.as_deref(), Some("E310"));
 
-        let (_, diags) = check_src("function bad(a: Array[u64]) { a[0u64] = 1u64; }");
+        let (_, diags) = check_src("fun bad(a: Array[u64]) { a[0u64] = 1u64; }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert_eq!(diags[0].code.as_deref(), Some("E310"));
 
-        let (_, diags) = check_src("function good(a: *Array[u64]) { a[0u64] = 1u64; }");
+        let (_, diags) = check_src("fun good(a: *Array[u64]) { a[0u64] = 1u64; }");
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
     fn deep_projection_does_not_leak_mutability() {
         let (_, diags) = check_src(
-            "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; function bad(p: Parent) { p.child.value = 1u64; }",
+            "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; fun bad(p: Parent) { p.child.value = 1u64; }",
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert_eq!(diags[0].code.as_deref(), Some("E310"));
 
         let (_, diags) = check_src(
-            "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; function good(p: *Parent) { p.child.value = 1u64; p.children[0u64].value = 1u64; }",
+            "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; fun good(p: *Parent) { p.child.value = 1u64; p.children[0u64].value = 1u64; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -4643,25 +4621,26 @@ mod tests {
     #[test]
     fn mutable_returns_preserve_and_cannot_launder() {
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; function create(): *Foo { return Foo { value = 1u64 }; } function main() { let e = create(); let v: Foo = create(); e; v; }",
+            "type Foo = object { value: u64, }; fun create(): *Foo { return Foo { value = 1u64 }; } fun main() { let e = create(); let v: Foo = create(); e; v; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
 
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; function inspect(v: Foo): Foo { return v; } function main() { let v: Foo = Foo { value = 1u64 }; let bad: *Foo = inspect(v); }",
+            "type Foo = object { value: u64, }; fun inspect(v: Foo): Foo { return v; } fun main() { let v: Foo = Foo { value = 1u64 }; let bad: *Foo = inspect(v); }",
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
     }
 
     #[test]
     fn fresh_allocations_default_readonly_and_adopt_mutable() {
-        let (typed, diags) =
-            check_src("type Foo = object { value: u64, }; function main() { let v = Foo { value = 1u64 }; v; }");
+        let (typed, diags) = check_src(
+            "type Foo = object { value: u64, }; fun main() { let v = Foo { value = 1u64 }; v; }",
+        );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.types.values().any(|t| *t == Ty::Object("Foo".into())));
 
         let (typed, diags) = check_src(
-            "type Foo = object { value: u64, }; function main() { let e: *Foo = Foo { value = 1u64 }; e; }",
+            "type Foo = object { value: u64, }; fun main() { let e: *Foo = Foo { value = 1u64 }; e; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed
@@ -4671,7 +4650,7 @@ mod tests {
 
         // Existing values never upgrade from context.
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; function get(): Foo { let v: Foo = Foo { value = 1u64 }; return v; } function main() { let bad: *Foo = get(); }",
+            "type Foo = object { value: u64, }; fun get(): Foo { let v: Foo = Foo { value = 1u64 }; return v; } fun main() { let bad: *Foo = get(); }",
         );
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
     }
@@ -4680,7 +4659,7 @@ mod tests {
     fn invalid_mutable_shapes_are_one_e106() {
         // `*T` parses (needs substitution) and fails here with one E106 per
         // invalid annotation.
-        let (_, diags) = check_src("function f[T](x: *T): T { return x; }");
+        let (_, diags) = check_src("fun f[T](x: *T): T { return x; }");
         assert_eq!(
             diags.iter().filter(|d| d.is_error()).count(),
             1,
@@ -4691,8 +4670,8 @@ mod tests {
         // `*u64` is rejected by the parser; type checking stays quiet (no
         // cascade) when fed the poisoned HIR.
         for src in [
-            "function f(x: *u64) { x; }",
-            "type Foo = object { value: *u64, }; function main() { let x = 1u64; x; }",
+            "fun f(x: *u64) { x; }",
+            "type Foo = object { value: *u64, }; fun main() { let x = 1u64; x; }",
         ] {
             let (toks, _) = vl_lex::lex(src);
             let (prog, pdiags) = vl_syntax::parse(&toks, src);
@@ -4710,7 +4689,7 @@ mod tests {
     #[test]
     fn as_cast_never_upgrades_capability() {
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; function main() { let v: Foo = Foo { value = 1u64 }; let x = v as u64; x; }",
+            "type Foo = object { value: u64, }; fun main() { let v: Foo = Foo { value = 1u64 }; let x = v as u64; x; }",
         );
         // `Foo as u64` is an unsupported cast (E302), not a capability upgrade.
         assert!(diags.iter().any(|d| d.code.as_deref() == Some("E302")));
@@ -4720,27 +4699,27 @@ mod tests {
     fn generic_mutable_inference_preserves_and_merges() {
         // Unconstrained `T` preserves `*Foo`.
         let (typed, diags) = check_src(
-            "type Foo = object { value: u64, }; function identity[T](x: T): T { return x; } function main() { let e: *Foo = Foo { value = 1u64 }; let same = identity(e); same; }",
+            "type Foo = object { value: u64, }; fun identity[T](x: T): T { return x; } fun main() { let e: *Foo = Foo { value = 1u64 }; let same = identity(e); same; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("identity$Mut_Object_Foo"));
 
         // Explicit turbofish accepts `*Foo`.
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; function identity[T](x: T): T { return x; } function main() { let e: *Foo = Foo { value = 1u64 }; let same = identity::[*Foo](e); same; }",
+            "type Foo = object { value: u64, }; fun identity[T](x: T): T { return x; } fun main() { let e: *Foo = Foo { value = 1u64 }; let same = identity::[*Foo](e); same; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
 
         // Mixed `*Foo` + `Foo` constraints choose read-only `Foo`.
         let (typed, diags) = check_src(
-            "type Foo = object { value: u64, }; function same[T](a: T, b: T): T { return a; } function main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = Foo { value = 2u64 }; let r = same(e, v); r; }",
+            "type Foo = object { value: u64, }; fun same[T](a: T, b: T): T { return a; } fun main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = Foo { value = 2u64 }; let r = same(e, v); r; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("same$Object_Foo"));
 
         // Mangling distinguishes `Foo` from `*Foo`.
         let (typed, diags) = check_src(
-            "type Foo = object { value: u64, }; function identity[T](x: T): T { return x; } function main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = Foo { value = 2u64 }; let a = identity(e); let b = identity(v); a; b; }",
+            "type Foo = object { value: u64, }; fun identity[T](x: T): T { return x; } fun main() { let e: *Foo = Foo { value = 1u64 }; let v: Foo = Foo { value = 2u64 }; let a = identity(e); let b = identity(v); a; b; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.instances.contains_key("identity$Mut_Object_Foo"));
@@ -4751,25 +4730,25 @@ mod tests {
     fn generic_mutable_forwarding_and_array_context() {
         // Forwarding preserves `*Foo` through `wrap[T]` -> `id[T]`.
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; function id[T](x: T): T { return x; } function wrap[T](x: T): T { return id(x); } function main() { let e: *Foo = Foo { value = 1u64 }; let r = wrap(e); r.value = 1u64; }",
+            "type Foo = object { value: u64, }; fun id[T](x: T): T { return x; } fun wrap[T](x: T): T { return id(x); } fun main() { let e: *Foo = Foo { value = 1u64 }; let r = wrap(e); r.value = 1u64; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
 
         // `*Array[T]` is valid with a mutable formal.
         let (_, diags) = check_src(
-            "function get[T](a: *Array[T]): T { return a[0u64]; } function main() { let a: *Array[u64] = [1u64]; let x = get(a); x; }",
+            "fun get[T](a: *Array[T]): T { return a[0u64]; } fun main() { let a: *Array[u64] = [1u64]; let x = get(a); x; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
 
         // Read-only `Array[T]` formal accepts `*Array[u64]` via downgrade.
         let (_, diags) = check_src(
-            "function first[T](a: Array[T]): T { return a[0u64]; } function main() { let a: *Array[u64] = [1u64]; let x = first(a); x; }",
+            "fun first[T](a: Array[T]): T { return a[0u64]; } fun main() { let a: *Array[u64] = [1u64]; let x = first(a); x; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
 
         // Fresh array infers through a mutable generic formal.
         let (_, diags) = check_src(
-            "function take[T](a: *Array[T]): u64 { return 1u64; } function main() { let x = take([1u64]); x; }",
+            "fun take[T](a: *Array[T]): u64 { return 1u64; } fun main() { let x = take([1u64]); x; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -4778,7 +4757,7 @@ mod tests {
     fn generic_bounds_rechecked_after_substitution() {
         // `*Foo` does not satisfy `Numeric`.
         let (_, diags) = check_src(
-            "type Foo = object { value: u64, }; function add[T extends Numeric](a: T, b: T): T { return a + b; } function main() { let e: *Foo = Foo { value = 1u64 }; let x = add(e, e); x; }",
+            "type Foo = object { value: u64, }; fun add[T extends Numeric](a: T, b: T): T { return a + b; } fun main() { let e: *Foo = Foo { value = 1u64 }; let x = add(e, e); x; }",
         );
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E303")),
@@ -4787,13 +4766,13 @@ mod tests {
 
         // `*String` satisfies `Comparable` via its base.
         let (_, diags) = check_src(
-            "function eq[T extends Comparable](a: T, b: T): bool { return a == b; } function f(s: *String): bool { return eq(s, s); } function main() { let x = 1u64; x; }",
+            "fun eq[T extends Comparable](a: T, b: T): bool { return a == b; } fun f(s: *String): bool { return eq(s, s); } fun main() { let x = 1u64; x; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
 
         // Every monomorphized instance is normalized (no `Param`/`*T` leaks).
         let (hir, typed, diags) = check_src_with_hir(
-            "type Foo = object { value: u64, }; function identity[T](x: T): T { return x; } function main() { let e: *Foo = Foo { value = 1u64 }; let r = identity(e); r; }",
+            "type Foo = object { value: u64, }; fun identity[T](x: T): T { return x; } fun main() { let e: *Foo = Foo { value = 1u64 }; let r = identity(e); r; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.validate_normalized(&hir, &diags).is_empty());

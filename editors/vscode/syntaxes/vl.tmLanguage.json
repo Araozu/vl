@@ -57,7 +57,7 @@
     "declarations": {
       "patterns": [
         {
-          "match": "\\b(function)(\\s+)([A-Za-z_][A-Za-z0-9_]*)",
+          "match": "\\b(fun)(\\s+)([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": { "name": "storage.type.function.vl" },
             "3": { "name": "entity.name.function.vl" }
@@ -83,7 +83,7 @@
       "patterns": [
         {
           "name": "storage.type.vl",
-          "match": "\\b(?:let|function|type)\\b"
+          "match": "\\b(?:let|fun|type)\\b"
         },
         {
           "name": "keyword.control.vl",

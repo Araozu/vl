@@ -27,7 +27,7 @@ while literals assign with `name = value`. A fresh literal adopts an expected
 ```vl
 type Counter = object { value: u64, label: String, };
 
-function main() {
+fun main() {
     let counter: *Counter = Counter { label = "count", value = 0 };
     counter.value = counter.value + 1;
 }
@@ -44,12 +44,12 @@ read-only alias observes writes made through a mutable one.
 ```vl
 type Counter = object { value: u64, label: String, };
 
-function bump(counter: *Counter): *Counter {
+fun bump(counter: *Counter): *Counter {
     counter.value = counter.value + 1;
     return counter;
 }
 
-function main() {
+fun main() {
     let editable: *Counter = Counter { value = 1, label = "count" };
     let view: Counter = editable; // allowed downgrade
 
@@ -69,12 +69,12 @@ write through a mutable view is therefore visible through every alias:
 ```vl
 type Counter = object { value: u64, label: String, };
 
-function bump(counter: *Counter): *Counter {
+fun bump(counter: *Counter): *Counter {
     counter.value = counter.value + 1;
     return counter;
 }
 
-function main() {
+fun main() {
     let first: *Counter = Counter { value = 1, label = "count" };
     let second = bump(first);
     second.value = second.value + 1;
@@ -93,11 +93,11 @@ type Parent = object {
     children: *Array[*Child],
 };
 
-function inspect(parent: Parent) {
+fun inspect(parent: Parent) {
     // parent.child.value = 1; // error: read-only view
 }
 
-function edit(parent: *Parent) {
+fun edit(parent: *Parent) {
     parent.child.value = 1; // allowed
 }
 ```

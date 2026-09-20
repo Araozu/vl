@@ -18,7 +18,7 @@ pub enum TokenKind {
     Bool(bool),
     String(Vec<u8>),
     Let,
-    Function,
+    Fun,
     Type,
     Object,
     If,
@@ -27,7 +27,7 @@ pub enum TokenKind {
     Break,
     Continue,
     Return,
-    /// Explicit numeric conversion (`value as u8`, TypeScript-like).
+    /// Explicit numeric conversion (`value as u8`).
     As,
     /// Generic bound introducer (`T extends Numeric`).
     Extends,
@@ -366,7 +366,7 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 let word = &src[start..i];
                 let kind = match word {
                     "let" => TokenKind::Let,
-                    "function" => TokenKind::Function,
+                    "fun" => TokenKind::Fun,
                     "type" => TokenKind::Type,
                     "object" => TokenKind::Object,
                     "if" => TokenKind::If,
@@ -391,7 +391,7 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 diags.push(
                     Diagnostic::error(format!("unexpected character `{c}`"))
                         .with_label(Span::new(i, end), "unexpected here")
-                        .with_note("identifiers use letters, digits and `_`; see `let`, `function`")
+                        .with_note("identifiers use letters, digits and `_`; see `let`, `fun`")
                         .with_code("E000"),
                 );
                 tokens.push(Token::new(TokenKind::Invalid, Span::new(i, end)));
@@ -417,10 +417,17 @@ mod tests {
     }
 
     #[test]
-    fn lexes_function_keyword() {
+    fn lexes_fun_keyword() {
+        let (toks, diags) = lex("fun main() {}");
+        assert!(diags.is_empty());
+        assert!(matches!(toks[0].kind, TokenKind::Fun));
+    }
+
+    #[test]
+    fn function_is_not_a_keyword() {
         let (toks, diags) = lex("function main() {}");
         assert!(diags.is_empty());
-        assert!(matches!(toks[0].kind, TokenKind::Function));
+        assert!(matches!(toks[0].kind, TokenKind::Ident(ref name) if name == "function"));
     }
 
     #[test]
@@ -558,7 +565,7 @@ mod tests {
 
     #[test]
     fn lexes_as_and_extends_keywords() {
-        let (toks, diags) = lex("x as u8; function f[T extends Numeric](a: T): T { return a; }");
+        let (toks, diags) = lex("x as u8; fun f[T extends Numeric](a: T): T { return a; }");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::As)));
         assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Extends)));

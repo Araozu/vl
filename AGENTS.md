@@ -4,8 +4,8 @@ Read this before touching code. Short on purpose.
 
 ## Language
 
-VL surface syntax is TypeScript-like (`let`, `function`, braces, `//` comments).
-Semicolons are mandatory; keep new syntax TS-consistent.
+VL surface syntax uses `let`, `fun`, braces, and `//` comments.
+Semicolons are mandatory.
 
 ## Layout
 

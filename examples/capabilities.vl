@@ -4,15 +4,15 @@ type Counter = object {
     value: u64,
 };
 
-function read(counter: Counter): u64 {
+fun read(counter: Counter): u64 {
     return counter.value;
 }
 
-function increment(counter: *Counter) {
+fun increment(counter: *Counter) {
     counter.value = counter.value + 1;
 }
 
-function main() {
+fun main() {
     let counter: *Counter = Counter { value = 0 };
     let view: Counter = counter;
 
