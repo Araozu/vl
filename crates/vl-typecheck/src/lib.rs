@@ -3206,8 +3206,29 @@ fn common_type(a: &Ty, b: &Ty) -> Option<Ty> {
         }
     }
     match (a, b) {
-        (Ty::Array(x), Ty::Array(y)) => common_type(x, y).map(|e| Ty::Array(Box::new(e))),
+        // Nested container arguments stay invariant: no capability downgrade
+        // inside `Array` (only top-level `*R`/`R` mixing above, plus `int`).
+        // `Array[*Foo]` vs `Array[Foo]` therefore has no common type.
+        (Ty::Array(x), Ty::Array(y)) => invariant_common(x, y).map(|e| Ty::Array(Box::new(e))),
         (Ty::Mutable(x), Ty::Mutable(y)) => common_type(x, y).map(|e| Ty::Mutable(Box::new(e))),
+        _ => None,
+    }
+}
+
+/// Capability-invariant common type for nested positions: exact, `int`
+/// deferral, and structural `Array` recursion only (no `*R`/`R` downgrade).
+fn invariant_common(a: &Ty, b: &Ty) -> Option<Ty> {
+    if same_type(a, b) {
+        return Some(a.clone());
+    }
+    if *a == Ty::Int && is_integer(b) {
+        return Some(b.clone());
+    }
+    if *b == Ty::Int && is_integer(a) {
+        return Some(a.clone());
+    }
+    match (a, b) {
+        (Ty::Array(x), Ty::Array(y)) => invariant_common(x, y).map(|e| Ty::Array(Box::new(e))),
         _ => None,
     }
 }

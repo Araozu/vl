@@ -486,30 +486,21 @@ impl Lowerer<'_> {
     }
 }
 
-/// Bind an object/array value in its own local home. GC references alias the
-/// same heap allocation, but rebinding one local must not change another
-/// local that happened to receive that reference from a `let` initializer.
-/// Capability is already erased, so `*Object`/`*Array` alias alike.
+/// Bind a `let` value in its own local home. Rebinding one local must not
+/// change another that received the same value (`let b = a; a = 2;` leaves
+/// `b` alone for values and references alike). Capabilities are already
+/// erased, so all types alias the same way here.
 fn bind_local(l: &mut Lowerer, def: Option<&vl_hir::DefId>, value: &HirExpr, reg: Reg) {
     let Some(def) = def else {
         return;
     };
-    let is_ref = matches!(
-        l.resolved_ty(value.id()).map(|t| t.erase_capability()),
-        Some(Ty::Object(_) | Ty::Array(_))
-    );
-    let home = if is_ref {
-        let dst = l.reg();
-        l.instrs.push(Instr::Copy {
-            dst,
-            src: reg,
-            span: value.span(),
-        });
-        dst
-    } else {
-        reg
-    };
-    l.bindings.insert(def.0, home);
+    let dst = l.reg();
+    l.instrs.push(Instr::Copy {
+        dst,
+        src: reg,
+        span: value.span(),
+    });
+    l.bindings.insert(def.0, dst);
 }
 
 /// One top-level statement inside a function body. Shared by monomorphic
@@ -1852,6 +1843,24 @@ mod tests {
         // No rematerialized `<global>` pseudo-functions.
         assert!(!dump.contains("<global>"), "{dump}");
         assert!(lir.validate_runtime().is_none());
+    }
+
+    #[test]
+    fn primitive_rebinding_keeps_independent_homes() {
+        // `let b = a; a = 2;` must not change `b`: every `let` gets its own
+        // home `copy`, for values and references alike.
+        let src = "function main() { let a = 1u64; let b = a; a = 2u64; b; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let lir = lower(&hir, &typed);
+        let dump = lir.dump();
+        // Two lets -> two home copies (plus the rebinding copy).
+        assert!(dump.matches("copy").count() >= 3, "{dump}");
     }
 
     #[test]

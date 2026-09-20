@@ -1103,6 +1103,58 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
                 break;
             }
         }
+        // With globals, `main` calls resolve to the separate `main` body
+        // below (no re-init); the `<entrypoint>` above runs inits once at
+        // startup then calls it. Without globals, `main` IS the entrypoint.
+        if is_main && !prog.globals.is_empty() {
+            // Call `main` (zero args, void) then bare return.
+            if let Some(main_const) = fn_consts.get("main").copied() {
+                nara_calli(&mut e, main_const, Span::empty(0));
+            } else {
+                e.diags.push(
+                    Diagnostic::error("internal compiler error: missing main function constant")
+                        .with_code("E500"),
+                );
+                break;
+            }
+            e.bytecode.push(0x00); // ret (entrypoint, void)
+            if e.diags.iter().any(|d| d.is_error()) {
+                break;
+            }
+            if !nara_resolve_jumps(&mut e) {
+                break;
+            }
+            functions_out.push((entry_name_idx, std::mem::take(&mut e.bytecode)));
+            // Now emit the separate `main` body (no init) for calls.
+            e.reset_fn(nara_last_use(f));
+            let ctx = NaraFnCtx {
+                func: f,
+                is_main: false,
+                sigs: &sigs,
+                fn_consts: &fn_consts,
+                objects: &objects,
+                print_fn_idx,
+                print_u64_fn_idx,
+                global_slots: &global_slots,
+                global_tys: &global_tys,
+            };
+            for (idx, ins) in f.instrs.iter().enumerate() {
+                nara_instr(&mut e, ins, &ctx);
+                nara_free_dead(&mut e, ins, idx);
+                if e.diags.iter().any(|d| d.is_error()) {
+                    break;
+                }
+            }
+            if e.diags.iter().any(|d| d.is_error()) {
+                break;
+            }
+            if !nara_resolve_jumps(&mut e) {
+                break;
+            }
+            let main_idx = fn_names.get("main").copied().unwrap_or(entry_name_idx);
+            functions_out.push((main_idx, std::mem::take(&mut e.bytecode)));
+            continue;
+        }
         for (idx, ins) in f.instrs.iter().enumerate() {
             nara_instr(&mut e, ins, &ctx);
             nara_free_dead(&mut e, ins, idx);
@@ -1122,80 +1174,6 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
             fn_names.get(&f.name).copied().unwrap_or(entry_name_idx)
         };
         functions_out.push((name_idx, std::mem::take(&mut e.bytecode)));
-    }
-    // Library without `main` but with globals: emit an `<entrypoint>` that
-    // only initializes module state, so globals are never silently dropped.
-    // (Future library loading reuses this; no second entrypoint policy.)
-    // Works even with no user functions (global-only libraries): initializers
-    // without calls lower without a function context.
-    if !prog.functions.iter().any(|f| f.name == "main") && !prog.globals.is_empty() {
-        e.reset_fn(std::collections::HashMap::new());
-        // Stub function for init-only emission when no user function exists.
-        let stub;
-        let first: &vl_lir::Function = match prog.functions.first() {
-            Some(f) => f,
-            None => {
-                stub = vl_lir::Function {
-                    name: "<entrypoint>".into(),
-                    param_tys: vec![],
-                    ret: vl_typecheck::Ty::Void,
-                    instrs: vec![],
-                };
-                &stub
-            }
-        };
-        {
-            let ctx = NaraFnCtx {
-                func: first,
-                is_main: false,
-                sigs: &sigs,
-                fn_consts: &fn_consts,
-                objects: &objects,
-                print_fn_idx,
-                print_u64_fn_idx,
-                global_slots: &global_slots,
-                global_tys: &global_tys,
-            };
-            e.bytecode
-                .extend_from_slice(&[0x27, MODULE_STATE_RF, value_count, ref_count]);
-            for (gi, g) in prog.globals.iter().enumerate() {
-                let Some((is_ref, slot)) = global_slots.get(&g.id).copied() else {
-                    continue;
-                };
-                if g.init.is_empty() {
-                    continue;
-                }
-                let base = ((gi as u32) + 1) * 1_000_000;
-                let frag_last = nara_last_use_fragment(&g.init, &g.result);
-                let saved_last = std::mem::replace(&mut e.last_use, frag_last);
-                for ins in &g.init {
-                    nara_instr(&mut e, &remap_labels(ins, base), &ctx);
-                    if e.diags.iter().any(|d| d.is_error()) {
-                        break;
-                    }
-                }
-                e.last_use = saved_last;
-                if e.diags.iter().any(|d| d.is_error()) {
-                    break;
-                }
-                if is_ref {
-                    if let Some(rf) = e.rf_map.get(&g.result).copied() {
-                        e.bytecode
-                            .extend_from_slice(&[0x2f, MODULE_STATE_RF, slot, rf]);
-                    }
-                } else if let Some(rv) = e.rv_map.get(&g.result).copied() {
-                    e.bytecode
-                        .extend_from_slice(&[0x2d, MODULE_STATE_RF, slot, rv]);
-                }
-                free_fragment_regs(&mut e, &g.init, &g.result);
-            }
-            // Void return for the init-only entrypoint (bare `ret`,
-            // like `is_main` in `nara_ret`).
-            e.bytecode.push(0x00);
-            if !e.diags.iter().any(|d| d.is_error()) && nara_resolve_jumps(&mut e) {
-                functions_out.push((entry_name_idx, std::mem::take(&mut e.bytecode)));
-            }
-        }
     }
     if e.diags.iter().any(|d| d.is_error()) {
         diags.append(&mut e.diags);
@@ -1533,6 +1511,12 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 e.invalid.insert(*dst);
                 return;
             };
+            // Dead home (never read later, e.g. an unused `let`): no machine
+            // register or bytecode, like dead `Const`/`ArrayGet`.
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, kind);
+                return;
+            }
             if e.rv_map
                 .get(dst)
                 .copied()

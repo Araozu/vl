@@ -133,9 +133,10 @@ heap object, so a field write through a `*Point` is visible through every
 alias, including read-only ones. See the
 [Objects](/docs/objects) chapter for details.
 
-The name can be assigned a new value later, but the replacement must have the
-same type (a `*Foo` binding accepts a fresh `Foo {}`; a read-only `Foo`
-binding never accepts a `*Foo` upgrade):
+The name can be assigned a new value later, but the replacement must be
+coercible to the declared type: a `*Foo` value downgrades into a `Foo`
+binding, while a `Foo` value never upgrades into a `*Foo` binding (a
+`*Foo` binding accepts a fresh `Foo {}` via contextual capability):
 
 ```vl
 function main() {
