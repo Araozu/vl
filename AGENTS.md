@@ -66,11 +66,11 @@ cargo run -q -- build examples/arith.vl --emit lir > tests/golden/arith.lir
    Cover each touched stage with a unit test; extend `tests/pipeline.rs`
    and `examples/` for end-to-end behaviour.
 
-## Adding a backend (target TBD)
+## Adding a backend
 
 New file/type in `crates/vl-codegen` implementing `Target`, register in
 `lookup()` + `all_targets()`. Never branch the driver or LIR on target
-names. `dummy` stays until a real target replaces it as default.
+names. Naravm is currently the sole target.
 
 ## Commit style
 

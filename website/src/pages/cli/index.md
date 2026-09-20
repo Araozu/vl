@@ -62,8 +62,7 @@ List the code-generation targets known to the compiler:
 cargo run -- targets
 ```
 
-`naravm` produces a runnable Naravm vmfile. `dummy` and `stackvm` are text
-inspection backends; `stackvm` is a sketch and is not executable.
+`naravm` produces a runnable Naravm vmfile and is the only supported target.
 
 ## Build options
 
@@ -71,7 +70,7 @@ inspection backends; `stackvm` is a sketch and is not executable.
 
 | Option | Purpose |
 | --- | --- |
-| `--target <name>` | Select `naravm`, `dummy`, or `stackvm`. |
+| `--target <name>` | Select `naravm`. |
 | `--emit <kind>` | Dump `tokens`, `ast`, `lir`, or `asm` instead of the final artifact. |
 | `--out <path>` | Write output to a file instead of stdout. |
 
@@ -79,7 +78,7 @@ Examples:
 
 ```sh
 cargo run -- build examples/arith.vl --emit lir
-cargo run -- build examples/arith.vl --target dummy --emit asm
+cargo run -- build examples/arith.vl --target naravm
 cargo run -- build examples/hello.vl --target naravm --out /tmp/hello.nara
 ```
 

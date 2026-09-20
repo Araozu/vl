@@ -38,7 +38,7 @@ the token definitions and recursive-descent parser when the language changes.
 cargo run -- check examples/hello.vl        # frontend end-to-end
 cargo run -- build examples/hello.vl        # compile (Naravm backend)
 cargo run -- build examples/arith.vl --emit lir
-cargo run -- build examples/arith.vl --target stackvm
+cargo run -- build examples/arith.vl --target naravm
 cargo run -- lex examples/hello.vl
 cargo run -- parse examples/hello.vl
 cargo run -- targets                         # list backends

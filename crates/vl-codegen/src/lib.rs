@@ -1,11 +1,7 @@
 //! vl-codegen: backends. LIR -> target output.
 //!
-//! The final target platform is **undecided**, so this crate is a stable
-//! [`Target`] trait plus thin placeholder backends:
+//! This crate exposes a stable [`Target`] trait and the Naravm backend:
 //!
-//! - [`DummyTarget`]: human-readable pseudo-assembly, used by tests and
-//!   `--emit asm` until a real target lands.
-//! - [`StackVmTarget`]: stack-machine text format sketch (still TBD).
 //! - [`NaraVmTarget`]: executable Naravm 0.2 vmfiles: `fun main()`,
 //!   when present, becomes the `<entrypoint>` function plus one Nara function
 //!   per other user function. Integer/float arithmetic, comparisons, and control flow
@@ -87,212 +83,14 @@ pub fn modules_for_target(target: &str) -> Vec<vl_common::ModuleSpec> {
 
 /// All backends the driver knows about.
 pub fn all_targets() -> Vec<&'static str> {
-    vec![
-        NaraVmTarget.name(),
-        DummyTarget.name(),
-        StackVmTarget.name(),
-    ]
+    vec![NaraVmTarget.name()]
 }
 
 /// Look up a backend by `--target` flag value.
 pub fn lookup(name: &str) -> Option<Box<dyn Target>> {
     match name {
         "naravm" => Some(Box::new(NaraVmTarget)),
-        "dummy" => Some(Box::new(DummyTarget)),
-        "stackvm" => Some(Box::new(StackVmTarget)),
         _ => None,
-    }
-}
-
-// ---------------------------------------------------------- Dummy ---
-
-/// Pseudo-assembly for humans and golden tests. NOT a real ISA.
-pub struct DummyTarget;
-
-impl Target for DummyTarget {
-    fn name(&self) -> &'static str {
-        "dummy"
-    }
-
-    fn emit(&self, prog: &LirProgram) -> (Option<Artifact>, Vec<Diagnostic>) {
-        if let Some(bad) = prog.validate_runtime() {
-            return (
-                None,
-                vec![Diagnostic::error(format!("internal compiler error: {bad}")).with_code("E500")],
-            );
-        }
-        let mut text = format!("; vl dummy target — module {}\n", prog.module);
-        for g in &prog.globals {
-            text.push_str(&format!("global %{} {} : {} =\n", g.id, g.name, g.ty));
-            for ins in &g.init {
-                text.push_str(&format!("  {}\n", dummy_instr(ins)));
-            }
-            text.push_str(&format!("  init %{}\n", g.result.0));
-        }
-        for f in &prog.functions {
-            text.push_str(&format!("{}:\n", f.name));
-            for ins in &f.instrs {
-                text.push_str(&format!("  {}\n", dummy_instr(ins)));
-            }
-        }
-        (
-            Some(Artifact {
-                target: self.name().into(),
-                text,
-                bytes: None,
-            }),
-            vec![],
-        )
-    }
-}
-
-fn dummy_instr(ins: &Instr) -> String {
-    match ins {
-        Instr::Const { dst, value, .. } => format!("mov %{}, {}", dst.0, scalar_text(*value)),
-        Instr::StringConst { dst, .. } => format!("string %{} (unsupported)", dst.0),
-        Instr::Param { dst, index, .. } => format!("param %{}, {index}", dst.0),
-        Instr::Copy { dst, src, .. } => format!("mov %{}, %{}", dst.0, src.0),
-        Instr::GlobalLoad { dst, global, .. } => format!("global_load %{}, %{}", dst.0, global),
-        Instr::GlobalStore { global, src, .. } => format!("global_store %{}, %{}", global, src.0),
-        Instr::Not { dst, src, .. } => format!("not %{}, %{}", dst.0, src.0),
-        Instr::BinOp {
-            dst, op, lhs, rhs, ..
-        } => {
-            let m = match op {
-                LirOp::Add => "add",
-                LirOp::Sub => "sub",
-                LirOp::Mul => "mul",
-                LirOp::Div => "div",
-                LirOp::Eq => "eq",
-                LirOp::Ne => "ne",
-                LirOp::Lt => "lt",
-                LirOp::Le => "le",
-                LirOp::Gt => "gt",
-                LirOp::Ge => "ge",
-            };
-            format!("{m} %{}, %{}, %{}", dst.0, lhs.0, rhs.0)
-        }
-        Instr::Call {
-            dst, callee, args, ..
-        } => {
-            let args = args
-                .iter()
-                .map(|arg| format!("%{}", arg.0))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("call %{}, {callee}({args})", dst.0)
-        }
-        Instr::Ret { src, .. } => format!("ret %{}", src.0),
-        Instr::NewArray { dst, len, .. } => {
-            format!("new_array %{}, %{}", dst.0, len.0)
-        }
-        Instr::ArrayLit { dst, elems, .. } => {
-            let elems = elems
-                .iter()
-                .map(|e| format!("%{}", e.0))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("new_array_lit %{}, [{elems}]", dst.0)
-        }
-        Instr::ArrayGet {
-            dst, array, index, ..
-        } => {
-            format!("array_get %{}, %{}[%{}]", dst.0, array.0, index.0)
-        }
-        Instr::ArraySet {
-            array,
-            index,
-            value,
-            ..
-        } => {
-            format!("array_set %{}[%{}], %{}", array.0, index.0, value.0)
-        }
-        Instr::NewObject {
-            dst, name, fields, ..
-        } => {
-            format!("new_object %{} {name} ({} fields)", dst.0, fields.len())
-        }
-        Instr::ObjectGet {
-            dst, object, name, ..
-        } => {
-            format!("object_get %{} %{}.{}", dst.0, object.0, name)
-        }
-        Instr::ObjectSet {
-            object,
-            name,
-            value,
-            ..
-        } => {
-            format!("object_set %{}.{} = %{}", object.0, name, value.0)
-        }
-        Instr::Cast {
-            dst, src, target, ..
-        } => {
-            format!("cast %{}, %{} : {target}", dst.0, src.0)
-        }
-        Instr::BranchIfFalse { cond, target, .. } => {
-            format!("branch_if_false %{}, L{}", cond.0, target)
-        }
-        Instr::Jump { target, .. } => format!("jump L{}", target),
-        Instr::Label { id, .. } => format!("L{}:", id),
-    }
-}
-
-fn scalar_text(value: Scalar) -> String {
-    match value {
-        Scalar::Int(v) => format!("{v}int"),
-        Scalar::U64(v) => format!("{v}u64"),
-        Scalar::I64(v) => format!("{v}i64"),
-        Scalar::F64(v) => format!("{}f64", f64::from_bits(v)),
-        Scalar::Bool(v) => v.to_string(),
-        Scalar::U8(v) => format!("{v}u8"),
-    }
-}
-
-// -------------------------------------------------------- StackVM ---
-
-/// Sketch of a stack-machine text backend. Emits `push`/`add`/… lines;
-/// the bytecode encoding is TBD with the target decision.
-pub struct StackVmTarget;
-
-impl Target for StackVmTarget {
-    fn name(&self) -> &'static str {
-        "stackvm"
-    }
-
-    fn emit(&self, prog: &LirProgram) -> (Option<Artifact>, Vec<Diagnostic>) {
-        let diags =
-            vec![
-                Diagnostic::warning("stackvm backend is a sketch; output is not yet executable")
-                    .with_note("track the target-platform decision before hardening this"),
-            ];
-        if let Some(bad) = prog.validate_runtime() {
-            return (
-                None,
-                vec![Diagnostic::error(format!("internal compiler error: {bad}")).with_code("E500")],
-            );
-        }
-        let mut text = format!("# vl stackvm sketch — module {}\n", prog.module);
-        for g in &prog.globals {
-            text.push_str(&format!(".global %{} {} : {}\n", g.id, g.name, g.ty));
-            for ins in &g.init {
-                text.push_str(&format!("  {}\n", stackvm_instr(ins)));
-            }
-        }
-        for f in &prog.functions {
-            text.push_str(&format!(".fn {}\n", f.name));
-            for ins in &f.instrs {
-                text.push_str(&format!("  {}\n", stackvm_instr(ins)));
-            }
-        }
-        (
-            Some(Artifact {
-                target: self.name().into(),
-                text,
-                bytes: None,
-            }),
-            diags,
-        )
     }
 }
 
@@ -3001,87 +2799,6 @@ fn pad4(out: &mut Vec<u8>) {
     }
 }
 
-fn stackvm_instr(ins: &Instr) -> String {
-    match ins {
-        Instr::Const { value, .. } => format!("push {}", scalar_text(*value)),
-        Instr::StringConst { dst, .. } => format!("string %{} (unsupported)", dst.0),
-        Instr::Param { index, .. } => format!("param {index}"),
-        Instr::Copy { .. } => "dup".into(),
-        Instr::Not { .. } => "not".into(),
-        Instr::BinOp { op, .. } => match op {
-            LirOp::Add => "add",
-            LirOp::Sub => "sub",
-            LirOp::Mul => "mul",
-            LirOp::Div => "div",
-            LirOp::Eq => "eq",
-            LirOp::Ne => "ne",
-            LirOp::Lt => "lt",
-            LirOp::Le => "le",
-            LirOp::Gt => "gt",
-            LirOp::Ge => "ge",
-        }
-        .into(),
-        Instr::Call { callee, args, .. } => {
-            let args = args
-                .iter()
-                .map(|arg| format!("%{}", arg.0))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("call {callee}({args})")
-        }
-        Instr::Ret { .. } => "ret".into(),
-        Instr::GlobalLoad { dst, global, .. } => format!("global_load %{} %{}", dst.0, global),
-        Instr::GlobalStore { global, src, .. } => format!("global_store %{} %{}", global, src.0),
-        Instr::NewArray { dst, len, .. } => {
-            format!("new_array %{} len %{}", dst.0, len.0)
-        }
-        Instr::ArrayLit { dst, elems, .. } => {
-            format!("array_lit %{} of {} elems", dst.0, elems.len())
-        }
-        Instr::ArrayGet {
-            dst, array, index, ..
-        } => {
-            format!("array_get %{} %{}[%{}]", dst.0, array.0, index.0)
-        }
-        Instr::ArraySet {
-            array,
-            index,
-            value,
-            ..
-        } => {
-            format!("array_set %{}[%{}] %{}", array.0, index.0, value.0)
-        }
-        Instr::NewObject {
-            dst, name, fields, ..
-        } => {
-            format!("new_object %{} {name} ({} fields)", dst.0, fields.len())
-        }
-        Instr::ObjectGet {
-            dst, object, name, ..
-        } => {
-            format!("object_get %{} %{}.{}", dst.0, object.0, name)
-        }
-        Instr::ObjectSet {
-            object,
-            name,
-            value,
-            ..
-        } => {
-            format!("object_set %{}.{} = %{}", object.0, name, value.0)
-        }
-        Instr::Cast {
-            dst, src, target, ..
-        } => {
-            format!("cast %{} %{} : {target}", dst.0, src.0)
-        }
-        Instr::BranchIfFalse { cond, target, .. } => {
-            format!("branch_if_false %{} -> L{}", cond.0, target)
-        }
-        Instr::Jump { target, .. } => format!("jump L{}", target),
-        Instr::Label { id, .. } => format!("L{}:", id),
-    }
-}
-
 /// Out-of-range register ids would be a compiler bug; surface it loudly.
 pub fn reg_oob(span: Span, reg: u32) -> Diagnostic {
     Diagnostic::error(format!(
@@ -3278,25 +2995,6 @@ mod tests {
     }
 
     #[test]
-    fn dummy_and_stackvm_emit_array_instrs() {
-        let lir = lir_of("fun main() { var a = [1u64]; a[0u64] = 2u64; val x = a[0u64]; }");
-        let (art, diags) = DummyTarget.emit(&lir);
-        assert!(diags.is_empty());
-        let text = art.unwrap().text;
-        assert!(
-            text.contains("array_get") && text.contains("array_set"),
-            "{text}"
-        );
-
-        let (art, _) = StackVmTarget.emit(&lir);
-        let text = art.unwrap().text;
-        assert!(
-            text.contains("array_get") && text.contains("array_set"),
-            "{text}"
-        );
-    }
-
-    #[test]
     fn countdown_while_emits_runnable_naravm() {
         let lir = lir_of(
             "use std; fun main() { var i = 3u64; while (i > 0u64) { std.print_u64(i); i = i - 1u64; } }",
@@ -3402,40 +3100,8 @@ fun main() {
     }
 
     #[test]
-    fn dummy_emits_control_flow() {
-        let lir = lir_of("fun main() { var i = 0; while (i < 1) { i = i + 1; } }");
-        let (art, diags) = DummyTarget.emit(&lir);
-        assert!(diags.is_empty());
-        let text = art.unwrap().text;
-        assert!(text.contains("jump") && text.contains("L0:"), "{text}");
-    }
-
-    #[test]
-    fn dummy_emits_text() {
-        let lir = lir_of("fun main() { 1 + 2; }");
-        let (art, diags) = DummyTarget.emit(&lir);
-        assert!(diags.is_empty());
-        assert!(art.unwrap().text.contains("add"));
-    }
-
-    #[test]
     fn unknown_target_is_none() {
         assert!(lookup("x86-64").is_none());
-    }
-
-    #[test]
-    fn backends_emit_calls_and_parameters() {
-        let lir =
-            lir_of("fun add(a: i64, b: i64): i64 { return a + b; } fun main() { add(1, 2); }");
-        let (art, diags) = DummyTarget.emit(&lir);
-        assert!(diags.is_empty());
-        let text = art.unwrap().text;
-        assert!(text.contains("param %0, 0"), "{text}");
-        assert!(text.contains("call %2, add(%0, %1)"), "{text}");
-
-        let (art, diags) = StackVmTarget.emit(&lir);
-        assert_eq!(diags.len(), 1);
-        assert!(art.unwrap().text.contains("call add(%0, %1)"));
     }
 
     #[test]
@@ -3509,9 +3175,7 @@ fun main() {
         assert!(!modules_for_target("naravm")
             .iter()
             .any(|m| m.path.as_string() == "std.fs"));
-        assert!(modules_for_target("dummy")
-            .iter()
-            .any(|m| m.path.as_string() == "std.fs"));
+        assert!(modules_for_target("unknown").iter().any(|m| m.path.as_string() == "std.fs"));
     }
 
     #[test]
@@ -3568,11 +3232,6 @@ fun main() {
         let lir = lir_of(
             "type Foo = object { value: u64, }; fun bump(c: *Foo) { c.value = 1u64; } fun fill(a: *Array[u64]) { a[0u64] = 1u64; } fun main() { val c: *Foo = Foo { value = 1u64 }; bump(c); }",
         );
-        let (art, diags) = DummyTarget.emit(&lir);
-        assert!(diags.is_empty(), "{diags:?}");
-        let text = art.unwrap().text;
-        assert!(text.contains("object_set"), "{text}");
-        assert!(text.contains("array_set"), "{text}");
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");
         let bytes = artifact.unwrap().bytes.unwrap();
@@ -3668,11 +3327,6 @@ fun main() {
             }],
         };
         let (_, diags) = NaraVmTarget.emit(&lir);
-        assert!(
-            diags.iter().any(|d| d.code.as_deref() == Some("E500")),
-            "{diags:?}"
-        );
-        let (_, diags) = DummyTarget.emit(&lir);
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E500")),
             "{diags:?}"

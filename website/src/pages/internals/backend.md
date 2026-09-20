@@ -38,9 +38,8 @@ backend will consume the program.
 
 ## `vl-codegen`
 
-Defines the `Target` trait and registers `naravm`, `dummy`, and `stackvm`.
-`naravm` serializes Naravm 0.2 vmfiles; the other targets are inspection
-backends.
+Defines the `Target` trait and registers the `naravm` backend, which serializes
+Naravm 0.2 vmfiles.
 
 The Naravm backend compiles every `fun` item: `fun main()` (which
 takes no parameters) becomes the `<entrypoint>` function and each other user

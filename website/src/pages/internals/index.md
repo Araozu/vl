@@ -43,9 +43,8 @@ from becoming a cascade of repeated errors.
 
 ## Target boundary
 
-`vl-lir` stays independent of any target platform. Backends implement the
-`Target` trait in `vl-codegen` and are registered by name. The current targets
-are `naravm`, `dummy`, and `stackvm`; only `naravm` produces a runnable vmfile.
+`vl-lir` stays independent of any target platform. The `naravm` backend
+implements the `Target` trait in `vl-codegen` and produces runnable vmfiles.
 
 The driver selects a target at build time with `--target`. The frontend and
 LIR do not branch on target names, which keeps adding a backend local to

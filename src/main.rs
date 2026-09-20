@@ -36,7 +36,7 @@ enum Cmd {
     Build {
         /// Source file. Omit this to build the current directory's project.
         file: Option<PathBuf>,
-        /// Which backend to use (target platform TBD; see `vl-codegen`).
+        /// Which backend to use.
         #[arg(long, default_value = "naravm")]
         target: String,
         /// Dump an intermediate instead of compiling.
