@@ -113,8 +113,10 @@ is discarded, never returned),
 calls between user functions (nestable, order-independent, recursive;
 arity and argument types are checked, `void` results only as bare statements),
 `if`/`else` conditionals with mandatory parentheses, and `while` loops
-with `break` / `continue`. Every program must define a zero-argument
-`function main()` returning `void` as its entrypoint; other functions compile
+with `break` / `continue`. A runnable program defines a zero-argument
+`function main()` returning `void` as its entrypoint; `main` is optional at
+compile time (snippets and libraries compile without one — entrypoint
+presence is validated by the VM/loader, not the compiler). Other functions compile
 to their own Nara functions on the Naravm target (see `examples/calls.vl`).
 Branches may be single statements or brace-delimited blocks. `//` comments.
 String escapes are `\\0`,
