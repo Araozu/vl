@@ -1,6 +1,6 @@
 <script lang="ts">
   import { compileVl, formatCompileLines } from '../lib/vl-compile';
-  let source = $state('use std.print;\n\nfunction main() {\n    print("Hello, world!\\n");\n}');
+  let source = $state('use std.println;\n\nfunction main() {\n    println("Hello, world!");\n}');
   let output = $state<string[]>(['// Naravm compiler ready — press Run']);
   let compiling = $state(false);
   let artifact = $state<Uint8Array | null>(null);
@@ -35,8 +35,8 @@
   }
 
   function loadSample(kind: 'hello' | 'arith' | 'error') {
-    if (kind === 'hello') source = 'use std.print;\n\nfunction main() {\n    print("Hello, world!\\n");\n}';
-    if (kind === 'arith') source = 'use std.print;\n\nfunction main() {\n    print("2 + 3 = ");\n}';
+    if (kind === 'hello') source = 'use std.println;\n\nfunction main() {\n    println("Hello, world!");\n}';
+    if (kind === 'arith') source = 'use std.println;\n\nfunction main() {\n    println("2 + 3 = 5");\n}';
     if (kind === 'error') source = 'function main() { undefined_var; }';
     artifact = null;
     output = ['// sample loaded — press Run'];

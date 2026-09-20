@@ -23,7 +23,7 @@ Request:
 
 ```json
 {
-  "source": "use std.print;\nfunction main() { print(\"hello\\n\"); }",
+  "source": "use std.println;\nfunction main() { println(\"hello\"); }",
   "filename": "playground.vl"
 }
 ```

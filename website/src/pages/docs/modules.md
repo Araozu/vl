@@ -10,8 +10,7 @@ availability: VL 0.1+
 
 As a program grows, put related code in separate files and reuse it with
 imports. VL also provides a small standard library for common operations such
-as printing (`std.print` writes a string as-is; `std.println` appends a
-newline).
+as printing (`std.println` appends a newline; `std.print` writes a string as-is).
 
 ## Source files are modules
 
@@ -22,12 +21,12 @@ Each `.vl` file is a module named after its filename without the extension. A
 use std;
 
 function main() {
-    std.print("hello\n");
+    std.println("hello");
 }
 ```
 
-Here, `std` is the module name and `print` is an export from that module. The
-dotted form `std.print(...)` makes it clear where the function comes from.
+Here, `std` is the module name and `println` is an export from that module. The
+dotted form `std.println(...)` makes it clear where the function comes from.
 
 ## Importing a single export
 
@@ -35,10 +34,10 @@ A trailing name can be imported directly. This lets you call the function
 without writing its module name:
 
 ```vl
-use std.print;
+use std.println;
 
 function main() {
-    print("hello\n");
+    println("hello");
 }
 ```
 
@@ -88,9 +87,9 @@ A small program can combine an import, a function, and a string:
 use std;
 
 function greet(name: String) {
-    std.print("Hello, ");
-    std.print(name);
-    std.print("!\n");
+    std.println("Hello, ");
+    std.println(name);
+    std.println("!");
 }
 
 function main() {

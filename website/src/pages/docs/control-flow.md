@@ -24,9 +24,9 @@ function main() {
     let temperature = 25;
 
     if (temperature > 30) {
-        std.print("hot\n");
+        std.println("hot");
     } else {
-        std.print("comfortable\n");
+        std.println("comfortable");
     }
 }
 ```
@@ -38,18 +38,18 @@ You can omit braces when a branch contains one statement, but braces are often
 clearer and make it easier to add another statement later:
 
 ```vl
-if (ready) std.print("go\n");
+if (ready) std.println("go");
 ```
 
 Several choices can be chained with `else if`:
 
 ```vl
 if (score >= 90) {
-    std.print("A\n");
+    std.println("A");
 } else if (score >= 80) {
-    std.print("B\n");
+    std.println("B");
 } else {
-    std.print("keep practicing\n");
+    std.println("keep practicing");
 }
 ```
 

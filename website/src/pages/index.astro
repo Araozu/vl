@@ -4,8 +4,8 @@ import Playground from '../components/Playground.svelte';
 import { Code } from 'astro:components';
 import vlLang from '../grammars/vl.tmLanguage.json';
 
-const heroSample = `use std.print;\nfunction main() { print("Hello, world!\\n"); }`;
-const overviewSample = `// A complete program has one required entrypoint\nuse std.print;\nfunction main() { print("Hello, world!\\n"); }`;
+const heroSample = `use std.println;\nfunction main() { println("Hello, world!"); }`;
+const overviewSample = `// A complete program has one required entrypoint\nuse std.println;\nfunction main() { println("Hello, world!"); }`;
 const vlThemes = { light: 'github-light', dark: 'github-dark' };
 ---
 

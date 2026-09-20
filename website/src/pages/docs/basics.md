@@ -18,7 +18,7 @@ variables, `function` for reusable work, and semicolons to finish statements.
 use std;
 
 function main() {
-    std.print("Hello, VL!\n");
+    std.println("Hello, VL!");
 }
 ```
 
@@ -27,12 +27,11 @@ Read this from top to bottom:
 1. `use std;` makes the standard library module available.
 2. `function main()` defines the starting point of the program.
 3. Braces mark the function body.
-4. `std.print(...)` calls a function.
+4. `std.println(...)` calls a function.
 5. The semicolon marks the end of the call.
 
-`std.print` writes the string exactly as given. When you want the line to
-end with a newline, call `std.println("Hello, VL!")` instead — it appends
-`"\n"` for you.
+`std.println` writes the string and appends a `"\n"` for you. A plain
+`std.print` also exists and writes the string exactly as given.
 
 Every runnable program needs a zero-argument `function main()` that returns
 `void`. A missing return type means `void`, so `function main()` and
@@ -175,7 +174,7 @@ use std;
 
 function main() {
     let message = "ready";
-    std.print(message);
+    std.println(message);
 }
 ```
 

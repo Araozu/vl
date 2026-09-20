@@ -17,10 +17,10 @@
 
     Import the module before calling it:
   import_example: |
-    use std.print;
+    use std.println;
 
     function main() {
-        print("Hello, world!\n");
+        println("Hello, world!");
     }
   functions:
     - name: print

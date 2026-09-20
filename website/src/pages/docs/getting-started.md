@@ -24,16 +24,16 @@ binary.
 Create `hello.vl` with one import and one entrypoint:
 
 ```vl
-use std.print;
+use std.println;
 
 function main() {
-    print("Hello, world!\n");
+    println("Hello, world!");
 }
 ```
 
-The `print` call writes the string without adding another newline. To end
-the line automatically, use `println` instead — `println("Hello, world!")`
-prints the same bytes as `print("Hello, world!\n")`.
+The `println` call writes the string and ends the line automatically. A plain
+`print` also exists for output without an added newline — `println("Hello,
+world!")` prints the same bytes as `print("Hello, world!\n")`.
 
 ## Check the source
 

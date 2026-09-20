@@ -45,8 +45,7 @@ early, or let it reach the closing brace.
 use std;
 
 function announce(message: String) {
-    std.print(message);
-    std.print("\n");
+    std.println(message);
 }
 
 function main() {
