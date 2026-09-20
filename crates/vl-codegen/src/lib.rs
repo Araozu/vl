@@ -1049,13 +1049,14 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
                 // die at their last textual use inside this fragment).
                 let frag_last = nara_last_use_fragment(&g.init, &g.result);
                 let saved_last = std::mem::replace(&mut e.last_use, frag_last);
-                for ins in &g.init {
+                for (frag_idx, ins) in g.init.iter().enumerate() {
                     let remapped = remap_labels(ins, base);
                     nara_instr(&mut e, &remapped, &ctx);
                     // Free against the fragment's liveness, not the main's.
                     // (Uses `e.last_use` currently holding the fragment map;
                     // indices below are fragment-relative, which is fine for
                     // straight-line temps. Branchy inits use offset labels.)
+                    nara_free_dead(&mut e, &remapped, frag_idx);
                     if e.diags.iter().any(|d| d.is_error()) {
                         break;
                     }
@@ -1174,6 +1175,83 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
             fn_names.get(&f.name).copied().unwrap_or(entry_name_idx)
         };
         functions_out.push((name_idx, std::mem::take(&mut e.bytecode)));
+    }
+    // Library without `main` but with globals: emit an `<entrypoint>` that
+    // only initializes module state, so globals are never silently dropped.
+    // LIR already retains the initializer bodies; this keeps the executable
+    // artifact consistent (standalone `naravm lib.nara` inits then exits).
+    // Future multi-module loading can replace this with an explicit init
+    // entry; for single-module builds this reuses the existing entrypoint
+    // policy instead of inventing a second one.
+    if !prog.functions.iter().any(|f| f.name == "main") && !prog.globals.is_empty() {
+        e.reset_fn(std::collections::HashMap::new());
+        // Stub function for init-only emission when no user function exists.
+        let stub;
+        let first: &vl_lir::Function = match prog.functions.first() {
+            Some(f) => f,
+            None => {
+                stub = vl_lir::Function {
+                    name: "<entrypoint>".into(),
+                    param_tys: vec![],
+                    ret: vl_typecheck::Ty::Void,
+                    instrs: vec![],
+                };
+                &stub
+            }
+        };
+        {
+            let ctx = NaraFnCtx {
+                func: first,
+                is_main: false,
+                sigs: &sigs,
+                fn_consts: &fn_consts,
+                objects: &objects,
+                print_fn_idx,
+                print_u64_fn_idx,
+                global_slots: &global_slots,
+                global_tys: &global_tys,
+            };
+            e.bytecode
+                .extend_from_slice(&[0x27, MODULE_STATE_RF, value_count, ref_count]);
+            for (gi, g) in prog.globals.iter().enumerate() {
+                let Some((is_ref, slot)) = global_slots.get(&g.id).copied() else {
+                    continue;
+                };
+                if g.init.is_empty() {
+                    continue;
+                }
+                let base = ((gi as u32) + 1) * 1_000_000;
+                let frag_last = nara_last_use_fragment(&g.init, &g.result);
+                let saved_last = std::mem::replace(&mut e.last_use, frag_last);
+                for (frag_idx, ins) in g.init.iter().enumerate() {
+                    let remapped = remap_labels(ins, base);
+                    nara_instr(&mut e, &remapped, &ctx);
+                    nara_free_dead(&mut e, &remapped, frag_idx);
+                    if e.diags.iter().any(|d| d.is_error()) {
+                        break;
+                    }
+                }
+                e.last_use = saved_last;
+                if e.diags.iter().any(|d| d.is_error()) {
+                    break;
+                }
+                if is_ref {
+                    if let Some(rf) = e.rf_map.get(&g.result).copied() {
+                        e.bytecode
+                            .extend_from_slice(&[0x2f, MODULE_STATE_RF, slot, rf]);
+                    }
+                } else if let Some(rv) = e.rv_map.get(&g.result).copied() {
+                    e.bytecode
+                        .extend_from_slice(&[0x2d, MODULE_STATE_RF, slot, rv]);
+                }
+                free_fragment_regs(&mut e, &g.init, &g.result);
+            }
+            // Void return for the init-only entrypoint (bare `ret`).
+            e.bytecode.push(0x00);
+            if !e.diags.iter().any(|d| d.is_error()) && nara_resolve_jumps(&mut e) {
+                functions_out.push((entry_name_idx, std::mem::take(&mut e.bytecode)));
+            }
+        }
     }
     if e.diags.iter().any(|d| d.is_error()) {
         diags.append(&mut e.diags);

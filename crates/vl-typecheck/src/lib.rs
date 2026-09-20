@@ -1428,9 +1428,12 @@ impl Checker {
         for (i, (arg, got)) in args.iter().zip(arg_tys.iter()).enumerate() {
             // Bare `Array.new(n)` without an element type defers its error
             // until the formal is known (contextual `Array`/` *Array`
-            // supplies it); all other poisoned args stay quiet.
+            // supplies it); empty `[]` defers the same way. All other
+            // poisoned args stay quiet.
             let is_bare_new = matches!(arg, HirExpr::Call { name, type_args, .. } if name == "Array.new" && type_args.is_empty());
-            if ty_has_error(got) && !is_bare_new {
+            let is_empty_array =
+                matches!(arg, HirExpr::ArrayLiteral { elems, .. } if elems.is_empty());
+            if ty_has_error(got) && !(is_bare_new || is_empty_array) {
                 continue;
             }
             let want = Ty::from_vl_in(&params[i].ty, &self.type_env);
@@ -2286,6 +2289,17 @@ impl Checker {
                             continue;
                         }
                     }
+                    // Empty `[]` likewise defers to the expected formal:
+                    // inferring now would emit E302 before the explicit
+                    // `::[T]` (or a concrete `Array[T]` formal) is known.
+                    // Push a quiet `Error`; the later expected check either
+                    // adopts the formal contextually or reports one error.
+                    if let HirExpr::ArrayLiteral { elems, .. } = arg {
+                        if elems.is_empty() {
+                            arg_tys.push(Ty::Error);
+                            continue;
+                        }
+                    }
                     let t = self.infer_expr(arg);
                     if ty_has_error(&t) {
                         poisoned = true;
@@ -2372,10 +2386,11 @@ impl Checker {
                     return self.record(*id, Ty::Error);
                 }
                 for (i, original_got) in arg_tys.iter().enumerate() {
-                    // Bare `Array.new` defers to expected-formal contextual
-                    // handling below; other poisoned args stay quiet.
+                    // Bare `Array.new` and empty `[]` defer to expected-formal
+                    // contextual handling below; other poisoned args stay quiet.
                     let is_bare_new = matches!(&args[i], HirExpr::Call { name, type_args, .. } if name == "Array.new" && type_args.is_empty());
-                    if ty_has_error(original_got) && !is_bare_new {
+                    let is_empty_array = matches!(&args[i], HirExpr::ArrayLiteral { elems, .. } if elems.is_empty());
+                    if ty_has_error(original_got) && !(is_bare_new || is_empty_array) {
                         continue;
                     }
                     let want = &param_tys[i];
