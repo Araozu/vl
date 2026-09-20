@@ -24,10 +24,11 @@ let words = ["one", "two"];
 
 For an array whose size is known but whose values will be filled in later, use
 the builtin `Array.new` constructor. The preferred form annotates the `let`
-so the element type comes from the annotation:
+so the element type comes from the annotation. Element writes require a
+`*Array[T]` view; reads work through either capability:
 
 ```vl
-let scores: Array[u64] = Array.new(3);
+let scores: *Array[u64] = Array.new(3);
 scores[0] = 10;
 scores[1] = 20;
 scores[2] = 30;
@@ -50,7 +51,7 @@ An index selects one element. Indexes start at zero, so the first element is
 
 ```vl
 function main() {
-    let values = [4, 8, 15];
+    let values: *Array[u64] = [4, 8, 15];
     let first = values[0];
     values[1] = first + 1;
 }
@@ -58,6 +59,9 @@ function main() {
 
 Indexes are `u64` values. Reading or writing outside the array bounds traps at
 runtime, so keep the length alongside the array when a loop needs it.
+`Array[T]` reads while `*Array[T]` writes; a `*Array[T]` argument downgrades
+to `Array[T]`, never the reverse. Indexing projects element capabilities
+(`Array[*Foo][i]` reads as `Foo`):
 
 ```vl
 function sum(values: Array[u64], count: u64): u64 {
@@ -71,8 +75,15 @@ function sum(values: Array[u64], count: u64): u64 {
 }
 ```
 
+```vl
+function fill(values: *Array[u64]) {
+    values[0] = 1;
+}
+```
+
 Arrays are reference values. Passing an array to a function gives that function
-the same array, so an assignment to an element changes the shared array.
+the same array, so an element write through a `*Array[T]` changes the shared
+array while a read-only `Array[T]` cannot write.
 
 ## Generic functions
 
@@ -87,17 +98,17 @@ function first[T](values: Array[T]): T {
 }
 
 function main() {
-    let numbers = [10, 20];
+    let numbers: *Array[u64] = [10, 20];
     let number = first(numbers);
-
     let words = ["hi", "bye"];
     let word = first(words);
 }
 ```
 
 VL infers `T` from the argument: it chooses `u64` for `numbers` and `String`
-for `words`. If inference is unclear, provide the type explicitly with the
-turbofish form `::[T]`:
+for `words`, preserving `*Foo` when the actual is mutable. If inference is
+unclear, provide the type explicitly with the
+turbofish form `::[T]` (including capabilities, e.g. `::[*Foo]`):
 
 ```vl
 let number = first::[u64](numbers);

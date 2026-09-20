@@ -16,6 +16,7 @@
     { "include": "#number" },
     { "include": "#turbofish" },
     { "include": "#function-call" },
+    { "include": "#capability" },
     { "include": "#type" },
     { "include": "#operator" },
     { "include": "#punctuation" }
@@ -197,6 +198,10 @@
     "type": {
       "patterns": [
         {
+          "name": "storage.modifier.capability.vl",
+          "match": "\\*(?=\\s*(?:u64|i64|f64|bool|u8|void|String|File|Array|[A-Z]))"
+        },
+        {
           "name": "storage.type.primitive.vl",
           "match": "\\b(?:u64|i64|f64|bool|u8|void)\\b"
         },
@@ -261,6 +266,10 @@
     "function-call": {
       "name": "entity.name.function.call.vl",
       "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?=\\s*::\\s*\\[|\\s*\\()"
+    },
+    "capability": {
+      "name": "storage.modifier.capability.vl",
+      "match": "\\*(?=\\s*(?:u64|i64|f64|bool|u8|void|String|File|Array|[A-Z]))"
     },
     "operator": {
       "patterns": [

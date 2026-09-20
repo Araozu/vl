@@ -34,7 +34,25 @@ The parts of the definition are:
 5. `return a + b;` sends the result back to the caller.
 
 The caller supplies arguments in the same order as the parameters. The number
-and types of the arguments must match the definition.
+and types of the arguments must match the definition. A `*Foo` argument
+downgrades to a `Foo` parameter; a `Foo` argument never upgrades to `*Foo`.
+
+## Fixed parameters
+
+Function parameters are always fixed bindings, for primitives and references
+alike. A function may mutate through a `*Foo` parameter, but it may never
+rebind the parameter itself:
+
+```vl
+function inspect(item: Foo) {
+    // item = other; // error: parameters cannot be rebound
+}
+
+function update(item: *Foo) {
+    item.value = 1; // allowed: mutates the referent
+    // item = other; // error: the binding is still fixed
+}
+```
 
 ## Functions that return nothing
 
@@ -71,7 +89,19 @@ function larger(a: i64, b: i64): i64 {
 ```
 
 `return;` is only for `void` functions. A returned value must have the type
-declared after the parameter list.
+declared after the parameter list. A `*Foo` result may initialize either a
+mutable or read-only binding; a `Foo` result can never initialize `*Foo`:
+
+```vl
+function create_foo(): *Foo {
+    return Foo {};
+}
+
+function main() {
+    let editable = create_foo();      // inferred *Foo
+    let view: Foo = create_foo();     // allowed downgrade
+}
+```
 
 ## Calling functions from functions
 

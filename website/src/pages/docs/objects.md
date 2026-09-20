@@ -21,12 +21,38 @@ type Counter = object {
 
 Create an object with a named literal. Every declared field must appear exactly
 once, and fields may be written in any order. Declarations use `name: type`,
-while literals assign with `name = value`:
+while literals assign with `name = value`. A fresh literal adopts an expected
+`*` capability and otherwise defaults to a read-only view:
 
 ```vl
 function main() {
-    let counter = Counter { label = "count", value = 0 };
+    let counter: *Counter = Counter { label = "count", value = 0 };
     counter.value = counter.value + 1;
+}
+```
+
+## Read-only views, mutable views, and aliasing
+
+`Foo` is a read-only view of a GC-managed `Foo`; `*Foo` is a mutable view of
+the same kind of allocation. Mutation authority belongs to each view, not to
+the heap object: there is no freezing, no borrow checker, and no exclusive
+mutable alias. Multiple `*Foo` aliases may coexist with read-only ones, and a
+read-only alias observes writes made through a mutable one.
+
+```vl
+function bump(counter: *Counter): *Counter {
+    counter.value = counter.value + 1;
+    return counter;
+}
+
+function main() {
+    let editable: *Counter = Counter { value = 1, label = "count" };
+    let view: Counter = editable; // allowed downgrade
+
+    editable.value = 2; // visible through `view`
+    let same = bump(editable);
+    same.value = same.value + 1;
+    // editable.value is now 4.
 }
 ```
 
@@ -34,26 +60,48 @@ function main() {
 
 Objects are reference values. Assigning an object, passing it to a function,
 or returning it passes the same object; it does not copy the fields. A field
-write is therefore visible through every alias:
+write through a mutable view is therefore visible through every alias:
 
 ```vl
-function bump(counter: Counter): Counter {
+function bump(counter: *Counter): *Counter {
     counter.value = counter.value + 1;
     return counter;
 }
 
 function main() {
-    let first = Counter { value = 1, label = "count" };
+    let first: *Counter = Counter { value = 1, label = "count" };
     let second = bump(first);
     second.value = second.value + 1;
     // first.value is now 3.
 }
 ```
 
-Object fields use the normal VL types, including `String`, `Array[T]`, and
-other object types. A field whose type is itself a reference value keeps that
-reference when the containing object is assigned. Array elements remain
-mutable through their existing indexing operations.
+Field declarations carry the maximum stored capability. Reading through a
+read-only receiver downgrades mutable fields transitively; a mutable receiver
+preserves them. Field assignment itself requires a `*Object` receiver:
+
+```vl
+type Child = object { value: u64, };
+type Parent = object {
+    child: *Child,
+    children: *Array[*Child],
+};
+
+function inspect(parent: Parent) {
+    // parent.child.value = 1; // error: read-only view
+}
+
+function edit(parent: *Parent) {
+    parent.child.value = 1; // allowed
+}
+```
+
+Object fields use the normal VL types, including `String`, `Array[T]`,
+`*Array[T]`, and other object types (including `*Child`). A field whose type
+is itself a reference value keeps that reference when the containing object
+is assigned. Array elements are read through either capability but written
+only through a mutable `*Array[T]` access path (projected transitively, as
+above).
 
 Objects are nominal data types. VL currently gives them fields and reference
 semantics only: there are no implicit constructors, methods, inheritance,

@@ -59,8 +59,8 @@ operations make sense for it.
 | `u8` | `255u8` | A small non-negative number |
 | `f64` | `3.14f64` | A decimal number |
 | `bool` | `true` | A yes/no value |
-| `String` | `"hello"` | A byte string |
-| `object` type | `Counter { value = 1 }` | Named mutable data with reference semantics |
+| `String` | `"hello"` | A byte string (read-only view) |
+| `object` type | `Counter { value = 1 }` | Named GC data; `Foo` reads, `*Foo` mutates |
 
 Integer literals are chosen from their context. For example, the parameter
 type tells VL what type the `1` and `2` should have here:
@@ -95,8 +95,11 @@ wrap instruction).
 
 ## Variables with `let`
 
-`let` gives a value a name so you can use it later. VL infers the type from the
-value on the right side of `=`.
+`let` is the only binding keyword: there is no `var`, `val`, or `const`.
+Every local `let` is rebindable, and its type is fixed after declaration.
+A reference spelling controls mutation authority: `Foo` is a read-only view
+of a GC-managed `Foo`, while `*Foo` is a mutable view of the same allocation.
+Passing or assigning either spelling copies the GC reference.
 
 ```vl
 let name = "Ada";
@@ -107,11 +110,13 @@ let welcome = visits == 1;
 A type can also be written down explicitly with an annotation. The value must
 have that type (integer literals adapt, so `3` works where `u64` is written).
 An annotation is required to give `Array.new` its element type without a
-turbofish:
+turbofish. A fresh object or array adopts an expected `*` capability:
 
 ```vl
 let retries: u64 = 3;
-let scores: Array[u64] = Array.new(3);
+let scores: *Array[u64] = Array.new(3);
+let view = Foo {};
+let editable: *Foo = Foo {};
 ```
 
 Named object types use `type Name = object { ... };` declarations. Their fields
@@ -119,21 +124,25 @@ are comma-separated, and an object literal initializes every field:
 
 ```vl
 type Point = object { x: u64, y: u64, };
-let point = Point { x = 10, y = 20 };
+let point: *Point = Point { x = 10, y = 20 };
 point.x = 11;
 ```
 
 Objects have reference semantics: assignment and function calls share the same
-heap object, so a field write is visible through every alias. See the
+heap object, so a field write through a `*Point` is visible through every
+alias, including read-only ones. See the
 [Objects](/docs/objects) chapter for details.
 
 The name can be assigned a new value later, but the replacement must have the
-same type:
+same type (a `*Foo` binding accepts a fresh `Foo {}`; a read-only `Foo`
+binding never accepts a `*Foo` upgrade):
 
 ```vl
 function main() {
     let count = 0;
     count = count + 1;
+    let current: *Counter = Counter { value = 0 };
+    current = Counter { value = 10 };
 }
 ```
 
