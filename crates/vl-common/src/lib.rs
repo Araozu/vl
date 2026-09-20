@@ -27,8 +27,8 @@ pub mod span;
 
 pub use diagnostic::{Diagnostic, Label, Severity};
 pub use module::{
-    Export, ExportDecl, FuncSig, ModuleInterface, ModuleOrigin, ModulePath, ModuleSpec, ParamSig,
-    SymbolRef,
+    Export, ExportDecl, FuncSig, ModuleInterface, ModuleOrigin, ModulePath, ModuleSpec,
+    ObjectExport, ObjectFieldSig, ParamSig, SymbolRef,
 };
 pub use source::{FileId, Source, Sources};
 pub use span::Span;

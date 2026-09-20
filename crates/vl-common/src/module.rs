@@ -80,11 +80,34 @@ pub struct Export {
     pub sig: FuncSig,
 }
 
+/// One exported object type: its short name, its fully qualified identity
+/// (`<module>.<name>`), and its field layouts. Object identity is nominal
+/// and qualified so two modules may each define a `Person` without collision;
+///
+/// importers name the type `vl.person.Person`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectExport {
+    pub name: String,
+    pub qualified: String,
+    pub fields: Vec<ObjectFieldSig>,
+}
+
+/// One exported object field: its name plus its declared type. Inner object
+/// references are stored fully qualified (`vl.person.Person`, never bare
+/// `Person`) so importers resolve them without the provider's scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectFieldSig {
+    pub name: String,
+    pub ty: VlType,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleSpec {
     pub path: ModulePath,
     pub exports: Vec<Export>,
     pub generic_exports: Vec<String>,
+    /// Exported object layouts, keyed by disambiguation through `qualified`.
+    pub objects: Vec<ObjectExport>,
     /// The provider had lexer/parser errors, so recovered AST omissions are
     /// not reliable evidence that an export does not exist.
     pub parse_poisoned: bool,
@@ -102,6 +125,7 @@ pub struct ModuleInterface {
     pub origin: ModuleOrigin,
     pub functions: Vec<Export>,
     pub generic_functions: Vec<String>,
+    pub objects: Vec<ObjectExport>,
     pub parse_poisoned: bool,
     pub poisoned_exports: Vec<String>,
     pub global_dependent_exports: Vec<String>,
@@ -113,6 +137,7 @@ impl ModuleInterface {
             path: self.path.clone(),
             exports: self.functions.clone(),
             generic_exports: self.generic_functions.clone(),
+            objects: self.objects.clone(),
             parse_poisoned: self.parse_poisoned,
             poisoned_exports: self.poisoned_exports.clone(),
             global_dependent_exports: self.global_dependent_exports.clone(),
@@ -135,6 +160,7 @@ impl ModuleSpec {
                 })
                 .collect(),
             generic_exports: Vec::new(),
+            objects: Vec::new(),
             parse_poisoned: false,
             poisoned_exports: Vec::new(),
             global_dependent_exports: Vec::new(),
