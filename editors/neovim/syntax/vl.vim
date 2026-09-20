@@ -27,7 +27,7 @@ syntax region vlString start=+"+ skip=+\\\\\|\\"+ end=+"+ oneline contains=vlEsc
 
 syntax keyword vlTodo TODO FIXME XXX NOTE contained
 syntax match vlComment '//.*$' contains=vlTodo
-syntax match vlOperator '\v(==|!=|<=|>=|&&|\|\||::|[+*/=!<>-])'
+syntax match vlOperator '\(==\|!=\|<=\|>=\|&&\|||\|::\|[+*/=!<>-]\)'
 
 highlight default link vlDeclaration Keyword
 highlight default link vlOperatorKeyword Operator

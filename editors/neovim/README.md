@@ -33,3 +33,22 @@ Run `:Lazy sync`, then open a `.vl` file. Verify detection with:
 ```
 
 The result should be `filetype=vl`.
+
+### Local development
+
+To load a local checkout instead of the repository plugin, use `dir` in the
+Lazy spec:
+
+```lua
+{
+  dir = vim.fn.expand("~/projects/rust/vl"),
+  name = "vl",
+  lazy = false,
+  init = function(plugin)
+    vim.opt.runtimepath:append(plugin.dir .. "/editors/neovim")
+    vim.filetype.add({ extension = { vl = "vl" } })
+  end,
+}
+```
+
+Change the path to the location of your local VL checkout.
