@@ -64,7 +64,7 @@
       "patterns": [
         {
           "name": "keyword.declaration.vl",
-          "match": "\\b(?:let|function|use)\\b"
+          "match": "\\b(?:let|function|use|type|object|as|extends)\\b"
         },
         {
           "name": "keyword.control.conditional.vl",

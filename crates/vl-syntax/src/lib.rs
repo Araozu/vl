@@ -3,9 +3,11 @@
 //! Grammar (v0, TypeScript-like surface):
 //! ```text
 //! program := item*
-//! item    := `use` ... | `let` ident (`:` type)? `=` expr `;` | `function` ident type-params? `(` params? `)` (`:` type)? block | `type` ident `=` `object` `{` fields? `}` `;`
+//! item    := `use` ... | `let` ident (`:` type)? `=` expr `;` | `function` ident type-params? `(` params? `)` (`:` type)? block | `type` ident `=` `object` `{` object-fields? `}` `;`
 //! type-params := `[` type-param (`,` type-param)* `]`
 //! type-param  := ident (`extends` (`Numeric` | `Comparable`))?
+//! object-fields := object-field (`,` object-field)* `,`?
+//! object-field := ident `:` type
 //! params  := param (`,` param)*
 //! param   := ident `:` type
 //! type    := `u64` | `i64` | `f64` | `bool` | `u8` | `string` | `File` | object-name | `Array` `[` type `]` | type-param | `void` (`void` only as return)
@@ -26,7 +28,7 @@
 //! factor  := unary ((`*`|`/`) unary)*
 //! unary   := (`-`|`!`) unary | postfix
 //! postfix := primary (`[` expr `]` | `.` ident)*
-//! primary := literal | array-literal | object-literal | call | `(` expr `)`
+//! primary := literal | string | array-literal | object-literal | call | path | `(` expr `)`
 //! array-literal := `[` (expr (`,` expr)* `,`?)? `]`
 //! object-literal := ident `{` (ident `:` expr (`,` ident `:` expr)* `,`?)? `}`
 //! call    := path (`::` `[` type (`,` type)* `]`)? `(` args? `)`

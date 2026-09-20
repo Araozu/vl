@@ -27,9 +27,12 @@ possible.
 ## `vl-syntax`
 
 Parses tokens into the syntax tree and recovers per item so one malformed item
-does not prevent the rest of a file from being inspected.
+does not prevent the rest of a file from being inspected. The grammar includes
+named object declarations (`type Name = object { ... };`), named object
+literals, and field reads and writes.
 
 ## `vl-semantic`
 
 Resolves names and imports, reporting undefined names and duplicate definitions
-before later stages consume the tree.
+before later stages consume the tree. It resolves object type names while
+leaving object layout and field-type checks to `vl-typecheck`.

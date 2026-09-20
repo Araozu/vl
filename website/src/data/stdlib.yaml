@@ -91,7 +91,7 @@
       returns:
         type: File
       detail: |
-        Opens a file, yielding a `File` object (Naravm `ObjectFile`).
+        Opens a file, yielding a `File` reference/handle (Naravm `ObjectFile`).
 
         Fallible at the VM level (`errno`/`0x30`); VL error handling is out of
         scope for now, so the language surface is a plain `File` return. The
@@ -113,7 +113,9 @@
       example: |
         let s = read(f);
   outro: |
-    `File` is a VL object type mapping to the VM `ObjectFile`. See [Basics](/docs/basics) for the core type list.
+    `File` is a built-in VL reference/handle type mapping to the VM `ObjectFile`;
+    it is distinct from user-defined `object` declarations. See [Basics](/docs/basics)
+    for the core type list.
 
 - id: string
   order: 3

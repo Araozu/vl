@@ -1,7 +1,7 @@
 # VL — vibecoded language
 
 Bootstrap compiler for a small expression language. Split-crate pipeline,
-Ariadne error reporting, target platform TBD.
+Ariadne error reporting, and a Naravm backend with target-neutral LIR.
 
 ## Architecture
 
@@ -11,7 +11,7 @@ Ariadne error reporting, target platform TBD.
   ▼  vl-syntax     tokens -> AST (recursive descent, per-item recovery)
   │  vl-semantic   AST -> name resolution (scopes, undefined/duplicate defs)
   ▼  vl-hir        resolved AST -> HIR (desugared, node ids, DefId links)
-  │  vl-typecheck  HIR -> types (`u64`, `i64`, `f64`, `bool`, `u8`, strings)
+  │  vl-typecheck  HIR -> types (scalars, strings, `File`, `Array[T]`, objects)
   ▼  vl-lir        typed HIR -> three-address code (target-agnostic)
   │  vl-codegen    LIR -> backend output via `Target` trait
   ▼
@@ -22,6 +22,11 @@ Ariadne error reporting, target platform TBD.
 Dependency rule: each crate depends only on stages below it; everything
 may depend on `vl-common`; nothing depends on the driver. `vl-lir` stays
 target-agnostic — new targets mean new `Target` impls in `vl-codegen`.
+
+The canonical lexical and syntax references are
+[`vl-lex/GRAMMAR.md`](crates/vl-lex/GRAMMAR.md) and
+[`vl-syntax/GRAMMAR.md`](crates/vl-syntax/GRAMMAR.md). Keep them aligned with
+the token definitions and recursive-descent parser when the language changes.
 
 ## Requirements
 
@@ -117,7 +122,8 @@ String escapes are `\\0`,
 Semicolons are mandatory. Strings are carried as bytes through LIR. Extern
 signatures (`std.print`, `std.fs`, `std.string`) are declared in
 `vl-codegen::modules` and enforced by `vl-typecheck`; backends map VL types to
-target concepts. See crate docs for the grammar.
+target concepts. See the [lexical grammar](crates/vl-lex/GRAMMAR.md) and
+[syntax grammar](crates/vl-syntax/GRAMMAR.md) for the complete grammar.
 
 ## Roadmap
 

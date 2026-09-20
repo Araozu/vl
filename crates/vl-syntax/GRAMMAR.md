@@ -25,8 +25,9 @@ block    := "{" stmt* "}"
 stmt     := let_stmt | assign_stmt | index_assign_stmt | field_assign_stmt | if_stmt | while_stmt | break_stmt | continue_stmt | return_stmt | expr_stmt
 let_stmt := "let" ident (":" type)? "=" expr ";"
 assign_stmt := ident "=" expr ";"
-index_assign_stmt := expr "[" expr "]" "=" expr ";"
-field_assign_stmt := expr "." ident "=" expr ";"
+index_assign_stmt := assignable "[" expr "]" "=" expr ";"
+field_assign_stmt := assignable "." ident "=" expr ";"
+assignable := ident ("[" expr "]" | "." ident)*
 if_stmt  := "if" "(" expr ")" branch ("else" branch)?
 while_stmt := "while" "(" expr ")" branch
 break_stmt := "break" ";"
@@ -37,7 +38,8 @@ expr_stmt := expr ";"                   ; mandatory, TS-style; value discarded (
 expr     := or
 or       := and ("||" and)*
 and      := equality ("&&" equality)*
-equality := comparison (("==" | "!=") comparison)*
+equality := cast (("==" | "!=") cast)*
+cast     := comparison ("as" type)*
 comparison := term (("<" | "<=" | ">" | ">=") term)*
 term     := factor (("+" | "-") factor)* ; left-assoc
 factor   := unary (("*" | "/") unary)*   ; left-assoc
@@ -53,9 +55,9 @@ path     := ident ("." ident)*
 ```
 
 Terminal names are `vl-lex` `TokenKind`s: `Let Function Type Object If Else While Break
-Continue Return Eq Semi LParen RParen LBrace RBrace Comma Dot Colon Plus Minus
-Star Slash EqEq Bang BangEq Lt LtEq Gt GtEq AmpAmp PipePipe Ident I64 U64 F64 U8
-Bool String Eof`.
+Continue Return As Extends Eq EqEq Bang BangEq Lt LtEq Gt GtEq AmpAmp PipePipe
+Plus Minus Star Slash Semi LParen RParen LBrace RBrace LBracket RBracket Comma
+Dot Colon ColonColon Ident Int I64 U64 F64 U8 Bool String Invalid Eof`.
 
 ### Notes
 
@@ -65,6 +67,8 @@ Bool String Eof`.
 * There are no implicit returns: only `return expr;` yields a value
   (`return;` for `void`). A trailing `d;` is a discarded expression statement.
 * Unary is `-` / `!`, right-recursive: `- -5`, `!x` ok; `+x` → `E103`.
+  Casts use `as` and bind between arithmetic and equality: `a + b as u8`
+  is `(a + b) as u8`, while `a == b as u8` is `a == (b as u8)`.
 * Parens are transparent in the AST: `(e)` returns inner `Expr`, span drops parens.
 * Calls are callee-by-name (`ident(args)`), TypeScript-style, so forward
   references to `function` items work.
@@ -77,24 +81,27 @@ Bool String Eof`.
 ```text
 Program { items: Vec<Item> }
 Item ::= Use { path, names, span }
-       | Let { name, name_span, value: Expr, span }
-       | Function { name, name_span, params: Vec<Param>, ret: Option<VlType>, ret_span, body: Vec<Stmt>, span }
+       | Let { name, name_span, ty, ty_span, value: Expr, span }
+       | Function { name, name_span, type_params: Vec<TypeParam>, params: Vec<Param>, ret: Option<VlType>, ret_span, body: Vec<Stmt>, span }
        | Object { name, name_span, fields: Vec<ObjectField>, span }
+TypeParam ::= { name, span, bound: Option<GenericBound> }
 Param ::= { name, name_span, ty: Option<VlType>, ty_span }
-Stmt ::= Let { name, name_span, value: Expr, span }
+Stmt ::= Let { name, name_span, ty, ty_span, value: Expr, span }
        | Assign { name, name_span, value: Expr, span }
        | IndexAssign { array, index, value, span }
-       | FieldAssign { base, field, value, span }
+       | FieldAssign { base, field, field_span, value, span }
        | If { condition, then_body, else_body, span }
        | While { condition, body, span }
        | Break { span } | Continue { span }
        | Return { value: Option<Expr>, span }
        | Expr(Expr)
 Expr ::= Literal(Scalar, Span) | String(Vec<u8>, Span) | ArrayLiteral { elems, span }
-         | ObjectLiteral { name, fields, span } | Index { base, index, span }
+         | ObjectLiteral { name, name_span, fields: Vec<(String, Span, Expr)>, span }
+         | Index { base, index, span }
          | Field { base, name, span } | Var { path, span }
-         | Call { callee: path, callee_span, args, span }
+         | Call { callee: path, callee_span, type_args, type_args_span, args, span }
          | Unary { op, rhs, span } | Binary { op, lhs, rhs, span }
+         | Cast { inner, target, target_span, span }
 BinOp ::= Add | Sub | Mul | Div | Eq | Ne | Lt | Le | Gt | Ge | And | Or
 UnOp  ::= Neg | Not
 ```
@@ -139,7 +146,7 @@ Missing `;` (`let x = 1`) → `E100`; `@` never reaches here (lexer `E000`).
 "function main() { d }"             → E100 (expected `;`), stmt dropped
 "function f(): i64 { return 1 }"    → E100 (expected `;`), stmt dropped
 "let x = - -5;"                     → Unary(Neg, Unary(Neg, 5))
-"d;" at top level                   → E101 (items start with use/let/function)
+"d;" at top level                   → E101 (items start with use/let/function/type)
 ```
 
 ## Modules

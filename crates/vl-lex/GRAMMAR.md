@@ -8,12 +8,14 @@ Signature: `lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>)`. Never panics.
 ```text
 source   := (trivia | token)* EOF
 trivia   := whitespace | comment
-token    := keyword | ident | number | bool | string | punct
+token    := keyword | ident | number | boolean | string | operator | delimiter
 EOF      := synthetic, zero-width span at src.len()
 ```
 
-Lexer scans left-to-right on `src.as_bytes()`, index `i`.
-At each step: whitespace → skip; `//` → skip to `\n`; else one token or one error.
+The lexer scans left-to-right on `src.as_bytes()`. At each step it skips
+whitespace or a line comment, then emits one token or one diagnostic and an
+`Invalid` token. Two-character operators are recognized before their
+single-character prefixes.
 
 ## Trivia (no token emitted)
 
@@ -22,20 +24,33 @@ whitespace := [ \t \r \n ]+
 comment    := "//" [^\n]*
 ```
 
-`//` wins over `/` (`Slash`). Comment runs to but not including `\n`.
-The `\n` itself is then whitespace. Unterminated comment at EOF just stops.
+`//` wins over `/` (`Slash`). Comments run to but do not include `\n`; the
+newline is then whitespace. An unterminated comment at EOF simply stops.
 
 ## Tokens
 
 ```text
-keyword := "let" | "function" | "type" | "object" | "if" | "else" | "while" | "break" | "continue" | "return"; exact match, else ident
-ident   := [a-zA-Z_] [a-zA-Z0-9_]* ; stored as Ident(String)
-number  := digits [ "." digits ] suffix?
-suffix  := "u64" | "i64" | "f64" | "u8"
-bool    := "true" | "false"
-string  := `"` string_char* `"`  ; stored as String(Vec<u8>)
-punct   := "+" | "-" | "*" | "/" | "=" | ";" | "(" | ")" | "{" | "}" | ","
+keyword    := "let" | "function" | "type" | "object" | "if" | "else"
+            | "while" | "break" | "continue" | "return" | "as" | "extends"
+ident      := [a-zA-Z_] [a-zA-Z0-9_]*
+number     := digits ("." digits)? suffix?
+suffix     := "u64" | "i64" | "f64" | "u8"
+boolean    := "true" | "false"
+string     := `"` string_char* `"`
+operator   := "==" | "!=" | "<=" | ">=" | "&&" | "||"
+            | "+" | "-" | "*" | "/" | "=" | "!" | "<" | ">"
+delimiter  := "::" | ";" | "(" | ")" | "{" | "}" | "[" | "]"
+            | "," | "." | ":"
 ```
+
+Keywords are exact word matches; all other words are `Ident(String)`. The
+lexer recognizes `true` and `false` as `Bool`, rather than identifiers.
+`use` is intentionally left as an identifier because the parser treats it as
+a contextual item introducer.
+`number` requires the `f64` suffix when a fractional part is present; integer
+suffixes select the corresponding token kind. A numeric suffix is consumed as
+ASCII alphanumerics, so an unknown suffix produces one `E001` diagnostic for
+the whole literal.
 
 `string_char` is any byte other than `"`, `\\`, `\n`, or `\r`, or one of the
 escapes `\\0`, `\\n`, `\\r`, `\\t`, `\\\\`, and `\\"`. String contents are
@@ -43,68 +58,57 @@ bytes; no UTF-8 decoding is performed.
 
 | Spelling | `TokenKind` | Span |
 |---|---|---|
-| `let` | `Let` | `start..end` of word |
-| `function` | `Function` | `start..end` of word |
-| `type` | `Type` | `start..end` of word |
-| `object` | `Object` | `start..end` of word |
-| `if` | `If` | `start..end` of word |
-| `else` | `Else` | `start..end` of word |
-| `while` | `While` | `start..end` of word |
-| `break` | `Break` | `start..end` of word |
-| `continue` | `Continue` | `start..end` of word |
-| `return` | `Return` | `start..end` of word |
-| `[a-zA-Z_][a-zA-Z0-9_]*` | `Ident(String)` | `start..end` of word |
-| `[0-9]+` | `Int(i64)` | `start..end` of digits |
-| `[0-9]+u64` | `U64(u64)` | `start..end` |
-| `[0-9]+i64` | `I64(i64)` | `start..end` |
-| `[0-9]+u8` | `U8(u8)` | `start..end` |
-| `[0-9]+.[0-9]+f64` | `F64(u64)` | `start..end`, using `f64::to_bits` |
-| `true` / `false` | `Bool(bool)` | `start..end` of word |
-| `"..."` | `String(Vec<u8>)` | `start..end` including quotes |
-| `+` | `Plus` | `i..i+1` |
-| `-` | `Minus` | `i..i+1` |
-| `*` | `Star` | `i..i+1` |
-| `/` | `Slash` | `i..i+1` (only if next byte isn't `/`) |
-| `=` | `Eq` | `i..i+1` |
-| `;` | `Semi` | `i..i+1` |
-| `(` | `LParen` | `i..i+1` |
-| `)` | `RParen` | `i..i+1` |
-| `{` | `LBrace` | `i..i+1` |
-| `}` | `RBrace` | `i..i+1` |
-| `,` | `Comma` | `i..i+1` |
+| `let`, `function`, `type`, `object`, `if`, `else`, `while`, `break`, `continue`, `return` | matching keyword | word span |
+| `as` | `As` | word span |
+| `extends` | `Extends` | word span |
+| `[a-zA-Z_][a-zA-Z0-9_]*` | `Ident(String)` | word span |
+| `true` / `false` | `Bool(bool)` | word span |
+| `[0-9]+` | `Int(i64)` | digit span |
+| `[0-9]+i64` / `[0-9]+u64` / `[0-9]+u8` | `I64` / `U64` / `U8` | literal span |
+| `[0-9]+.[0-9]+f64` | `F64(u64)` using `f64::to_bits` | literal span |
+| `"..."` | `String(Vec<u8>)` | including quotes |
+| `+ - * / =` | `Plus`, `Minus`, `Star`, `Slash`, `Eq` | one byte |
+| `== != ! < <= > >=` | `EqEq`, `BangEq`, `Bang`, `Lt`, `LtEq`, `Gt`, `GtEq` | one or two bytes |
+| `&& \|\|` | `AmpAmp`, `PipePipe` | two bytes |
+| `; ( ) { } [ ] , . :` | matching delimiter | one byte |
+| `::` | `ColonColon` | two bytes |
+| malformed numeric/string or unexpected character | `Invalid` plus diagnostic | offending span |
+| end of input | `Eof` | `Span::empty(src.len())` |
 
 Notes:
 
-* Maximal munch: `letx` → `Ident("letx")`, not `Let` + `Ident`. Same for `function1`, `letter`, `functional`.
-* Ident continuation in code is `(b as char).is_alphanumeric() || b == b'_'` — for ASCII input this equals `[0-9A-Za-z_]`. Non-ASCII bytes fall through to the error arm.
-* Unsuffixed integer literals are untyped `int`; a contextual concrete integer type is selected during type checking.
-  Floating literals require the `f64` suffix.
-* All spans are byte offsets, half-open `[start, end)` (`vl_common::Span`). Single-char punct is always length 1.
-* `Eof` is always appended, even when errors occurred: `Span::empty(src.len())`.
+* Maximal munch applies to words and operators: `letx` is `Ident("letx")`,
+  and `::`, `==`, `!=`, `<=`, `>=`, `&&`, and `||` are single tokens.
+* Identifier continuation in code is `b.is_ascii_alphanumeric() || b == b'_'`.
+  For ASCII input this equals `[0-9A-Za-z_]`; non-ASCII bytes are errors.
+* Unsuffixed integer literals are untyped `int`; contextual type selection
+  happens during type checking.
+* All spans are byte offsets, half-open `[start, end)` (`vl_common::Span`).
+* `Eof` is always appended, even when errors occurred.
 
-## Errors (both `Severity::Error`, both recover by skipping)
+## Errors (all `Severity::Error`, all recover by skipping)
 
 | Code | Message | Span | Recovery |
 |---|---|---|---|
-| `E000` | `unexpected character \`{c}\`` + note `identifiers use letters, digits and \`_\`; see \`let\`, \`function\`` | `i..i+1` | emit diag, `i += 1`, no token |
-| `E001` | invalid or out-of-range numeric literal | `start..i` of literal | emit diag, no token, continue after literal |
-| `E002` | `unterminated string literal` | opening quote through line end/EOF | emit diag, no token; continue lexing |
-| `E003` | `unknown string escape` | backslash and escaped byte | emit diag; no string token |
+| `E000` | `unexpected character \`{c}\`` | one character | emit `Invalid`, advance by the UTF-8 scalar width |
+| `E001` | invalid or out-of-range numeric literal | whole literal | emit `Invalid`, continue after the literal |
+| `E002` | `unterminated string literal` | opening quote through line end/EOF | emit `Invalid`, leave the newline for whitespace |
+| `E003` | `unknown string escape` | backslash and escaped byte | emit `Invalid` string token and continue |
 
-One diag per offending byte / per bad literal. Lexing never stops early.
+Lexing never stops early; later valid tokens and the final `Eof` are retained.
 
 ## Examples
 
 ```text
-"let x = 1 + 2;"  → Let Ident("x") Eq I64(1) Plus I64(2) Semi Eof, no diags
-"// hi\nlet a=1;" → Let Ident("a") Eq I64(1) Semi Eof
-"let x = @;"      → Let Ident("x") Eq Semi Eof + E000 on `@` (0-width? no: 1-byte span)
-"1u8" → U8(1), no diags
-"a\\n" → String([97, 10])
+"let x = 1 + 2;"  → Let Ident("x") Eq Int(1) Plus Int(2) Semi Eof, no diags
+"// hi\nlet a=1;" → Let Ident("a") Eq Int(1) Semi Eof
+"let x = @;"      → Let Ident("x") Eq Invalid Semi Eof + E000 on `@`
+"1u8"             → U8(1), no diags
+"a\\n"             → String([97, 10])
+"type Point = object { x: u64, };" → Type ... Object ... Colon ... Comma ...
+"f::[u64](x)"     → Ident ColonColon LBracket Ident RBracket LParen ...
 ```
 
-## Explicitly NOT lexed in v0
-
-No `== != <= >= ! && ||`, no chars, no hex/binary/octal ints,
-no block comments (`/* */`), no `_`-separators in ints (`1_000` → `I64(1)` +
-`Ident("_000")` — `_000` starts with `_`, so it lexes as an identifier).
+Unsupported v0 input includes character literals, block comments (`/* */`),
+hex/binary/octal integers, and `_` separators in integers. For example,
+`1_000` lexes as `Int(1)` followed by `Ident("_000")`.

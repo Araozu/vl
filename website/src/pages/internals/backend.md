@@ -22,11 +22,14 @@ Lowers the resolved syntax tree into a desugared tree with node ids and
 
 ## `vl-typecheck`
 
-Checks `u64`, `i64`, `f64`, `bool`, `u8`, `Array[T]`, and byte-string values,
-producing typed HIR and diagnostics. Array literals must hold one uniform
-element type; indexing requires an `Array[T]` base and a `u64` index.
-Generic functions check once with opaque parameters and monomorphize per
-concrete call (`f$u64`, ...).
+Checks scalar types (`u64`, `i64`, `f64`, `bool`, and `u8`), byte strings,
+the built-in `File` handle, `Array[T]`, and nominal user-defined `object`
+types, producing typed HIR and diagnostics. Array literals must hold one
+uniform element type; indexing requires an `Array[T]` base and a `u64` index.
+Object literals must initialize every declared field exactly once, and field
+reads and writes are checked against the object's nominal layout. Objects and
+arrays remain reference values through this stage. Generic functions check
+once with opaque parameters and monomorphize per concrete call (`f$u64`, ...).
 
 ## `vl-lir`
 
