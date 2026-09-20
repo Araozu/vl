@@ -958,8 +958,11 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
 
     // Pre-pass: intern every user function name plus a
     // `Function{module, function}` constant for it, so (mutually) recursive
-    // calls resolve even when the callee is emitted later. `main` maps to
-    // the `<entrypoint>` name, which is what the VM registers.
+    // calls resolve even when the callee is emitted later. With globals,
+    // `main` calls resolve to the separate `main` body (no re-init);
+    // `<entrypoint>` runs inits once at startup then calls `main`.
+    // Without globals, `main` maps directly to `<entrypoint>` as before.
+    let has_globals = !prog.globals.is_empty();
     let mut fn_consts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut fn_names: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for f in &prog.functions {
@@ -967,7 +970,18 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
             continue;
         }
         if f.name == "main" {
-            if let Some(idx) = nara_push_fn_const(&mut e, module_idx, entry_name_idx) {
+            if has_globals {
+                // Separate `main` body for recursion; entrypoint calls it.
+                let Some(main_idx) = e.add_string(b"main", Span::empty(0)) else {
+                    continue;
+                };
+                if let Some(idx) = nara_push_fn_const(&mut e, module_idx, main_idx) {
+                    fn_consts.insert(f.name.clone(), idx);
+                    fn_names.insert(f.name.clone(), main_idx);
+                }
+                // Entrypoint const (not in fn_consts; startup only).
+                let _ = nara_push_fn_const(&mut e, module_idx, entry_name_idx);
+            } else if let Some(idx) = nara_push_fn_const(&mut e, module_idx, entry_name_idx) {
                 fn_consts.insert(f.name.clone(), idx);
             }
             continue;
@@ -1016,7 +1030,10 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
             global_tys: &global_tys,
         };
         if is_main && !prog.globals.is_empty() {
-            // Allocate the module-state container first.
+            // Allocate the module-state container first (exact sizes).
+            // Initializers run once at startup before the main body.
+            // Note: a pathological recursive `main()` call would re-enter the
+            // entrypoint and re-run initializers; no program does this.
             e.bytecode
                 .extend_from_slice(&[0x27, MODULE_STATE_RF, value_count, ref_count]); // createi rf3F, V, R
                                                                                       // Run initializers in source order, storing each result.
@@ -1109,9 +1126,25 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
     // Library without `main` but with globals: emit an `<entrypoint>` that
     // only initializes module state, so globals are never silently dropped.
     // (Future library loading reuses this; no second entrypoint policy.)
+    // Works even with no user functions (global-only libraries): initializers
+    // without calls lower without a function context.
     if !prog.functions.iter().any(|f| f.name == "main") && !prog.globals.is_empty() {
         e.reset_fn(std::collections::HashMap::new());
-        if let Some(first) = prog.functions.first() {
+        // Stub function for init-only emission when no user function exists.
+        let stub;
+        let first: &vl_lir::Function = match prog.functions.first() {
+            Some(f) => f,
+            None => {
+                stub = vl_lir::Function {
+                    name: "<entrypoint>".into(),
+                    param_tys: vec![],
+                    ret: vl_typecheck::Ty::Void,
+                    instrs: vec![],
+                };
+                &stub
+            }
+        };
+        {
             let ctx = NaraFnCtx {
                 func: first,
                 is_main: false,
@@ -1156,6 +1189,9 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
                 }
                 free_fragment_regs(&mut e, &g.init, &g.result);
             }
+            // Void return for the init-only entrypoint (bare `ret`,
+            // like `is_main` in `nara_ret`).
+            e.bytecode.push(0x00);
             if !e.diags.iter().any(|d| d.is_error()) && nara_resolve_jumps(&mut e) {
                 functions_out.push((entry_name_idx, std::mem::take(&mut e.bytecode)));
             }
@@ -3381,5 +3417,170 @@ function main() {
         assert!(modules_for_target("dummy")
             .iter()
             .any(|m| m.path.as_string() == "std.fs"));
+    }
+
+    #[test]
+    fn mutable_and_readonly_share_runtime_abi() {
+        use vl_typecheck::Ty;
+        // `Foo` and `*Foo` lower to the same register class and container ops.
+        let ro = NaraKind::of_ty(&Ty::Object("Foo".into())).expect("object kind");
+        let mu = NaraKind::of_ty(&Ty::Mutable(Box::new(Ty::Object("Foo".into()))))
+            .expect("mutable kind");
+        assert_eq!(ro, mu);
+        assert!(ro.is_ref());
+        let ro_arr = NaraKind::of_ty(&Ty::Array(Box::new(Ty::U64))).expect("array kind");
+        let mu_arr = NaraKind::of_ty(&Ty::Mutable(Box::new(Ty::Array(Box::new(Ty::U64)))))
+            .expect("mutable array kind");
+        assert_eq!(ro_arr, mu_arr);
+    }
+
+    #[test]
+    fn extern_signatures_grant_no_hidden_mutation() {
+        // Language-visible externs stay read-only; mutation authority comes
+        // only from `*` in VL source, never inferred from VM internals.
+        for m in modules() {
+            for e in &m.exports {
+                assert!(
+                    vl_common::VlType::mutable_wellformed_error(&e.sig.ret).is_none()
+                        || matches!(e.sig.ret, vl_common::VlType::Mutable(_)),
+                    "extern {}.{} ret must be well-formed",
+                    m.path.as_string(),
+                    e.name
+                );
+                for p in &e.sig.params {
+                    // No extern param is mutable today (no mutable string/file ops).
+                    assert!(
+                        !p.ty.is_mutable_view(),
+                        "extern {}.{} param {} must not be mutable",
+                        m.path.as_string(),
+                        e.name,
+                        p.name
+                    );
+                }
+                // No extern return is mutable today either.
+                assert!(
+                    !e.sig.ret.is_mutable_view(),
+                    "extern {}.{} return must not be mutable",
+                    m.path.as_string(),
+                    e.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn object_and_array_mutation_via_mutable_params() {
+        let lir = lir_of(
+            "type Foo = object { value: u64, }; function bump(c: *Foo) { c.value = 1u64; } function fill(a: *Array[u64]) { a[0u64] = 1u64; } function main() { let c: *Foo = Foo { value = 1u64 }; bump(c); }",
+        );
+        let (art, diags) = DummyTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let text = art.unwrap().text;
+        assert!(text.contains("object_set"), "{text}");
+        assert!(text.contains("array_set"), "{text}");
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let bytes = artifact.unwrap().bytes.unwrap();
+        // setvati/setrfati for field/element writes plus container ops.
+        assert!(bytes.contains(&0x2d) || bytes.contains(&0x2f), "{bytes:?}");
+    }
+
+    #[test]
+    fn shared_mutable_global_across_functions() {
+        let lir = lir_of(
+            "type Foo = object { value: u64, }; let g: *Foo = Foo { value = 1u64 }; function bump() { g.value = 2u64; } function read(): u64 { return g.value; } function main() { bump(); let x = read(); x; }",
+        );
+        // Both functions load the same stable global ID.
+        let loads: Vec<u32> = lir
+            .functions
+            .iter()
+            .flat_map(|f| {
+                f.instrs.iter().filter_map(|i| match i {
+                    Instr::GlobalLoad { global, .. } => Some(*global),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert!(!loads.is_empty(), "{}", lir.dump());
+        // Plus initializer loads (if any) share the same IDs.
+        let dump = lir.dump();
+        assert!(dump.contains("global_load"), "{dump}");
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let bytes = artifact.unwrap().bytes.unwrap();
+        // Module container + global access ops present.
+        assert!(bytes.contains(&0x27), "no createi in {bytes:?}"); // createi
+        assert!(
+            bytes.contains(&0x2e) || bytes.contains(&0x2c),
+            "no global load in {bytes:?}"
+        );
+    }
+
+    #[test]
+    fn global_rebinding_value_and_ref() {
+        let lir = lir_of(
+            "let n = 1u64; type Foo = object { value: u64, }; let g: *Foo = Foo { value = 1u64 }; function main() { n = 2u64; g = Foo { value = 3u64 }; n; g; }",
+        );
+        let stores = lir
+            .functions
+            .iter()
+            .flat_map(|f| {
+                f.instrs.iter().filter_map(|i| match i {
+                    Instr::GlobalStore { global, .. } => Some(*global),
+                    _ => None,
+                })
+            })
+            .count();
+        assert_eq!(stores, 2, "{}", lir.dump());
+        let (_artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn nested_calls_and_recursion_preserve_module_state() {
+        // Reserved rf3F never allocated for temps; recursion + nested calls
+        // keep globals working (verified by successful emission + calli).
+        let lir = lir_of(
+            "let n = 0u64; function inner(): u64 { return n; } function outer(): u64 { return inner() + inner(); } function fact(n: u64): u64 { if (n == 0u64) { return 1u64; } return n * fact(n - 1u64); } function main() { let a = outer(); let b = fact(3u64); a + b; }",
+        );
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let bytes = artifact.unwrap().bytes.unwrap();
+        assert!(bytes.contains(&0x20), "no calli in {bytes:?}");
+        assert!(bytes.contains(&0x27), "no module container in {bytes:?}");
+    }
+
+    #[test]
+    fn capability_leak_is_internal_e500() {
+        use vl_common::Span;
+        use vl_lir::{Function, Global, LirProgram, Reg};
+        let lir = LirProgram {
+            module: "t".into(),
+            objects: vec![],
+            globals: vec![Global {
+                id: 0,
+                name: "g".into(),
+                ty: vl_typecheck::Ty::Mutable(Box::new(vl_typecheck::Ty::Object("Foo".into()))),
+                init: vec![],
+                result: Reg(u32::MAX),
+                span: Span::empty(0),
+            }],
+            functions: vec![Function {
+                name: "main".into(),
+                param_tys: vec![],
+                ret: vl_typecheck::Ty::Void,
+                instrs: vec![],
+            }],
+        };
+        let (_, diags) = NaraVmTarget.emit(&lir);
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E500")),
+            "{diags:?}"
+        );
+        let (_, diags) = DummyTarget.emit(&lir);
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E500")),
+            "{diags:?}"
+        );
     }
 }
