@@ -761,7 +761,19 @@ impl<'a> Parser<'a> {
                     return Some(end);
                 }
                 self.bump();
-                Some(start)
+                let mut end = start;
+                // Consume a qualified tail (`vl.person.Person`) so recovery
+                // does not leave stray `.ident` tokens behind.
+                while matches!(self.peek().kind, TokenKind::Dot)
+                    && matches!(
+                        self.toks.get(self.pos + 1).map(|t| &t.kind),
+                        Some(TokenKind::Ident(_))
+                    )
+                {
+                    self.bump(); // `.`
+                    end = self.bump().span;
+                }
+                Some(end)
             }
             _ => None,
         }
@@ -786,6 +798,32 @@ impl<'a> Parser<'a> {
                     return self.parse_array_type(allowed, strict);
                 }
                 self.bump();
+                // Qualified object type (`vl.person.Person`): consume the
+                // dotted tail. Existence is validated by typechecking, which
+                // sees every module's exported layouts; the parser only
+                // records the fully qualified spelling.
+                let mut full = name.clone();
+                let mut end = t.span;
+                while matches!(self.peek().kind, TokenKind::Dot)
+                    && matches!(
+                        self.toks.get(self.pos + 1).map(|t| &t.kind),
+                        Some(TokenKind::Ident(_))
+                    )
+                {
+                    self.bump(); // `.`
+                    let segment = self.bump();
+                    match &segment.kind {
+                        TokenKind::Ident(part) => {
+                            full.push('.');
+                            full.push_str(part);
+                            end = segment.span;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                if full.contains('.') {
+                    return Some((VlType::Object(full), Span::new(t.span.start, end.end)));
+                }
                 if name == "Array" && !allowed.iter().any(|a| a == "Array") {
                     self.diags.push(
                         Diagnostic::error("`Array` expects an element type")
@@ -1643,8 +1681,8 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(_) => {
                 let path = self.parse_path()?;
                 let end = self.toks[self.pos.saturating_sub(1)].span.end;
-                if path.len() == 1 && matches!(self.peek().kind, TokenKind::LBrace) {
-                    return self.parse_object_literal(path[0].clone(), t.span);
+                if matches!(self.peek().kind, TokenKind::LBrace) {
+                    return self.parse_object_literal(path.join("."), t.span);
                 }
                 let (type_args, type_args_span) = self.parse_type_args()?;
                 if !type_args.is_empty() && !matches!(self.peek().kind, TokenKind::LParen) {
@@ -2521,6 +2559,59 @@ mod tests {
                         vec![VlType::Mutable(Box::new(VlType::Object("Foo".into())))]
                     ),
                     other => panic!("expected call, got {other:?}"),
+                },
+                other => panic!("expected val, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qualified_object_types_parse() {
+        let (prog, diags) = parse_src(
+            "fun f(p: vl.person.Person): *vl.person.Person { return p; } fun g(xs: Array[vl.person.Person]) { xs; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { params, ret, .. } => {
+                assert_eq!(
+                    params[0].ty,
+                    Some(VlType::Object("vl.person.Person".into()))
+                );
+                assert_eq!(
+                    *ret,
+                    Some(VlType::Mutable(Box::new(VlType::Object(
+                        "vl.person.Person".into()
+                    ))))
+                );
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+        match &prog.items[1] {
+            Item::Function { params, .. } => {
+                assert_eq!(
+                    params[0].ty,
+                    Some(VlType::Array(Box::new(VlType::Object(
+                        "vl.person.Person".into()
+                    ))))
+                );
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qualified_object_literal_parses() {
+        let (prog, diags) =
+            parse_src("fun main() { val x = vl.person.Person { name = \"R\" }; x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { body, .. } => match &body[0] {
+                Stmt::Let { value, .. } => match value {
+                    Expr::ObjectLiteral { name, .. } => {
+                        assert_eq!(name, "vl.person.Person")
+                    }
+                    other => panic!("expected object literal, got {other:?}"),
                 },
                 other => panic!("expected val, got {other:?}"),
             },
