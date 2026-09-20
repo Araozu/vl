@@ -278,6 +278,73 @@ fn resolve_project_path(root: &Path, path: &Path) -> PathBuf {
     }
 }
 
+fn normalized_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+            }
+            other => result.push(other.as_os_str()),
+        }
+    }
+    result
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    let left = canonical_or_normalized(left);
+    let right = canonical_or_normalized(right);
+    left.starts_with(&right) || right.starts_with(&left)
+}
+
+fn canonical_or_normalized(path: &Path) -> PathBuf {
+    if let Ok(path) = path.canonicalize() {
+        return path;
+    }
+    let mut suffix = Vec::new();
+    let mut ancestor = path;
+    while let Some(name) = ancestor.file_name() {
+        suffix.push(name.to_owned());
+        ancestor = ancestor.parent().unwrap_or_else(|| Path::new("."));
+        if let Ok(mut resolved) = ancestor.canonicalize() {
+            suffix.reverse();
+            for component in suffix {
+                resolved.push(component);
+            }
+            return resolved;
+        }
+    }
+    normalized_path(path)
+}
+
+fn discover_project(file: &Path) -> Result<Option<Project>, String> {
+    let absolute = file
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", file.display()))?;
+    let mut dir = absolute
+        .parent()
+        .ok_or_else(|| format!("cannot find parent of {}", file.display()))?
+        .to_path_buf();
+    loop {
+        if dir.join("vl.toml").is_file() {
+            let project = load_project(&dir)?;
+            let source = resolve_project_path(&dir, &project.config.source)
+                .canonicalize()
+                .ok();
+            if source
+                .as_ref()
+                .is_some_and(|source| absolute.starts_with(source))
+            {
+                return Ok(Some(project));
+            }
+        }
+        if !dir.pop() {
+            return Ok(None);
+        }
+    }
+}
+
 fn collect_vl_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries = fs::read_dir(dir)
         .map_err(|e| format!("cannot read source folder {}: {e}", dir.display()))?;
@@ -335,6 +402,28 @@ fn project_module_for_file(
     Ok(module)
 }
 
+fn source_module_collides(
+    module: &str,
+    compiler_modules: &[vl_common::ModuleSpec],
+    target_modules: &[vl_common::ModuleSpec],
+) -> bool {
+    module == "std"
+        || module.starts_with("std.")
+        || target_modules
+            .iter()
+            .any(|target| target.path.as_string() == module)
+        || compiler_modules
+            .iter()
+            .filter(|catalog| {
+                catalog
+                    .path
+                    .segments()
+                    .first()
+                    .is_some_and(|root| root != "std")
+            })
+            .any(|catalog| catalog.path.as_string() == module)
+}
+
 fn project_output_path(out_dir: &Path, module: &str, extension: &str) -> PathBuf {
     out_dir.join(format!("{}.{}", module.replace('.', "__"), extension))
 }
@@ -363,6 +452,60 @@ struct Frontend {
     lir: vl_lir::LirProgram,
 }
 
+fn run_frontend_ast(
+    ast: &vl_syntax::Program,
+    modules: &[vl_common::ModuleSpec],
+    entrypoint_module: Option<&str>,
+) -> Result<Frontend, Vec<vl_common::Diagnostic>> {
+    let (res, mut diags) = vl_semantic::resolve_with_modules(ast, modules);
+    let mains = ast
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            vl_syntax::Item::Function {
+                name,
+                params,
+                ret,
+                span,
+                ..
+            } if name == "main" => Some((params.len(), ret.clone(), *span)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !mains.is_empty() {
+        if let Some((count, ret, span)) = mains.first() {
+            if *count != 0 {
+                diags.push(
+                    vl_common::Diagnostic::error("`main` must not take parameters")
+                        .with_label(*span, "entrypoint declared here")
+                        .with_code("E401"),
+                );
+            }
+            if *ret != Some(vl_common::VlType::Void) {
+                diags.push(
+                    vl_common::Diagnostic::error("`main` must return `void`")
+                        .with_label(*span, "entrypoint declared here")
+                        .with_note("omit the return type (it defaults to `void`)")
+                        .with_code("E401"),
+                );
+            }
+        }
+    }
+    let hir = vl_hir::lower(ast, &res);
+    let (typed, mut d) = vl_typecheck::check(&hir);
+    diags.append(&mut d);
+    if !res.poisoned_imports {
+        diags.append(&mut typed.validate_normalized(&hir, &diags));
+    }
+    if diags.iter().any(|d| d.is_error()) {
+        return Err(diags);
+    }
+    let mut lir = vl_lir::lower(&hir, &typed);
+    lir.entrypoint = entrypoint_module == Some(ast.module.as_str());
+    lir.entrypoint_module = entrypoint_module.map(str::to_owned);
+    Ok(Frontend { lir })
+}
+
 fn run_frontend(
     text: &str,
     modules: &[vl_common::ModuleSpec],
@@ -374,14 +517,15 @@ fn run_frontend(
     diags.append(&mut d);
     let (ast, mut d) = vl_syntax::parse_with_module(&toks, text, module);
     diags.append(&mut d);
+    if diags.iter().any(|d| d.is_error()) {
+        return Err(diags);
+    }
     let (res, mut d) = vl_semantic::resolve_with_modules(&ast, modules);
     diags.append(&mut d);
     if !diags.iter().any(|d| d.is_error()) {
-        // `main` is optional: snippets and libraries compile without an
-        // entrypoint. Whether a runnable program defines a usable
-        // entrypoint is validated by a higher stage (the VM/loader), not
-        // the compiler. When `main` is present, its shape is still checked
-        // here so mistakes surface early.
+        // `main` is optional, but its signature is checked wherever it is
+        // declared. Project ownership is decided after all source modules
+        // have been inspected.
         let mains = ast
             .items
             .iter()
@@ -422,12 +566,19 @@ fn run_frontend(
     diags.append(&mut d);
     // Boundary guard: no unresolved `int`/`Param`/nested-`Error` type may
     // reach lowering without a diagnostic. E500s here are compiler bugs.
-    diags.append(&mut typed.validate_normalized(&hir, &diags));
+    if !res.poisoned_imports {
+        diags.append(&mut typed.validate_normalized(&hir, &diags));
+    }
 
     if diags.iter().any(|d| d.is_error()) {
         return Err(diags);
     }
     let lir = vl_lir::lower(&hir, &typed);
+    let mut lir = lir;
+    // Standalone builds are programs, whereas project builds set ownership
+    // explicitly below. This preserves the existing single-file CLI behavior.
+    lir.entrypoint = true;
+    lir.entrypoint_module = Some(module.to_owned());
     Ok(Frontend { lir })
 }
 
@@ -480,6 +631,14 @@ fn main() -> ExitCode {
             }
         }
         Cmd::Check { file } => {
+            match discover_project(&file) {
+                Ok(Some(project)) => return check_project(&project),
+                Ok(None) => {}
+                Err(message) => {
+                    emit_driver_error(&message, "E602");
+                    return ExitCode::from(2);
+                }
+            }
             let (name, text) = match read_input(&file) {
                 Ok(v) => v,
                 Err(e) => {
@@ -508,7 +667,14 @@ fn main() -> ExitCode {
             emit,
             out,
         } => match file {
-            Some(file) => build_single(&file, &target, emit, &out),
+            Some(file) => match discover_project(&file) {
+                Ok(Some(project)) => build_project_at(&project, &target, emit, out.as_ref()),
+                Ok(None) => build_single(&file, &target, emit, &out),
+                Err(message) => {
+                    emit_driver_error(&message, "E602");
+                    ExitCode::from(2)
+                }
+            },
             None => build_project(&target, emit, out.as_ref()),
         },
         Cmd::Run { name } => run_project_script(name.as_deref()),
@@ -598,6 +764,7 @@ fn build_single(file: &Path, target: &str, emit: Option<Emit>, out: &Option<Path
     }
 }
 
+#[allow(dead_code)]
 fn compile_project_source(
     text: &str,
     module: &str,
@@ -651,15 +818,23 @@ fn compile_project_source(
     ProjectFileBuild { output, diags }
 }
 
-fn build_project(target: &str, emit: Option<Emit>, out_override: Option<&PathBuf>) -> ExitCode {
-    let project = match load_project(Path::new(".")) {
-        Ok(project) => project,
-        Err(message) => {
-            emit_driver_error(&message, "E602");
-            return ExitCode::from(2);
-        }
-    };
-    let source_dir = resolve_project_path(&project.root, &project.config.source);
+fn build_project_at(
+    project: &Project,
+    target: &str,
+    emit: Option<Emit>,
+    out_override: Option<&PathBuf>,
+) -> ExitCode {
+    let source_dir =
+        match resolve_project_path(&project.root, &project.config.source).canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                emit_driver_error(
+                    &format!("cannot resolve project source folder: {error}"),
+                    "E603",
+                );
+                return ExitCode::from(2);
+            }
+        };
     if !source_dir.is_dir() {
         emit_driver_error(
             &format!(
@@ -699,18 +874,35 @@ fn build_project(target: &str, emit: Option<Emit>, out_override: Option<&PathBuf
     let out_dir = out_override
         .map(|path| resolve_project_path(&project.root, path))
         .unwrap_or_else(|| resolve_project_path(&project.root, &project.config.out));
-    if let Err(e) = fs::create_dir_all(&out_dir) {
+    let out_dir = canonical_or_normalized(&out_dir);
+    if paths_overlap(&source_dir, &out_dir) {
         emit_driver_error(
-            &format!("cannot create output folder {}: {e}", out_dir.display()),
+            &format!("output path overlaps project source: {}", out_dir.display()),
+            "E602",
+        );
+        return ExitCode::from(2);
+    }
+    if out_dir.exists() && !out_dir.is_dir() {
+        emit_driver_error(
+            &format!("output path is not a directory: {}", out_dir.display()),
+            "E601",
+        );
+        return ExitCode::from(2);
+    }
+    let Some(out_parent) = out_dir.parent() else {
+        emit_driver_error("cannot determine output folder parent", "E601");
+        return ExitCode::from(2);
+    };
+    if let Err(e) = fs::create_dir_all(out_parent) {
+        emit_driver_error(
+            &format!("cannot create output parent {}: {e}", out_parent.display()),
             "E601",
         );
         return ExitCode::from(2);
     }
 
-    let extension = project_output_extension(emit, target);
-    let mut failed = false;
+    let mut units = Vec::new();
     let mut driver_failed = false;
-    let mut output_paths = HashSet::new();
     for file in files {
         let (filename, text) = match read_input(&file) {
             Ok(input) => input,
@@ -728,24 +920,211 @@ fn build_project(target: &str, emit: Option<Emit>, out_override: Option<&PathBuf
                 continue;
             }
         };
-        let built = compile_project_source(&text, &module, target, emit);
+        let (tokens, mut diags) = vl_lex::lex(&text);
+        let (ast, mut parse_diags) = vl_syntax::parse_with_module(&tokens, &text, &module);
+        diags.append(&mut parse_diags);
+        units.push((filename, text, module, ast, diags, false));
+    }
+    let target_modules = if matches!(emit, Some(Emit::Asm) | None) {
+        vl_codegen::modules_for_target(target)
+    } else {
+        vl_codegen::modules()
+    };
+    let compiler_modules = vl_codegen::modules();
+    let mut modules = target_modules.clone();
+    let mut source_names = HashSet::new();
+    let mut entrypoint_module = None;
+    let mut catalog_collision_reported = false;
+    let shallow_emit = matches!(emit, Some(Emit::Tokens) | Some(Emit::Ast));
+    for (_, _, module, ast, unit_diags, _) in &mut units {
+        let interface = if shallow_emit {
+            None
+        } else {
+            let (interface, mut interface_diags) = vl_semantic::collect_interface_quiet(ast);
+            let mut interface = interface;
+            interface.parse_poisoned = !unit_diags.is_empty();
+            unit_diags.append(&mut interface_diags);
+            Some(interface)
+        };
+        let new_source = source_names.insert(module.clone());
+        if !new_source {
+            emit_driver_error(&format!("duplicate source module `{module}`"), "E602");
+            driver_failed = true;
+        }
+        let collides = source_module_collides(module, &compiler_modules, &target_modules);
+        if collides {
+            if !catalog_collision_reported {
+                emit_driver_error(
+                    &format!("source module `{module}` is reserved by the compiler module catalog (collides with a target module)"),
+                    "E602",
+                );
+                catalog_collision_reported = true;
+            }
+            driver_failed = true;
+        }
+        if !new_source {
+            continue;
+        }
+        if !collides {
+            if let Some(interface) = &interface {
+                modules.push(interface.as_spec());
+            }
+        }
+        if !collides && new_source {
+            for item in &ast.items {
+                if let vl_syntax::Item::Function { name, span, .. } = item {
+                    if name == "main" {
+                        if entrypoint_module.is_some() {
+                            unit_diags.push(
+                                vl_common::Diagnostic::error(
+                                    "project defines more than one `main` function",
+                                )
+                                .with_label(*span, "additional entrypoint declared here")
+                                .with_code("E401"),
+                            );
+                        } else {
+                            entrypoint_module = Some(module.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    modules.sort_by_key(|module| module.path.as_string());
+    units.sort_by(|left, right| left.2.cmp(&right.2));
+    let mut failed = false;
+    let mut outputs = Vec::new();
+    let extension = project_output_extension(emit, target);
+    for (filename, text, module, ast, mut unit_diags, skip_frontend) in units {
+        let built = if matches!(emit, Some(Emit::Tokens) | Some(Emit::Ast)) {
+            let output = if matches!(emit, Some(Emit::Ast)) {
+                ProjectOutput::Text(format!("{ast:#?}\n"))
+            } else {
+                let (tokens, _) = vl_lex::lex(&text);
+                ProjectOutput::Text(format!("{tokens:#?}\n"))
+            };
+            ProjectFileBuild {
+                output: Some(output),
+                diags: unit_diags,
+            }
+        } else if skip_frontend || unit_diags.iter().any(|d| d.is_error()) {
+            ProjectFileBuild {
+                output: None,
+                diags: unit_diags,
+            }
+        } else {
+            match run_frontend_ast(&ast, &modules, entrypoint_module.as_deref()) {
+                Ok(frontend) if matches!(emit, Some(Emit::Lir)) => ProjectFileBuild {
+                    output: Some(ProjectOutput::Text(frontend.lir.dump())),
+                    diags: unit_diags,
+                },
+                Ok(frontend) => {
+                    let backend = vl_codegen::lookup(target)
+                        .expect("project target was validated before building");
+                    let (artifact, mut d) = backend.emit(&frontend.lir);
+                    unit_diags.append(&mut d);
+                    ProjectFileBuild {
+                        output: artifact.map(|a| {
+                            a.bytes
+                                .map(ProjectOutput::Bytes)
+                                .unwrap_or(ProjectOutput::Text(a.text))
+                        }),
+                        diags: unit_diags,
+                    }
+                }
+                Err(mut d) => {
+                    unit_diags.append(&mut d);
+                    ProjectFileBuild {
+                        output: None,
+                        diags: unit_diags,
+                    }
+                }
+            }
+        };
         let file_failed = emit_all(&built.diags, &filename, &text);
         failed |= file_failed;
         if let Some(output) = built.output {
-            // Token/AST output remains useful for malformed files. Final
-            // artifacts are only written when their frontend/backend is clean.
-            if !file_failed || matches!(emit, Some(Emit::Tokens) | Some(Emit::Ast)) {
-                let output_path = project_output_path(&out_dir, &module, &extension);
-                if !output_paths.insert(output_path.clone()) {
-                    emit_driver_error(
-                        &format!("multiple source files produce {}", output_path.display()),
-                        "E602",
-                    );
-                    driver_failed = true;
-                } else if let Err(message) = write_project_output(&output_path, &output) {
-                    emit_driver_error(&message, "E601");
-                    driver_failed = true;
+            let path = project_output_path(&out_dir, &module, &extension);
+            outputs.push((path, output));
+        }
+    }
+    // Final artifacts are transactional: preflight every destination, write
+    // the complete set to a private directory, then publish it.
+    if (!failed && !driver_failed) || (shallow_emit && !driver_failed) {
+        let mut paths = HashSet::new();
+        if let Some((path, _)) = outputs.iter().find(|(path, _)| !paths.insert(path.clone())) {
+            emit_driver_error(
+                &format!("multiple source files produce {}", path.display()),
+                "E602",
+            );
+            driver_failed = true;
+        }
+        if !driver_failed {
+            let output_name = out_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("out");
+            let staging =
+                out_parent.join(format!(".{output_name}.vl-staging-{}", std::process::id()));
+            let backup =
+                out_parent.join(format!(".{output_name}.vl-backup-{}", std::process::id()));
+            if staging.exists() {
+                emit_driver_error(
+                    &format!("staging path already exists: {}", staging.display()),
+                    "E601",
+                );
+                driver_failed = true;
+            } else if let Err(error) = fs::create_dir(&staging) {
+                emit_driver_error(
+                    &format!(
+                        "cannot create staging folder {}: {error}",
+                        staging.display()
+                    ),
+                    "E601",
+                );
+                driver_failed = true;
+            } else {
+                for (path, output) in &outputs {
+                    let staged_path =
+                        staging.join(path.file_name().expect("output path has a filename"));
+                    if let Err(message) = write_project_output(&staged_path, output) {
+                        emit_driver_error(&message, "E601");
+                        driver_failed = true;
+                        break;
+                    }
                 }
+                if !driver_failed {
+                    if backup.exists() {
+                        driver_failed = true;
+                        emit_driver_error(
+                            &format!("backup path already exists: {}", backup.display()),
+                            "E601",
+                        );
+                    } else if out_dir.exists() && fs::rename(&out_dir, &backup).is_err() {
+                        driver_failed = true;
+                        emit_driver_error(
+                            &format!("cannot stage existing output folder {}", out_dir.display()),
+                            "E601",
+                        );
+                    } else if let Err(error) = fs::rename(&staging, &out_dir) {
+                        driver_failed = true;
+                        emit_driver_error(
+                            &format!(
+                                "cannot publish output folder {}: {error}",
+                                out_dir.display()
+                            ),
+                            "E601",
+                        );
+                        if backup.exists() {
+                            let _ = fs::rename(&backup, &out_dir);
+                        }
+                    } else {
+                        let _ = fs::remove_dir_all(&backup);
+                    }
+                }
+                // Individual files were only written inside staging. If
+                // publication failed, leave the prior output untouched.
+                let _ = fs::remove_dir_all(&staging);
             }
         }
     }
@@ -753,6 +1132,133 @@ fn build_project(target: &str, emit: Option<Emit>, out_override: Option<&PathBuf
     if driver_failed {
         ExitCode::from(2)
     } else if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn build_project(target: &str, emit: Option<Emit>, out_override: Option<&PathBuf>) -> ExitCode {
+    let project = match load_project(Path::new(".")) {
+        Ok(project) => project,
+        Err(message) => {
+            emit_driver_error(&message, "E602");
+            return ExitCode::from(2);
+        }
+    };
+    build_project_at(&project, target, emit, out_override)
+}
+
+fn check_project(project: &Project) -> ExitCode {
+    let source = match resolve_project_path(&project.root, &project.config.source).canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            emit_driver_error(
+                &format!("cannot resolve project source folder: {error}"),
+                "E603",
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let target_modules = vl_codegen::modules();
+    let compiler_modules = vl_codegen::modules();
+    let mut files = Vec::new();
+    if let Err(message) = collect_vl_files(&source, &mut files) {
+        emit_driver_error(&message, "E603");
+        return ExitCode::from(2);
+    }
+    files.sort();
+    let mut units = Vec::new();
+    let mut modules = target_modules.clone();
+    let mut failed = false;
+    let mut entrypoint_module = None;
+    let mut source_names = HashSet::new();
+    let mut catalog_collision_reported = false;
+    for file in files {
+        let (name, text) = match read_input(&file) {
+            Ok(value) => value,
+            Err(message) => {
+                emit_driver_error(&message, "E600");
+                failed = true;
+                continue;
+            }
+        };
+        let module = match project_module_for_file(&project.config, &source, &file) {
+            Ok(value) => value,
+            Err(message) => {
+                emit_driver_error(&message, "E602");
+                failed = true;
+                continue;
+            }
+        };
+        let collides = source_module_collides(&module, &compiler_modules, &target_modules);
+        if collides {
+            if !catalog_collision_reported {
+                emit_driver_error(
+                    &format!("source module `{module}` is reserved by the compiler module catalog (collides with a target module)"),
+                    "E602",
+                );
+                catalog_collision_reported = true;
+            }
+            failed = true;
+        }
+        let new_source = source_names.insert(module.clone());
+        if !new_source {
+            emit_driver_error(&format!("duplicate source module `{module}`"), "E602");
+            failed = true;
+        }
+        let (tokens, mut diags) = vl_lex::lex(&text);
+        let (ast, mut parse_diags) = vl_syntax::parse_with_module(&tokens, &text, &module);
+        diags.append(&mut parse_diags);
+        let (interface, mut interface_diags) = vl_semantic::collect_interface_quiet(&ast);
+        let mut interface = interface;
+        interface.parse_poisoned = !diags.is_empty();
+        diags.append(&mut interface_diags);
+        if !collides && new_source {
+            for item in &ast.items {
+                if let vl_syntax::Item::Function { name, span, .. } = item {
+                    if name == "main" {
+                        if entrypoint_module.is_some() {
+                            diags.push(
+                                vl_common::Diagnostic::error(
+                                    "project defines more than one `main` function",
+                                )
+                                .with_label(*span, "additional entrypoint declared here")
+                                .with_code("E401"),
+                            );
+                        } else {
+                            entrypoint_module = Some(module.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if collides {
+            units.push((name, text, ast, diags, true));
+            continue;
+        }
+        if new_source {
+            // Duplicate source names report an error but retain the first
+            // interface as the canonical catalog entry.
+            modules.push(interface.as_spec());
+        }
+        units.push((name, text, ast, diags, false));
+    }
+    modules.sort_by_key(|module| module.path.as_string());
+    units.sort_by(|left, right| {
+        let left_module = left.2.module.as_str();
+        let right_module = right.2.module.as_str();
+        left_module.cmp(right_module)
+    });
+    for (name, text, ast, mut diags, skip_frontend) in units {
+        if !skip_frontend && diags.iter().all(|d| !d.is_error()) {
+            if let Err(mut d) = run_frontend_ast(&ast, &modules, entrypoint_module.as_deref()) {
+                diags.append(&mut d);
+            }
+        }
+        failed |= emit_all(&diags, &name, &text);
+    }
+    if failed {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS

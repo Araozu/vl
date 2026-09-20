@@ -156,6 +156,9 @@ pub enum Item {
         /// `None` when the return annotation was missing (already reported).
         ret: Option<VlType>,
         ret_span: Option<Span>,
+        /// A parser error occurred in the function header. The recovered
+        /// declaration must not be published as an export.
+        signature_poisoned: bool,
         body: Vec<Stmt>,
         span: Span,
     },
@@ -1030,6 +1033,7 @@ impl<'a> Parser<'a> {
     fn parse_function_item(&mut self) -> Option<Item> {
         let function_tok = self.bump(); // `function`
         let (name, name_span) = self.parse_ident()?;
+        let header_diag_count = self.diags.len();
         let type_params = self.parse_type_params()?;
         let allowed: Vec<String> = type_params.iter().map(|p| p.name.clone()).collect();
         self.expect(&TokenKind::LParen, "`(`")?;
@@ -1090,6 +1094,7 @@ impl<'a> Parser<'a> {
             params,
             ret,
             ret_span,
+            signature_poisoned: self.diags.len() != header_diag_count,
             body,
             span: Span::new(function_tok.span.start, close.span.end),
         })

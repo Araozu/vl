@@ -2317,6 +2317,7 @@ impl Checker {
                 type_args,
                 args,
                 span,
+                ..
             } => {
                 let mut arg_tys = Vec::with_capacity(args.len());
                 let mut poisoned = false;

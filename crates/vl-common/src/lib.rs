@@ -26,7 +26,10 @@ pub enum Scalar {
 pub mod span;
 
 pub use diagnostic::{Diagnostic, Label, Severity};
-pub use module::{Export, ExportDecl, FuncSig, ModulePath, ModuleSpec, ParamSig};
+pub use module::{
+    Export, ExportDecl, FuncSig, ModuleInterface, ModuleOrigin, ModulePath, ModuleSpec, ParamSig,
+    SymbolRef,
+};
 pub use source::{FileId, Source, Sources};
 pub use span::Span;
 pub use ty::{GenericBound, ParseTyError, VlType};
