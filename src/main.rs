@@ -83,6 +83,11 @@ fn run_frontend(
     let (res, mut d) = vl_semantic::resolve_with_modules(&ast, modules);
     diags.append(&mut d);
     if !diags.iter().any(|d| d.is_error()) {
+        // `main` is optional: snippets and libraries compile without an
+        // entrypoint. Whether a runnable program defines a usable
+        // entrypoint is validated by a higher stage (the VM/loader), not
+        // the compiler. When `main` is present, its shape is still checked
+        // here so mistakes surface early.
         let mains = ast
             .items
             .iter()
@@ -97,12 +102,7 @@ fn run_frontend(
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if mains.is_empty() {
-            diags.push(
-                vl_common::Diagnostic::error("program must define `function main()`")
-                    .with_code("E400"),
-            );
-        } else {
+        if !mains.is_empty() {
             if mains[0].0 != 0 {
                 diags.push(
                     vl_common::Diagnostic::error("`main` must not take parameters")

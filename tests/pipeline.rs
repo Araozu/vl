@@ -28,6 +28,22 @@ fn hello_compiles_to_lir() {
 }
 
 #[test]
+fn snippet_without_main_compiles_to_lir_and_naravm() {
+    use vl_codegen::Target;
+    // No `main`: snippets and libraries must compile. Entrypoint presence
+    // is validated by the VM/loader, not the compiler.
+    let lir = frontend("function add(a: u64, b: u64): u64 { return a + b; }")
+        .expect("snippet without main must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("fn add:"), "{dump}");
+    assert!(!dump.contains("fn main:"), "{dump}");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+}
+
+#[test]
 fn println_compiles_and_runs_on_naravm() {
     use vl_codegen::Target;
     let lir = frontend("use std; function main() { std.println(\"hi\"); std.print(\"x\\n\"); }")
