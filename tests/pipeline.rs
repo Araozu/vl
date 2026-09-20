@@ -2,13 +2,15 @@
 //! Run with `cargo test --workspace` (or `./scripts/check.sh`).
 
 fn frontend(src: &str) -> Result<vl_lir::LirProgram, Vec<vl_common::Diagnostic>> {
+    let stdlib = vl_stdlib::load();
     let (toks, mut diags) = vl_lex::lex(src);
     let (ast, mut d) = vl_syntax::parse(&toks, src);
     diags.append(&mut d);
-    // Same lazy prelude as the driver: helpers a snippet calls behave as
-    // locals; untouched snippets compile exactly as before.
-    let ast = vl_stdlib::inject(ast);
-    let (res, mut d) = vl_semantic::resolve_with_modules(&ast, &vl_codegen::modules());
+    // Same merged catalog + link step as the driver: helpers a snippet
+    // calls behave as locals; untouched snippets compile exactly as before.
+    let mut catalog = vl_codegen::modules();
+    stdlib.extend_catalog(&mut catalog);
+    let (res, mut d) = vl_semantic::resolve_with_modules(&ast, &catalog);
     diags.append(&mut d);
     let hir = vl_hir::lower(&ast, &res);
     let (typed, mut d) = vl_typecheck::check(&hir);
@@ -18,7 +20,9 @@ fn frontend(src: &str) -> Result<vl_lir::LirProgram, Vec<vl_common::Diagnostic>>
     if diags.iter().any(|d| d.is_error()) {
         return Err(diags);
     }
-    Ok(vl_lir::lower(&hir, &typed))
+    let mut lir = vl_lir::lower(&hir, &typed);
+    stdlib.link(&mut lir);
+    Ok(lir)
 }
 
 #[test]
@@ -264,7 +268,9 @@ fn frontend_project(
         diags.append(&mut d);
         parsed.push(ast);
     }
+    let stdlib = vl_stdlib::load();
     let mut modules = vl_codegen::modules();
+    stdlib.extend_catalog(&mut modules);
     for ast in &parsed {
         let (interface, mut d) = vl_semantic::collect_interface_quiet(ast);
         diags.append(&mut d);
@@ -272,17 +278,18 @@ fn frontend_project(
     }
     let mut out = Vec::new();
     for ast in &parsed {
-        let ast = vl_stdlib::inject(ast.clone());
-        let (res, mut d) = vl_semantic::resolve_with_modules(&ast, &modules);
+        let (res, mut d) = vl_semantic::resolve_with_modules(ast, &modules);
         diags.append(&mut d);
-        let hir = vl_hir::lower(&ast, &res);
+        let hir = vl_hir::lower(ast, &res);
         let (typed, mut d) = vl_typecheck::check_with_modules(&hir, &modules);
         diags.append(&mut d);
         diags.append(&mut typed.validate_normalized(&hir, &diags));
         if diags.iter().any(|d| d.is_error()) {
             return Err(diags);
         }
-        out.push(vl_lir::lower(&hir, &typed));
+        let mut lir = vl_lir::lower(&hir, &typed);
+        stdlib.link(&mut lir);
+        out.push(lir);
     }
     Ok(out)
 }
@@ -805,21 +812,33 @@ fn stdlib_extern_arg_types_are_checked() {
 }
 
 #[test]
-fn stdlib_prelude_helpers_inject_lazily_and_emit() {
+fn stdlib_helpers_link_lazily_behind_explicit_use() {
     use vl_codegen::Target;
-    let lir = frontend("use std; fun main() { std.print(u64_to_string(max_u64(3u64, 9u64))); std.print_u64(clamp_u64(100u64, 0u64, 10u64)); }")
-        .expect("prelude helpers must inject");
+    let lir = frontend("use std; use std.math; use std.fmt; fun main() { std.print(fmt.u64_to_string(math.max_u64(3u64, 9u64))); std.print_u64(math.clamp_u64(100u64, 0u64, 10u64)); }")
+        .expect("stdlib helpers must link");
     let dump = lir.dump();
-    for name in ["fn max_u64:", "fn u64_to_string:", "fn clamp_u64:"] {
+    for name in [
+        "fn std$math$max_u64:",
+        "fn std$fmt$u64_to_string:",
+        "fn std$math$clamp_u64:",
+    ] {
         assert!(dump.contains(name), "{name} missing in {dump}");
     }
-    // Unreferenced helpers stay out.
-    assert!(!dump.contains("fn is_even:"), "{dump}");
+    // Unreferenced helpers stay out; nothing is implicitly in scope.
+    assert!(!dump.contains("std$math$is_even"), "{dump}");
+    assert!(!dump.contains("std.math::"), "{dump}");
     let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
     assert!(diags.is_empty(), "{diags:?}");
     let bytes = artifact.unwrap().bytes.unwrap();
     assert_eq!(&bytes[..4], b"nara");
     assert!(bytes.contains(&0x20), "expected calli instructions");
+}
+
+#[test]
+fn stdlib_helpers_need_an_explicit_use() {
+    let err = frontend("fun main() { val m = math.max_u64(1u64, 2u64); m; }")
+        .expect_err("helpers need `use std.math`");
+    assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1, "{err:?}");
 }
 
 #[test]
@@ -829,7 +848,7 @@ fn stdlib_example_compiles_and_runs_on_naravm() {
     let lir = frontend(&src).expect("stdlib.vl must compile");
     let dump = lir.dump();
     assert!(dump.contains("call std.string::concat"), "{dump}");
-    assert!(dump.contains("call max_u64"), "{dump}");
+    assert!(dump.contains("call std$math$max_u64"), "{dump}");
     let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
     assert!(diags.is_empty(), "{diags:?}");
     let bytes = artifact.unwrap().bytes.unwrap();
