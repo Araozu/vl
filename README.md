@@ -94,7 +94,7 @@ a zero-filled array of `n` elements (no import needed), `[1, 2]` is an
 array literal, `a[i]` reads element `i`, and `a[i] = v;` writes it
 (see `examples/arrays.vl`). Indices are always `u64`.
 Objects use declarations such as `type Counter = object { value: u64, label: String, };`
-and named literals such as `Counter { value: 1, label: "count" }`. Object values
+and named literals such as `Counter { value = 1, label = "count" }`. Object values
 have reference semantics: assignment, parameters, and returns alias the same
 heap object, and `p.field = value;` mutates it through every alias. Fields are
 comma-separated and every field must be initialized. Objects are nominal data

@@ -47,7 +47,7 @@ unary    := ("-" | "!") unary | postfix
 call     := path ("::" "[" type ("," type)* "]")? "(" args? ")"
 postfix  := primary ("[" expr "]" | "." ident)*
 primary  := literal | string | array_literal | object_literal | call | path | "(" expr ")"
-object_literal := ident "{" (ident ":" expr ("," ident ":" expr)* ","?)? "}"
+object_literal := ident "{" (ident "=" expr ("," ident "=" expr)* ","?)? "}"
 array_literal := "[" (expr ("," expr)* ","?)? "]"
 args     := expr ("," expr)*
 literal  := int | i64 | u64 | f64 | u8 | bool

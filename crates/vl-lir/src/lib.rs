@@ -1407,7 +1407,7 @@ mod tests {
 
     #[test]
     fn objects_lower_to_dedicated_instrs() {
-        let src = "type Counter = object { value: u64, }; function main() { let c = Counter { value: 1 }; c.value = c.value + 1; }";
+        let src = "type Counter = object { value: u64, }; function main() { let c = Counter { value = 1 }; c.value = c.value + 1; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);
@@ -1422,7 +1422,7 @@ mod tests {
 
     #[test]
     fn object_let_alias_gets_an_independent_rebinding_home() {
-        let src = "type Counter = object { value: u64, }; function main() { let a = Counter { value: 1 }; let b = a; b = Counter { value: 2 }; a.value = 3; }";
+        let src = "type Counter = object { value: u64, }; function main() { let a = Counter { value = 1 }; let b = a; b = Counter { value = 2 }; a.value = 3; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         let (res, _) = vl_semantic::resolve(&prog);

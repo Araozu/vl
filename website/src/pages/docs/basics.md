@@ -60,7 +60,7 @@ operations make sense for it.
 | `f64` | `3.14f64` | A decimal number |
 | `bool` | `true` | A yes/no value |
 | `String` | `"hello"` | A byte string |
-| `object` type | `Counter { value: 1 }` | Named mutable data with reference semantics |
+| `object` type | `Counter { value = 1 }` | Named mutable data with reference semantics |
 
 Integer literals are chosen from their context. For example, the parameter
 type tells VL what type the `1` and `2` should have here:
@@ -119,7 +119,7 @@ are comma-separated, and an object literal initializes every field:
 
 ```vl
 type Point = object { x: u64, y: u64, };
-let point = Point { x: 10, y: 20 };
+let point = Point { x = 10, y = 20 };
 point.x = 11;
 ```
 

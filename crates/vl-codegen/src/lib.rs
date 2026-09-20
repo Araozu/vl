@@ -2613,7 +2613,7 @@ mod tests {
     #[test]
     fn naravm_emits_objects_with_mixed_lane_field_ops() {
         let lir = lir_of(
-            "use std; type Counter = object { value: u64, label: String, }; function main() { let c = Counter { value: 1, label: \"count\" }; c.value = 2; std.print(c.label); }",
+            "use std; type Counter = object { value: u64, label: String, }; function main() { let c = Counter { value = 1, label = \"count\" }; c.value = 2; std.print(c.label); }",
         );
         let (artifact, diags) = NaraVmTarget.emit(&lir);
         assert!(diags.is_empty(), "{diags:?}");

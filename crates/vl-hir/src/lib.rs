@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn objects_lower_with_field_reads_and_writes() {
-        let src = "type Counter = object { value: u64, }; function main() { let c = Counter { value: 1 }; c.value = c.value + 1; }";
+        let src = "type Counter = object { value: u64, }; function main() { let c = Counter { value = 1 }; c.value = c.value + 1; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");

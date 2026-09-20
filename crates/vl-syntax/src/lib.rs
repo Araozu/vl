@@ -30,7 +30,7 @@
 //! postfix := primary (`[` expr `]` | `.` ident)*
 //! primary := literal | string | array-literal | object-literal | call | path | `(` expr `)`
 //! array-literal := `[` (expr (`,` expr)* `,`?)? `]`
-//! object-literal := ident `{` (ident `:` expr (`,` ident `:` expr)* `,`?)? `}`
+//! object-literal := ident `{` (ident `=` expr (`,` ident `=` expr)* `,`?)? `}`
 //! call    := path (`::` `[` type (`,` type)* `]`)? `(` args? `)`
 //! path    := ident (`.` ident)*
 //! args    := expr (`,` expr)*
@@ -42,7 +42,7 @@
 //! always `u64`; elements have the array's `T`.
 //!
 //! Objects are named reference types: `type Name = object { field: type, };`
-//! creates a heap object, `Name { field: value }` initializes one, and field
+//! creates a heap object, `Name { field = value }` initializes one, and field
 //! assignment mutates the shared object visible through every alias.
 //!
 //! Generic functions declare type parameters after the name
@@ -1544,7 +1544,7 @@ impl<'a> Parser<'a> {
         let mut fields = Vec::new();
         while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
             let (field, field_span) = self.parse_ident()?;
-            self.expect(&TokenKind::Colon, "`:` after object field")?;
+            self.expect(&TokenKind::Eq, "`=` after object field")?;
             let value = self.parse_expr()?;
             fields.push((field, field_span, value));
             if matches!(self.peek().kind, TokenKind::Comma) {
@@ -1691,7 +1691,7 @@ mod tests {
     #[test]
     fn parses_object_declaration_literal_and_field_assign() {
         let (prog, diags) = parse_src(
-            "type Counter = object { value: u64, label: String, }; function main() { let c = Counter { label: \"x\", value: 1 }; c.value = 2; }",
+            "type Counter = object { value: u64, label: String, }; function main() { let c = Counter { label = \"x\", value = 1 }; c.value = 2; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(matches!(prog.items[0], Item::Object { ref fields, .. } if fields.len() == 2));

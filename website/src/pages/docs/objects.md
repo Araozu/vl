@@ -20,11 +20,12 @@ type Counter = object {
 ```
 
 Create an object with a named literal. Every declared field must appear exactly
-once, and fields may be written in any order:
+once, and fields may be written in any order. Declarations use `name: type`,
+while literals assign with `name = value`:
 
 ```vl
 function main() {
-    let counter = Counter { label: "count", value: 0 };
+    let counter = Counter { label = "count", value = 0 };
     counter.value = counter.value + 1;
 }
 ```
@@ -42,7 +43,7 @@ function bump(counter: Counter): Counter {
 }
 
 function main() {
-    let first = Counter { value: 1, label: "count" };
+    let first = Counter { value = 1, label = "count" };
     let second = bump(first);
     second.value = second.value + 1;
     // first.value is now 3.

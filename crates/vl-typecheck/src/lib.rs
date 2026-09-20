@@ -2649,7 +2649,7 @@ mod tests {
     #[test]
     fn objects_check_field_types_and_reference_operations() {
         let (_, diags) = check_src(
-            "type Counter = object { value: u64, }; function bump(c: Counter): Counter { c.value = c.value + 1; return c; } function main() { let c = Counter { value: 1 }; let d = bump(c); d.value = 3; }",
+            "type Counter = object { value: u64, }; function bump(c: Counter): Counter { c.value = c.value + 1; return c; } function main() { let c = Counter { value = 1 }; let d = bump(c); d.value = 3; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -2657,7 +2657,7 @@ mod tests {
     #[test]
     fn object_literal_field_count_is_one_diagnostic() {
         let (_, diags) = check_src(
-            "type Point = object { x: u64, }; function main() { let p = Point { y: 1, z: 2 }; }",
+            "type Point = object { x: u64, }; function main() { let p = Point { y = 1, z = 2 }; }",
         );
         let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
         assert_eq!(errors.len(), 1, "{diags:?}");
