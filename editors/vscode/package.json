@@ -1,0 +1,52 @@
+{
+  "name": "vl-language-support",
+  "displayName": "VL Language Support",
+  "description": "Syntax highlighting and editor configuration for the VL programming language.",
+  "version": "0.1.0",
+  "publisher": "vl-lang",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Araozu/vl.git",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "vl",
+    "language",
+    "syntax highlighting"
+  ],
+  "scripts": {
+    "package": "vsce package --out vl-language-support.vsix"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "3.6.2"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "vl",
+        "aliases": [
+          "VL",
+          "vl"
+        ],
+        "extensions": [
+          ".vl"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "vl",
+        "scopeName": "source.vl",
+        "path": "./syntaxes/vl.tmLanguage.json"
+      }
+    ]
+  }
+}

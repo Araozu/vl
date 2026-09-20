@@ -1,0 +1,147 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "VL",
+  "scopeName": "source.vl",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#declarations" },
+    { "include": "#keywords" },
+    { "include": "#constants" },
+    { "include": "#types" },
+    { "include": "#function-calls" },
+    { "include": "#properties" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.vl",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.vl",
+          "begin": "\"",
+          "end": "\"|(?=$)",
+          "patterns": [
+            {
+              "name": "constant.character.escape.vl",
+              "match": "\\\\(?:0|n|r|t|\\\\|\")"
+            },
+            {
+              "name": "invalid.illegal.escape.vl",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.vl",
+          "match": "\\b[0-9]+\\.[0-9]+f64\\b"
+        },
+        {
+          "name": "constant.numeric.integer.vl",
+          "match": "\\b[0-9]+(?:i64|u64|u8)?\\b"
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(function)(\\s+)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.function.vl" },
+            "3": { "name": "entity.name.function.vl" }
+          }
+        },
+        {
+          "match": "\\b(type)(\\s+)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.vl" },
+            "3": { "name": "entity.name.type.vl" }
+          }
+        },
+        {
+          "match": "\\b(let)(\\s+)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.vl" },
+            "3": { "name": "variable.other.readwrite.vl" }
+          }
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "storage.type.vl",
+          "match": "\\b(?:let|function|type)\\b"
+        },
+        {
+          "name": "keyword.control.vl",
+          "match": "\\b(?:if|else|while|break|continue|return)\\b"
+        },
+        {
+          "name": "keyword.other.vl",
+          "match": "\\b(?:use|as|extends|object)\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.vl",
+          "match": "\\b(?:true|false)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.primitive.vl",
+          "match": "\\b(?:u64|i64|f64|u8|bool|void)\\b"
+        },
+        {
+          "name": "support.type.vl",
+          "match": "\\b(?:Array|String|File|Numeric|Comparable)\\b"
+        },
+        {
+          "name": "entity.name.type.vl",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "function-calls": {
+      "patterns": [
+        {
+          "name": "entity.name.function.call.vl",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b(?=\\s*(?:::\\s*\\[[^\\]\\r\\n]*\\]\\s*)?\\()"
+        }
+      ]
+    },
+    "properties": {
+      "patterns": [
+        {
+          "name": "variable.other.property.vl",
+          "match": "(?<=\\.)[A-Za-z_][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.vl",
+          "match": "==|!=|<=|>=|&&|\\|\\||::|[+\\-*/=!<>]"
+        }
+      ]
+    }
+  }
+}
