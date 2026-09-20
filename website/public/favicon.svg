@@ -7,37 +7,48 @@
    viewBox="0 0 512 512"
    version="1.1"
    id="svg1"
+   sodipodi:docname="logo.svg"
+   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
    xmlns="http://www.w3.org/2000/svg"
    xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview1"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     showguides="false"
+     inkscape:zoom="1.5234375"
+     inkscape:cx="255.67179"
+     inkscape:cy="255.67179"
+     inkscape:window-width="1920"
+     inkscape:window-height="1080"
+     inkscape:window-x="0"
+     inkscape:window-y="0"
+     inkscape:window-maximized="0"
+     inkscape:current-layer="layer1" />
   <defs
      id="defs1" />
   <g
      id="layer1">
-    <rect
-       width="512"
-       height="512"
-       rx="112"
-       fill="#ffffff"
-       id="bg" />
-    <text
-       xml:space="preserve"
-       style="font-size:442.321px;writing-mode:lr-tb;direction:ltr;fill:#000000;stroke-width:2.30376"
-       x="11.958602"
-       y="402.34894"
-       id="text1"><tspan
-         id="tspan1"
-         x="11.958602"
-         y="402.34894"
-         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:442.321px;font-family:'SF Pro';-inkscape-font-specification:'SF Pro Bold';fill:#000000;stroke-width:2.30376">V</tspan></text>
-    <text
-       xml:space="preserve"
-       style="font-size:442.321px;writing-mode:lr-tb;direction:ltr;fill:#000000;stroke-width:2.30376"
-       x="262.07312"
-       y="402.34879"
-       id="text2"><tspan
-         id="tspan2"
-         x="262.07312"
-         y="402.34879"
-         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:442.321px;font-family:'SF Pro';-inkscape-font-specification:'SF Pro Bold';fill:#000000;stroke-width:2.30376">L</tspan></text>
+    <g
+       id="g1">
+      <path
+         style="font-weight:bold;font-size:442.321px;font-family:'SF Pro';-inkscape-font-specification:'SF Pro Bold';stroke-width:2.30376"
+         d="m 122.32288,402.34894 h 79.47956 L 306.11935,90.694044 H 233.76704 L 162.71059,335.61203 h -1.29586 L 90.142297,90.694044 H 18.00596 Z"
+         id="text1"
+         aria-label="V" />
+      <path
+         style="font-weight:bold;font-size:442.321px;font-family:'SF Pro';-inkscape-font-specification:'SF Pro Bold';stroke-width:2.30376"
+         d="M 287.99037,402.34879 H 489.49696 V 348.5705 H 353.21544 V 90.693891 h -65.22507 z"
+         id="text2"
+         aria-label="L"
+         inkscape:label="text2" />
+    </g>
   </g>
 </svg>
