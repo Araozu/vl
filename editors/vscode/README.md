@@ -15,8 +15,8 @@ language.
 From this directory:
 
 ```sh
-npm ci
-npm run package
+pnpm install --frozen-lockfile
+pnpm package
 ```
 
 This produces `vl-language-support.vsix`, which can be installed with:

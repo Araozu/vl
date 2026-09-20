@@ -3,6 +3,7 @@
   "displayName": "VL Language Support",
   "description": "Syntax highlighting and editor configuration for the VL programming language.",
   "version": "0.1.0",
+  "packageManager": "pnpm@12.4.2",
   "publisher": "vl-lang",
   "license": "MIT OR Apache-2.0",
   "repository": {

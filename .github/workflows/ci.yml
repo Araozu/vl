@@ -20,13 +20,16 @@ jobs:
         working-directory: editors/vscode
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.2
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: editors/vscode/package-lock.json
-      - run: npm ci
-      - run: npm run package
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: editors/vscode/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm package
       - uses: actions/upload-artifact@v4
         with:
           name: vl-language-support-vsix
