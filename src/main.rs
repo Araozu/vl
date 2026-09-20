@@ -496,7 +496,7 @@ fn run_frontend_ast(
         }
     }
     let hir = vl_hir::lower(ast, &res);
-    let (typed, mut d) = vl_typecheck::check(&hir);
+    let (typed, mut d) = vl_typecheck::check_with_modules(&hir, modules);
     diags.append(&mut d);
     if !res.poisoned_imports {
         diags.append(&mut typed.validate_normalized(&hir, &diags));

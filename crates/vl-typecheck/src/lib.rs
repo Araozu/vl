@@ -538,7 +538,205 @@ fn generic_template_ids(prog: &HirProgram) -> HashSet<u32> {
     out
 }
 
+/// True when a converted type names a qualified object (`a.b.C`) with no
+/// layout in scope. Callers poison quietly: [`validate_qualified_types`]
+/// already reported the E302, so any follow-on mismatch would cascade.
+fn ty_has_unknown_qualified(ty: &Ty, objects: &HashMap<String, ObjectSigTy>) -> bool {
+    match ty {
+        Ty::Object(name) => name.contains('.') && !objects.contains_key(name),
+        Ty::Array(elem) => ty_has_unknown_qualified(elem, objects),
+        Ty::Mutable(inner) => ty_has_unknown_qualified(inner, objects),
+        _ => false,
+    }
+}
+
+/// Report qualified object references (`vl.person.Person`) with no layout in
+/// scope. Bare names were already validated by the parser against the file's
+/// own `type` items, so only dotted spellings are checked here: each gets one
+/// E302 pointing at its annotation. Cast targets are skipped (`check_cast`
+/// owns that position); other uses (literals, field access) resolve through
+/// the same map and report themselves during inference.
+fn validate_qualified_types(
+    prog: &HirProgram,
+    objects: &HashMap<String, ObjectSigTy>,
+) -> Vec<Diagnostic> {
+    fn check_ty(
+        ty: &VlType,
+        span: Span,
+        objects: &HashMap<String, ObjectSigTy>,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        match ty {
+            VlType::Object(name) if name.contains('.') && !objects.contains_key(name) => {
+                diags.push(
+                    Diagnostic::error(format!("cannot find object type `{name}`"))
+                        .with_label(span, "unknown object type")
+                        .with_code("E302"),
+                );
+            }
+            VlType::Array(elem) => check_ty(elem, span, objects, diags),
+            VlType::Mutable(inner) => check_ty(inner, span, objects, diags),
+            _ => {}
+        }
+    }
+    fn check_expr(
+        expr: &HirExpr,
+        objects: &HashMap<String, ObjectSigTy>,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        match expr {
+            HirExpr::Cast { inner, .. } => {
+                // Target owned by `check_cast`; it reports once itself.
+                check_expr(inner, objects, diags);
+            }
+            HirExpr::Call {
+                type_args,
+                args,
+                span,
+                ..
+            } => {
+                for arg in type_args {
+                    check_ty(arg, *span, objects, diags);
+                }
+                for arg in args {
+                    check_expr(arg, objects, diags);
+                }
+            }
+            HirExpr::ArrayLiteral { elems, .. } => {
+                for elem in elems {
+                    check_expr(elem, objects, diags);
+                }
+            }
+            HirExpr::ObjectLiteral { fields, .. } => {
+                for (_, value) in fields {
+                    check_expr(value, objects, diags);
+                }
+            }
+            HirExpr::Index { base, index, .. } => {
+                check_expr(base, objects, diags);
+                check_expr(index, objects, diags);
+            }
+            HirExpr::Field { base, .. } => check_expr(base, objects, diags),
+            HirExpr::Binary { lhs, rhs, .. } => {
+                check_expr(lhs, objects, diags);
+                check_expr(rhs, objects, diags);
+            }
+            HirExpr::Unary { inner, .. } => check_expr(inner, objects, diags),
+            HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
+        }
+    }
+    fn check_stmts(
+        stmts: &[HirStmt],
+        objects: &HashMap<String, ObjectSigTy>,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                HirStmt::Let {
+                    ty, ty_span, value, ..
+                } => {
+                    if let (Some(ty), Some(span)) = (ty, ty_span) {
+                        check_ty(ty, *span, objects, diags);
+                    }
+                    check_expr(value, objects, diags);
+                }
+                HirStmt::Assign { value, .. } => check_expr(value, objects, diags),
+                HirStmt::Expr(value) => check_expr(value, objects, diags),
+                HirStmt::IndexAssign {
+                    array,
+                    index,
+                    value,
+                    ..
+                } => {
+                    check_expr(array, objects, diags);
+                    check_expr(index, objects, diags);
+                    check_expr(value, objects, diags);
+                }
+                HirStmt::FieldAssign { base, value, .. } => {
+                    check_expr(base, objects, diags);
+                    check_expr(value, objects, diags);
+                }
+                HirStmt::If {
+                    condition,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    check_expr(condition, objects, diags);
+                    check_stmts(then_body, objects, diags);
+                    if let Some(else_body) = else_body {
+                        check_stmts(else_body, objects, diags);
+                    }
+                }
+                HirStmt::While {
+                    condition, body, ..
+                } => {
+                    check_expr(condition, objects, diags);
+                    check_stmts(body, objects, diags);
+                }
+                HirStmt::Return { value, .. } => {
+                    if let Some(value) = value {
+                        check_expr(value, objects, diags);
+                    }
+                }
+                HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
+            }
+        }
+    }
+    let mut diags = Vec::new();
+    for item in &prog.items {
+        match item {
+            HirItem::Object { fields, .. } => {
+                for (_, ty, span) in fields {
+                    if let Some(ty) = ty {
+                        check_ty(ty, *span, objects, &mut diags);
+                    }
+                }
+            }
+            HirItem::Let {
+                ty, ty_span, value, ..
+            } => {
+                if let (Some(ty), Some(span)) = (ty, ty_span) {
+                    check_ty(ty, *span, objects, &mut diags);
+                }
+                check_expr(value, objects, &mut diags);
+            }
+            HirItem::Fn {
+                params,
+                ret,
+                ret_span,
+                body,
+                ..
+            } => {
+                for (_, _, ty, span) in params {
+                    if let Some(ty) = ty {
+                        check_ty(ty, *span, objects, &mut diags);
+                    }
+                }
+                if let (Some(ret), Some(span)) = (ret, ret_span) {
+                    check_ty(ret, *span, objects, &mut diags);
+                }
+                check_stmts(body, objects, &mut diags);
+            }
+        }
+    }
+    diags
+}
+
 pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
+    check_with_modules(prog, &[])
+}
+
+/// Check one module with every project module's exported object layouts in
+/// scope. Local objects are keyed both bare (`Person`, for code written in
+/// the defining module) and qualified (`vl.person.Person`); foreign objects
+/// are keyed qualified only, so nominal identity never collides across
+/// modules. Unknown qualified references are reported once here (E302);
+/// field and literal uses stay quiet downstream when the layout is missing.
+pub fn check_with_modules(
+    prog: &HirProgram,
+    modules: &[vl_common::ModuleSpec],
+) -> (TypedProgram, Vec<Diagnostic>) {
     let mut cx = Checker {
         typed: TypedProgram::default(),
         diags: vec![],
@@ -553,6 +751,30 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
         pending_instances: Vec::new(),
         fixed_defs: HashSet::new(),
     };
+    // Merge foreign layouts first so local declarations can reference
+    // them (a local field may hold a `vl.other.Person`). The driver's own
+    // interface is included in `modules`; it is skipped because the local
+    // definitions below are the canonical entry.
+    for spec in modules {
+        if spec.path.as_string() == prog.module {
+            continue;
+        }
+        for export in &spec.objects {
+            if cx.typed.objects.contains_key(&export.qualified) {
+                continue;
+            }
+            let mut out_fields = Vec::with_capacity(export.fields.len());
+            for field in &export.fields {
+                out_fields.push((
+                    field.name.clone(),
+                    Ty::from_vl_in(&field.ty, &HashMap::new()),
+                ));
+            }
+            cx.typed
+                .objects
+                .insert(export.qualified.clone(), ObjectSigTy { fields: out_fields });
+        }
+    }
     // Pass 0: collect object layouts so field types and object literals can
     // refer to declarations in either order.
     for item in &prog.items {
@@ -565,6 +787,10 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
                     .unwrap_or(Ty::Error);
                 if ty_has_error(&field_ty) {
                     // Parser already reported (unknown type); stay quiet.
+                } else if ty_has_unknown_qualified(&field_ty, &cx.typed.objects) {
+                    // Qualified reference with no layout in scope: the
+                    // validation walk below owns the E302, so poison quietly.
+                    field_ty = Ty::Error;
                 } else if !validate_capability(&field_ty, *span, &mut cx.diags) {
                     field_ty = Ty::Error;
                 } else if field_ty.is_void() {
@@ -577,11 +803,17 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
                 }
                 out_fields.push((field.clone(), field_ty));
             }
+            let sig = ObjectSigTy { fields: out_fields };
+            cx.typed.objects.insert(name.clone(), sig.clone());
+            // Qualified identity for cross-module references and
+            // self-references spelled `vl.person.Person`.
             cx.typed
                 .objects
-                .insert(name.clone(), ObjectSigTy { fields: out_fields });
+                .insert(format!("{}.{}", prog.module, name), sig);
         }
     }
+    cx.diags
+        .append(&mut validate_qualified_types(prog, &cx.typed.objects));
     // Pass 1: collect function signatures so calls resolve arity + types
     // regardless of definition order (matches the resolver pre-pass).
     for item in &prog.items {
@@ -611,6 +843,12 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
                     .as_ref()
                     .map(|v| Ty::from_vl_in(v, &env))
                     .unwrap_or(Ty::Error);
+                if !ty_has_error(&pt) && ty_has_unknown_qualified(&pt, &cx.typed.objects) {
+                    // Qualified reference with no layout: the validation walk
+                    // owns the E302, so poison quietly instead of cascading
+                    // arity-independent E303s at every call site.
+                    pt = Ty::Error;
+                }
                 if !ty_has_error(&pt) && !validate_capability(&pt, *pspan, &mut cx.diags) {
                     pt = Ty::Error;
                 } else if !ty_has_error(&pt) && pt.is_void() {
@@ -629,6 +867,9 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
                 .as_ref()
                 .map(|v| Ty::from_vl_in(v, &env))
                 .unwrap_or(Ty::Error);
+            if !ty_has_error(&ret_ty) && ty_has_unknown_qualified(&ret_ty, &cx.typed.objects) {
+                ret_ty = Ty::Error;
+            }
             if !ty_has_error(&ret_ty) {
                 let rsp = ret_span.unwrap_or(*span);
                 if !validate_capability(&ret_ty, rsp, &mut cx.diags) {
@@ -845,6 +1086,12 @@ impl Checker {
         let ann = ty.as_ref().map(|v| Ty::from_vl_in(v, &self.type_env));
         if let Some(a) = &ann {
             if ty_has_error(a) {
+                let _ = self.infer_expr(value);
+                return Ty::Error;
+            }
+            if ty_has_unknown_qualified(a, &self.typed.objects) {
+                // Qualified annotation with no layout: the validation walk
+                // owns the E302, so poison quietly instead of cascading E309.
                 let _ = self.infer_expr(value);
                 return Ty::Error;
             }
@@ -3510,6 +3757,43 @@ mod tests {
             "fun sum(a: Array[u64]): u64 { return a[0u64]; } fun main() { val a: *Array[u64] = Array.new::[u64](3u64); a[0u64] = 1u64; val b = [1u64, 2u64]; sum(a); sum(b); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    fn check_importer(provider_src: &str, importer_src: &str) -> (TypedProgram, Vec<Diagnostic>) {
+        let (toks, _) = vl_lex::lex(provider_src);
+        let (provider, _) = vl_syntax::parse_with_module(&toks, provider_src, "vl.person");
+        let (interface, _) = vl_semantic::collect_interface_quiet(&provider);
+        let spec = interface.as_spec();
+        let (toks, _) = vl_lex::lex(importer_src);
+        let (prog, mut diags) = vl_syntax::parse_with_module(&toks, importer_src, "vl.main");
+        let (res, mut d) = vl_semantic::resolve_with_modules(&prog, std::slice::from_ref(&spec));
+        diags.append(&mut d);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, mut d) = check_with_modules(&hir, std::slice::from_ref(&spec));
+        diags.append(&mut d);
+        (typed, diags)
+    }
+
+    const PERSON_PROVIDER: &str = "type Person = object { name: String, age: u64, }; fun new(name: String, age: u64): *Person { return Person { name = name, age = age, }; } fun name_of(p: Person): String { return p.name; }";
+
+    #[test]
+    fn imported_object_types_check_clean() {
+        let (_, diags) = check_importer(
+            PERSON_PROVIDER,
+            "use vl.person; fun main() { var rose = person.new(\"R\", 1); rose.age = 2; val n: String = person.name_of(rose); val lit: vl.person.Person = vl.person.Person { name = \"L\", age = 3 }; person.name_of(lit); }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+    }
+
+    #[test]
+    fn unknown_qualified_object_is_one_diagnostic() {
+        let (_, diags) = check_importer(
+            PERSON_PROVIDER,
+            "use vl.person; fun main() { val x: vl.person.Nope = person.new(\"R\", 1); }",
+        );
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E302"), "{diags:?}");
     }
 
     #[test]
