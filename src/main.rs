@@ -457,6 +457,10 @@ fn run_frontend_ast(
     modules: &[vl_common::ModuleSpec],
     entrypoint_module: Option<&str>,
 ) -> Result<Frontend, Vec<vl_common::Diagnostic>> {
+    // Project interfaces were collected from the raw user AST; the prelude
+    // joins here so its helpers stay local and never pollute the catalog.
+    let owned = vl_stdlib::inject(ast.clone());
+    let ast = &owned;
     let (res, mut diags) = vl_semantic::resolve_with_modules(ast, modules);
     let mains = ast
         .items
@@ -520,6 +524,8 @@ fn run_frontend(
     if diags.iter().any(|d| d.is_error()) {
         return Err(diags);
     }
+    // Lazily merged helpers behave as locals written by the user.
+    let ast = vl_stdlib::inject(ast);
     let (res, mut d) = vl_semantic::resolve_with_modules(&ast, modules);
     diags.append(&mut d);
     if !diags.iter().any(|d| d.is_error()) {
