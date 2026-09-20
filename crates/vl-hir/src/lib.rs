@@ -6,6 +6,13 @@
 //! stages can skip rather than cascade errors). Returns are explicit:
 //! only `return expr;` / `return;` yields a value; trailing expression
 //! statements are discarded values, never implicit returns.
+//!
+//! Reference types are capabilities (`Foo` is a read-only view,
+//! `*Foo` is a mutable view of the same GC allocation). HIR preserves
+//! every qualified [`VlType`] exactly for type checking; it never erases
+//! capability and never desugars field/index writes into pointer
+//! operations. Binding assignment (`Assign`), field writes
+//! (`FieldAssign`), and element writes (`IndexAssign`) stay distinct.
 
 use vl_common::{GenericBound, Scalar, Span, VlType};
 
@@ -878,6 +885,188 @@ mod tests {
                 ));
             }
             other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mutable_types_survive_lowering() {
+        let src = "type Child = object { value: u64, }; type Parent = object { child: *Child, children: *Array[*Child], }; function edit(parent: *Parent): *Parent { let x: *Child = parent.child; x; return parent; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[1] {
+            HirItem::Object { fields, .. } => {
+                assert_eq!(
+                    fields[0].1,
+                    Some(VlType::Mutable(Box::new(VlType::Object("Child".into()))))
+                );
+                assert_eq!(
+                    fields[1].1,
+                    Some(VlType::Mutable(Box::new(VlType::Array(Box::new(
+                        VlType::Mutable(Box::new(VlType::Object("Child".into())))
+                    )))))
+                );
+            }
+            other => panic!("expected object, got {other:?}"),
+        }
+        match &hir.items[2] {
+            HirItem::Fn {
+                params, ret, body, ..
+            } => {
+                assert_eq!(
+                    params[0].2,
+                    Some(VlType::Mutable(Box::new(VlType::Object("Parent".into()))))
+                );
+                assert_eq!(
+                    *ret,
+                    Some(VlType::Mutable(Box::new(VlType::Object("Parent".into()))))
+                );
+                // `let x` binds a fresh local; its initializer reads `parent`.
+                let param_def = params[0].1.clone().expect("param def");
+                let param = res.defs.iter().find(|d| d.id == param_def).expect("param");
+                assert_eq!(param.kind, vl_semantic::DefKind::Parameter);
+                assert_eq!(param.name, "parent");
+                match &body[0] {
+                    HirStmt::Let { ty, def, value, .. } => {
+                        assert_eq!(
+                            *ty,
+                            Some(VlType::Mutable(Box::new(VlType::Object("Child".into()))))
+                        );
+                        let local_def = def.clone().expect("let def must survive");
+                        let local = res
+                            .defs
+                            .iter()
+                            .find(|d| d.id == local_def)
+                            .expect("local def");
+                        assert_eq!(local.kind, vl_semantic::DefKind::Local);
+                        assert_eq!(local.name, "x");
+                        // Initializer `parent.child` reads through the param.
+                        match value {
+                            HirExpr::Field { base, name, .. } => {
+                                assert_eq!(name, "child");
+                                match &**base {
+                                    HirExpr::Var { def, name, .. } => {
+                                        assert_eq!(name, "parent");
+                                        assert_eq!(*def, Some(param_def));
+                                    }
+                                    other => panic!("expected parent var, got {other:?}"),
+                                }
+                            }
+                            other => panic!("expected field read, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected let, got {other:?}"),
+                }
+                // `x;` reads the local, `return parent;` reads the parameter.
+                match &body[1] {
+                    HirStmt::Expr(HirExpr::Var { def, name, .. }) => {
+                        assert_eq!(name, "x");
+                        assert!(def.is_some());
+                    }
+                    other => panic!("expected x read, got {other:?}"),
+                }
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mutable_call_type_args_and_assign_kinds_survive() {
+        let src = "type Foo = object { value: u64, }; function id[T](x: T): T { return x; } function main() { let base = Foo { value = 1u64 }; let e = id::[*Foo](base); let arr = [1u64]; let c = base as Foo; e = base; e.value = 1u64; arr[0u64] = 2u64; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[2] {
+            HirItem::Fn { body, .. } => {
+                // `let e = id::[*Foo](base)`: mutable turbofish survives.
+                match &body[1] {
+                    HirStmt::Let {
+                        def, value, ty: _, ..
+                    } => {
+                        let let_def = def.clone().expect("e def");
+                        match value {
+                            HirExpr::Call {
+                                type_args,
+                                args,
+                                def: callee,
+                                ..
+                            } => {
+                                assert_eq!(
+                                    *type_args,
+                                    vec![VlType::Mutable(Box::new(VlType::Object("Foo".into())))]
+                                );
+                                assert!(callee.is_some());
+                                match &args[0] {
+                                    HirExpr::Var { def, name, .. } => {
+                                        assert_eq!(name, "base");
+                                        assert!(def.is_some());
+                                        // Argument refers to the earlier `base` local.
+                                        match &body[0] {
+                                            HirStmt::Let { def: base_def, .. } => {
+                                                assert_eq!(*def, *base_def);
+                                            }
+                                            other => {
+                                                panic!("expected base let, got {other:?}")
+                                            }
+                                        }
+                                    }
+                                    other => panic!("expected base var, got {other:?}"),
+                                }
+                            }
+                            other => panic!("expected call, got {other:?}"),
+                        }
+                        // `e = base` targets the `e` local exactly.
+                        match &body[4] {
+                            HirStmt::Assign { def: target, .. } => {
+                                assert_eq!(*target, Some(let_def));
+                            }
+                            other => panic!("expected assign, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected let e, got {other:?}"),
+                }
+                // `let c = base as Foo` preserves the cast target exactly.
+                match &body[3] {
+                    HirStmt::Let { value, .. } => match value {
+                        HirExpr::Cast { target, .. } => {
+                            assert_eq!(*target, VlType::Object("Foo".into()));
+                        }
+                        other => panic!("expected cast, got {other:?}"),
+                    },
+                    other => panic!("expected let c, got {other:?}"),
+                }
+                assert!(matches!(&body[4], HirStmt::Assign { .. }));
+                assert!(matches!(&body[5], HirStmt::FieldAssign { .. }));
+                assert!(matches!(&body[6], HirStmt::IndexAssign { .. }));
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mutable_cast_and_top_let_targets_survive() {
+        let src = "type Foo = object { value: u64, }; let g: *Foo = Foo { value = 1u64 }; function main() { let c = g as Foo; c; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[1] {
+            HirItem::Let { ty, def, .. } => {
+                assert_eq!(
+                    *ty,
+                    Some(VlType::Mutable(Box::new(VlType::Object("Foo".into()))))
+                );
+                assert!(def.is_some());
+            }
+            other => panic!("expected top let, got {other:?}"),
         }
     }
 }
