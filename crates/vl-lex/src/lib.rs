@@ -25,6 +25,10 @@ pub enum TokenKind {
     Break,
     Continue,
     Return,
+    /// Explicit numeric conversion (`value as u8`, TypeScript-like).
+    As,
+    /// Generic bound introducer (`T extends Numeric`).
+    Extends,
     Plus,
     Minus,
     Star,
@@ -367,6 +371,8 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                     "break" => TokenKind::Break,
                     "continue" => TokenKind::Continue,
                     "return" => TokenKind::Return,
+                    "as" => TokenKind::As,
+                    "extends" => TokenKind::Extends,
                     "true" => TokenKind::Bool(true),
                     "false" => TokenKind::Bool(false),
                     _ => TokenKind::Ident(word.to_string()),
@@ -536,5 +542,13 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
         assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::ColonColon)));
         assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Colon)));
+    }
+
+    #[test]
+    fn lexes_as_and_extends_keywords() {
+        let (toks, diags) = lex("x as u8; function f[T extends Numeric](a: T): T { return a; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::As)));
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Extends)));
     }
 }

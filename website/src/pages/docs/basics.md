@@ -77,6 +77,21 @@ function main() {
 
 Decimal literals need an explicit suffix such as `f64`. Values do not silently
 change from one numeric type to another; when a type matters, write it down.
+Integer literals adapt to their context (`let x: u8 = 3;` checks the range),
+but variables never convert implicitly: a `u64` variable does not flow into a
+`u8` parameter.
+
+Explicit conversions use TypeScript-like `as` (integers only in v0):
+
+```vl
+let v = 200u64;
+let w = v as u8;
+let lit = 10 as u8;
+```
+
+Literals are range-checked at compile time (`300 as u8` fails); variable
+conversions are unchecked reinterpretations with no runtime cost (no trap, no
+wrap instruction).
 
 ## Variables with `let`
 

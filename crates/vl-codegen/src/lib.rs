@@ -192,6 +192,11 @@ fn dummy_instr(ins: &Instr) -> String {
         } => {
             format!("array_set %{}[%{}], %{}", array.0, index.0, value.0)
         }
+        Instr::Cast {
+            dst, src, target, ..
+        } => {
+            format!("cast %{}, %{} : {target}", dst.0, src.0)
+        }
         Instr::BranchIfFalse { cond, target, .. } => {
             format!("branch_if_false %{}, L{}", cond.0, target)
         }
@@ -820,6 +825,9 @@ fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::R
             I::Copy { src, .. } => {
                 touch(*src, idx);
             }
+            I::Cast { src, .. } => {
+                touch(*src, idx);
+            }
             I::Not { src, .. } => {
                 touch(*src, idx);
             }
@@ -906,6 +914,9 @@ fn nara_free_dead(e: &mut NaraEmit, ins: &Instr, idx: usize) {
             if dst != src {
                 dead.push(*src);
             }
+        }
+        I::Cast { src, .. } => {
+            dead.push(*src);
         }
         I::Not { src, .. } => {
             dead.push(*src);
@@ -1071,6 +1082,46 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                     return;
                 };
                 e.kinds.insert(*dst, kind);
+                e.bytecode.extend_from_slice(&[0x04, d, s]); // cpv
+            }
+        }
+        Instr::Cast {
+            dst,
+            src,
+            target,
+            span,
+        } => {
+            // Explicit integer conversion: unchecked reinterpretation (no
+            // trap, no wrap op). Literals were range-checked by typechecking;
+            // variables keep their 64-bit payload and change lane.
+            if e.invalid.contains(src) {
+                e.invalid.insert(*dst);
+                return;
+            }
+            let Some(target_kind) = NaraKind::of_ty(target) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            if target_kind.is_ref() {
+                e.diags.push(
+                    Diagnostic::error("Naravm backend does not support casts to reference types")
+                        .with_label(*span, "unsupported cast")
+                        .with_code("E404"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            }
+            let Some(s) = e.value_reg(*src, *span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(d) = e.fresh_rv(*span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            e.rv_map.insert(*dst, d);
+            e.kinds.insert(*dst, target_kind);
+            if s != d {
                 e.bytecode.extend_from_slice(&[0x04, d, s]); // cpv
             }
         }
@@ -2114,6 +2165,11 @@ fn stackvm_instr(ins: &Instr) -> String {
             ..
         } => {
             format!("array_set %{}[%{}] %{}", array.0, index.0, value.0)
+        }
+        Instr::Cast {
+            dst, src, target, ..
+        } => {
+            format!("cast %{} %{} : {target}", dst.0, src.0)
         }
         Instr::BranchIfFalse { cond, target, .. } => {
             format!("branch_if_false %{} -> L{}", cond.0, target)

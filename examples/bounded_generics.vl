@@ -1,0 +1,26 @@
+// Constrained generics (`T extends Numeric`, `T extends Comparable`).
+//
+// Unconstrained `T` is fully opaque (no operators). `Numeric` unlocks
+// arithmetic, ordering, and equality; `Comparable` unlocks equality over
+// numbers, bools, and strings. Bounds are checked at call sites (concrete
+// types) and by implication for forwarding (`Numeric` implies `Comparable`).
+use std;
+
+function add[T extends Numeric](a: T, b: T): T {
+    return a + b;
+}
+
+function eq[T extends Comparable](a: T, b: T): bool {
+    return a == b;
+}
+
+function main() {
+    std.print_u64(add(1u64, 2u64));
+    std.print_u64(add::[u8](10u8, 20u8) as u64);
+    let ok = eq(add(1u64, 2u64), 3u64);
+    if (ok) {
+        std.print("bounded ok\n");
+    } else {
+        std.print("bounded mismatch\n");
+    }
+}

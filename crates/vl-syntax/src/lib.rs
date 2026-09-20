@@ -4,7 +4,8 @@
 //! ```text
 //! program := item*
 //! item    := `let` ident (`:` type)? `=` expr `;` | `function` ident type-params? `(` params? `)` (`:` type)? block
-//! type-params := `[` ident (`,` ident)* `]`
+//! type-params := `[` type-param (`,` type-param)* `]`
+//! type-param  := ident (`extends` (`Numeric` | `Comparable`))?
 //! params  := param (`,` param)*
 //! param   := ident `:` type
 //! type    := `u64` | `i64` | `f64` | `bool` | `u8` | `string` | `File` | `Array` `[` type `]` | type-param | `void` (`void` only as return)
@@ -18,7 +19,8 @@
 //! expr    := or
 //! or      := and (`||` and)*
 //! and     := equality (`&&` equality)*
-//! equality:= comparison ((`==`|`!=`) comparison)*
+//! equality:= cast ((`==`|`!=`) cast)*
+//! cast    := comparison (`as` type)*
 //! comparison := term ((`<`|`<=`|`>`|`>=`) term)*
 //! term    := factor ((`+`|`-`) factor)*
 //! factor  := unary ((`*`|`/`) unary)*
@@ -37,11 +39,17 @@
 //! always `u64`; elements have the array's `T`.
 //!
 //! Generic functions declare type parameters after the name
-//! (`function first[T](a: Array[T]): T { ... }`). Calls infer them from the
-//! value arguments (`first(a)`) or pass them explicitly with a turbofish
+//! (`function first[T](a: Array[T]): T { ... }`, optionally bounded as
+//! `function add[T extends Numeric](a: T, b: T): T`). Calls infer them from
+//! the value arguments (`first(a)`) or pass them explicitly with a turbofish
 //! (`first::[u64](a)`). `f[T](args)` without `::` is *not* a generic call —
 //! it parses as indexing `f[T]` (which is not callable), and the parser says
 //! so explicitly.
+//!
+//! Explicit numeric conversions use TypeScript-like `as` (`value as u8`):
+//! integer-to-integer casts with no runtime cost (literals are range-checked
+//! at compile time; variable conversions are unchecked reinterpretations).
+//! Implicit cross-integer conversions stay narrow (literals only).
 //!
 //! Calls are callee-by-name (`ident(args)`), TypeScript-style. The callee
 //! is a plain variable use so forward references to `function` items work.
@@ -55,8 +63,8 @@
 //! The parser recovers per-item: one bad item doesn't kill the rest.
 
 pub use vl_common::Scalar;
-pub use vl_common::VlType;
 use vl_common::{Diagnostic, Span};
+pub use vl_common::{GenericBound, VlType};
 use vl_lex::{Token, TokenKind};
 
 // ---------------------------------------------------------------- AST ---
@@ -78,11 +86,14 @@ pub struct Param {
     pub ty_span: Option<Span>,
 }
 
-/// One declared type parameter: `T` in `function first[T](...)`.
+/// One declared type parameter: `T` in `function first[T](...)`, optionally
+/// bounded (`T extends Numeric`). Bounds enable operators on otherwise-opaque
+/// `T` without full subtyping.
 #[derive(Debug, Clone)]
 pub struct TypeParam {
     pub name: String,
     pub span: Span,
+    pub bound: Option<GenericBound>,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +220,15 @@ pub enum Expr {
         rhs: Box<Expr>,
         span: Span,
     },
+    /// Explicit numeric conversion (`value as u8`, TypeScript-like).
+    /// Integer-to-integer only in v0; literals are range-checked at compile
+    /// time, variable conversions are unchecked (no runtime cost).
+    Cast {
+        inner: Box<Expr>,
+        target: VlType,
+        target_span: Span,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,7 +262,7 @@ impl Expr {
             Expr::Index { span, .. } => *span,
             Expr::Var { span, .. } => *span,
             Expr::Call { span, .. } => *span,
-            Expr::Unary { span, .. } | Expr::Binary { span, .. } => *span,
+            Expr::Unary { span, .. } | Expr::Binary { span, .. } | Expr::Cast { span, .. } => *span,
         }
     }
 }
@@ -575,9 +595,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse `[T, U]` after a function name. Returns the declared type
-    /// parameters (empty when there is no bracket). Reports duplicates,
-    /// empty lists, and shadowing of primitive type names.
+    /// Parse `[T, U extends Numeric]` after a function name. Returns the
+    /// declared type parameters (empty when there is no bracket). Reports
+    /// duplicates, empty lists, shadowing of primitive type names, and
+    /// unknown bounds (only `Numeric` and `Comparable` exist).
     fn parse_type_params(&mut self) -> Option<Vec<TypeParam>> {
         if !matches!(self.peek().kind, TokenKind::LBracket) {
             return Some(Vec::new());
@@ -612,7 +633,8 @@ impl<'a> Parser<'a> {
                                 .with_code("E200"),
                         );
                     } else {
-                        params.push(TypeParam { name, span });
+                        let bound = self.parse_opt_extends()?;
+                        params.push(TypeParam { name, span, bound });
                     }
                 }
                 None => return None,
@@ -626,6 +648,40 @@ impl<'a> Parser<'a> {
         }
         self.expect(&TokenKind::RBracket, "`]` after type parameters")?;
         Some(params)
+    }
+
+    /// Parse an optional `extends Bound` tail (`Numeric` or `Comparable`).
+    fn parse_opt_extends(&mut self) -> Option<Option<GenericBound>> {
+        if !matches!(self.peek().kind, TokenKind::Extends) {
+            return Some(None);
+        }
+        self.bump(); // `extends`
+        let t = self.peek().clone();
+        match &t.kind {
+            TokenKind::Ident(name) => {
+                self.bump();
+                match name.parse::<GenericBound>() {
+                    Ok(bound) => Some(Some(bound)),
+                    Err(_) => {
+                        self.diags.push(
+                            Diagnostic::error(format!("unknown bound `{name}`"))
+                                .with_label(t.span, "expected `Numeric` or `Comparable`")
+                                .with_note("write `T extends Numeric` or `T extends Comparable`")
+                                .with_code("E105"),
+                        );
+                        None
+                    }
+                }
+            }
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(format!("expected a bound, found {}", describe(&t.kind)))
+                        .with_label(t.span, "expected `Numeric` or `Comparable` here")
+                        .with_code("E104"),
+                );
+                None
+            }
+        }
     }
 
     fn parse_function_item(&mut self) -> Option<Item> {
@@ -973,7 +1029,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_equality(&mut self) -> Option<Expr> {
-        let mut lhs = self.parse_comparison()?;
+        let mut lhs = self.parse_cast()?;
         loop {
             let op = match &self.peek().kind {
                 TokenKind::EqEq => BinOp::Eq,
@@ -981,7 +1037,7 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             self.bump();
-            let rhs = self.parse_comparison()?;
+            let rhs = self.parse_cast()?;
             let span = lhs.span().merge(rhs.span());
             lhs = Expr::Binary {
                 op,
@@ -991,6 +1047,31 @@ impl<'a> Parser<'a> {
             };
         }
         Some(lhs)
+    }
+
+    /// Explicit conversion (`expr as u8`), tighter than `==` but looser than
+    /// `+`: `a + b as u8` is `(a + b) as u8`, while `a == b as u8` is
+    /// `a == (b as u8)`. Chains left-associatively (`x as u8 as u64`).
+    /// Targets are concrete value types in v0 (`as T` with a type parameter
+    /// is rejected: it parses with no scope, so `T` is an unknown type).
+    fn parse_cast(&mut self) -> Option<Expr> {
+        let mut base = self.parse_comparison()?;
+        while matches!(self.peek().kind, TokenKind::As) {
+            self.bump(); // `as`
+            let Some((target, target_span)) = self.parse_type(&[], true) else {
+                // `parse_type` already reported; abort this cast chain so one
+                // bad target does not cascade.
+                return None;
+            };
+            let span = Span::new(base.span().start, target_span.end);
+            base = Expr::Cast {
+                inner: Box::new(base),
+                target,
+                target_span,
+                span,
+            };
+        }
+        Some(base)
     }
 
     fn parse_comparison(&mut self) -> Option<Expr> {
@@ -1301,6 +1382,8 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::Break => "`break`".into(),
         TokenKind::Continue => "`continue`".into(),
         TokenKind::Return => "`return`".into(),
+        TokenKind::As => "`as`".into(),
+        TokenKind::Extends => "`extends`".into(),
         TokenKind::Plus => "`+`".into(),
         TokenKind::Minus => "`-`".into(),
         TokenKind::Star => "`*`".into(),
@@ -1824,5 +1907,40 @@ mod tests {
             .items
             .iter()
             .any(|item| matches!(item, Item::Function { name, .. } if name == "tail")));
+    }
+
+    #[test]
+    fn parses_as_cast_with_precedence() {
+        // `a + b as u8` is `(a + b) as u8`; `a == b as u8` is `a == (b as u8)`.
+        let (prog, diags) = parse_src("function main() { let x = 1u64 + 2u64 as u8; x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { body, .. } => match &body[0] {
+                Stmt::Let { value, .. } => assert!(matches!(value, Expr::Cast { .. })),
+                other => panic!("expected cast let, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_bounded_type_params() {
+        let (prog, diags) =
+            parse_src("function add[T extends Numeric](a: T, b: T): T { return a + b; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { type_params, .. } => {
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].name, "T");
+                assert_eq!(type_params[0].bound, Some(GenericBound::Numeric));
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_bound_is_an_error() {
+        let (_prog, diags) = parse_src("function f[T extends Bogus](x: T): T { return x; }");
+        assert!(diags.iter().any(|d| d.code.as_deref() == Some("E105")));
     }
 }

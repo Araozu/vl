@@ -431,6 +431,7 @@ impl Resolver {
                 self.resolve_expr(lhs);
                 self.resolve_expr(rhs);
             }
+            Expr::Cast { inner, .. } => self.resolve_expr(inner),
         }
     }
 

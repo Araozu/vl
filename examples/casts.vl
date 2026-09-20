@@ -1,0 +1,19 @@
+// Explicit numeric conversions (`value as u8`, TypeScript-like).
+//
+// Integer-to-integer only in v0: literals are range-checked at compile time
+// (`300 as u8` fails), variables reinterpret unchecked with no runtime cost.
+// Implicit cross-integer conversions stay narrow (literals only); variables
+// require `as`.
+use std;
+
+function take_u8(x: u8): u8 {
+    return x;
+}
+
+function main() {
+    let v = 200u64;
+    let w = take_u8(v as u8);
+    std.print_u64(w as u64);
+    let lit = 10 as u8;
+    std.print_u64(lit as u64);
+}

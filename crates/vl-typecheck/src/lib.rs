@@ -21,8 +21,10 @@
 use std::collections::{HashMap, HashSet};
 
 use vl_common::Scalar;
-use vl_common::{Diagnostic, Span, VlType};
+use vl_common::{Diagnostic, GenericBound, Span, VlType};
 use vl_hir::{HirBinOp, HirExpr, HirItem, HirProgram, HirStmt, HirUnOp};
+
+mod mono;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ty {
@@ -87,13 +89,25 @@ impl Ty {
         }
     }
 
-    /// Fully concrete (no `Param` inside)? Only concrete types reach LIR.
+    /// Fully concrete (no `Param` inside, no unresolved `Int`)? Only
+    /// concrete types reach LIR. `Int` is an untyped literal awaiting context
+    /// and must be defaulted (`u64`) before lowering; `Param` is an opaque
+    /// generic use resolved per instance; `Error` (including nested
+    /// `Array[Error]`) is poison already reported upstream.
     pub fn is_concrete(&self) -> bool {
         match self {
             Ty::Array(elem) => elem.is_concrete(),
-            Ty::Param(_) | Ty::Error => false,
+            Ty::Param(_) | Ty::Error | Ty::Int => false,
             _ => true,
         }
+    }
+
+    /// Normalized for emission: concrete and containing no `Error` at any
+    /// depth. Poisoned types (`Error` / `Array[Error]`) are never emitted
+    /// (LIR skips them); every other recorded type in monomorphic code and
+    /// every instance signature must satisfy this.
+    pub fn is_normalized(&self) -> bool {
+        self.is_concrete()
     }
 
     /// Element type for `Array[T]`; `None` for everything else.
@@ -148,6 +162,9 @@ pub struct FuncSigTy {
     pub ret: Ty,
     /// Declared type parameters (`[]` when monomorphic).
     pub type_params: Vec<String>,
+    /// Bound per type parameter (`T -> Numeric`); absent means unconstrained
+    /// (fully opaque, no operators).
+    pub bounds: HashMap<String, GenericBound>,
 }
 
 impl FuncSigTy {
@@ -209,6 +226,173 @@ impl TypedProgram {
     pub fn sig_of(&self, def: u32) -> Option<&FuncSigTy> {
         self.func_sigs.get(&def)
     }
+
+    /// Validate the normalized-type invariant at the typecheck-to-LIR
+    /// boundary: every non-poisoned type in monomorphic code and every
+    /// instance signature must be normalized (no `Int`, no `Param`, no
+    /// nested `Error`). Generic template bodies legitimately contain
+    /// `Param` and are skipped. Returns diagnostics (E500, compiler bug)
+    /// for any violation so invalid types cannot silently disappear in LIR.
+    pub fn validate_normalized(&self, prog: &HirProgram) -> Vec<Diagnostic> {
+        validate_normalized(self, prog)
+    }
+}
+
+/// See [`TypedProgram::validate_normalized`].
+pub fn validate_normalized(typed: &TypedProgram, prog: &HirProgram) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    let generic_ids = generic_template_ids(prog);
+    for (id, ty) in &typed.types {
+        if generic_ids.contains(id) {
+            continue;
+        }
+        if ty_has_error(ty) {
+            continue;
+        }
+        if !ty.is_normalized() {
+            diags.push(
+                Diagnostic::error(format!(
+                    "non-normalized type `{ty}` reached the LIR boundary (compiler bug)"
+                ))
+                .with_note(
+                    "unresolved `int`/`Param` must be defaulted or monomorphized before lowering",
+                )
+                .with_code("E500"),
+            );
+        }
+    }
+    for (name, inst) in &typed.instances {
+        for ty in inst
+            .sig
+            .param_tys
+            .iter()
+            .chain(std::iter::once(&inst.sig.ret))
+        {
+            if ty_has_error(ty) {
+                continue;
+            }
+            if !ty.is_normalized() {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "instance `{name}` has non-normalized type `{ty}` (compiler bug)"
+                    ))
+                    .with_code("E500"),
+                );
+            }
+        }
+        for arg in &inst.args {
+            if !arg.is_normalized() && !ty_has_error(arg) {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "instance `{name}` has non-normalized argument `{arg}` (compiler bug)"
+                    ))
+                    .with_code("E500"),
+                );
+            }
+        }
+    }
+    diags
+}
+
+/// All `HirId.0` values inside generic function templates (bodies, params,
+/// and the item id itself). Their recorded types may contain `Param`.
+fn generic_template_ids(prog: &HirProgram) -> HashSet<u32> {
+    fn expr_ids(e: &HirExpr, out: &mut HashSet<u32>) {
+        out.insert(e.id().0);
+        match e {
+            HirExpr::ArrayLiteral { elems, .. } => {
+                for el in elems {
+                    expr_ids(el, out);
+                }
+            }
+            HirExpr::Index { base, index, .. } => {
+                expr_ids(base, out);
+                expr_ids(index, out);
+            }
+            HirExpr::Call { args, .. } => {
+                for a in args {
+                    expr_ids(a, out);
+                }
+            }
+            HirExpr::Binary { lhs, rhs, .. } => {
+                expr_ids(lhs, out);
+                expr_ids(rhs, out);
+            }
+            HirExpr::Unary { inner, .. } => expr_ids(inner, out),
+            HirExpr::Cast { inner, .. } => expr_ids(inner, out),
+            HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
+        }
+    }
+    fn stmt_ids(s: &HirStmt, out: &mut HashSet<u32>) {
+        match s {
+            HirStmt::Let { id, value, .. } | HirStmt::Assign { id, value, .. } => {
+                out.insert(id.0);
+                expr_ids(value, out);
+            }
+            HirStmt::IndexAssign {
+                id,
+                array,
+                index,
+                value,
+                ..
+            } => {
+                out.insert(id.0);
+                expr_ids(array, out);
+                expr_ids(index, out);
+                expr_ids(value, out);
+            }
+            HirStmt::Expr(e) => expr_ids(e, out),
+            HirStmt::Return { value, .. } => {
+                if let Some(e) = value {
+                    expr_ids(e, out);
+                }
+            }
+            HirStmt::If {
+                condition,
+                then_body,
+                else_body,
+                ..
+            } => {
+                expr_ids(condition, out);
+                for st in then_body {
+                    stmt_ids(st, out);
+                }
+                if let Some(body) = else_body {
+                    for st in body {
+                        stmt_ids(st, out);
+                    }
+                }
+            }
+            HirStmt::While {
+                condition, body, ..
+            } => {
+                expr_ids(condition, out);
+                for st in body {
+                    stmt_ids(st, out);
+                }
+            }
+            HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
+        }
+    }
+    let mut out = HashSet::new();
+    for item in &prog.items {
+        if let HirItem::Fn {
+            id,
+            type_params,
+            body,
+            ..
+        } = item
+        {
+            if type_params.is_empty() {
+                continue;
+            }
+            out.insert(id.0);
+            for st in body {
+                stmt_ids(st, &mut out);
+            }
+        }
+    }
+    out
 }
 
 pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
@@ -222,7 +406,7 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
         fn_ret_span: None,
         fn_span: Span::empty(0),
         type_env: HashMap::new(),
-        prog,
+        type_bounds: HashMap::new(),
         pending_instances: Vec::new(),
     };
     // Pass 1: collect function signatures so calls resolve arity + types
@@ -244,7 +428,7 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
             // substitutes its own type arguments.
             let env: HashMap<String, Ty> = type_params
                 .iter()
-                .map(|n| (n.clone(), Ty::Param(n.clone())))
+                .map(|p| (p.name.clone(), Ty::Param(p.name.clone())))
                 .collect();
             let param_tys = params
                 .iter()
@@ -266,7 +450,11 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
                     param_names,
                     param_tys,
                     ret: ret_ty,
-                    type_params: type_params.clone(),
+                    type_params: type_params.iter().map(|p| p.name.clone()).collect(),
+                    bounds: type_params
+                        .iter()
+                        .filter_map(|p| p.bound.map(|b| (p.name.clone(), b)))
+                        .collect(),
                 },
             );
         }
@@ -274,11 +462,17 @@ pub fn check(prog: &HirProgram) -> (TypedProgram, Vec<Diagnostic>) {
     for item in &prog.items {
         cx.check_item(item);
     }
-    cx.monomorphize();
-    (cx.typed, cx.diags)
+    // Separate monomorphization pass: instance expansion owns caching,
+    // poison suppression, expanding-recursion diagnostics, and budgets.
+    let pending = std::mem::take(&mut cx.pending_instances);
+    let mut typed = std::mem::take(&mut cx.typed);
+    let mut diags = std::mem::take(&mut cx.diags);
+    drop(cx);
+    mono::expand(prog, &mut typed, pending, &mut diags);
+    (typed, diags)
 }
 
-struct Checker<'a> {
+struct Checker {
     typed: TypedProgram,
     diags: Vec<Diagnostic>,
     bindings: HashMap<u32, Ty>,
@@ -290,12 +484,14 @@ struct Checker<'a> {
     /// Current function's type parameters mapped to opaque `Param` types
     /// (empty while checking monomorphic code).
     type_env: HashMap<String, Ty>,
-    prog: &'a HirProgram,
-    /// Concrete `(template DefId.0, args)` pairs awaiting worklist expansion.
+    /// Bounds of the current function's type parameters (`T -> Numeric`).
+    type_bounds: HashMap<String, GenericBound>,
+    /// Concrete `(template DefId.0, args)` pairs awaiting the separate
+    /// monomorphization pass ([`mono::expand`]).
     pending_instances: Vec<(u32, Vec<Ty>)>,
 }
 
-impl<'a> Checker<'a> {
+impl Checker {
     fn record(&mut self, id: vl_hir::HirId, ty: Ty) -> Ty {
         self.typed.types.insert(id.0, ty.clone());
         ty
@@ -342,10 +538,15 @@ impl<'a> Checker<'a> {
                     );
                 }
                 // Each type parameter checks opaquely as `Param(name)`; calls
-                // substitute their own arguments per site.
+                // substitute their own arguments per site. Bounds (`extends`)
+                // unlock operators on otherwise-opaque `T`.
                 self.type_env = type_params
                     .iter()
-                    .map(|n| (n.clone(), Ty::Param(n.clone())))
+                    .map(|p| (p.name.clone(), Ty::Param(p.name.clone())))
+                    .collect();
+                self.type_bounds = type_params
+                    .iter()
+                    .filter_map(|p| p.bound.map(|b| (p.name.clone(), b)))
                     .collect();
                 let ret_ty = ret
                     .as_ref()
@@ -377,15 +578,19 @@ impl<'a> Checker<'a> {
                     self.check_stmt(stmt);
                 }
                 self.type_env.clear();
+                self.type_bounds.clear();
                 if poisoned_sig {
                     return;
                 }
                 if ret_ty == Ty::Void {
                     // `return;` is optional; bare expression values are
-                    // discarded. Any body is accepted.
+                    // discarded. Any body is accepted, but still warn on
+                    // unreachable code.
+                    check_unreachable(body, &mut self.diags);
                     return;
                 }
-                if !stmts_always_return(body) {
+                check_unreachable(body, &mut self.diags);
+                if block_flow(body) != Flow::Returns {
                     // Any `return` (even a mistyped or bare one, already
                     // reported) counts as diverging, so this fires only when
                     // some reachable path falls through — one root cause.
@@ -527,8 +732,14 @@ impl<'a> Checker<'a> {
                 }
             }
             HirStmt::Expr(e) => {
-                // Value discarded; still infer for inner errors.
-                let _ = self.infer_expr(e);
+                // Value discarded; still infer for inner errors. A bare `int`
+                // result defaults to `u64` so no unresolved `Int` reaches LIR
+                // (e.g. `1 + 2;` in a void function lowers as `u64`).
+                let t = self.infer_expr(e);
+                if t == Ty::Int {
+                    self.coerce_expr_literals(e, &Ty::U64);
+                    let _ = self.infer_expr(e);
+                }
             }
             HirStmt::Return { value, span } => {
                 match value {
@@ -894,13 +1105,59 @@ impl<'a> Checker<'a> {
                 }
                 out.push(t);
             }
+            if !self.check_bounds(name, span, sig, &out) {
+                return None;
+            }
             return Some(out);
         }
         self.infer_type_args(name, span, sig, arg_tys)
     }
 
-    /// Infer omitted type arguments by unifying formal parameter types
-    /// against actual argument types.
+    /// Check inferred or explicit type arguments against the callee's bounds.
+    /// Concrete types must satisfy the bound directly; an outer `Param`
+    /// satisfies by implication (`Numeric` implies `Comparable`). Reports one
+    /// E303 per violation.
+    fn check_bounds(&mut self, name: &str, span: Span, sig: &FuncSigTy, args: &[Ty]) -> bool {
+        for (param, arg) in sig.type_params.iter().zip(args.iter()) {
+            let Some(bound) = sig.bounds.get(param) else {
+                continue;
+            };
+            if ty_satisfies_bound(arg, *bound, &self.type_bounds) {
+                continue;
+            }
+            // Friendlier message when an unconstrained outer `T` flows into a
+            // bounded callee inside a generic body.
+            if matches!(arg, Ty::Param(_)) {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "`{name}` requires `{param}` to satisfy `{bound}`, but it is passed as `{arg}`"
+                    ))
+                    .with_label(span, format!("`{arg}` does not satisfy `{bound}` here"))
+                    .with_note(format!(
+                        "add `extends {bound}` to `{arg}` or pass a concrete `{bound}` type"
+                    ))
+                    .with_code("E303"),
+                );
+            } else {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "`{name}` type argument `{arg}` does not satisfy `{bound}`"
+                    ))
+                    .with_label(span, format!("expected a `{bound}` type here"))
+                    .with_code("E303"),
+                );
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Infer omitted type arguments constraint-based: collect every
+    /// `Param` constraint first, then solve. Collecting before solving makes
+    /// inference independent of argument order (`same(1u64, 2)` and
+    /// `same(1, 2u64)` both infer `T = u64`) and prepares for nested
+    /// constraints (`Array[Array[T]]`) and contextual result inference
+    /// (an expected return type contributes one more constraint).
     fn infer_type_args(
         &mut self,
         name: &str,
@@ -908,92 +1165,20 @@ impl<'a> Checker<'a> {
         sig: &FuncSigTy,
         arg_tys: &[Ty],
     ) -> Option<Vec<Ty>> {
-        let mut binds: HashMap<String, Ty> = HashMap::new();
+        let mut set = ConstraintSet::default();
         for (formal, actual) in sig.param_tys.iter().zip(arg_tys.iter()) {
             if ty_has_error(actual) || ty_has_error(formal) {
                 continue;
             }
-            if !Self::unify(formal, actual, &mut binds, name, span, &mut self.diags) {
+            if !set.collect(formal, actual, name, span, &mut self.diags) {
                 return None;
             }
         }
-        let mut out = Vec::with_capacity(sig.type_params.len());
-        for p in &sig.type_params {
-            match binds.remove(p) {
-                // Unconstrained `int` literals default to the target's
-                // unsigned lane: `id(300)` infers `T = u64`, so a generic
-                // result crossing a concrete integer boundary (`return
-                // id(300);` in a `u8` function) mismatches instead of
-                // silently truncating.
-                Some(t) => out.push(default_inferred_ty(t)),
-                None => {
-                    self.diags.push(
-                        Diagnostic::error(format!("cannot infer type argument `{p}` for `{name}`"))
-                            .with_label(span, "pass it explicitly: `::[...]`")
-                            .with_note(format!("write `{name}::[{p}](...)` with a concrete type"))
-                            .with_code("E303"),
-                    );
-                    return None;
-                }
-            }
+        let out = set.solve(name, span, sig, &mut self.diags)?;
+        if !self.check_bounds(name, span, sig, &out) {
+            return None;
         }
         Some(out)
-    }
-
-    /// Unify one formal parameter type against an actual argument type,
-    /// recording `Param` bindings. Reports exactly one diagnostic on
-    /// conflict and returns false.
-    fn unify(
-        formal: &Ty,
-        actual: &Ty,
-        binds: &mut HashMap<String, Ty>,
-        name: &str,
-        span: Span,
-        diags: &mut Vec<Diagnostic>,
-    ) -> bool {
-        match (formal, actual) {
-            (Ty::Param(p), t) => {
-                if let Some(bound) = binds.get(p).cloned() {
-                    // Integer literals (`int`) defer to concrete constraints
-                    // so argument order is unobservable: `same(1u64, 2)` and
-                    // `same(1, 2u64)` both infer `T = u64`.
-                    if bound == Ty::Int && is_integer(t) && *t != Ty::Int {
-                        binds.insert(p.clone(), t.clone());
-                        return true;
-                    }
-                    if *t == Ty::Int && is_integer(&bound) {
-                        return true;
-                    }
-                    if !types_compatible(t, &bound) {
-                        diags.push(
-                            Diagnostic::error(format!(
-                                "`{name}` infers conflicting types for `{p}`: `{bound}` vs `{t}`"
-                            ))
-                            .with_label(span, "conflicting arguments here")
-                            .with_code("E306"),
-                        );
-                        return false;
-                    }
-                    true
-                } else {
-                    binds.insert(p.clone(), t.clone());
-                    true
-                }
-            }
-            (Ty::Array(f), Ty::Array(a)) => Self::unify(f, a, binds, name, span, diags),
-            (f, a) => {
-                if f != a {
-                    diags.push(
-                        Diagnostic::error(format!("`{name}` expects `{f}`, got `{a}`"))
-                            .with_label(span, format!("expected `{f}` here"))
-                            .with_code("E306"),
-                    );
-                    false
-                } else {
-                    true
-                }
-            }
-        }
     }
 
     /// `Array.new::[T](count)`: one `u64` argument, returns `Array[T]`.
@@ -1082,198 +1267,23 @@ impl<'a> Checker<'a> {
         self.record(id, Ty::Array(Box::new(elem)))
     }
 
-    /// Drain [`Checker::pending_instances`](Self::pending_instances):
-    /// for every concrete call discovered while checking, substitute the
-    /// template's type arguments and resolve the calls inside its body, so
-    /// generic-to-generic forwarding (`wrap[T]` calling `id::[T]`) lands on
-    /// concrete instances too. LIR emits one function per entry of
-    /// [`TypedProgram::instances`].
-    fn monomorphize(&mut self) {
-        let mut visited: HashSet<String> = HashSet::new();
-        while let Some((def, args)) = self.pending_instances.pop() {
-            let Some(sig) = self.typed.func_sigs.get(&def).cloned() else {
-                continue;
-            };
-            let Some(name) = self.instance_name(def) else {
-                continue;
-            };
-            let mangled = mangle(&name, &args);
-            // Skip duplicates before enforcing the budget: a repeated call
-            // at the valid boundary must not consume the instance allowance.
-            if visited.contains(&mangled) {
-                continue;
-            }
-            // Type-expanding recursion (`grow[T]` calling `grow[[T]]>`)
-            // would otherwise create infinitely many instances. Cap the
-            // worklist with a diagnostic instead of hanging the compiler.
-            if visited.len() >= MAX_INSTANCES {
-                let span = self.fn_span_for(def);
-                self.diags.push(
-                    Diagnostic::error(
-                        "generic instantiation limit exceeded (possible polymorphic recursion)",
-                    )
-                    .with_label(span, "recursive instantiations keep growing here")
-                    .with_note(
-                        "avoid calls that wrap a type parameter in a larger type (`grow([x])`)",
-                    )
-                    .with_code("E303"),
-                );
-                break;
-            }
-            visited.insert(mangled.clone());
-            let (param_tys, ret_ty) = sig.instantiate(&args);
-            self.typed.instances.insert(
-                mangled.clone(),
-                Instance {
-                    orig: def,
-                    args: args.clone(),
-                    sig: FuncSigTy {
-                        param_names: sig.param_names.clone(),
-                        param_tys,
-                        ret: ret_ty,
-                        type_params: Vec::new(),
-                    },
-                },
-            );
-            // Resolve the calls inside this instance's body under its
-            // substitution environment.
-            let env: HashMap<String, Ty> = sig
-                .type_params
-                .iter()
-                .cloned()
-                .zip(args.iter().cloned())
-                .collect();
-            let calls = calls_in_item(self.prog, &self.typed, def);
-            for (call_id, callee_def, type_args, actual_tys) in calls {
-                let Some(inner) = self.typed.func_sigs.get(&callee_def).cloned() else {
-                    continue;
-                };
-                if inner.type_params.is_empty() {
-                    continue;
-                }
-                // Substitute first: formals, explicit args, and the recorded
-                // (generic) actual types all live in template space.
-                let actuals: Vec<Ty> = actual_tys.iter().map(|t| subst_ty(t, &env)).collect();
-                if actuals.iter().any(ty_has_error) {
-                    continue;
-                }
-                let resolved: Option<Vec<Ty>> = if type_args.is_empty() {
-                    Self::infer_quiet(&inner, &actuals)
-                } else {
-                    let mut out = Vec::with_capacity(type_args.len());
-                    let mut ok = true;
-                    for v in &type_args {
-                        // Explicit arguments name outer parameters (`T`
-                        // means the caller's `T`): substitute, and anything
-                        // still a `Param` afterwards is unbound (already
-                        // reported while checking the template).
-                        let t = Self::vl_in_instance(v, &env);
-                        if !t.is_concrete() {
-                            ok = false;
-                            break;
-                        }
-                        out.push(t);
-                    }
-                    ok.then_some(out)
-                };
-                let Some(resolved) = resolved else {
-                    continue;
-                };
-                if resolved.len() != inner.type_params.len()
-                    || !resolved.iter().all(|t| t.is_concrete())
-                {
-                    continue;
-                }
-                let Some(inner_name) = self.instance_name(callee_def) else {
-                    continue;
-                };
-                let inner_mangled = mangle(&inner_name, &resolved);
-                self.typed
-                    .inst_calls
-                    .insert((mangled.clone(), call_id), inner_mangled.clone());
-                if !self.typed.instances.contains_key(&inner_mangled)
-                    && !self
-                        .pending_instances
-                        .iter()
-                        .any(|(d, a)| *d == callee_def && *a == resolved)
-                {
-                    self.pending_instances.push((callee_def, resolved));
-                }
-            }
-        }
-    }
-
-    /// Convert an explicit type argument under an instance environment:
-    /// outer parameter names substitute, concrete types convert directly.
-    fn vl_in_instance(v: &VlType, env: &HashMap<String, Ty>) -> Ty {
-        match v {
-            VlType::Param(name) => env.get(name).cloned().unwrap_or(Ty::Param(name.clone())),
-            VlType::Array(elem) => Ty::Array(Box::new(Self::vl_in_instance(elem, env))),
-            _ => Ty::from_vl(v),
-        }
-    }
-
-    /// Quiet inference for worklist expansion (errors were already reported
-    /// while checking the template generically).
-    fn infer_quiet(sig: &FuncSigTy, actuals: &[Ty]) -> Option<Vec<Ty>> {
-        let mut binds: HashMap<String, Ty> = HashMap::new();
-        for (formal, actual) in sig.param_tys.iter().zip(actuals.iter()) {
-            if !Self::unify_quiet(formal, actual, &mut binds) {
-                return None;
-            }
-        }
-        sig.type_params
-            .iter()
-            .map(|p| binds.remove(p).map(default_inferred_ty))
-            .collect::<Option<Vec<_>>>()
-    }
-
-    fn unify_quiet(formal: &Ty, actual: &Ty, binds: &mut HashMap<String, Ty>) -> bool {
-        match (formal, actual) {
-            (Ty::Param(p), t) => {
-                if let Some(bound) = binds.get(p).cloned() {
-                    if bound == Ty::Int && is_integer(t) && *t != Ty::Int {
-                        binds.insert(p.clone(), t.clone());
-                        return true;
-                    }
-                    if *t == Ty::Int && is_integer(&bound) {
-                        return true;
-                    }
-                    bound == *t
-                } else {
-                    binds.insert(p.clone(), t.clone());
-                    true
-                }
-            }
-            (Ty::Array(f), Ty::Array(a)) => Self::unify_quiet(f, a, binds),
-            (f, a) => f == a,
-        }
-    }
-
     fn infer_expr_expected(&mut self, expr: &HirExpr, expected: &Ty) -> Ty {
         self.coerce_expr_literals(expr, expected);
         self.infer_expr(expr)
     }
 
     /// Give untyped integer literals the concrete type required by a use site.
-    /// Updating the recorded types here also lets LIR select the right integer
-    /// register class without adding conversion instructions. Literals are
-    /// range-checked before recording: `let x: u8 = 300;` is an error rather
-    /// than a silent truncation.
+    /// This is the central coercion entry: literal defaulting + range checks
+    /// live here (see [`coerce_int_literal`]). Updating the recorded types
+    /// here also lets LIR select the right integer register class without
+    /// adding conversion instructions.
     fn coerce_expr_literals(&mut self, expr: &HirExpr, expected: &Ty) {
         match expr {
             HirExpr::Literal { id, value, span }
                 if matches!(value, Scalar::Int(_)) && is_integer(expected) =>
             {
                 if let Scalar::Int(v) = value {
-                    if !int_fits_in(*v, expected) {
-                        self.diags.push(
-                            Diagnostic::error(format!(
-                                "integer literal `{v}` out of range for `{expected}`"
-                            ))
-                            .with_label(*span, format!("expected `{expected}` here"))
-                            .with_code("E302"),
-                        );
+                    if coerce_int_literal(*v, expected, *span, &mut self.diags).is_none() {
                         self.record(*id, Ty::Error);
                         return;
                     }
@@ -1299,28 +1309,25 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Template function name for a `DefId.0` (worklist helper).
-    fn instance_name(&self, def: u32) -> Option<String> {
-        self.prog.items.iter().find_map(|item| match item {
-            HirItem::Fn {
-                def: Some(d), name, ..
-            } if d.0 == def => Some(name.clone()),
-            _ => None,
-        })
+    /// Numeric in the current generic scope: concrete numerics plus `Param`
+    /// with a `Numeric` bound. Unconstrained `T` stays opaque (no operators).
+    fn is_numeric_in_scope(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Param(name) => self.type_bounds.get(name) == Some(&GenericBound::Numeric),
+            _ => is_numeric(ty),
+        }
     }
 
-    /// Template function span for diagnostics (falls back to empty).
-    fn fn_span_for(&self, def: u32) -> Span {
-        self.prog
-            .items
-            .iter()
-            .find_map(|item| match item {
-                HirItem::Fn {
-                    def: Some(d), span, ..
-                } if d.0 == def => Some(*span),
-                _ => None,
-            })
-            .unwrap_or(Span::empty(0))
+    /// Comparable in scope: concrete comparables plus `Param` with `Numeric`
+    /// (numbers compare) or `Comparable` bounds.
+    fn is_comparable_in_scope(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Param(name) => matches!(
+                self.type_bounds.get(name),
+                Some(GenericBound::Numeric) | Some(GenericBound::Comparable)
+            ),
+            _ => is_comparable(ty),
+        }
     }
 
     fn infer_expr(&mut self, expr: &HirExpr) -> Ty {
@@ -1651,7 +1658,13 @@ impl<'a> Checker<'a> {
                 }
                 match op {
                     HirBinOp::Add | HirBinOp::Sub | HirBinOp::Mul | HirBinOp::Div => {
-                        if lt == Ty::Int && is_integer(&rt) {
+                        // Central coercion: an `Int` literal defers to a
+                        // concrete integer lane; two bare `Int`s default to
+                        // `u64` so no unresolved `Int` reaches LIR.
+                        if lt == Ty::Int && rt == Ty::Int {
+                            self.coerce_expr_literals(lhs, &Ty::U64);
+                            self.coerce_expr_literals(rhs, &Ty::U64);
+                        } else if lt == Ty::Int && is_integer(&rt) {
                             self.coerce_expr_literals(lhs, &rt);
                         } else if rt == Ty::Int && is_integer(&lt) {
                             self.coerce_expr_literals(rhs, &lt);
@@ -1661,8 +1674,23 @@ impl<'a> Checker<'a> {
                         if ty_has_error(&lt) || ty_has_error(&rt) {
                             return self.record(*id, Ty::Error);
                         }
-                        if !types_compatible(&lt, &rt) || !is_numeric(&lt) {
-                            self.diags.push(mismatch(*span, &lt, &rt));
+                        if !types_compatible(&lt, &rt) || !self.is_numeric_in_scope(&lt) {
+                            // Opaque `T` without a `Numeric` bound cannot use
+                            // arithmetic; point at the bound instead of a bare
+                            // mismatch.
+                            if matches!((&lt, &rt), (Ty::Param(_), _) | (_, Ty::Param(_)))
+                                && types_compatible(&lt, &rt)
+                            {
+                                self.diags.push(
+                                    Diagnostic::error(format!(
+                                        "cannot use arithmetic on generic `{lt}` without a `Numeric` bound"
+                                    ))
+                                    .with_label(*span, "add `extends Numeric` to the type parameter")
+                                    .with_code("E302"),
+                                );
+                            } else {
+                                self.diags.push(mismatch(*span, &lt, &rt));
+                            }
                             return self.record(*id, Ty::Error);
                         }
                         if matches!(op, HirBinOp::Div) && is_zero_literal(rhs) {
@@ -1676,7 +1704,10 @@ impl<'a> Checker<'a> {
                         self.record(*id, lt)
                     }
                     HirBinOp::Eq | HirBinOp::Ne => {
-                        if lt == Ty::Int && is_integer(&rt) {
+                        if lt == Ty::Int && rt == Ty::Int {
+                            self.coerce_expr_literals(lhs, &Ty::U64);
+                            self.coerce_expr_literals(rhs, &Ty::U64);
+                        } else if lt == Ty::Int && is_integer(&rt) {
                             self.coerce_expr_literals(lhs, &rt);
                         } else if rt == Ty::Int && is_integer(&lt) {
                             self.coerce_expr_literals(rhs, &lt);
@@ -1686,14 +1717,32 @@ impl<'a> Checker<'a> {
                         if ty_has_error(&lt) || ty_has_error(&rt) {
                             return self.record(*id, Ty::Error);
                         }
-                        if !types_compatible(&lt, &rt) || !is_comparable(&lt) {
-                            self.diags.push(mismatch(*span, &lt, &rt));
+                        if !types_compatible(&lt, &rt) || !self.is_comparable_in_scope(&lt) {
+                            if matches!((&lt, &rt), (Ty::Param(_), _) | (_, Ty::Param(_)))
+                                && types_compatible(&lt, &rt)
+                            {
+                                self.diags.push(
+                                    Diagnostic::error(format!(
+                                        "cannot compare generic `{lt}` without a `Comparable` bound"
+                                    ))
+                                    .with_label(
+                                        *span,
+                                        "add `extends Comparable` (or `extends Numeric`)",
+                                    )
+                                    .with_code("E302"),
+                                );
+                            } else {
+                                self.diags.push(mismatch(*span, &lt, &rt));
+                            }
                             return self.record(*id, Ty::Error);
                         }
                         self.record(*id, Ty::Bool)
                     }
                     HirBinOp::Lt | HirBinOp::Le | HirBinOp::Gt | HirBinOp::Ge => {
-                        if lt == Ty::Int && is_integer(&rt) {
+                        if lt == Ty::Int && rt == Ty::Int {
+                            self.coerce_expr_literals(lhs, &Ty::U64);
+                            self.coerce_expr_literals(rhs, &Ty::U64);
+                        } else if lt == Ty::Int && is_integer(&rt) {
                             self.coerce_expr_literals(lhs, &rt);
                         } else if rt == Ty::Int && is_integer(&lt) {
                             self.coerce_expr_literals(rhs, &lt);
@@ -1703,8 +1752,23 @@ impl<'a> Checker<'a> {
                         if ty_has_error(&lt) || ty_has_error(&rt) {
                             return self.record(*id, Ty::Error);
                         }
-                        if !types_compatible(&lt, &rt) || !is_numeric(&lt) {
-                            self.diags.push(mismatch(*span, &lt, &rt));
+                        if !types_compatible(&lt, &rt) || !self.is_numeric_in_scope(&lt) {
+                            if matches!((&lt, &rt), (Ty::Param(_), _) | (_, Ty::Param(_)))
+                                && types_compatible(&lt, &rt)
+                            {
+                                self.diags.push(
+                                    Diagnostic::error(format!(
+                                        "cannot order generic `{lt}` without a `Numeric` bound"
+                                    ))
+                                    .with_label(
+                                        *span,
+                                        "add `extends Numeric` to the type parameter",
+                                    )
+                                    .with_code("E302"),
+                                );
+                            } else {
+                                self.diags.push(mismatch(*span, &lt, &rt));
+                            }
                             return self.record(*id, Ty::Error);
                         }
                         self.record(*id, Ty::Bool)
@@ -1724,7 +1788,106 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+            HirExpr::Cast {
+                id,
+                inner,
+                target,
+                target_span,
+                span,
+            } => self.check_cast(*id, inner, target, *target_span, *span),
         }
+    }
+
+    /// Explicit numeric conversion (`value as u8`, TypeScript-like).
+    ///
+    /// Semantics (v0, integers only):
+    /// - Target must be `u64`, `i64`, or `u8` (float/string/array casts are
+    ///   rejected with E302; they need ISA conversions not yet specified).
+    /// - Source must be an integer (`u64/i64/u8/int` literal, or a `Param`
+    ///   with a `Numeric` bound). All other sources are E302.
+    /// - Literals are range-checked at compile time (`300 as u8` is E302).
+    /// - Variable conversions are unchecked reinterpretations with no runtime
+    ///   cost (no trap, no wrap instruction): the 64-bit payload is kept and
+    ///   reinterpreted per the target lane (backends treat `u8` like `u64`
+    ///   for arithmetic). Out-of-range variables are logic errors.
+    /// - Implicit cross-integer conversions stay narrow: only literals coerce
+    ///   implicitly; variables require `as`.
+    fn check_cast(
+        &mut self,
+        id: vl_hir::HirId,
+        inner: &HirExpr,
+        target_vl: &VlType,
+        target_span: Span,
+        _span: Span,
+    ) -> Ty {
+        let target = Ty::from_vl_in(target_vl, &self.type_env);
+        if ty_has_error(&target) {
+            // Unknown target (`as Bogus` parses, but `T` params are rejected
+            // at parse scope): report once here since the parser could not.
+            self.diags.push(
+                Diagnostic::error(format!("unknown cast target `{target_vl}`"))
+                    .with_label(target_span, "no type with this name is in scope")
+                    .with_code("E105"),
+            );
+            let _ = self.infer_expr(inner);
+            return self.record(id, Ty::Error);
+        }
+        // v0 targets: integers only.
+        if !matches!(target, Ty::U64 | Ty::I64 | Ty::U8) {
+            self.diags.push(
+                Diagnostic::error(format!("cannot cast to `{target}` (only `u64`, `i64`, `u8` casts are supported)"))
+                    .with_label(target_span, "unsupported cast target")
+                    .with_note("float, string, and array conversions need target conversions not yet specified")
+                    .with_code("E302"),
+            );
+            let _ = self.infer_expr(inner);
+            return self.record(id, Ty::Error);
+        }
+        // Identity: still infer inner for its errors.
+        let inner_ty = self.infer_expr(inner);
+        if ty_has_error(&inner_ty) || ty_has_error(&target) {
+            return self.record(id, Ty::Error);
+        }
+        if inner_ty == Ty::Void {
+            self.diags.push(
+                Diagnostic::error("cannot cast a `void` value")
+                    .with_label(inner.span(), "`void` is not a value")
+                    .with_code("E308"),
+            );
+            return self.record(id, Ty::Error);
+        }
+        // Source must be an integer (or a `Numeric` parameter).
+        let source_ok = match &inner_ty {
+            Ty::Int | Ty::U64 | Ty::I64 | Ty::U8 => true,
+            Ty::Param(name) => self.type_bounds.get(name) == Some(&GenericBound::Numeric),
+            _ => false,
+        };
+        if !source_ok {
+            self.diags.push(
+                Diagnostic::error(format!("cannot cast `{inner_ty}` to `{target}`"))
+                    .with_label(
+                        inner.span(),
+                        format!("expected an integer here, got `{inner_ty}`"),
+                    )
+                    .with_code("E302"),
+            );
+            return self.record(id, Ty::Error);
+        }
+        // Literals range-check against the target; variables are unchecked.
+        if let HirExpr::Literal {
+            value: Scalar::Int(v),
+            span: lit_span,
+            ..
+        } = inner
+        {
+            if coerce_int_literal(*v, &target, *lit_span, &mut self.diags).is_none() {
+                return self.record(id, Ty::Error);
+            }
+            // Record the literal under its target lane so LIR emits the right
+            // constant class without a conversion instruction.
+            self.record(inner.id(), target.clone());
+        }
+        self.record(id, target)
     }
 }
 
@@ -1732,125 +1895,6 @@ fn mismatch(span: Span, lt: &Ty, rt: &Ty) -> Diagnostic {
     Diagnostic::error(format!("type mismatch: {lt} vs {rt}"))
         .with_label(span, format!("expected {lt} on both sides"))
         .with_code("E302")
-}
-
-/// Every `Call` inside one template function: `(call HirId.0, callee
-/// DefId.0, explicit type args, recorded generic actual types)`. Used by the
-/// monomorphization worklist to resolve inner calls per outer instance.
-fn calls_in_item(
-    prog: &HirProgram,
-    typed: &TypedProgram,
-    def: u32,
-) -> Vec<(u32, u32, Vec<VlType>, Vec<Ty>)> {
-    fn expr_ty(typed: &TypedProgram, e: &HirExpr) -> Ty {
-        typed.type_of_id(e.id()).unwrap_or(Ty::Error)
-    }
-    fn walk_expr(
-        typed: &TypedProgram,
-        e: &HirExpr,
-        out: &mut Vec<(u32, u32, Vec<VlType>, Vec<Ty>)>,
-    ) {
-        match e {
-            HirExpr::Call {
-                id,
-                def,
-                type_args,
-                args,
-                ..
-            } => {
-                for arg in args {
-                    walk_expr(typed, arg, out);
-                }
-                if let Some(d) = def {
-                    let actuals = args.iter().map(|a| expr_ty(typed, a)).collect();
-                    out.push((id.0, d.0, type_args.clone(), actuals));
-                }
-            }
-            HirExpr::ArrayLiteral { elems, .. } => {
-                for elem in elems {
-                    walk_expr(typed, elem, out);
-                }
-            }
-            HirExpr::Index { base, index, .. } => {
-                walk_expr(typed, base, out);
-                walk_expr(typed, index, out);
-            }
-            HirExpr::Binary { lhs, rhs, .. } => {
-                walk_expr(typed, lhs, out);
-                walk_expr(typed, rhs, out);
-            }
-            HirExpr::Unary { inner, .. } => walk_expr(typed, inner, out),
-            HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
-        }
-    }
-    fn walk_stmt(
-        typed: &TypedProgram,
-        s: &HirStmt,
-        out: &mut Vec<(u32, u32, Vec<VlType>, Vec<Ty>)>,
-    ) {
-        match s {
-            HirStmt::Let { value, .. } | HirStmt::Assign { value, .. } => {
-                walk_expr(typed, value, out)
-            }
-            HirStmt::Expr(e) => walk_expr(typed, e, out),
-            HirStmt::Return { value, .. } => {
-                if let Some(e) = value {
-                    walk_expr(typed, e, out);
-                }
-            }
-            HirStmt::IndexAssign {
-                array,
-                index,
-                value,
-                ..
-            } => {
-                walk_expr(typed, array, out);
-                walk_expr(typed, index, out);
-                walk_expr(typed, value, out);
-            }
-            HirStmt::If {
-                condition,
-                then_body,
-                else_body,
-                ..
-            } => {
-                walk_expr(typed, condition, out);
-                for s in then_body {
-                    walk_stmt(typed, s, out);
-                }
-                if let Some(body) = else_body {
-                    for s in body {
-                        walk_stmt(typed, s, out);
-                    }
-                }
-            }
-            HirStmt::While {
-                condition, body, ..
-            } => {
-                walk_expr(typed, condition, out);
-                for s in body {
-                    walk_stmt(typed, s, out);
-                }
-            }
-            HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
-        }
-    }
-    let mut out = Vec::new();
-    for item in &prog.items {
-        let HirItem::Fn {
-            def: Some(d), body, ..
-        } = item
-        else {
-            continue;
-        };
-        if d.0 != def {
-            continue;
-        }
-        for s in body {
-            walk_stmt(typed, s, &mut out);
-        }
-    }
-    out
 }
 
 fn is_zero_literal(expr: &HirExpr) -> bool {
@@ -1879,13 +1923,13 @@ fn scalar_ty(value: Scalar) -> Ty {
     }
 }
 
-fn is_integer(ty: &Ty) -> bool {
+pub(crate) fn is_integer(ty: &Ty) -> bool {
     matches!(ty, Ty::Int | Ty::U64 | Ty::I64 | Ty::U8)
 }
 
 /// Recursive poison check: `Array[Error]` is just as poisoned as `Error.
 /// Direct `== Ty::Error` comparisons miss nested poison and cascade.
-fn ty_has_error(ty: &Ty) -> bool {
+pub(crate) fn ty_has_error(ty: &Ty) -> bool {
     match ty {
         Ty::Error => true,
         Ty::Array(elem) => ty_has_error(elem),
@@ -1893,9 +1937,40 @@ fn ty_has_error(ty: &Ty) -> bool {
     }
 }
 
-/// Budget for monomorphization: type-expanding recursion creates a fresh
-/// instance per nesting level (`T`, `Array[T]`, `Array[Array[T]]`, ...).
-const MAX_INSTANCES: usize = 64;
+/// Central integer coercion: the single operation for literal defaulting,
+/// range checks, and compatibility.
+///
+/// - Literal defaulting: an unconstrained `int` literal defaults to the
+///   target's unsigned lane (`u64`) via [`default_inferred_ty`].
+/// - Range checks: [`int_fits_in`] + [`coerce_int_literal`] reject
+///   out-of-range literals (`let x: u8 = 300;`) with E302 instead of
+///   silently truncating.
+/// - Compatibility: after [`Checker::coerce_expr_literals`] has run,
+///   ordinary compatibility is exact equality ([`types_compatible`]); the old
+///   general `Int`-vs-integer exception lives only inside coercion, so an
+///   `int` variable cannot escape to a narrower parameter.
+///
+/// All use sites funnel through `infer_expr_expected` (coerce then infer)
+/// plus exact `types_compatible`, keeping implicit cross-integer conversions
+/// narrow (literals only).
+pub fn coerce_int_literal(
+    value: i64,
+    want: &Ty,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) -> Option<Ty> {
+    if !int_fits_in(value, want) {
+        diags.push(
+            Diagnostic::error(format!(
+                "integer literal `{value}` out of range for `{want}`"
+            ))
+            .with_label(span, format!("expected `{want}` here"))
+            .with_code("E302"),
+        );
+        return None;
+    }
+    Some(want.clone())
+}
 
 /// Does an untyped `int` literal value fit in the target integer type?
 fn int_fits_in(v: i64, expected: &Ty) -> bool {
@@ -1910,7 +1985,7 @@ fn int_fits_in(v: i64, expected: &Ty) -> bool {
 /// Default for inferred type arguments left as untyped `int`: the target's
 /// unsigned lane (`u64`). Keeps non-literal `Int` expressions (generic call
 /// results) from staying compatible with every integer type.
-fn default_inferred_ty(ty: Ty) -> Ty {
+pub(crate) fn default_inferred_ty(ty: Ty) -> Ty {
     match ty {
         Ty::Int => Ty::U64,
         Ty::Array(elem) => Ty::Array(Box::new(default_inferred_ty(*elem))),
@@ -1918,23 +1993,208 @@ fn default_inferred_ty(ty: Ty) -> Ty {
     }
 }
 
-/// Definite-return analysis: does this statement diverge (exit the function
-/// via `return`, value or bare)? `while` never counts (the body may not run);
-/// `if` counts only when both branches diverge.
-fn stmt_always_returns(stmt: &HirStmt) -> bool {
-    match stmt {
-        HirStmt::Return { .. } => true,
-        HirStmt::If {
-            then_body,
-            else_body: Some(else_body),
-            ..
-        } => stmts_always_return(then_body) && stmts_always_return(else_body),
-        _ => false,
+/// Constraint-based generic inference: one entry per type parameter holding
+/// every actual type that constrains it. Collecting first and solving after
+/// makes inference independent of argument order and supports nested
+/// constraints (`Array[Array[T]]` contributes `T` through two layers).
+/// A future contextual pass can push one more constraint from the expected
+/// return type before solving.
+#[derive(Debug, Default)]
+struct ConstraintSet {
+    per_param: HashMap<String, Vec<Ty>>,
+}
+
+impl ConstraintSet {
+    /// Collect constraints from one formal-vs-actual pair. `Param` uses push
+    /// a constraint; concrete formals must match exactly (an `Int` actual
+    /// against an integer formal is coercible and contributes nothing — the
+    /// later per-argument coercion pass handles it). Reports one E306 on
+    /// concrete mismatch and returns false.
+    fn collect(
+        &mut self,
+        formal: &Ty,
+        actual: &Ty,
+        name: &str,
+        span: Span,
+        diags: &mut Vec<Diagnostic>,
+    ) -> bool {
+        match (formal, actual) {
+            (Ty::Param(p), t) => {
+                self.per_param.entry(p.clone()).or_default().push(t.clone());
+                true
+            }
+            (Ty::Array(f), Ty::Array(a)) => self.collect(f, a, name, span, diags),
+            (f, a) if f == a => true,
+            // An untyped literal against a concrete integer lane coerces
+            // later; it is not an inference conflict.
+            (f, Ty::Int) if is_integer(f) => true,
+            (f, a) => {
+                diags.push(
+                    Diagnostic::error(format!("`{name}` expects `{f}`, got `{a}`"))
+                        .with_label(span, format!("expected `{f}` here"))
+                        .with_code("E306"),
+                );
+                false
+            }
+        }
+    }
+
+    /// Solve collected constraints into concrete type arguments, defaulting
+    /// leftover `int` to `u64`. Integer literals defer to concrete
+    /// constraints, so `same(1u64, 2)` and `same(1, 2u64)` both solve
+    /// `T = u64`. Reports one diagnostic per failure.
+    fn solve(
+        mut self,
+        name: &str,
+        span: Span,
+        sig: &FuncSigTy,
+        diags: &mut Vec<Diagnostic>,
+    ) -> Option<Vec<Ty>> {
+        let mut out = Vec::with_capacity(sig.type_params.len());
+        for p in &sig.type_params {
+            let constraints = self.per_param.remove(p).unwrap_or_default();
+            if constraints.is_empty() {
+                diags.push(
+                    Diagnostic::error(format!("cannot infer type argument `{p}` for `{name}`"))
+                        .with_label(span, "pass it explicitly: `::[...]`")
+                        .with_note(format!("write `{name}::[{p}](...)` with a concrete type"))
+                        .with_code("E303"),
+                );
+                return None;
+            }
+            // Concrete (non-`Int`) constraints must all agree; `Int`
+            // constraints defer to them.
+            let mut concrete: Option<Ty> = None;
+            for t in &constraints {
+                if *t == Ty::Int {
+                    continue;
+                }
+                // An `Int` nested inside an array (should not survive
+                // literal defaulting, but be safe) defaults before compare.
+                let t = default_inferred_ty(t.clone());
+                match &concrete {
+                    None => concrete = Some(t),
+                    Some(c) if *c == t => {}
+                    Some(c) => {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "`{name}` infers conflicting types for `{p}`: `{c}` vs `{t}`"
+                            ))
+                            .with_label(span, "conflicting arguments here")
+                            .with_code("E306"),
+                        );
+                        return None;
+                    }
+                }
+            }
+            match concrete {
+                Some(t) => out.push(t),
+                // All constraints were `int` literals: default to `u64` so a
+                // generic result crossing a concrete boundary (`return
+                // id(300);` in a `u8` function) mismatches instead of
+                // silently truncating.
+                None => out.push(Ty::U64),
+            }
+        }
+        Some(out)
     }
 }
 
-fn stmts_always_return(stmts: &[HirStmt]) -> bool {
-    stmts.iter().any(stmt_always_returns)
+/// General control-flow analysis: how does a statement complete?
+/// `FallsThrough` means execution may continue past it; the other three
+/// diverge (exit the current block via `return`/`break`/`continue`).
+/// `while` always falls through (the body may not run; `break` exits to
+/// after the loop). An `if` without `else` always falls through (the missing
+/// branch does). This grounds the definite-return check (`Returns`) and
+/// unreachable-code warnings, and prepares for future `match`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    FallsThrough,
+    Returns,
+    Breaks,
+    Continues,
+}
+
+/// Flow of one statement.
+pub fn stmt_flow(stmt: &HirStmt) -> Flow {
+    match stmt {
+        HirStmt::Return { .. } => Flow::Returns,
+        HirStmt::Break { .. } => Flow::Breaks,
+        HirStmt::Continue { .. } => Flow::Continues,
+        HirStmt::Let { .. }
+        | HirStmt::Assign { .. }
+        | HirStmt::IndexAssign { .. }
+        | HirStmt::Expr(_) => Flow::FallsThrough,
+        HirStmt::While { .. } => Flow::FallsThrough,
+        HirStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            let then_flow = block_flow(then_body);
+            let Some(else_body) = else_body else {
+                return Flow::FallsThrough;
+            };
+            let else_flow = block_flow(else_body);
+            if then_flow == else_flow {
+                return then_flow;
+            }
+            if then_flow == Flow::FallsThrough || else_flow == Flow::FallsThrough {
+                return Flow::FallsThrough;
+            }
+            // Both branches diverge but differently (`return` vs `break`):
+            // no path falls through, but not every path returns either.
+            // Report a diverging non-`Returns` flow so the missing-return
+            // check still fires while unreachable-code analysis still sees
+            // the construct as diverging.
+            Flow::Breaks
+        }
+    }
+}
+
+/// Flow of a block: the first diverging statement wins (later statements
+/// are unreachable); a block with no diverging statement falls through.
+pub fn block_flow(stmts: &[HirStmt]) -> Flow {
+    for stmt in stmts {
+        let flow = stmt_flow(stmt);
+        if flow != Flow::FallsThrough {
+            return flow;
+        }
+    }
+    Flow::FallsThrough
+}
+
+/// Warn on statements unreachable after a diverging statement, recursing
+/// into branches and loop bodies. Warnings never fail the build.
+fn check_unreachable(stmts: &[HirStmt], diags: &mut Vec<Diagnostic>) {
+    let mut diverged = false;
+    for stmt in stmts {
+        if diverged {
+            diags.push(
+                Diagnostic::warning("unreachable code")
+                    .with_label(stmt_span(stmt), "this statement can never run")
+                    .with_note("it follows a `return`, `break`, or `continue`")
+                    .with_code("W001"),
+            );
+        }
+        match stmt {
+            HirStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                check_unreachable(then_body, diags);
+                if let Some(body) = else_body {
+                    check_unreachable(body, diags);
+                }
+            }
+            HirStmt::While { body, .. } => check_unreachable(body, diags),
+            _ => {}
+        }
+        if stmt_flow(stmt) != Flow::FallsThrough {
+            diverged = true;
+        }
+    }
 }
 
 /// Span of one statement (for labelling the fallthrough path).
@@ -1954,7 +2214,7 @@ fn stmt_span(stmt: &HirStmt) -> Span {
 
 /// Span of the construct that lets execution fall through: an `if` whose
 /// taken branch returns while the other path falls through, else the last
-/// statement (`None` for an empty body).
+/// statement (`None` for an empty body). Implemented over [`block_flow`].
 fn fallthrough_span(body: &[HirStmt]) -> Option<Span> {
     for stmt in body {
         if let HirStmt::If {
@@ -1964,10 +2224,10 @@ fn fallthrough_span(body: &[HirStmt]) -> Option<Span> {
             ..
         } = stmt
         {
-            let then_returns = stmts_always_return(then_body);
+            let then_returns = block_flow(then_body) == Flow::Returns;
             let else_returns = else_body
                 .as_ref()
-                .map(|body| stmts_always_return(body))
+                .map(|body| block_flow(body) == Flow::Returns)
                 .unwrap_or(false);
             if then_returns != else_returns {
                 return Some(*span);
@@ -1977,10 +2237,14 @@ fn fallthrough_span(body: &[HirStmt]) -> Option<Span> {
     body.last().map(stmt_span)
 }
 
+/// Ordinary compatibility after coercion: exact type equality (plus
+/// structural `Array[T]` recursion). The former general `Int`-vs-integer
+/// exception is gone on purpose — integer literals are coerced to their
+/// context type by [`Checker::coerce_expr_literals`] before this runs, so a
+/// lingering `Int` here means "no context supplied one" and must not match
+/// every integer lane.
 fn types_compatible(got: &Ty, want: &Ty) -> bool {
-    got == want
-        || (*got == Ty::Int && is_integer(want))
-        || matches!((got, want), (Ty::Array(g), Ty::Array(w)) if types_compatible(g, w))
+    got == want || matches!((got, want), (Ty::Array(g), Ty::Array(w)) if types_compatible(g, w))
 }
 
 fn is_numeric(ty: &Ty) -> bool {
@@ -1992,6 +2256,46 @@ fn is_comparable(ty: &Ty) -> bool {
         ty,
         Ty::Int | Ty::U64 | Ty::I64 | Ty::F64 | Ty::Bool | Ty::U8 | Ty::String
     )
+}
+
+/// Does a concrete type satisfy a generic bound? `Numeric` covers the
+/// arithmetic lanes (`u64,i64,f64,u8`, plus undefaulted `int` defensively);
+/// `Comparable` covers those plus `bool` and `string` (equality).
+pub(crate) fn bound_satisfied(bound: GenericBound, ty: &Ty) -> bool {
+    match bound {
+        GenericBound::Numeric => matches!(ty, Ty::Int | Ty::U64 | Ty::I64 | Ty::F64 | Ty::U8),
+        GenericBound::Comparable => matches!(
+            ty,
+            Ty::Int | Ty::U64 | Ty::I64 | Ty::F64 | Ty::Bool | Ty::U8 | Ty::String
+        ),
+    }
+}
+
+/// Does an outer bound imply an inner requirement? `Numeric` is stronger:
+/// it satisfies both `Numeric` and `Comparable`. `Comparable` satisfies
+/// only `Comparable`. Unconstrained satisfies neither.
+fn bound_implies(outer: Option<GenericBound>, inner: GenericBound) -> bool {
+    matches!(
+        (outer, inner),
+        (Some(GenericBound::Numeric), _)
+            | (Some(GenericBound::Comparable), GenericBound::Comparable)
+    )
+}
+
+/// Does `ty` (concrete or outer `Param`) satisfy `bound` given the current
+/// function's bounds? Concrete types check directly; an outer parameter
+/// checks by implication (so `wrap[T]` cannot forward an unconstrained `T`
+/// to a `Numeric` callee).
+fn ty_satisfies_bound(
+    ty: &Ty,
+    bound: GenericBound,
+    outer_bounds: &HashMap<String, GenericBound>,
+) -> bool {
+    match ty {
+        Ty::Param(name) => bound_implies(outer_bounds.get(name).copied(), bound),
+        Ty::Array(_) => false,
+        _ => bound_satisfied(bound, ty),
+    }
 }
 
 #[cfg(test)]
@@ -2566,16 +2870,16 @@ mod tests {
 
     #[test]
     fn expanding_recursion_hits_the_instance_budget() {
-        // Type-expanding recursion must terminate with a single diagnostic,
-        // not hang the compiler. The void body keeps the return check quiet
-        // so the budget error is the one root cause.
+        // Original void-function repro: type-expanding recursion must
+        // terminate with exactly one E303 diagnostic, not hang the compiler.
+        // The void body keeps the return check quiet so the budget error is
+        // the one root cause (single-root-error rule).
         let (_, diags) =
             check_src("function grow[T](x: T) { grow([x]); } function main() { grow(1u64); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert_eq!(diags[0].code.as_deref(), Some("E303"), "{diags:?}");
         assert!(
-            diags
-                .iter()
-                .any(|d| d.message.contains("instantiation limit exceeded")),
+            diags[0].message.contains("instantiation limit exceeded"),
             "{diags:?}"
         );
     }
@@ -2684,5 +2988,238 @@ mod tests {
                 .any(|d| d.message.contains("instantiation limit exceeded")),
             "{diags:?}"
         );
+    }
+
+    // -- Item 2: normalized-type invariant -------------------------------
+
+    fn check_src_with_hir(src: &str) -> (vl_hir::HirProgram, TypedProgram, Vec<Diagnostic>) {
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = check(&hir);
+        (hir, typed, diags)
+    }
+
+    #[test]
+    fn normalized_validation_accepts_clean_programs() {
+        for src in [
+            "function main() { let x = 1; x; }",
+            "function id[T](x: T): T { return x; } function main() { id(1u64); }",
+            "function main() { let a = [1, 2]; a; }",
+            "function main() { 1 + 2; }",
+        ] {
+            let (hir, typed, diags) = check_src_with_hir(src);
+            assert!(diags.iter().all(|d| !d.is_error()), "{src}: {diags:?}");
+            assert!(typed.validate_normalized(&hir).is_empty(), "{src}");
+        }
+    }
+
+    #[test]
+    fn normalized_validation_rejects_lingering_int() {
+        let (hir, mut typed, _) = check_src_with_hir("function main() { let x = 1u64; x; }");
+        // Inject a non-normalized `Int` where a concrete type belongs.
+        typed.types.insert(0, Ty::Int);
+        let errs = typed.validate_normalized(&hir);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].code.as_deref(), Some("E500"));
+    }
+
+    #[test]
+    fn normalized_validation_skips_generic_templates() {
+        // `Param` inside a generic body is expected and must not trip the
+        // boundary check; instances themselves are concrete.
+        let (hir, typed, diags) = check_src_with_hir(
+            "function id[T](x: T): T { return x; } function main() { id(1u64); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.validate_normalized(&hir).is_empty());
+        assert!(typed.instances.contains_key("id$u64"));
+    }
+
+    #[test]
+    fn untyped_arithmetic_defaults_to_u64() {
+        let (typed, diags) = check_src("function main() { 1 + 2; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.types.values().any(|t| *t == Ty::U64));
+        assert!(!typed.types.values().any(|t| *t == Ty::Int));
+    }
+
+    // -- Item 3: centralized coercion ------------------------------------
+
+    #[test]
+    fn implicit_cross_integer_stays_narrow() {
+        // Concrete `i64` does not coerce to `u64` even though both are
+        // integers; only literals coerce.
+        let (_, diags) =
+            check_src("function take(x: u64): u64 { return x; } function main() { let v: i64 = 1i64; take(v); }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("expects `u64`"), "{diags:?}");
+    }
+
+    #[test]
+    fn coerce_int_literal_range_checks() {
+        let mut diags = Vec::new();
+        assert!(coerce_int_literal(255, &Ty::U8, Span::empty(0), &mut diags).is_some());
+        assert!(diags.is_empty());
+        assert!(coerce_int_literal(300, &Ty::U8, Span::empty(0), &mut diags).is_none());
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code.as_deref(), Some("E302"));
+    }
+
+    // -- Item 4: constraint-based inference --------------------------------
+
+    #[test]
+    fn nested_array_constraints_solve() {
+        let (typed, diags) = check_src(
+            "function first2[T](a: Array[Array[T]]): T { return a[0u64][0u64]; } function main() { first2([[1u64]]); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.instances.contains_key("first2$u64"));
+    }
+
+    #[test]
+    fn all_int_constraints_default_to_u64() {
+        let (typed, diags) = check_src(
+            "function same[T](a: T, b: T): T { return a; } function main() { same(1, 2); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.instances.contains_key("same$u64"));
+    }
+
+    // -- Item 6: flow -------------------------------------------------------
+
+    #[test]
+    fn flow_breaks_do_not_satisfy_returns() {
+        // `break` inside `while` diverges the loop body but the function
+        // still falls through.
+        let (_, diags) =
+            check_src("function f(): u64 { while (true) { break; } } function main() { f(); }");
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E307")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn unreachable_code_warns_without_failing() {
+        let (_, diags) = check_src("function main() { return; let x = 1; x; }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("W001")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn if_both_branches_return_satisfies() {
+        let (_, diags) = check_src(
+            "function f(x: bool): u64 { if (x) { return 1u64; } else { return 2u64; } } function main() { f(true); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    // -- Item 7: `as` casts --------------------------------------------------
+
+    #[test]
+    fn as_cast_same_type_checks() {
+        let (_, diags) = check_src("function main() { let x = 1u64 as u64; x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn as_cast_variable_between_integers_checks() {
+        let (_, diags) = check_src(
+            "function take(x: u8): u8 { return x; } function main() { let v = 200u64; take(v as u8); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn as_cast_literal_out_of_range_is_one_error() {
+        let (_, diags) = check_src("function main() { let x = 300 as u8; x; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("out of range"), "{diags:?}");
+    }
+
+    #[test]
+    fn as_cast_rejects_non_integer_target() {
+        let (_, diags) = check_src("function main() { let x = 1u64 as string; x; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("cannot cast"), "{diags:?}");
+    }
+
+    #[test]
+    fn as_cast_rejects_non_integer_source() {
+        let (_, diags) = check_src("function main() { let s = \"hi\"; let x = s as u8; x; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("cannot cast"), "{diags:?}");
+    }
+
+    #[test]
+    fn implicit_variable_conversion_still_rejected() {
+        // Without `as`, a `u64` variable must not flow into `u8`.
+        let (_, diags) = check_src(
+            "function take(x: u8): u8 { return x; } function main() { let v = 1u64; take(v); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+    }
+
+    // -- Item 8: constrained generics ----------------------------------------
+
+    #[test]
+    fn unconstrained_param_rejects_arithmetic() {
+        let (_, diags) = check_src(
+            "function add[T](a: T, b: T): T { return a + b; } function main() { add(1u64, 2u64); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("Numeric"), "{diags:?}");
+    }
+
+    #[test]
+    fn numeric_bound_allows_arithmetic() {
+        let (typed, diags) = check_src(
+            "function add[T extends Numeric](a: T, b: T): T { return a + b; } function main() { add(1u64, 2u64); add(1i64, 2i64); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.instances.contains_key("add$u64"));
+        assert!(typed.instances.contains_key("add$i64"));
+    }
+
+    #[test]
+    fn comparable_bound_allows_equality() {
+        let (_, diags) = check_src(
+            "function eq[T extends Comparable](a: T, b: T): bool { return a == b; } function main() { eq(1u64, 2u64); eq(\"a\", \"b\"); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn bound_violation_is_one_error() {
+        let (_, diags) = check_src(
+            "function add[T extends Numeric](a: T, b: T): T { return a + b; } function main() { add(\"a\", \"b\"); }",
+        );
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert!(diags[0].message.contains("does not satisfy"), "{diags:?}");
+        assert_eq!(diags[0].code.as_deref(), Some("E303"));
+    }
+
+    #[test]
+    fn unconstrained_forwarding_to_bounded_is_an_error() {
+        let (_, diags) = check_src(
+            "function add[T extends Numeric](a: T, b: T): T { return a + b; } function wrap[T](x: T): T { return add(x, x); } function main() { wrap(1u64); }",
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("satisfy")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn numeric_implies_comparable_forwarding() {
+        let (_, diags) = check_src(
+            "function eq[T extends Comparable](a: T, b: T): bool { return a == b; } function wrap[T extends Numeric](x: T): bool { return eq(x, x); } function main() { wrap(1u64); }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
     }
 }

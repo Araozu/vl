@@ -496,3 +496,65 @@ fn annotated_let_mismatch_is_one_error() {
         "{err:?}"
     );
 }
+
+#[test]
+fn as_casts_compile_to_cast_and_run_on_naravm() {
+    use vl_codegen::Target;
+    let lir = frontend(
+        "function take(x: u8): u8 { return x; } function main() { let v = 200u64; let w = take(v as u8); let lit = 10 as u8; w; lit; }",
+    )
+    .expect("casts must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("cast"), "{dump}");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+}
+
+#[test]
+fn as_cast_out_of_range_is_one_error() {
+    let err = frontend("function main() { let x = 300 as u8; x; }").expect_err("must fail");
+    assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
+    assert!(
+        err.iter().any(|d| d.message.contains("out of range")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn constrained_generics_compile_to_instances_and_run_on_naravm() {
+    use vl_codegen::Target;
+    let lir = frontend(
+        "function add[T extends Numeric](a: T, b: T): T { return a + b; } function eq[T extends Comparable](a: T, b: T): bool { return a == b; } function main() { let s = add(1u64, 2u64); let ok = eq(s, 3u64); ok; }",
+    )
+    .expect("constrained generics must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("call add$u64"), "{dump}");
+    assert!(!dump.contains("fn add:\n"), "{dump}");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+}
+
+#[test]
+fn unconstrained_generic_operator_is_one_error() {
+    let err = frontend(
+        "function add[T](a: T, b: T): T { return a + b; } function main() { add(1u64, 2u64); }",
+    )
+    .expect_err("must fail");
+    assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
+    assert!(err.iter().any(|d| d.message.contains("Numeric")), "{err:?}");
+}
+
+#[test]
+fn lir_boundary_holds_no_unresolved_types() {
+    let (toks, _) = vl_lex::lex("function main() { 1 + 2; }");
+    let (ast, _) = vl_syntax::parse(&toks, "");
+    let (res, _) = vl_semantic::resolve(&ast);
+    let hir = vl_hir::lower(&ast, &res);
+    let (typed, diags) = vl_typecheck::check(&hir);
+    assert!(diags.iter().all(|d| !d.is_error()));
+    assert!(typed.validate_normalized(&hir).is_empty());
+    let lir = vl_lir::lower(&hir, &typed);
+    assert!(!lir.dump().contains("int"), "{}", lir.dump());
+}

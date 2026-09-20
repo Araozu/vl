@@ -29,7 +29,7 @@ pub use diagnostic::{Diagnostic, Label, Severity};
 pub use module::{Export, ExportDecl, FuncSig, ModulePath, ModuleSpec, ParamSig};
 pub use source::{FileId, Source, Sources};
 pub use span::Span;
-pub use ty::{ParseTyError, VlType};
+pub use ty::{GenericBound, ParseTyError, VlType};
 
 /// Convenience alias: pipeline stages return values plus diagnostics
 /// instead of failing fast, so one run can surface many errors.

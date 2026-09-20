@@ -96,3 +96,35 @@ impl VlType {
         }
     }
 }
+
+/// Bound on a generic type parameter (`T extends Numeric`).
+///
+/// Bounds enable useful generic algorithms without full subtyping: an
+/// unconstrained `T` is fully opaque (no operators), `Numeric` allows
+/// arithmetic (`+ - * /`), ordering (`< <= > >=`), and equality, while
+/// `Comparable` allows equality (`== !=`) over numbers, bools, and strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenericBound {
+    Numeric,
+    Comparable,
+}
+
+impl fmt::Display for GenericBound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GenericBound::Numeric => write!(f, "Numeric"),
+            GenericBound::Comparable => write!(f, "Comparable"),
+        }
+    }
+}
+
+impl FromStr for GenericBound {
+    type Err = ParseTyError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Numeric" => Ok(GenericBound::Numeric),
+            "Comparable" => Ok(GenericBound::Comparable),
+            other => Err(ParseTyError(other.to_string())),
+        }
+    }
+}

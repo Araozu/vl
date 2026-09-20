@@ -110,4 +110,25 @@ Each concrete use of a generic function gets its own compiled instance. A
 generic function that is never called produces no instance, and `main` itself
 cannot be generic.
 
+## Constrained generics
+
+An unconstrained `T` is fully opaque: it cannot use operators. Bounds unlock
+useful algorithms without full subtyping:
+
+```vl
+function add[T extends Numeric](a: T, b: T): T {
+    return a + b;
+}
+
+function eq[T extends Comparable](a: T, b: T): bool {
+    return a == b;
+}
+```
+
+`Numeric` allows arithmetic (`+ - * /`), ordering, and equality over
+`u64`, `i64`, `f64`, and `u8`. `Comparable` allows equality (`== !=`) over
+numbers, `bool`, and `string`. A `Numeric` bound implies `Comparable`, so a
+`Numeric` value forwards to a `Comparable` function, but an unconstrained `T`
+cannot flow into either.
+
 Continue with [modules and strings](/docs/modules).

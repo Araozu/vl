@@ -93,6 +93,15 @@ pub enum Instr {
         elem: Ty,
         span: Span,
     },
+    /// Explicit integer conversion (`value as u8`). Backends lower it to a
+    /// value copy reinterpreting the 64-bit payload per `target` (literals
+    /// were range-checked by typechecking; variables are unchecked).
+    Cast {
+        dst: Reg,
+        src: Reg,
+        target: Ty,
+        span: Span,
+    },
     /// Explicit `return` (or fallthrough / global initializer value).
     Ret {
         src: Reg,
@@ -232,6 +241,11 @@ fn fmt_instr(ins: &Instr) -> String {
                 "array_set %{}[%{}], %{} : {elem}",
                 array.0, index.0, value.0
             )
+        }
+        Instr::Cast {
+            dst, src, target, ..
+        } => {
+            format!("%{} = cast %{} : {target}", dst.0, src.0)
         }
         Instr::Ret { src, .. } => format!("ret %{}", src.0),
         Instr::BranchIfFalse { cond, target, .. } => {
@@ -400,14 +414,16 @@ fn lower_fn_stmt(
 /// see a well-formed epilogue. Explicit `return` emits its own `Ret` inline
 /// (VM `ret` transfers control immediately, so later instructions are
 /// unreachable fallthrough); only emit the default fallthrough when the top
-/// level does not end with an unconditional `return`.
+/// level does not end with an unconditional `return`. The payload is a
+/// normalized `u64` zero (`void` backends ignore it); never an unresolved
+/// `int`.
 fn lower_fn_epilogue(l: &mut Lowerer, topped_return: bool) {
     let ends_with_ret = topped_return && matches!(l.instrs.last(), Some(Instr::Ret { .. }));
     if !ends_with_ret {
         let r = l.reg();
         l.instrs.push(Instr::Const {
             dst: r,
-            value: Scalar::Int(0),
+            value: Scalar::U64(0),
             span: Span::empty(0),
         });
         l.instrs.push(Instr::Ret {
@@ -542,7 +558,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
         };
         let env: HashMap<String, Ty> = type_params
             .iter()
-            .cloned()
+            .map(|p| p.name.clone())
             .zip(inst.args.iter().cloned())
             .collect();
         let mut l = Lowerer {
@@ -768,6 +784,22 @@ impl Lowerer<'_> {
                     Some(dst)
                 }
             },
+            HirExpr::Cast { inner, span, .. } => {
+                // Explicit conversion: the inner value was range-checked by
+                // typechecking (literals) or is an unchecked integer
+                // reinterpretation (variables). Emit a cast so backends set
+                // the target register class.
+                let src = self.lower_expr(inner, typed)?;
+                let target = self.resolved_ty(expr.id())?;
+                let dst = self.reg();
+                self.instrs.push(Instr::Cast {
+                    dst,
+                    src,
+                    target,
+                    span: *span,
+                });
+                Some(dst)
+            }
         }
     }
 
@@ -1356,7 +1388,7 @@ mod tests {
         let dump = lower(&hir, &typed).dump();
         assert!(dump.contains("const 7u64"), "{dump}");
         // Explicit `return` is the tail: no default-zero fallthrough.
-        assert!(!dump.contains("const 0int"), "{dump}");
+        assert!(!dump.contains("const 0u64"), "{dump}");
     }
 
     #[test]
@@ -1372,7 +1404,7 @@ mod tests {
         // Discarded tail still lowers, but the function epilogue is the
         // default zero (void fallthrough), not the tail value.
         assert!(dump.contains("const 7u64"), "{dump}");
-        assert!(dump.contains("const 0int"), "{dump}");
+        assert!(dump.contains("const 0u64"), "{dump}");
     }
 
     #[test]
@@ -1397,5 +1429,38 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn casts_lower_to_cast_instr_with_target_type() {
+        let src = "function main() { let v = 200u64; let x = v as u8; x; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.validate_normalized(&hir).is_empty());
+        let dump = lower(&hir, &typed).dump();
+        assert!(dump.contains("cast"), "{dump}");
+        assert!(dump.contains(": u8"), "{dump}");
+    }
+
+    #[test]
+    fn emitted_types_are_normalized() {
+        // No `int`/`Param` survives to LIR in monomorphic code: `1 + 2`
+        // defaults to `u64` and validates clean.
+        let src = "function main() { 1 + 2; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(typed.validate_normalized(&hir).is_empty());
+        let dump = lower(&hir, &typed).dump();
+        assert!(!dump.contains("int"), "{dump}");
+        assert!(dump.contains("u64"), "{dump}");
     }
 }

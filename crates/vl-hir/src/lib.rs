@@ -7,13 +7,21 @@
 //! only `return expr;` / `return;` yields a value; trailing expression
 //! statements are discarded values, never implicit returns.
 
-use vl_common::{Scalar, Span, VlType};
+use vl_common::{GenericBound, Scalar, Span, VlType};
 
 pub use vl_semantic::DefId;
 use vl_syntax::{
     BinOp as AstBinOp, Expr as AstExpr, Item as AstItem, Program as AstProgram, Stmt as AstStmt,
     UnOp as AstUnOp,
 };
+
+/// One generic type parameter with its optional bound
+/// (`T` vs `T extends Numeric`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirTypeParam {
+    pub name: String,
+    pub bound: Option<GenericBound>,
+}
 
 /// Unique node id within one lowering run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -41,8 +49,8 @@ pub enum HirItem {
         id: HirId,
         def: Option<DefId>,
         name: String,
-        /// Declared type parameter names (`[]` when monomorphic).
-        type_params: Vec<String>,
+        /// Declared type parameters (`[]` when monomorphic).
+        type_params: Vec<HirTypeParam>,
         /// `(name, def, type, span)`. `ty` is `None` when the annotation was
         /// missing/unknown (already reported; typecheck poisons quietly).
         params: Vec<(String, Option<DefId>, Option<VlType>, Span)>,
@@ -161,6 +169,14 @@ pub enum HirExpr {
         inner: Box<HirExpr>,
         span: Span,
     },
+    /// Explicit conversion (`value as u8`).
+    Cast {
+        id: HirId,
+        inner: Box<HirExpr>,
+        target: VlType,
+        target_span: Span,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,7 +210,8 @@ impl HirExpr {
             | HirExpr::Var { id, .. }
             | HirExpr::Call { id, .. }
             | HirExpr::Binary { id, .. }
-            | HirExpr::Unary { id, .. } => *id,
+            | HirExpr::Unary { id, .. }
+            | HirExpr::Cast { id, .. } => *id,
         }
     }
 
@@ -207,7 +224,8 @@ impl HirExpr {
             | HirExpr::Var { span, .. }
             | HirExpr::Call { span, .. }
             | HirExpr::Binary { span, .. }
-            | HirExpr::Unary { span, .. } => *span,
+            | HirExpr::Unary { span, .. }
+            | HirExpr::Cast { span, .. } => *span,
         }
     }
 }
@@ -289,7 +307,13 @@ impl<'a> Lowerer<'a> {
                 id: self.id(),
                 def: self.def_at_site(*name_span),
                 name: name.clone(),
-                type_params: type_params.iter().map(|p| p.name.clone()).collect(),
+                type_params: type_params
+                    .iter()
+                    .map(|p| HirTypeParam {
+                        name: p.name.clone(),
+                        bound: p.bound,
+                    })
+                    .collect(),
                 params: params
                     .iter()
                     .map(|p| {
@@ -499,6 +523,18 @@ impl<'a> Lowerer<'a> {
                     span: *span,
                 }
             }
+            AstExpr::Cast {
+                inner,
+                target,
+                target_span,
+                span,
+            } => HirExpr::Cast {
+                id: self.id(),
+                inner: Box::new(self.lower_expr(inner)),
+                target: target.clone(),
+                target_span: *target_span,
+                span: *span,
+            },
         }
     }
 }
@@ -567,7 +603,14 @@ mod tests {
                 ret,
                 ..
             } => {
-                assert_eq!(type_params, &vec!["T".to_string()]);
+                assert_eq!(
+                    type_params
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .collect::<Vec<_>>(),
+                    vec!["T".to_string()]
+                );
+                assert!(type_params[0].bound.is_none());
                 assert!(matches!(params[0].2, Some(VlType::Array(_))));
                 assert!(matches!(ret, Some(VlType::Param(_))));
             }
@@ -722,6 +765,33 @@ mod tests {
                 &body[0],
                 HirStmt::Expr(HirExpr::Call { def: None, .. })
             )),
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn casts_and_bounds_lower() {
+        let src = "function add[T extends Numeric](a: T, b: T): T { let c = a as u64; return a + b; } function main() { add(1u64, 2u64); }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Fn {
+                type_params, body, ..
+            } => {
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].bound, Some(vl_common::GenericBound::Numeric));
+                assert!(matches!(
+                    &body[0],
+                    HirStmt::Let {
+                        value: HirExpr::Cast { .. },
+                        ..
+                    }
+                ));
+            }
             other => panic!("expected fn, got {other:?}"),
         }
     }
