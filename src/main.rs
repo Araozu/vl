@@ -452,16 +452,29 @@ struct Frontend {
     lir: vl_lir::LirProgram,
 }
 
+/// Embedded standard library, loaded once: `std.string` / `std.math` /
+/// `std.fmt` VL helpers merged into the module catalog and linked inline.
+fn stdlib() -> &'static vl_stdlib::Stdlib {
+    static STDLIB: std::sync::OnceLock<vl_stdlib::Stdlib> = std::sync::OnceLock::new();
+    STDLIB.get_or_init(vl_stdlib::load)
+}
+
+/// Resolve `modules` plus the stdlib helper exports.
+fn modules_with_stdlib(modules: &[vl_common::ModuleSpec]) -> Vec<vl_common::ModuleSpec> {
+    let mut catalog = modules.to_vec();
+    stdlib().extend_catalog(&mut catalog);
+    catalog
+}
+
 fn run_frontend_ast(
     ast: &vl_syntax::Program,
     modules: &[vl_common::ModuleSpec],
     entrypoint_module: Option<&str>,
 ) -> Result<Frontend, Vec<vl_common::Diagnostic>> {
-    // Project interfaces were collected from the raw user AST; the prelude
-    // joins here so its helpers stay local and never pollute the catalog.
-    let owned = vl_stdlib::inject(ast.clone());
-    let ast = &owned;
-    let (res, mut diags) = vl_semantic::resolve_with_modules(ast, modules);
+    // Project interfaces were collected from the raw user AST; stdlib
+    // helpers join the catalog here and link inline below.
+    let catalog = modules_with_stdlib(modules);
+    let (res, mut diags) = vl_semantic::resolve_with_modules(ast, &catalog);
     let mains = ast
         .items
         .iter()
@@ -505,6 +518,7 @@ fn run_frontend_ast(
         return Err(diags);
     }
     let mut lir = vl_lir::lower(&hir, &typed);
+    stdlib().link(&mut lir);
     lir.entrypoint = entrypoint_module == Some(ast.module.as_str());
     lir.entrypoint_module = entrypoint_module.map(str::to_owned);
     Ok(Frontend { lir })
@@ -524,9 +538,10 @@ fn run_frontend(
     if diags.iter().any(|d| d.is_error()) {
         return Err(diags);
     }
-    // Lazily merged helpers behave as locals written by the user.
-    let ast = vl_stdlib::inject(ast);
-    let (res, mut d) = vl_semantic::resolve_with_modules(&ast, modules);
+    // Referenced stdlib helpers resolve through the merged catalog and
+    // link inline below; nothing is implicitly in scope.
+    let catalog = modules_with_stdlib(modules);
+    let (res, mut d) = vl_semantic::resolve_with_modules(&ast, &catalog);
     diags.append(&mut d);
     if !diags.iter().any(|d| d.is_error()) {
         // `main` is optional, but its signature is checked wherever it is
@@ -581,6 +596,7 @@ fn run_frontend(
     }
     let lir = vl_lir::lower(&hir, &typed);
     let mut lir = lir;
+    stdlib().link(&mut lir);
     // Standalone builds are programs, whereas project builds set ownership
     // explicitly below. This preserves the existing single-file CLI behavior.
     lir.entrypoint = true;
