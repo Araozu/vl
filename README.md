@@ -83,8 +83,11 @@ builds; project imports require the project build/check path. Object types are
 nominal and cross modules by fully qualified name: a `type Person` declared
 in module `my_app.person` is named `my_app.person.Person` in any other
 module's signatures, annotations, and literals (`val p: my_app.person.Person`,
-`my_app.person.Person { ... }`). Imported generic functions and cross-module
-global boundaries remain deferred.
+`my_app.person.Person { ... }`). Generic functions infer and specialize across
+modules (`use my_app.lib.id;` then `id(1u64)` emits `id$u64` in the provider);
+concrete instances are emitted once in their owning module and stdlib generic
+helpers (e.g. `std.math.max[T extends Numeric]`) link per compilation.
+Cross-module global boundaries remain deferred.
 
 Project scripts are commands in the optional `[scripts]` table. They run only
 through `vl run`: `vl run` runs the special `run` script, while `vl run check`

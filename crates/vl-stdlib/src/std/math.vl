@@ -50,3 +50,14 @@ fun abs_i64(a: i64): i64 {
 fun is_even(v: u64): bool {
     return math.mod_u64(v, 2u64) == 0u64;
 }
+
+// Generic bounded helper: infers `T` from its arguments or selects it
+// explicitly (`max::[u64](a, b)`). Generates arithmetic/comparison per
+// instantiation while keeping the typed helpers above untouched.
+fun max[T extends Numeric](a: T, b: T): T {
+    if (a > b) {
+        return a;
+    } else {
+        return b;
+    }
+}

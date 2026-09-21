@@ -377,13 +377,13 @@ fn project_check_uses_source_catalog() {
 }
 
 #[test]
-fn imported_generic_is_rejected_with_a_focused_diagnostic() {
+fn imported_generic_checks_and_builds() {
     let root = temp_project("generic-import");
     fs::create_dir_all(root.join("src")).expect("create source tree");
     fs::write(root.join("vl.toml"), "module = \"demo\"\n").expect("write config");
     fs::write(
         root.join("src/main.vl"),
-        "use demo.lib.id; fun main() { id(1u64); }",
+        "use demo.lib.id; fun main() { val x = id(1u64); }",
     )
     .expect("write main");
     fs::write(
@@ -392,8 +392,210 @@ fn imported_generic_is_rejected_with_a_focused_diagnostic() {
     )
     .expect("write library");
     let output = run(&root, &["check", "src/main.vl"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = run(&root, &["build", "--emit", "lir"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let main_lir = fs::read_to_string(root.join("out/demo__main.lir")).expect("main lir");
+    assert!(main_lir.contains("call demo.lib::id$u64"), "{main_lir}");
+    let lib_lir = fs::read_to_string(root.join("out/demo__lib.lir")).expect("lib lir");
+    assert!(lib_lir.contains("fn id$u64:"), "{lib_lir}");
+    assert!(!lib_lir.contains("fn id:\n"), "{lib_lir}");
+    let output = run(&root, &["build"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.join("out/demo__main.naravm").is_file());
+    assert!(root.join("out/demo__lib.naravm").is_file());
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
+
+#[test]
+fn imported_generic_supports_inference_and_turbofish() {
+    let root = temp_project("generic-infer-turbofish");
+    fs::create_dir_all(root.join("src")).expect("create source tree");
+    fs::write(root.join("vl.toml"), "module = \"demo\"\n").expect("write config");
+    fs::write(
+        root.join("src/main.vl"),
+        "use demo.lib.id; fun main() { val a = id(1u64); val b = id::[String](\"hi\"); a; b; }",
+    )
+    .expect("write main");
+    fs::write(
+        root.join("src/lib.vl"),
+        "fun id[T](value: T): T { return value; }",
+    )
+    .expect("write library");
+    let output = run(&root, &["check", "src/main.vl"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = run(&root, &["build", "--emit", "lir"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lib_lir = fs::read_to_string(root.join("out/demo__lib.lir")).expect("lib lir");
+    assert!(lib_lir.contains("fn id$u64:"), "{lib_lir}");
+    assert!(lib_lir.contains("fn id$String:"), "{lib_lir}");
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
+
+#[test]
+fn imported_generic_emits_once_for_many_callers() {
+    let root = temp_project("generic-dedup");
+    fs::create_dir_all(root.join("src")).expect("create source tree");
+    fs::write(root.join("vl.toml"), "module = \"demo\"\n").expect("write config");
+    fs::write(
+        root.join("src/main.vl"),
+        "use demo.lib.id; use demo.other; fun main() { val a = id(1u64); val b = other.get(2u64); a; b; }",
+    )
+    .expect("write main");
+    fs::write(
+        root.join("src/lib.vl"),
+        "fun id[T](value: T): T { return value; }",
+    )
+    .expect("write library");
+    fs::write(
+        root.join("src/other.vl"),
+        "use demo.lib; fun get[T](value: T): T { return lib.id(value); }",
+    )
+    .expect("write other");
+    let output = run(&root, &["build", "--emit", "lir"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lib_lir = fs::read_to_string(root.join("out/demo__lib.lir")).expect("lib lir");
+    assert_eq!(lib_lir.matches("fn id$u64:").count(), 1, "{lib_lir}");
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
+
+#[test]
+fn imported_generic_forwarding_chain_converges() {
+    let root = temp_project("generic-forward");
+    fs::create_dir_all(root.join("src")).expect("create source tree");
+    fs::write(root.join("vl.toml"), "module = \"demo\"\n").expect("write config");
+    fs::write(
+        root.join("src/lib.vl"),
+        "fun id[T](value: T): T { return value; }",
+    )
+    .expect("write lib");
+    fs::write(
+        root.join("src/mid.vl"),
+        "use demo.lib; fun wrap[T](x: T): T { return lib.id(x); }",
+    )
+    .expect("write mid");
+    fs::write(
+        root.join("src/main.vl"),
+        "use demo.mid; fun main() { val x = mid.wrap(1u64); }",
+    )
+    .expect("write main");
+    let output = run(&root, &["build", "--emit", "lir"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mid_lir = fs::read_to_string(root.join("out/demo__mid.lir")).expect("mid lir");
+    assert!(mid_lir.contains("call demo.lib::id$u64"), "{mid_lir}");
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
+
+#[test]
+fn imported_generic_budget_exceeded_is_one_e303() {
+    let root = temp_project("generic-budget");
+    fs::create_dir_all(root.join("src")).expect("create source tree");
+    fs::write(root.join("vl.toml"), "module = \"demo\"\n").expect("write config");
+    fs::write(root.join("src/lib.vl"), "fun grow[T](x: T) { grow([x]); }").expect("write lib");
+    fs::write(
+        root.join("src/main.vl"),
+        "use demo.lib; fun main() { lib.grow(1u64); }",
+    )
+    .expect("write main");
+    let output = run(&root, &["check", "src/main.vl"]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("E207"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("E303"), "{stderr}");
+    assert!(
+        stderr.contains("demolib") || stderr.contains("demo.lib") || stderr.contains("grow"),
+        "{stderr}"
+    );
+    assert!(!root.join("out/demo__main.naravm").exists());
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
+
+#[test]
+fn failed_project_leaves_previous_output_untouched() {
+    let root = temp_project("transaction-keep");
+    fs::create_dir_all(root.join("src")).expect("create source tree");
+    fs::write(root.join("vl.toml"), "module = \"demo\"\n").expect("write config");
+    fs::write(root.join("src/main.vl"), "fun main() { }").expect("write main");
+    let output = run(&root, &["build"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let artifact = root.join("out/demo__main.naravm");
+    assert!(artifact.is_file());
+    let before = fs::read(&artifact).expect("read artifact");
+    fs::write(root.join("src/main.vl"), "fun main( {").expect("break source");
+    let output = run(&root, &["build"]);
+    assert!(!output.status.success());
+    let after = fs::read(&artifact).expect("previous output must survive");
+    assert_eq!(before, after);
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
+
+#[test]
+fn cyclic_generic_call_graph_converges() {
+    let root = temp_project("generic-cycle");
+    fs::create_dir_all(root.join("src")).expect("create source tree");
+    fs::write(root.join("vl.toml"), "module = \"demo\"\n").expect("write config");
+    fs::write(
+        root.join("src/lib.vl"),
+        "use demo.mid; fun ping[T](x: T): T { return mid.pong(x); }",
+    )
+    .expect("write lib");
+    fs::write(
+        root.join("src/mid.vl"),
+        "use demo.lib; fun pong[T](x: T): T { return lib.ping(x); } fun wrap[T](x: T): T { return pong(x); }",
+    )
+    .expect("write mid");
+    // Converging same-type cycle would recurse forever at runtime, so check
+    // only (no execution): it must terminate the fixed point, not hit budget.
+    // Use a converging variant that terminates via a monomorphic base.
+    fs::write(
+        root.join("src/main.vl"),
+        "use demo.mid; fun main() { val x = mid.wrap(1u64); }",
+    )
+    .expect("write main");
+    // This cycle is same-type recursive (`ping[u64]` <-> `pong[u64]`) and would
+    // diverge at runtime, but the compiler must terminate (cache hit) rather
+    // than hang or hit the expanding budget. We assert it builds; runtime
+    // divergence is out of scope for this test.
+    // To keep the test terminating at runtime, we do not execute it.
+    let output = run(&root, &["build", "--emit", "lir"]);
+    // Same-type mutual recursion converges via cache hits (no E303).
+    // If the implementation hangs, this test times out; if it mis-budgets, it fails.
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     fs::remove_dir_all(root).expect("remove temporary project");
 }
 

@@ -26,8 +26,9 @@ use vl_common::{Diagnostic, GenericBound, Span, VlType};
 use vl_hir::{BindingKind, HirBinOp, HirExpr, HirItem, HirProgram, HirStmt, HirUnOp};
 
 mod mono;
+pub mod world;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Ty {
     /// Integer literal whose concrete integer type is supplied by context.
     Int,
@@ -244,11 +245,30 @@ pub fn subst_ty(ty: &Ty, env: &HashMap<String, Ty>) -> Ty {
     }
 }
 
-/// Mangled instance name: `first$u64`, `get$Array_String`. `$` is not lexable
+/// Mangled instance name: `first$u64`, `get$Array$String`. `$` is not lexable
 /// in VL source, so instances can never collide with user-written names.
+///
+/// Encoding is collision-free and deterministic: object names are fully
+/// qualified and escaped (`_` -> `__`, `.` -> `_D`, `$` -> `_S`), arrays and
+/// capabilities use `Array_`/`Mut_` prefixes, and multiple arguments join
+/// with `$` (which never appears inside an encoded argument). Single-argument
+/// names (`id$u64`, `same$Array_u8`) are unchanged.
 pub fn mangle(name: &str, args: &[Ty]) -> String {
     let parts: Vec<String> = args.iter().map(mangle_ty).collect();
-    format!("{name}${}", parts.join("_"))
+    format!("{name}${}", parts.join("$"))
+}
+
+fn sanitize_object_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        match ch {
+            '_' => out.push_str("__"),
+            '.' => out.push_str("_D"),
+            '$' => out.push_str("_S"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn mangle_ty(ty: &Ty) -> String {
@@ -261,7 +281,7 @@ fn mangle_ty(ty: &Ty) -> String {
         Ty::U8 => "u8".into(),
         Ty::String => "String".into(),
         Ty::File => "File".into(),
-        Ty::Object(name) => format!("Object_{}", name),
+        Ty::Object(name) => format!("Object_{}", sanitize_object_name(name)),
         Ty::Array(elem) => format!("Array_{}", mangle_ty(elem)),
         Ty::Tuple(fields) => {
             let parts: Vec<String> = fields
@@ -274,7 +294,7 @@ fn mangle_ty(ty: &Ty) -> String {
             format!("Tuple_{}", parts.join("_"))
         }
         Ty::Mutable(inner) => format!("Mut_{}", mangle_ty(inner)),
-        Ty::Param(name) => name.clone(),
+        Ty::Param(name) => sanitize_object_name(name),
         Ty::Void => "void".into(),
         Ty::Error => "error".into(),
     }
@@ -313,6 +333,77 @@ impl FuncSigTy {
             subst_ty(&self.ret, &env),
         )
     }
+
+    /// Convert a shared catalog signature (possibly generic) into a callable
+    /// signature. Type parameters become opaque `Param` types; bounds are
+    /// preserved for bound checking.
+    pub fn from_shared(sig: &vl_common::FuncSig) -> Self {
+        let env: HashMap<String, Ty> = sig
+            .type_params
+            .iter()
+            .map(|p| (p.name.clone(), Ty::Param(p.name.clone())))
+            .collect();
+        Self {
+            param_names: sig.params.iter().map(|p| p.name.clone()).collect(),
+            param_tys: sig
+                .params
+                .iter()
+                .map(|p| Ty::from_vl_in(&p.ty, &env))
+                .collect(),
+            ret: Ty::from_vl_in(&sig.ret, &env),
+            type_params: sig.type_params.iter().map(|p| p.name.clone()).collect(),
+            bounds: sig
+                .type_params
+                .iter()
+                .filter_map(|p| p.bound.map(|b| (p.name.clone(), b)))
+                .collect(),
+        }
+    }
+}
+
+pub use vl_common::TemplateKey;
+
+/// Identity of one concrete instantiation: its template plus structural type
+/// arguments. The emitted symbol is derived from this key only at the LIR
+/// boundary; never use a pre-mangled string as semantic identity upstream.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InstanceKey {
+    pub template: TemplateKey,
+    pub args: Vec<Ty>,
+}
+
+impl InstanceKey {
+    pub fn new(template: TemplateKey, args: Vec<Ty>) -> Self {
+        Self { template, args }
+    }
+
+    pub fn mangled(&self) -> String {
+        mangle(&self.template.function, &self.args)
+    }
+}
+
+impl PartialOrd for InstanceKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for InstanceKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Deterministic order for the worklist: owner, function, then the
+        // collision-free mangling (injective in `args`, so consistent with
+        // `Eq`).
+        (
+            self.template.module.clone(),
+            self.template.function.clone(),
+            self.mangled(),
+        )
+            .cmp(&(
+                other.template.module.clone(),
+                other.template.function.clone(),
+                other.mangled(),
+            ))
+    }
 }
 
 /// One monomorphized instance of a generic function.
@@ -350,6 +441,17 @@ pub struct TypedProgram {
     pub inst_calls: HashMap<(String, u32), String>,
     /// Mangled name -> concrete instance (signature + template link).
     pub instances: HashMap<String, Instance>,
+    /// Imported concrete call site (`HirId.0`) -> requested owner instance.
+    /// Only calls in non-generic code land here; calls inside generic
+    /// templates resolve per-instance via the world fixed point.
+    pub imported_root_calls: HashMap<u32, InstanceKey>,
+    /// `(outer local instance, call site)` -> requested owner instance for
+    /// imported callees discovered by the local worklist. The world fixed
+    /// point generalizes this to `(outer InstanceKey, call site)`.
+    pub imported_inst_calls: HashMap<(String, u32), InstanceKey>,
+    /// Concrete imported requests discovered in monomorphic code and global
+    /// initializers, awaiting the project-wide fixed point.
+    pub pending_imported: Vec<InstanceKey>,
 }
 
 impl TypedProgram {
@@ -860,7 +962,9 @@ pub fn check_with_modules(
         fn_span: Span::empty(0),
         type_env: HashMap::new(),
         type_bounds: HashMap::new(),
+        module: prog.module.clone(),
         pending_instances: Vec::new(),
+        pending_imported: Vec::new(),
         fixed_defs: HashSet::new(),
     };
     // Merge foreign layouts first so local declarations can reference
@@ -1011,9 +1115,11 @@ pub fn check_with_modules(
     // Separate monomorphization pass: instance expansion owns caching,
     // poison suppression, expanding-recursion diagnostics, and budgets.
     let pending = std::mem::take(&mut cx.pending_instances);
+    let pending_imported = std::mem::take(&mut cx.pending_imported);
     let mut typed = std::mem::take(&mut cx.typed);
     let mut diags = std::mem::take(&mut cx.diags);
     drop(cx);
+    typed.pending_imported = pending_imported;
     mono::expand(prog, &mut typed, pending, &mut diags);
     (typed, diags)
 }
@@ -1032,11 +1138,35 @@ struct Checker {
     type_env: HashMap<String, Ty>,
     /// Bounds of the current function's type parameters (`T -> Numeric`).
     type_bounds: HashMap<String, GenericBound>,
+    /// Owning module for object canonicalization in instance keys.
+    module: String,
     /// Concrete `(template DefId.0, args)` pairs awaiting the separate
     /// monomorphization pass ([`mono::expand`]).
     pending_instances: Vec<(u32, Vec<Ty>)>,
+    /// Concrete imported requests awaiting the project-wide fixed point.
+    pending_imported: Vec<InstanceKey>,
     /// Fixed `val` bindings share the assignment-poisoning path with params.
     fixed_defs: HashSet<u32>,
+}
+
+pub(crate) fn canonicalize_for_key(
+    ty: &Ty,
+    caller: &str,
+    objects: &HashMap<String, ObjectSigTy>,
+) -> Ty {
+    match ty {
+        Ty::Object(name) if !name.contains('.') => {
+            let qualified = format!("{caller}.{name}");
+            if objects.contains_key(&qualified) {
+                Ty::Object(qualified)
+            } else {
+                ty.clone()
+            }
+        }
+        Ty::Array(elem) => Ty::Array(Box::new(canonicalize_for_key(elem, caller, objects))),
+        Ty::Mutable(inner) => Ty::Mutable(Box::new(canonicalize_for_key(inner, caller, objects))),
+        _ => ty.clone(),
+    }
 }
 
 impl Checker {
@@ -3303,6 +3433,8 @@ impl Checker {
                 def,
                 external,
                 extern_sig,
+                extern_kind,
+                symbol,
                 name,
                 type_args,
                 args,
@@ -3362,7 +3494,145 @@ impl Checker {
                     if name == "Array.new" {
                         return self.check_array_new(name, *span, type_args, args, &arg_tys, *id);
                     }
-                    // Externs are never generic: `print::[u64]` is an error.
+                    let is_source = matches!(extern_kind, Some(vl_common::ExportKind::Source));
+                    if is_source {
+                        // Imported source function (monomorphic or generic):
+                        // same signature algorithm as local calls.
+                        let Some(shared) = extern_sig else {
+                            // Poisoned import (E202/E203/E208 already reported).
+                            return self.record(*id, Ty::Error);
+                        };
+                        let sig = FuncSigTy::from_shared(shared);
+                        if ty_has_error(&sig.ret) || sig.param_tys.iter().any(ty_has_error) {
+                            return self.record(*id, Ty::Error);
+                        }
+                        let Some(resolved) =
+                            self.resolve_type_args(name, *span, &sig, type_args, &arg_tys)
+                        else {
+                            return self.record(*id, Ty::Error);
+                        };
+                        let (param_tys, ret_ty) = sig.instantiate(&resolved);
+                        if args.len() != param_tys.len() {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "`{name}` expects {} argument(s), got {}",
+                                    param_tys.len(),
+                                    args.len()
+                                ))
+                                .with_label(*span, "wrong number of arguments")
+                                .with_code("E303"),
+                            );
+                            return self.record(*id, Ty::Error);
+                        }
+                        if poisoned {
+                            return self.record(*id, Ty::Error);
+                        }
+                        for (i, original_got) in arg_tys.iter().enumerate() {
+                            let is_bare_new = matches!(&args[i], HirExpr::Call { name, type_args, .. } if name == "Array.new" && type_args.is_empty());
+                            let is_empty_array = matches!(&args[i], HirExpr::ArrayLiteral { elems, .. } if elems.is_empty());
+                            if ty_has_error(original_got) && !(is_bare_new || is_empty_array) {
+                                continue;
+                            }
+                            let want = &param_tys[i];
+                            if ty_has_error(want) {
+                                continue;
+                            }
+                            let got = self.infer_expr_expected(&args[i], want);
+                            if ty_has_error(&got) {
+                                continue;
+                            }
+                            if got == Ty::Void || *want == Ty::Void {
+                                self.diags.push(
+                                    Diagnostic::error(format!(
+                                        "`{name}` parameter `{}` cannot be `void`",
+                                        sig.param_names[i]
+                                    ))
+                                    .with_label(args[i].span(), "unexpected `void` here")
+                                    .with_code("E308"),
+                                );
+                                return self.record(*id, Ty::Error);
+                            }
+                            if !can_coerce(&got, want) {
+                                if got.readonly_view() == want.readonly_view()
+                                    && got.is_mutable_view() != want.is_mutable_view()
+                                {
+                                    self.diags.push(
+                                        Diagnostic::error(format!(
+                                            "cannot pass read-only `{got}` to mutable parameter `{}: {want}`",
+                                            sig.param_names[i]
+                                        ))
+                                        .with_label(
+                                            args[i].span(),
+                                            "mutation authority is required here",
+                                        )
+                                        .with_note(format!(
+                                            "a read-only view cannot be upgraded to `{want}`"
+                                        ))
+                                        .with_code("E306"),
+                                    );
+                                } else {
+                                    self.diags.push(
+                                        Diagnostic::error(format!(
+                                            "`{name}` parameter `{}` expects `{}`, got `{got}`",
+                                            sig.param_names[i], want
+                                        ))
+                                        .with_label(
+                                            args[i].span(),
+                                            format!("expected `{want}` here"),
+                                        )
+                                        .with_code("E306"),
+                                    );
+                                }
+                                return self.record(*id, Ty::Error);
+                            }
+                        }
+                        // Concrete imported source calls outside a generic body
+                        // request an owner-module instance. Calls inside a
+                        // generic body resolve per outer instance in the world
+                        // fixed point (via `symbol` template identity).
+                        if self.type_env.is_empty() && resolved.iter().all(|t| t.is_concrete()) {
+                            if let Some(sym) = symbol {
+                                // Only generic source calls need cross-module
+                                // instantiation; monomorphic source calls use
+                                // the existing extern import path.
+                                if !sig.type_params.is_empty() {
+                                    // Canonicalize nominal object identity for
+                                    // cross-module dedup (`Person` in the
+                                    // caller becomes `<caller>.Person`).
+                                    let canonical: Vec<Ty> = resolved
+                                        .iter()
+                                        .map(|t| {
+                                            canonicalize_for_key(
+                                                t,
+                                                &self.module,
+                                                &self.typed.objects,
+                                            )
+                                        })
+                                        .collect();
+                                    let key = InstanceKey::new(
+                                        TemplateKey::new(sym.module.as_string(), sym.name.clone()),
+                                        canonical,
+                                    );
+                                    // Deduplicate requests; budget is enforced
+                                    // by the world fixed point.
+                                    if !self.typed.imported_root_calls.values().any(|k| k == &key)
+                                        && !self.pending_imported.iter().any(|k| k == &key)
+                                    {
+                                        self.pending_imported.push(key.clone());
+                                    }
+                                    self.typed.imported_root_calls.insert(id.0, key);
+                                }
+                            } else if !sig.type_params.is_empty() {
+                                // Defensive: generic source import without a
+                                // symbol should not happen (resolver always
+                                // attaches one); stay quiet rather than
+                                // emitting an unresolved call.
+                            }
+                        }
+                        return self.record(*id, ret_ty);
+                    }
+                    // Target-native exports are never generic:
+                    // `print::[u64]` is an error.
                     if !type_args.is_empty() {
                         self.diags.push(
                             Diagnostic::error(format!(
@@ -6013,5 +6283,108 @@ mod tests {
         );
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.validate_normalized(&hir, &diags).is_empty());
+    }
+
+    fn check_importer_with_provider(
+        provider_src: &str,
+        provider_module: &str,
+        importer_src: &str,
+    ) -> (TypedProgram, Vec<Diagnostic>) {
+        let (toks, _) = vl_lex::lex(provider_src);
+        let (provider, _) = vl_syntax::parse_with_module(&toks, provider_src, provider_module);
+        let (interface, _) = vl_semantic::collect_interface_quiet(&provider);
+        let spec = interface.as_spec();
+        let (toks, _) = vl_lex::lex(importer_src);
+        let (prog, mut diags) = vl_syntax::parse(&toks, importer_src);
+        let (res, mut d) = vl_semantic::resolve_with_modules(&prog, std::slice::from_ref(&spec));
+        diags.append(&mut d);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, mut d) = check_with_modules(&hir, std::slice::from_ref(&spec));
+        diags.append(&mut d);
+        (typed, diags)
+    }
+
+    #[test]
+    fn canonical_keys_and_collision_free_mangling() {
+        // Nested arrays, mutable views, and qualified objects mangle distinctly.
+        let array_u64 = Ty::Array(Box::new(Ty::U64));
+        let mut_array = Ty::Mutable(Box::new(array_u64.clone()));
+        assert_ne!(
+            mangle("f", std::slice::from_ref(&array_u64)),
+            mangle("f", std::slice::from_ref(&mut_array))
+        );
+        let a_person = Ty::Object("vl.a.Person".into());
+        let b_person = Ty::Object("vl.b.Person".into());
+        assert_ne!(mangle("f", &[a_person]), mangle("f", &[b_person]));
+        assert!(mangle("f", &[Ty::String]).contains("String"));
+        let key = InstanceKey::new(TemplateKey::new("demo.lib", "id"), vec![Ty::U64]);
+        assert_eq!(key.mangled(), "id$u64");
+    }
+
+    #[test]
+    fn imported_id_infers_and_accepts_turbofish() {
+        let (typed, diags) = check_importer_with_provider(
+            "fun id[T](value: T): T { return value; }",
+            "demo.lib",
+            "use demo.lib.id; fun main() { val a = id(1u64); val b = id::[String](\"s\"); a; b; }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_eq!(typed.pending_imported.len(), 2);
+        assert!(typed.imported_root_calls.len() == 2);
+    }
+
+    #[test]
+    fn imported_call_diagnostics_at_caller() {
+        for (src, code) in [
+            (
+                "use demo.lib.id; fun main() { id::[u64, u64](1u64); }",
+                "E303",
+            ),
+            ("use demo.lib.id; fun main() { id(); }", "E303"),
+            (
+                "use demo.lib.add; fun main() { add(\"a\", \"b\"); }",
+                "E303",
+            ),
+        ] {
+            let provider = if src.contains("add") {
+                "fun add[T extends Numeric](a: T, b: T): T { return a + b; }"
+            } else {
+                "fun id[T](value: T): T { return value; }"
+            };
+            let (_, diags) = check_importer_with_provider(provider, "demo.lib", src);
+            assert_eq!(
+                diags.iter().filter(|d| d.is_error()).count(),
+                1,
+                "{src}: {diags:?}"
+            );
+            assert_eq!(diags[0].code.as_deref(), Some(code), "{src}: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn imported_forwarding_records_no_root_inside_generic() {
+        // `wrap[T]` forwarding to imported `id[T]` stays generic (no root);
+        // the world resolves it after the outer becomes concrete.
+        let (typed, diags) = check_importer_with_provider(
+            "fun id[T](value: T): T { return value; }",
+            "demo.lib",
+            "use demo.lib; fun wrap[T](x: T): T { return lib.id(x); } fun main() { wrap(1u64); }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        // One local root (`wrap$u64`), no imported root yet (forwarding is nested).
+        assert!(typed.root_calls.len() == 1);
+        assert!(typed.pending_imported.is_empty());
+    }
+
+    #[test]
+    fn imported_instances_deduplicate_across_callers() {
+        let (typed, diags) = check_importer_with_provider(
+            "fun id[T](value: T): T { return value; }",
+            "demo.lib",
+            "use demo.lib.id; fun main() { val a = id(1u64); val b = id(2u64); a; b; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        // Same `id[u64]` twice: one pending key (deduplicated).
+        assert_eq!(typed.pending_imported.len(), 1);
     }
 }

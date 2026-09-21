@@ -305,8 +305,9 @@ impl LirProgram {
     }
 
     /// Boundary validation: no capability, generic, literal, or poison type
-    /// may reach backend emission (signatures, layouts, globals, and every
-    /// instruction's type metadata). Returns the offending description, if any.
+    /// may reach backend emission (signatures, layouts, globals, imports, and
+    /// every instruction's type metadata). Returns the offending description,
+    /// if any.
     pub fn validate_runtime(&self) -> Option<String> {
         fn bad(ty: &Ty) -> bool {
             matches!(ty, Ty::Mutable(_) | Ty::Param(_) | Ty::Int | Ty::Error)
@@ -315,6 +316,16 @@ impl LirProgram {
                     Ty::Tuple(fields) => fields.iter().any(|(_, t)| bad(t)),
                     _ => false,
                 }
+        }
+        for import in &self.imports {
+            for ty in import.param_tys.iter().chain(std::iter::once(&import.ret)) {
+                if bad(ty) {
+                    return Some(format!(
+                        "import {}::{} has non-runtime type `{ty}`",
+                        import.symbol.module, import.symbol.function
+                    ));
+                }
+            }
         }
         for o in &self.objects {
             for (_, ty) in &o.fields {
@@ -596,6 +607,11 @@ struct Lowerer<'t> {
     /// Mangled instance name when lowering a monomorphized body (used to
     /// resolve inner generic calls per instance); `None` for root code.
     outer: Option<String>,
+    /// World plan for project builds (`None` for single-module lowering).
+    /// When present, concrete targets take precedence over HIR symbols.
+    plan: Option<&'t vl_typecheck::world::MonomorphizationPlan>,
+    /// Outer instance key when lowering a world-plan body (`None` for roots).
+    outer_key: Option<vl_typecheck::InstanceKey>,
     typed: &'t vl_typecheck::TypedProgram,
     module: &'t str,
 }
@@ -1137,6 +1153,8 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                 loop_stack: Vec::new(),
                 env: HashMap::new(),
                 outer: None,
+                plan: None,
+                outer_key: None,
                 typed,
                 module: prog.module.as_str(),
             };
@@ -1192,6 +1210,8 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
             loop_stack: Vec::new(),
             env: HashMap::new(),
             outer: None,
+            plan: None,
+            outer_key: None,
             typed,
             module: prog.module.as_str(),
         };
@@ -1254,6 +1274,8 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                     loop_stack: Vec::new(),
                     env: HashMap::new(),
                     outer: None,
+                    plan: None,
+                    outer_key: None,
                     typed,
                     module: prog.module.as_str(),
                 };
@@ -1317,6 +1339,8 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
             loop_stack: Vec::new(),
             env,
             outer: Some(m.clone()),
+            plan: None,
+            outer_key: None,
             typed,
             module: prog.module.as_str(),
         };
@@ -1344,6 +1368,678 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
         });
     }
     out
+}
+
+/// Lower one stdlib generic instance body with its substitution and the world
+/// plan. Used by `vl-stdlib` per-compilation linking; the caller assigns the
+/// collision-proof local name and carries native imports.
+#[allow(clippy::too_many_arguments)]
+pub fn lower_stdlib_instance(
+    hir: &HirProgram,
+    typed: &vl_typecheck::TypedProgram,
+    plan: &vl_typecheck::world::MonomorphizationPlan,
+    outer_key: &vl_typecheck::InstanceKey,
+    env: &HashMap<String, Ty>,
+    params: &[(
+        String,
+        Option<vl_hir::DefId>,
+        Option<vl_common::VlType>,
+        Span,
+    )],
+    body: &[HirStmt],
+    inst: &vl_typecheck::Instance,
+) -> Option<Function> {
+    // No globals inside stdlib helpers (enforced at load); use an empty map.
+    let global_map: HashMap<u32, u32> = HashMap::new();
+    // The mangled concrete name is assigned by the caller; use a placeholder
+    // here for the outer mapping (only `outer_key` matters for nested calls).
+    let placeholder = outer_key.mangled();
+    let mut l = Lowerer {
+        next: 0,
+        instrs: vec![],
+        bindings: HashMap::new(),
+        globals: global_map,
+        next_label: 0,
+        loop_stack: Vec::new(),
+        env: env.clone(),
+        outer: Some(placeholder),
+        plan: Some(plan),
+        outer_key: Some(outer_key.clone()),
+        typed,
+        module: hir.module.as_str(),
+    };
+    for (index, (_, def, _, span)) in params.iter().enumerate() {
+        let dst = l.reg();
+        l.instrs.push(Instr::Param {
+            dst,
+            index,
+            span: *span,
+        });
+        if let Some(def) = def {
+            l.bindings.insert(def.0, dst);
+        }
+    }
+    let mut topped_return = false;
+    for stmt in body {
+        lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
+    }
+    lower_fn_epilogue(&mut l, topped_return);
+    Some(Function {
+        name: String::new(),
+        param_tys: inst.sig.param_tys.iter().map(rt).collect(),
+        ret: rt(&inst.sig.ret),
+        instrs: l.instrs,
+    })
+}
+
+/// Lower one plan-sensitive monomorphic stdlib helper per compilation.
+/// No substitution (monomorphic), but nested generic calls resolve via the
+/// plan as roots of the helper's module.
+pub fn lower_stdlib_mono(
+    hir: &HirProgram,
+    typed: &vl_typecheck::TypedProgram,
+    plan: &vl_typecheck::world::MonomorphizationPlan,
+    params: &[(
+        String,
+        Option<vl_hir::DefId>,
+        Option<vl_common::VlType>,
+        Span,
+    )],
+    body: &[HirStmt],
+) -> Option<Function> {
+    let global_map: HashMap<u32, u32> = HashMap::new();
+    let mut l = Lowerer {
+        next: 0,
+        instrs: vec![],
+        bindings: HashMap::new(),
+        globals: global_map,
+        next_label: 0,
+        loop_stack: Vec::new(),
+        env: HashMap::new(),
+        outer: None,
+        plan: Some(plan),
+        outer_key: None,
+        typed,
+        module: hir.module.as_str(),
+    };
+    for (index, (_, def, _, span)) in params.iter().enumerate() {
+        let dst = l.reg();
+        l.instrs.push(Instr::Param {
+            dst,
+            index,
+            span: *span,
+        });
+        if let Some(def) = def {
+            l.bindings.insert(def.0, dst);
+        }
+    }
+    let mut topped_return = false;
+    for stmt in body {
+        lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
+    }
+    lower_fn_epilogue(&mut l, topped_return);
+    // Signature from HIR (monomorphic, runtime-erased).
+    let param_tys = params
+        .iter()
+        .map(|(_, _, t, _)| t.as_ref().map(|v| rt(&Ty::from_vl(v))).unwrap_or(Ty::Error))
+        .collect();
+    // Return type: look up via first Param? Instead, derive from LIR? For
+    // monomorphic helpers the cached body already has the signature; here we
+    // reconstruct from HIR return annotation (must exist, else Error).
+    // To avoid threading `ret` through, use the cached body's signature when
+    // available? Simpler: leave `ret` as Error and let the caller fill from
+    // checked FuncSigTy. For now, compute from HIR via a placeholder: the
+    // caller (stdlib) will overwrite with the checked signature.
+    Some(Function {
+        name: String::new(),
+        param_tys,
+        ret: Ty::Error,
+        instrs: l.instrs,
+    })
+}
+
+/// Lower one project module with the complete world plan.
+///
+/// Differences from [`lower`]:
+/// - Generic templates never emit directly; one concrete `Function` is emitted
+///   per instance assigned to this owner in `plan.instances_by_owner`.
+/// - Calls resolve through the plan before falling back to the HIR symbol,
+///   so imported generic calls become concrete owner-module imports.
+/// - Imports are built from emitted concrete code only (never from
+///   uninstantiated templates, never the unmangled generic name),
+///   deduplicated by concrete symbol and sorted deterministically.
+/// - Capability erasure applies at the same boundary; backends see only
+///   concrete locals and concrete cross-module imports.
+pub fn lower_project(
+    prog: &HirProgram,
+    typed: &vl_typecheck::TypedProgram,
+    plan: &vl_typecheck::world::MonomorphizationPlan,
+) -> LirProgram {
+    let mut objects = typed
+        .objects
+        .iter()
+        .map(|(name, sig)| ObjectDef {
+            name: name.clone(),
+            fields: sig.fields.iter().map(|(n, t)| (n.clone(), rt(t))).collect(),
+        })
+        .collect::<Vec<_>>();
+    objects.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let global_items: Vec<(u32, String, vl_hir::HirId, HirExpr, Span)> = prog
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            HirItem::Let {
+                def: Some(def),
+                value,
+                id,
+                span,
+                ..
+            } => Some((def.0, format!("g{}", def.0), *id, value.clone(), *span)),
+            _ => None,
+        })
+        .collect();
+    let global_map: HashMap<u32, u32> = global_items
+        .iter()
+        .enumerate()
+        .map(|(idx, (def, _, _, _, _))| (*def, idx as u32))
+        .collect();
+
+    let mut out = LirProgram {
+        module: prog.module.clone(),
+        entrypoint: false,
+        entrypoint_module: None,
+        objects,
+        globals: Vec::new(),
+        functions: Vec::new(),
+        imports: Vec::new(),
+    };
+
+    for (idx, (_def, name, id, value, span)) in global_items.iter().enumerate() {
+        let gid = idx as u32;
+        let ty = typed
+            .type_of_id(*id)
+            .or_else(|| typed.type_of_id(value.id()))
+            .unwrap_or(Ty::Error);
+        if ty == Ty::Error || !ty.is_concrete() {
+            out.globals.push(Global {
+                id: gid,
+                name: name.clone(),
+                ty: Ty::Error,
+                init: Vec::new(),
+                result: Reg(u32::MAX),
+                span: *span,
+            });
+            continue;
+        }
+        let rty = rt(&ty);
+        let mut l = Lowerer {
+            next: 0,
+            instrs: vec![],
+            bindings: HashMap::new(),
+            globals: global_map.clone(),
+            next_label: 0,
+            loop_stack: Vec::new(),
+            env: HashMap::new(),
+            outer: None,
+            plan: Some(plan),
+            outer_key: None,
+            typed,
+            module: prog.module.as_str(),
+        };
+        if let Some(r) = l.lower_expr(value, typed) {
+            out.globals.push(Global {
+                id: gid,
+                name: name.clone(),
+                ty: rty,
+                init: l.instrs,
+                result: r,
+                span: *span,
+            });
+        } else {
+            out.globals.push(Global {
+                id: gid,
+                name: name.clone(),
+                ty: rty,
+                init: l.instrs,
+                result: Reg(u32::MAX),
+                span: *span,
+            });
+        }
+    }
+
+    for item in &prog.items {
+        match item {
+            HirItem::Object { .. } => {}
+            HirItem::Let { .. } | HirItem::Destructure { .. } => {}
+            HirItem::Fn {
+                name,
+                type_params,
+                params,
+                ret,
+                body,
+                ..
+            } => {
+                if !type_params.is_empty() {
+                    continue;
+                }
+                let param_tys = params
+                    .iter()
+                    .map(|(_, _, t, _)| {
+                        t.as_ref().map(|v| rt(&Ty::from_vl(v))).unwrap_or(Ty::Error)
+                    })
+                    .collect::<Vec<_>>();
+                let ret_ty = ret
+                    .as_ref()
+                    .map(|v| rt(&Ty::from_vl(v)))
+                    .unwrap_or(Ty::Error);
+                let mut l = Lowerer {
+                    next: 0,
+                    instrs: vec![],
+                    bindings: HashMap::new(),
+                    globals: global_map.clone(),
+                    next_label: 0,
+                    loop_stack: Vec::new(),
+                    env: HashMap::new(),
+                    outer: None,
+                    plan: Some(plan),
+                    outer_key: None,
+                    typed,
+                    module: prog.module.as_str(),
+                };
+                for (index, (_, def, _, span)) in params.iter().enumerate() {
+                    let dst = l.reg();
+                    l.instrs.push(Instr::Param {
+                        dst,
+                        index,
+                        span: *span,
+                    });
+                    if let Some(def) = def {
+                        l.bindings.insert(def.0, dst);
+                    }
+                }
+                let mut topped_return = false;
+                for stmt in body {
+                    lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
+                }
+                lower_fn_epilogue(&mut l, topped_return);
+                out.functions.push(Function {
+                    name: name.clone(),
+                    param_tys,
+                    ret: ret_ty,
+                    instrs: l.instrs,
+                });
+            }
+        }
+    }
+
+    // Owner instances from the plan, sorted deterministically by structural
+    // key (owner, function, collision-free mangling). The emitted symbol is
+    // derived via `key.mangled()` only here at the LIR boundary.
+    if let Some(owned) = plan.instances_by_owner.get(&prog.module) {
+        let mut keys: Vec<&vl_typecheck::InstanceKey> = owned.keys().collect();
+        keys.sort();
+        for key in keys {
+            let inst = &owned[key];
+            let m = key.mangled();
+            let template = prog.items.iter().find_map(|item| match item {
+                HirItem::Fn {
+                    def: Some(d),
+                    type_params,
+                    params,
+                    body,
+                    ..
+                } if d.0 == inst.orig => Some((type_params, params, body)),
+                _ => None,
+            });
+            let Some((type_params, params, body)) = template else {
+                continue;
+            };
+            let env: HashMap<String, Ty> = type_params
+                .iter()
+                .map(|p| p.name.clone())
+                .zip(inst.args.iter().cloned())
+                .collect();
+            let mut l = Lowerer {
+                next: 0,
+                instrs: vec![],
+                bindings: HashMap::new(),
+                globals: global_map.clone(),
+                next_label: 0,
+                loop_stack: Vec::new(),
+                env,
+                outer: Some(m.clone()),
+                plan: Some(plan),
+                outer_key: Some(key.clone()),
+                typed,
+                module: prog.module.as_str(),
+            };
+            for (index, (_, def, _, span)) in params.iter().enumerate() {
+                let dst = l.reg();
+                l.instrs.push(Instr::Param {
+                    dst,
+                    index,
+                    span: *span,
+                });
+                if let Some(def) = def {
+                    l.bindings.insert(def.0, dst);
+                }
+            }
+            let mut topped_return = false;
+            for stmt in body {
+                lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
+            }
+            lower_fn_epilogue(&mut l, topped_return);
+            out.functions.push(Function {
+                name: m,
+                param_tys: inst.sig.param_tys.iter().map(rt).collect(),
+                ret: rt(&inst.sig.ret),
+                instrs: l.instrs,
+            });
+        }
+    }
+
+    out.imports = collect_project_imports(prog, typed, plan);
+    out
+}
+
+/// Build imports from emitted concrete code only.
+///
+/// Walks non-generic bodies and global initializers (roots) plus the bodies of
+/// emitted owner instances, resolving each call through the plan. Unmapped
+/// monomorphic imports use their HIR symbol; uninstantiated templates are
+/// never scanned and the unmangled generic name is never imported. Results are
+/// deduplicated by concrete symbol (repeated uses must agree on types) and
+/// sorted for deterministic dumps and artifacts.
+fn collect_project_imports(
+    prog: &HirProgram,
+    typed: &vl_typecheck::TypedProgram,
+    plan: &vl_typecheck::world::MonomorphizationPlan,
+) -> Vec<FunctionImport> {
+    use std::collections::BTreeMap;
+    let mut by_symbol: BTreeMap<(String, String), FunctionImport> = BTreeMap::new();
+
+    fn import_sig_for_target(
+        plan: &vl_typecheck::world::MonomorphizationPlan,
+        target: &vl_typecheck::world::ConcreteTarget,
+    ) -> Option<(Vec<Ty>, Ty)> {
+        plan.instances_by_owner
+            .get(&target.key.template.module)?
+            .get(&target.key)
+            .map(|inst| {
+                (
+                    inst.sig.param_tys.iter().map(rt).collect(),
+                    rt(&inst.sig.ret),
+                )
+            })
+    }
+
+    fn push_import(
+        by_symbol: &mut BTreeMap<(String, String), FunctionImport>,
+        symbol: FunctionRef,
+        param_tys: Vec<Ty>,
+        ret: Ty,
+    ) {
+        // Defensive: no generic, literal, or poison type may reach the backend.
+        fn bad(ty: &Ty) -> bool {
+            matches!(ty, Ty::Mutable(_) | Ty::Param(_) | Ty::Int | Ty::Error)
+                || matches!(ty, Ty::Array(elem) if bad(elem))
+        }
+        if param_tys.iter().any(bad) || bad(&ret) {
+            return;
+        }
+        let key = (symbol.module.clone(), symbol.function.clone());
+        if let Some(existing) = by_symbol.get(&key) {
+            // Repeated uses must agree on concrete types; keep the first
+            // (typechecking already enforced consistency at each call site).
+            if existing.param_tys != param_tys || existing.ret != ret {
+                return;
+            }
+            return;
+        }
+        by_symbol.insert(
+            key,
+            FunctionImport {
+                symbol,
+                param_tys,
+                ret,
+            },
+        );
+    }
+
+    fn walk_expr(
+        prog: &HirProgram,
+        typed: &vl_typecheck::TypedProgram,
+        plan: &vl_typecheck::world::MonomorphizationPlan,
+        outer: Option<&vl_typecheck::InstanceKey>,
+        expr: &HirExpr,
+        by_symbol: &mut BTreeMap<(String, String), FunctionImport>,
+    ) {
+        match expr {
+            HirExpr::Call {
+                id,
+                symbol,
+                extern_sig,
+                args,
+                ..
+            } => {
+                for arg in args {
+                    walk_expr(prog, typed, plan, outer, arg, by_symbol);
+                }
+                let target = match outer {
+                    Some(key) => plan.nested_targets.get(&(key.clone(), id.0)).cloned(),
+                    None => plan.root_targets.get(&(prog.module.clone(), id.0)).cloned(),
+                };
+                // Unmapped source-generic calls are never imported unmangled
+                // (the world should have mapped every generic in emitted code;
+                // missing means lowering is blocked or the call was not emitted).
+                if target.is_none() {
+                    if let Some(sig) = extern_sig {
+                        if !sig.type_params.is_empty() {
+                            return;
+                        }
+                    }
+                }
+                if let Some(target) = target {
+                    if target.key.template.module == prog.module {
+                        return;
+                    }
+                    if let Some((param_tys, ret)) = import_sig_for_target(plan, &target) {
+                        push_import(
+                            by_symbol,
+                            FunctionRef {
+                                module: target.key.template.module.clone(),
+                                function: target.key.mangled(),
+                            },
+                            param_tys,
+                            ret,
+                        );
+                    }
+                    return;
+                }
+                // No plan mapping: monomorphic import (or local call).
+                if let Some(sym) = symbol {
+                    let reference = FunctionRef {
+                        module: sym.module.as_string(),
+                        function: sym.name.clone(),
+                    };
+                    if reference.module == prog.module {
+                        return;
+                    }
+                    // Only concrete monomorphic imports; generic templates
+                    // without a plan mapping are never imported (they would
+                    // be unmangled). Detect via the exported signature: if it
+                    // is generic, skip (the world should have mapped it; if it
+                    // didn't, lowering is blocked on errors or the call was
+                    // inside an unemitted template).
+                    // We approximate by checking the call's recorded types:
+                    // generic template calls have `Param` in their arg/return
+                    // types after substitution? For roots they are concrete.
+                    // To stay safe, skip any import whose call-site types are
+                    // not concrete-normalized.
+                    let param_tys: Vec<Ty> = args
+                        .iter()
+                        .filter_map(|a| typed.type_of_id(a.id()).map(|t| rt(&t)))
+                        .collect();
+                    if param_tys.len() != args.len() {
+                        return;
+                    }
+                    let ret = typed.type_of_id(*id).map(|t| rt(&t)).unwrap_or(Ty::Error);
+                    // Skip non-runtime (Param/Int/Error/Mutable) — these are
+                    // template-internal calls, not concrete imports.
+                    fn bad(ty: &Ty) -> bool {
+                        matches!(ty, Ty::Mutable(_) | Ty::Param(_) | Ty::Int | Ty::Error)
+                            || matches!(ty, Ty::Array(elem) if bad(elem))
+                    }
+                    if param_tys.iter().any(bad) || bad(&ret) {
+                        return;
+                    }
+                    push_import(by_symbol, reference, param_tys, ret);
+                }
+            }
+            HirExpr::ArrayLiteral { elems, .. } => {
+                for e in elems {
+                    walk_expr(prog, typed, plan, outer, e, by_symbol);
+                }
+            }
+            HirExpr::ObjectLiteral { fields, .. } => {
+                for (_, e) in fields {
+                    walk_expr(prog, typed, plan, outer, e, by_symbol);
+                }
+            }
+            HirExpr::TupleLiteral { elems, .. } => {
+                for (_, e) in elems {
+                    walk_expr(prog, typed, plan, outer, e, by_symbol);
+                }
+            }
+            HirExpr::TupleIndex { base, .. } => {
+                walk_expr(prog, typed, plan, outer, base, by_symbol);
+            }
+            HirExpr::Index { base, index, .. } => {
+                walk_expr(prog, typed, plan, outer, base, by_symbol);
+                walk_expr(prog, typed, plan, outer, index, by_symbol);
+            }
+            HirExpr::Field { base, .. }
+            | HirExpr::Unary { inner: base, .. }
+            | HirExpr::Cast { inner: base, .. } => {
+                walk_expr(prog, typed, plan, outer, base, by_symbol)
+            }
+            HirExpr::Binary { lhs, rhs, .. } => {
+                walk_expr(prog, typed, plan, outer, lhs, by_symbol);
+                walk_expr(prog, typed, plan, outer, rhs, by_symbol);
+            }
+            HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
+        }
+    }
+
+    fn walk_stmt(
+        prog: &HirProgram,
+        typed: &vl_typecheck::TypedProgram,
+        plan: &vl_typecheck::world::MonomorphizationPlan,
+        outer: Option<&vl_typecheck::InstanceKey>,
+        stmt: &HirStmt,
+        by_symbol: &mut BTreeMap<(String, String), FunctionImport>,
+    ) {
+        match stmt {
+            HirStmt::Let { value, .. } | HirStmt::Assign { value, .. } | HirStmt::Expr(value) => {
+                walk_expr(prog, typed, plan, outer, value, by_symbol)
+            }
+            HirStmt::Return {
+                value: Some(value), ..
+            } => walk_expr(prog, typed, plan, outer, value, by_symbol),
+            HirStmt::IndexAssign {
+                array,
+                index,
+                value,
+                ..
+            } => {
+                walk_expr(prog, typed, plan, outer, array, by_symbol);
+                walk_expr(prog, typed, plan, outer, index, by_symbol);
+                walk_expr(prog, typed, plan, outer, value, by_symbol);
+            }
+            HirStmt::FieldAssign { base, value, .. } => {
+                walk_expr(prog, typed, plan, outer, base, by_symbol);
+                walk_expr(prog, typed, plan, outer, value, by_symbol);
+            }
+            HirStmt::TupleAssign { base, value, .. } => {
+                walk_expr(prog, typed, plan, outer, base, by_symbol);
+                walk_expr(prog, typed, plan, outer, value, by_symbol);
+            }
+            HirStmt::Destructure { value, .. } => {
+                walk_expr(prog, typed, plan, outer, value, by_symbol);
+            }
+            HirStmt::If {
+                condition,
+                then_body,
+                else_body,
+                ..
+            } => {
+                walk_expr(prog, typed, plan, outer, condition, by_symbol);
+                for s in then_body {
+                    walk_stmt(prog, typed, plan, outer, s, by_symbol);
+                }
+                if let Some(body) = else_body {
+                    for s in body {
+                        walk_stmt(prog, typed, plan, outer, s, by_symbol);
+                    }
+                }
+            }
+            HirStmt::While {
+                condition, body, ..
+            } => {
+                walk_expr(prog, typed, plan, outer, condition, by_symbol);
+                for s in body {
+                    walk_stmt(prog, typed, plan, outer, s, by_symbol);
+                }
+            }
+            HirStmt::Return { value: None, .. }
+            | HirStmt::Break { .. }
+            | HirStmt::Continue { .. } => {}
+        }
+    }
+
+    // Roots: non-generic functions and global initializers.
+    for item in &prog.items {
+        match item {
+            HirItem::Fn {
+                type_params, body, ..
+            } if type_params.is_empty() => {
+                for stmt in body {
+                    walk_stmt(prog, typed, plan, None, stmt, &mut by_symbol);
+                }
+            }
+            HirItem::Let { value, .. } => {
+                walk_expr(prog, typed, plan, None, value, &mut by_symbol);
+            }
+            _ => {}
+        }
+    }
+    // Emitted owner instances only (never uninstantiated templates).
+    if let Some(owned) = plan.instances_by_owner.get(&prog.module) {
+        // Template bodies by DefId for walking.
+        let mut bodies: HashMap<u32, &[HirStmt]> = HashMap::new();
+        for item in &prog.items {
+            if let HirItem::Fn {
+                def: Some(d), body, ..
+            } = item
+            {
+                bodies.insert(d.0, body);
+            }
+        }
+        let mut keys: Vec<&vl_typecheck::InstanceKey> = owned.keys().collect();
+        keys.sort();
+        for key in keys {
+            let inst = &owned[key];
+            let Some(body) = bodies.get(&inst.orig) else {
+                continue;
+            };
+            for stmt in *body {
+                walk_stmt(prog, typed, plan, Some(key), stmt, &mut by_symbol);
+            }
+        }
+    }
+
+    by_symbol.into_values().collect()
 }
 
 impl Lowerer<'_> {
@@ -1523,6 +2219,7 @@ impl Lowerer<'_> {
                 id,
                 name,
                 symbol,
+                extern_sig,
                 args,
                 span,
                 ..
@@ -1546,33 +2243,112 @@ impl Lowerer<'_> {
                     });
                     return Some(dst);
                 }
+                // Concrete targets first: the world plan (project builds)
+                // maps every generic call to its owner-module mangled symbol.
+                // This fixes the ordering where an imported `symbol` would
+                // override a mangled generic call target.
+                if let Some(plan) = self.plan {
+                    let target = match &self.outer_key {
+                        Some(outer) => plan.nested_targets.get(&(outer.clone(), id.0)).cloned(),
+                        None => plan
+                            .root_targets
+                            .get(&(self.module.to_owned(), id.0))
+                            .cloned(),
+                    };
+                    if let Some(target) = target {
+                        let callee = FunctionRef {
+                            module: target.key.template.module.clone(),
+                            function: target.key.mangled(),
+                        };
+                        let mut arg_regs = Vec::with_capacity(args.len());
+                        for arg in args {
+                            arg_regs.push(self.lower_expr(arg, typed)?);
+                        }
+                        let dst = self.reg();
+                        self.instrs.push(Instr::Call {
+                            dst,
+                            callee,
+                            args: arg_regs,
+                            span: *span,
+                        });
+                        return Some(dst);
+                    }
+                }
                 // Monomorphized callees: root code consults `root_calls`,
                 // instance bodies consult `inst_calls` for their own outer
-                // instance. Unmapped names call through unchanged.
-                let function = match &self.outer {
+                // instance. Mapped names take precedence over the HIR symbol;
+                // unmapped imported names use their concrete symbol.
+                let mapped = match &self.outer {
+                    Some(outer) => self.typed.inst_calls.get(&(outer.clone(), id.0)).cloned(),
+                    None => self.typed.root_calls.get(&id.0).cloned(),
+                };
+                // Imported generic roots handled by the world plan also land
+                // in `imported_root_calls`; resolve them here for single-module
+                // lowering that carries a plan-less `typed` (defensive: the
+                // project path above already returned).
+                let mapped = mapped.or_else(|| {
+                    self.typed
+                        .imported_root_calls
+                        .get(&id.0)
+                        .map(|key| key.mangled())
+                });
+                // `imported_inst_calls` covers local-generic -> imported-generic
+                // forwarding discovered locally (world covers the rest).
+                let mapped = mapped.or_else(|| match &self.outer {
                     Some(outer) => self
                         .typed
-                        .inst_calls
+                        .imported_inst_calls
                         .get(&(outer.clone(), id.0))
-                        .cloned()
-                        .unwrap_or_else(|| name.clone()),
-                    None => self
-                        .typed
-                        .root_calls
-                        .get(&id.0)
-                        .cloned()
-                        .unwrap_or_else(|| name.clone()),
+                        .map(|key| key.mangled()),
+                    None => None,
+                });
+                // Defensive: a source-generic call without a concrete plan or
+                // local mapping must never reach the backend as an unmangled
+                // generic symbol. Skip it (typechecking already reported or
+                // the world blocked lowering).
+                if mapped.is_none() {
+                    if let Some(sig) = extern_sig {
+                        if !sig.type_params.is_empty() {
+                            return None;
+                        }
+                    }
+                }
+                let callee = match mapped {
+                    Some(function) => {
+                        // Local mangled target: it lives in the current module
+                        // unless the mapping came from an imported key (which
+                        // carries its owner). For old local-only maps the owner
+                        // is the caller; for imported keys resolve the owner.
+                        if let Some(key) = self.typed.imported_root_calls.get(&id.0).or_else(|| {
+                            match &self.outer {
+                                Some(outer) => {
+                                    self.typed.imported_inst_calls.get(&(outer.clone(), id.0))
+                                }
+                                None => None,
+                            }
+                        }) {
+                            FunctionRef {
+                                module: key.template.module.clone(),
+                                function: key.mangled(),
+                            }
+                        } else {
+                            FunctionRef {
+                                module: self.typed_module(),
+                                function,
+                            }
+                        }
+                    }
+                    None => symbol
+                        .as_ref()
+                        .map(|s| FunctionRef {
+                            module: s.module.as_string(),
+                            function: s.name.clone(),
+                        })
+                        .unwrap_or_else(|| FunctionRef {
+                            module: self.typed_module(),
+                            function: name.clone(),
+                        }),
                 };
-                let callee = symbol
-                    .as_ref()
-                    .map(|s| FunctionRef {
-                        module: s.module.as_string(),
-                        function: s.name.clone(),
-                    })
-                    .unwrap_or_else(|| FunctionRef {
-                        module: self.typed_module(),
-                        function,
-                    });
                 let mut arg_regs = Vec::with_capacity(args.len());
                 for arg in args {
                     arg_regs.push(self.lower_expr(arg, typed)?);
@@ -2683,5 +3459,88 @@ mod tests {
         let dump = lir.dump();
         assert!(!dump.contains('*'), "{dump}");
         assert!(dump.contains("object_set"), "{dump}");
+    }
+
+    type CheckedTriple = (
+        HirProgram,
+        vl_typecheck::TypedProgram,
+        vl_common::ModuleSpec,
+    );
+
+    #[allow(clippy::type_complexity)]
+    fn check_two(
+        src_a: &str,
+        mod_a: &str,
+        src_b: &str,
+        mod_b: &str,
+    ) -> (CheckedTriple, CheckedTriple, Vec<vl_common::ModuleSpec>) {
+        let (toks, _) = vl_lex::lex(src_a);
+        let (prog_a, _) = vl_syntax::parse_with_module(&toks, src_a, mod_a);
+        let (interface_a, _) = vl_semantic::collect_interface_quiet(&prog_a);
+        let spec_a = interface_a.as_spec();
+        let (toks, _) = vl_lex::lex(src_b);
+        let (prog_b, _) = vl_syntax::parse_with_module(&toks, src_b, mod_b);
+        let (interface_b, _) = vl_semantic::collect_interface_quiet(&prog_b);
+        let spec_b = interface_b.as_spec();
+        let modules = vec![spec_a.clone(), spec_b.clone()];
+        let catalog = modules.clone();
+        let (res_a, _) = vl_semantic::resolve_with_modules(&prog_a, &catalog);
+        let hir_a = vl_hir::lower(&prog_a, &res_a);
+        let (typed_a, _) = vl_typecheck::check_with_modules(&hir_a, &modules);
+        let (res_b, _) = vl_semantic::resolve_with_modules(&prog_b, &catalog);
+        let hir_b = vl_hir::lower(&prog_b, &res_b);
+        let (typed_b, _) = vl_typecheck::check_with_modules(&hir_b, &modules);
+        ((hir_a, typed_a, spec_a), (hir_b, typed_b, spec_b), modules)
+    }
+
+    #[test]
+    fn project_emit_uses_provider_mangled_symbol() {
+        let ((hir_lib, typed_lib, _), (hir_main, typed_main, _), _) = check_two(
+            "fun id[T](value: T): T { return value; }",
+            "demo.lib",
+            "use demo.lib.id; fun main() { val x = id(1u64); }",
+            "demo.main",
+        );
+        let refs = vec![(&hir_lib, &typed_lib), (&hir_main, &typed_main)];
+        let (plan, diags) = vl_typecheck::world::plan_world(&refs);
+        assert!(diags.is_empty(), "{diags:?}");
+        let provider = lower_project(&hir_lib, &typed_lib, &plan);
+        let importer = lower_project(&hir_main, &typed_main, &plan);
+        assert!(provider.functions.iter().any(|f| f.name == "id$u64"));
+        assert!(!provider.functions.iter().any(|f| f.name == "id"));
+        assert!(importer.dump().contains("call demo.lib::id$u64"));
+        assert!(importer
+            .imports
+            .iter()
+            .any(|i| i.symbol.function == "id$u64"));
+        for ty in importer
+            .imports
+            .iter()
+            .flat_map(|i| i.param_tys.iter().chain(std::iter::once(&i.ret)))
+        {
+            assert!(ty.is_concrete());
+            assert!(!matches!(ty, Ty::Param(_)));
+        }
+    }
+
+    #[test]
+    fn project_imports_are_deterministic() {
+        let ((hir_lib, typed_lib, _), (hir_main, typed_main, _), _) = check_two(
+            "fun id[T](value: T): T { return value; }",
+            "demo.lib",
+            "use demo.lib.id; fun main() { val a = id(1u64); val b = id(\"hi\"); a; b; }",
+            "demo.main",
+        );
+        let refs = vec![(&hir_lib, &typed_lib), (&hir_main, &typed_main)];
+        let (plan, _) = vl_typecheck::world::plan_world(&refs);
+        let importer = lower_project(&hir_main, &typed_main, &plan);
+        let names: Vec<String> = importer
+            .imports
+            .iter()
+            .map(|i| i.symbol.function.clone())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
     }
 }

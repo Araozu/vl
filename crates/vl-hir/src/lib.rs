@@ -230,9 +230,13 @@ pub enum HirExpr {
         /// Resolved callee (`None` when resolution failed; quiet downstream).
         def: Option<DefId>,
         external: bool,
-        /// Compiler-owned extern signature copied from the resolved `Def`.
-        /// `None` for locals, poisoned imports, or unresolved callees.
+        /// Compiler-owned callable signature copied from the resolved `Def`.
+        /// `None` for locals, poisoned imports, or unresolved callees. May be
+        /// generic for imported source functions.
         extern_sig: Option<vl_common::FuncSig>,
+        /// Source-versus-target linkage for imported calls. `None` for locals,
+        /// poisoned imports, and synthetic builtins.
+        extern_kind: Option<vl_common::ExportKind>,
         /// Qualified provider identity for imported and target functions.
         symbol: Option<vl_common::SymbolRef>,
         name: String,
@@ -691,12 +695,18 @@ impl<'a> Lowerer<'a> {
                 } else {
                     None
                 };
+                let extern_kind = if external {
+                    resolved.and_then(|r| r.export_kind)
+                } else {
+                    None
+                };
                 let symbol = resolved.and_then(|r| r.symbol.clone());
                 HirExpr::Call {
                     id: self.id(),
                     def,
                     external,
                     extern_sig,
+                    extern_kind,
                     symbol,
                     name: callee.join("."),
                     type_args: type_args.clone(),
@@ -1250,6 +1260,75 @@ mod tests {
                 assert!(def.is_some());
             }
             other => panic!("expected top val, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn imported_generic_preserves_sig_linkage_and_symbol() {
+        use vl_common::{Export, FuncSig, ParamSig, TypeParamSig};
+        let sig = FuncSig::generic(
+            vec![TypeParamSig {
+                name: "T".into(),
+                bound: None,
+            }],
+            vec![ParamSig {
+                name: "value".into(),
+                ty: VlType::Param("T".into()),
+            }],
+            VlType::Param("T".into()),
+        );
+        let module = vl_common::ModuleSpec::new_source(
+            &["demo", "lib"],
+            vec![Export::source("id".into(), sig.clone())],
+        );
+        let (toks, _) = vl_lex::lex("use demo.lib.id; fun main() { id(1u64); }");
+        let (prog, pdiags) = vl_syntax::parse(&toks, "");
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve_with_modules(&prog, &[module]);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Fn { body, .. } => match &body[0] {
+                HirStmt::Expr(value) => match value {
+                    HirExpr::Call {
+                        extern_sig,
+                        extern_kind,
+                        symbol,
+                        ..
+                    } => {
+                        let sig = extern_sig.as_ref().expect("generic sig");
+                        assert_eq!(sig.type_params.len(), 1);
+                        assert_eq!(*extern_kind, Some(vl_common::ExportKind::Source));
+                        let sym = symbol.as_ref().expect("symbol");
+                        assert_eq!(sym.module.as_string(), "demo.lib");
+                        assert_eq!(sym.name, "id");
+                    }
+                    other => panic!("expected call, got {other:?}"),
+                },
+                other => panic!("expected expr, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unresolved_generic_provider_stays_poisoned() {
+        let (toks, _) = vl_lex::lex("use demo.missing.id; fun main() { id(1u64); }");
+        let (prog, _) = vl_syntax::parse(&toks, "");
+        let (res, _) = vl_semantic::resolve_with_modules(&prog, &[]);
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Fn { body, .. } => match &body[0] {
+                HirStmt::Expr(value) => match value {
+                    HirExpr::Call { def, .. } => {
+                        // Poisoned import resolves to a def without sig/symbol.
+                        assert!(def.is_some());
+                    }
+                    other => panic!("expected call, got {other:?}"),
+                },
+                other => panic!("expected expr, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
         }
     }
 }

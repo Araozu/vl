@@ -466,50 +466,59 @@ fn modules_with_stdlib(modules: &[vl_common::ModuleSpec]) -> Vec<vl_common::Modu
     catalog
 }
 
-fn run_frontend_ast(
-    ast: &vl_syntax::Program,
+/// Single-file check: validate frontend + world plan, stopping successfully
+/// after validation (no lowering). Used by `vl check` for standalone files.
+fn run_frontend_check(
+    text: &str,
     modules: &[vl_common::ModuleSpec],
-    entrypoint_module: Option<&str>,
-) -> Result<Frontend, Vec<vl_common::Diagnostic>> {
-    // Project interfaces were collected from the raw user AST; stdlib
-    // helpers join the catalog here and link inline below.
+    module: &str,
+) -> Result<(), Vec<vl_common::Diagnostic>> {
+    let mut diags = Vec::new();
+    let (toks, mut d) = vl_lex::lex(text);
+    diags.append(&mut d);
+    let (ast, mut d) = vl_syntax::parse_with_module(&toks, text, module);
+    diags.append(&mut d);
+    if diags.iter().any(|d| d.is_error()) {
+        return Err(diags);
+    }
     let catalog = modules_with_stdlib(modules);
-    let (res, mut diags) = vl_semantic::resolve_with_modules(ast, &catalog);
-    let mains = ast
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            vl_syntax::Item::Function {
-                name,
-                params,
-                ret,
-                span,
-                ..
-            } if name == "main" => Some((params.len(), ret.clone(), *span)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if !mains.is_empty() {
-        if let Some((count, ret, span)) = mains.first() {
-            if *count != 0 {
+    let (res, mut d) = vl_semantic::resolve_with_modules(&ast, &catalog);
+    diags.append(&mut d);
+    if !diags.iter().any(|d| d.is_error()) {
+        let mains = ast
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                vl_syntax::Item::Function {
+                    name,
+                    params,
+                    ret,
+                    span,
+                    ..
+                } if name == "main" => Some((params.len(), ret.clone(), *span)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !mains.is_empty() {
+            if mains[0].0 != 0 {
                 diags.push(
                     vl_common::Diagnostic::error("`main` must not take parameters")
-                        .with_label(*span, "entrypoint declared here")
+                        .with_label(mains[0].2, "entrypoint declared here")
                         .with_code("E401"),
                 );
             }
-            if *ret != Some(vl_common::VlType::Void) {
+            if mains[0].1 != Some(vl_common::VlType::Void) {
                 diags.push(
                     vl_common::Diagnostic::error("`main` must return `void`")
-                        .with_label(*span, "entrypoint declared here")
+                        .with_label(mains[0].2, "entrypoint declared here")
                         .with_note("omit the return type (it defaults to `void`)")
                         .with_code("E401"),
                 );
             }
         }
     }
-    let hir = vl_hir::lower(ast, &res);
-    let (typed, mut d) = vl_typecheck::check_with_modules(&hir, modules);
+    let hir = vl_hir::lower(&ast, &res);
+    let (typed, mut d) = vl_typecheck::check(&hir);
     diags.append(&mut d);
     if !res.poisoned_imports {
         diags.append(&mut typed.validate_normalized(&hir, &diags));
@@ -517,11 +526,27 @@ fn run_frontend_ast(
     if diags.iter().any(|d| d.is_error()) {
         return Err(diags);
     }
-    let mut lir = vl_lir::lower(&hir, &typed);
-    stdlib().link(&mut lir);
-    lir.entrypoint = entrypoint_module == Some(ast.module.as_str());
-    lir.entrypoint_module = entrypoint_module.map(str::to_owned);
-    Ok(Frontend { lir })
+    let stdlib_checked = stdlib().checked_modules();
+    let mut world_refs: Vec<(&vl_hir::HirProgram, &vl_typecheck::TypedProgram)> =
+        Vec::with_capacity(1 + stdlib_checked.len());
+    world_refs.push((&hir, &typed));
+    for (shir, styped) in stdlib_checked {
+        world_refs.push((shir, styped));
+    }
+    let (plan, world_diags) = vl_typecheck::world::plan_world(&world_refs);
+    for (_, diag) in world_diags {
+        diags.push(diag);
+    }
+    if diags.iter().any(|d| d.is_error()) {
+        return Err(diags);
+    }
+    for (_, diag) in vl_typecheck::world::validate_plan(&plan, &world_refs, &diags) {
+        diags.push(diag);
+    }
+    if diags.iter().any(|d| d.is_error()) {
+        return Err(diags);
+    }
+    Ok(())
 }
 
 fn run_frontend(
@@ -594,9 +619,37 @@ fn run_frontend(
     if diags.iter().any(|d| d.is_error()) {
         return Err(diags);
     }
-    let lir = vl_lir::lower(&hir, &typed);
-    let mut lir = lir;
-    stdlib().link(&mut lir);
+    // Single-file world: one project module plus immutable checked stdlib
+    // modules, sharing the same fixed-point machinery as projects. The
+    // single-file path still cannot import arbitrary source modules without
+    // a project catalog.
+    let stdlib_checked = stdlib().checked_modules();
+    let mut world_refs: Vec<(&vl_hir::HirProgram, &vl_typecheck::TypedProgram)> =
+        Vec::with_capacity(1 + stdlib_checked.len());
+    world_refs.push((&hir, &typed));
+    for (shir, styped) in stdlib_checked {
+        world_refs.push((shir, styped));
+    }
+    let (plan, world_diags) = vl_typecheck::world::plan_world(&world_refs);
+    for (owner, diag) in world_diags {
+        // Stdlib owners have no user file; attribute to the single file
+        // (stdlib templates are trusted, so this is defensive).
+        let _ = owner;
+        diags.push(diag);
+    }
+    if diags.iter().any(|d| d.is_error()) {
+        return Err(diags);
+    }
+    // Validate every planned instance (signatures, args, substituted bodies)
+    // before lowering; `check` stops successfully after this validation.
+    for (_, diag) in vl_typecheck::world::validate_plan(&plan, &world_refs, &diags) {
+        diags.push(diag);
+    }
+    if diags.iter().any(|d| d.is_error()) {
+        return Err(diags);
+    }
+    let mut lir = vl_lir::lower_project(&hir, &typed, &plan);
+    stdlib().link_with_plan(&mut lir, &plan);
     // Standalone builds are programs, whereas project builds set ownership
     // explicitly below. This preserves the existing single-file CLI behavior.
     lir.entrypoint = true;
@@ -669,10 +722,11 @@ fn main() -> ExitCode {
                 }
             };
             // `check` validates frontend semantics independently of a codegen
-            // target; target capability checks belong to `build`.
+            // target; target capability checks belong to `build`. It stops
+            // after validation (no lowering).
             let modules = vl_codegen::modules();
             let module = source_module(&file);
-            match run_frontend(&text, &modules, &module) {
+            match run_frontend_check(&text, &modules, &module) {
                 Ok(_) => {
                     write_out(&None, &format!("ok: {name} checks clean\n"));
                     ExitCode::SUCCESS
@@ -838,6 +892,165 @@ fn compile_project_source(
         None => ProjectOutput::Text(artifact.text),
     });
     ProjectFileBuild { output, diags }
+}
+
+/// One checked source unit retained for the batch frontend.
+struct CheckedUnit {
+    hir: vl_hir::HirProgram,
+    typed: vl_typecheck::TypedProgram,
+}
+
+/// One parsed source unit: filename, text, module, AST, diagnostics, and
+/// whether to skip the frontend (duplicate/collision).
+type ProjectUnit = (
+    String,
+    String,
+    String,
+    vl_syntax::Program,
+    Vec<vl_common::Diagnostic>,
+    bool,
+);
+
+/// Batch frontend for projects: resolve, lower, and typecheck every clean
+/// unit while retaining its HIR/typed result, then run the project-wide
+/// monomorphization fixed point. Returns the checked units (in `units` order),
+/// the shared plan, and per-unit diagnostics appended to each unit's existing
+/// `diags`. If any frontend errors exist, monomorphization and artifact
+/// generation are skipped (the driver emits per-unit diagnostics and stops).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn batch_frontend(
+    units: &mut [ProjectUnit],
+    modules: &[vl_common::ModuleSpec],
+    entrypoint_module: Option<&str>,
+) -> Option<(
+    Vec<Option<CheckedUnit>>,
+    vl_typecheck::world::MonomorphizationPlan,
+)> {
+    // Resolve + lower + check every clean unit, retaining results.
+    let catalog = modules_with_stdlib(modules);
+    let mut checked: Vec<Option<CheckedUnit>> = Vec::with_capacity(units.len());
+    for (_, _, _module, ast, unit_diags, skip_frontend) in units.iter_mut() {
+        if *skip_frontend || unit_diags.iter().any(|d| d.is_error()) {
+            checked.push(None);
+            continue;
+        }
+        let (res, mut d) = vl_semantic::resolve_with_modules(ast, &catalog);
+        // `main` signature is checked wherever it is declared.
+        let mains = ast
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                vl_syntax::Item::Function {
+                    name,
+                    params,
+                    ret,
+                    span,
+                    ..
+                } if name == "main" => Some((params.len(), ret.clone(), *span)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !mains.is_empty() {
+            if let Some((count, ret, span)) = mains.first() {
+                if *count != 0 {
+                    d.push(
+                        vl_common::Diagnostic::error("`main` must not take parameters")
+                            .with_label(*span, "entrypoint declared here")
+                            .with_code("E401"),
+                    );
+                }
+                if *ret != Some(vl_common::VlType::Void) {
+                    d.push(
+                        vl_common::Diagnostic::error("`main` must return `void`")
+                            .with_label(*span, "entrypoint declared here")
+                            .with_note("omit the return type (it defaults to `void`)")
+                            .with_code("E401"),
+                    );
+                }
+            }
+        }
+        // If resolution already failed, skip lowering/checking but retain the
+        // diagnostics (lowering is blocked anyway).
+        if d.iter().any(|diag| diag.is_error()) {
+            unit_diags.append(&mut d);
+            checked.push(None);
+            continue;
+        }
+        let hir = vl_hir::lower(ast, &res);
+        let (typed, mut td) = vl_typecheck::check_with_modules(&hir, modules);
+        d.append(&mut td);
+        if !res.poisoned_imports {
+            d.append(&mut typed.validate_normalized(&hir, &d));
+        }
+        let _ = entrypoint_module;
+        unit_diags.append(&mut d);
+        if unit_diags.iter().any(|diag| diag.is_error()) {
+            checked.push(None);
+            continue;
+        }
+        checked.push(Some(CheckedUnit { hir, typed }));
+    }
+    if units
+        .iter()
+        .any(|(_, _, _, _, diags, _)| diags.iter().any(|d| d.is_error()))
+    {
+        return None;
+    }
+    // Combine checked project modules with immutable checked stdlib modules
+    // and run the global fixed point. Ordering is by module name (units are
+    // already sorted), so LIR and diagnostics are deterministic. Stdlib
+    // templates use the same discovery process but copy into the consumer
+    // (they have no separate artifacts).
+    let refs: Vec<(&vl_hir::HirProgram, &vl_typecheck::TypedProgram)> = checked
+        .iter()
+        .filter_map(|c| c.as_ref().map(|u| (&u.hir, &u.typed)))
+        .collect();
+    let stdlib_checked = stdlib().checked_modules();
+    let mut world_refs: Vec<(&vl_hir::HirProgram, &vl_typecheck::TypedProgram)> =
+        Vec::with_capacity(refs.len() + stdlib_checked.len());
+    world_refs.extend(refs.iter().copied());
+    for (hir, typed) in stdlib_checked {
+        world_refs.push((hir, typed));
+    }
+    let (plan, world_diags) = vl_typecheck::world::plan_world(&world_refs);
+    // Route world diagnostics to their owner module.
+    for (owner, diag) in world_diags {
+        if let Some(idx) = units.iter().position(|(_, _, m, _, _, _)| m == &owner) {
+            units[idx].4.push(diag);
+        } else if let Some(first) = units.first_mut() {
+            first.4.push(diag);
+        }
+    }
+    if units
+        .iter()
+        .any(|(_, _, _, _, diags, _)| diags.iter().any(|d| d.is_error()))
+    {
+        return None;
+    }
+    // Validate normalized types for ordinary code (already done per unit) and
+    // every planned instance (signatures, arguments, and substituted bodies).
+    // A surviving `Int`, `Param`, or nested `Error` remains an `E500`.
+    {
+        let prior: Vec<vl_common::Diagnostic> = units
+            .iter()
+            .flat_map(|(_, _, _, _, diags, _)| diags.iter().cloned())
+            .collect();
+        for (owner, diag) in vl_typecheck::world::validate_plan(&plan, &world_refs, &prior) {
+            if let Some(idx) = units.iter().position(|(_, _, m, _, _, _)| m == &owner) {
+                units[idx].4.push(diag);
+            } else if let Some(first) = units.first_mut() {
+                // Stdlib owners have no user unit; attribute defensively.
+                first.4.push(diag);
+            }
+        }
+        if units
+            .iter()
+            .any(|(_, _, _, _, diags, _)| diags.iter().any(|d| d.is_error()))
+        {
+            return None;
+        }
+    }
+    Some((checked, plan))
 }
 
 fn build_project_at(
@@ -1017,57 +1230,74 @@ fn build_project_at(
     let mut failed = false;
     let mut outputs = Vec::new();
     let extension = project_output_extension(emit, target);
-    for (filename, text, module, ast, mut unit_diags, skip_frontend) in units {
-        let built = if matches!(emit, Some(Emit::Tokens) | Some(Emit::Ast)) {
+    // Shallow emits stay per-unit (no frontend needed).
+    if matches!(emit, Some(Emit::Tokens) | Some(Emit::Ast)) {
+        for (filename, text, module, ast, unit_diags, _) in units {
             let output = if matches!(emit, Some(Emit::Ast)) {
                 ProjectOutput::Text(format!("{ast:#?}\n"))
             } else {
                 let (tokens, _) = vl_lex::lex(&text);
                 ProjectOutput::Text(format!("{tokens:#?}\n"))
             };
-            ProjectFileBuild {
+            let built = ProjectFileBuild {
                 output: Some(output),
                 diags: unit_diags,
+            };
+            let file_failed = emit_all(&built.diags, &filename, &text);
+            failed |= file_failed;
+            if let Some(output) = built.output {
+                let path = project_output_path(&out_dir, &module, &extension);
+                outputs.push((path, output));
             }
-        } else if skip_frontend || unit_diags.iter().any(|d| d.is_error()) {
-            ProjectFileBuild {
-                output: None,
-                diags: unit_diags,
-            }
-        } else {
-            match run_frontend_ast(&ast, &modules, entrypoint_module.as_deref()) {
-                Ok(frontend) if matches!(emit, Some(Emit::Lir)) => ProjectFileBuild {
-                    output: Some(ProjectOutput::Text(frontend.lir.dump())),
-                    diags: unit_diags,
-                },
-                Ok(frontend) => {
+        }
+    } else {
+        // Batch frontend: check all units, run the world fixed point, then
+        // lower every module with the complete plan. No provider artifact is
+        // emitted before all importers have been checked.
+        let batch = batch_frontend(&mut units, &modules, entrypoint_module.as_deref());
+        // Emit per-unit diagnostics (frontend + world) in module order.
+        for (filename, text, _, _, unit_diags, _) in &units {
+            failed |= emit_all(unit_diags, filename, text);
+        }
+        if let Some((checked, plan)) = batch {
+            for (idx, (filename, text, module, _, _, _)) in units.iter().enumerate() {
+                let Some(unit) = checked[idx].as_ref() else {
+                    continue;
+                };
+                let mut lir = vl_lir::lower_project(&unit.hir, &unit.typed, &plan);
+                stdlib().link_with_plan(&mut lir, &plan);
+                lir.entrypoint = entrypoint_module.as_deref() == Some(module.as_str());
+                lir.entrypoint_module = entrypoint_module.clone();
+                if matches!(emit, Some(Emit::Lir)) {
+                    outputs.push((
+                        project_output_path(&out_dir, module, &extension),
+                        ProjectOutput::Text(lir.dump()),
+                    ));
+                    let _ = (filename, text);
+                } else {
                     let backend = vl_codegen::lookup(target)
                         .expect("project target was validated before building");
-                    let (artifact, mut d) = backend.emit(&frontend.lir);
-                    unit_diags.append(&mut d);
-                    ProjectFileBuild {
-                        output: artifact.map(|a| {
+                    let (artifact, backend_diags) = backend.emit(&lir);
+                    if emit_all(&backend_diags, filename, text) {
+                        failed = true;
+                    }
+                    if let Some(a) = artifact {
+                        outputs.push((
+                            project_output_path(&out_dir, module, &extension),
                             a.bytes
                                 .map(ProjectOutput::Bytes)
-                                .unwrap_or(ProjectOutput::Text(a.text))
-                        }),
-                        diags: unit_diags,
-                    }
-                }
-                Err(mut d) => {
-                    unit_diags.append(&mut d);
-                    ProjectFileBuild {
-                        output: None,
-                        diags: unit_diags,
+                                .unwrap_or(ProjectOutput::Text(a.text)),
+                        ));
+                    } else {
+                        failed = true;
                     }
                 }
             }
-        };
-        let file_failed = emit_all(&built.diags, &filename, &text);
-        failed |= file_failed;
-        if let Some(output) = built.output {
-            let path = project_output_path(&out_dir, &module, &extension);
-            outputs.push((path, output));
+            // If world validation failed after lowering (defensive), `batch`
+            // would have been `None`; reaching here means lowering is allowed.
+        } else {
+            // Frontend or world errors already emitted above; no artifacts.
+            failed = true;
         }
     }
     // Final artifacts are transactional: preflight every destination, write
@@ -1267,18 +1497,35 @@ fn check_project(project: &Project) -> ExitCode {
         units.push((name, text, ast, diags, false));
     }
     modules.sort_by_key(|module| module.path.as_string());
-    units.sort_by(|left, right| {
-        let left_module = left.2.module.as_str();
-        let right_module = right.2.module.as_str();
-        left_module.cmp(right_module)
-    });
-    for (name, text, ast, mut diags, skip_frontend) in units {
-        if !skip_frontend && diags.iter().all(|d| !d.is_error()) {
-            if let Err(mut d) = run_frontend_ast(&ast, &modules, entrypoint_module.as_deref()) {
-                diags.append(&mut d);
-            }
-        }
-        failed |= emit_all(&diags, &name, &text);
+    // Adapt to the batch shape `(filename, text, module, ast, diags, skip)`.
+    let mut batch_units: Vec<(
+        String,
+        String,
+        String,
+        vl_syntax::Program,
+        Vec<vl_common::Diagnostic>,
+        bool,
+    )> = units
+        .into_iter()
+        .map(|(name, text, ast, diags, skip)| {
+            let module = ast.module.clone();
+            (name, text, module, ast, diags, skip)
+        })
+        .collect();
+    batch_units.sort_by(|l, r| l.2.cmp(&r.2));
+    // Batch frontend runs the world fixed point and validates; `check` stops
+    // successfully after validation (no lowering).
+    let batch = batch_frontend(&mut batch_units, &modules, entrypoint_module.as_deref());
+    for (name, text, _, _, diags, _) in &batch_units {
+        failed |= emit_all(diags, name, text);
+    }
+    if batch.is_none()
+        && !batch_units
+            .iter()
+            .any(|(_, _, _, _, diags, _)| diags.iter().any(|d| d.is_error()))
+    {
+        // Defensive: world produced no plan without diagnostics (impossible).
+        failed = true;
     }
     if failed {
         ExitCode::from(1)
