@@ -159,8 +159,9 @@ impl std::fmt::Display for TemplateKey {
 }
 
 /// One exported object type: its short name, its fully qualified identity
-/// (`<module>.<name>`), and its field layouts. Object identity is nominal
-/// and qualified so two modules may each define a `Person` without collision;
+/// (`<module>.<name>`), its field layouts, and its associated functions.
+/// Object identity is nominal and qualified so two modules may each define a
+/// `Person` without collision;
 ///
 /// importers name the type `vl.person.Person`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +169,19 @@ pub struct ObjectExport {
     pub name: String,
     pub qualified: String,
     pub fields: Vec<ObjectFieldSig>,
+    /// Associated functions declared inside the object body, each exported
+    /// under its short method name (`init` in `Counter.init`). Signatures
+    /// qualify local object references exactly like fields, so importers
+    /// resolve nominal identity without the provider's scope. Entries are
+    /// `Source` exports (they have bodies); generic methods carry type params.
+    pub methods: Vec<Export>,
+}
+
+impl ObjectExport {
+    /// Look up one associated function by its short method name.
+    pub fn lookup_method(&self, name: &str) -> Option<&Export> {
+        self.methods.iter().find(|m| m.name == name)
+    }
 }
 
 /// One exported object field: its name plus its declared type. Inner object

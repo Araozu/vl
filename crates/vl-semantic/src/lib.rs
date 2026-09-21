@@ -50,6 +50,11 @@ pub struct Resolution {
     /// Keyed by the use-site span start (spans are unique per node here).
     pub uses: HashMap<(usize, usize), DefId>,
     pub defs: Vec<Def>,
+    /// Instance-sugar call sites (`receiver.method(args)` where the head is a
+    /// bound value): callee span maps to the receiver head's [`DefId`].
+    /// `vl-hir` lowers these to method calls; `vl-typecheck` validates the
+    /// self-type gate. No E201 is reported for these sites here.
+    pub sugar_receivers: HashMap<(usize, usize), DefId>,
     /// Import names poisoned by an upstream provider diagnostic. Downstream
     /// stages use this to keep the poison quiet without inventing E500s.
     pub poisoned_imports: bool,
@@ -101,6 +106,9 @@ struct Resolver {
     out: Resolution,
     diags: Vec<Diagnostic>,
     modules: Vec<ModuleSpec>,
+    /// Owning module of the program under resolution (for qualified local
+    /// associated calls such as `my.mod.Counter.init(...)`).
+    module: String,
     imports: HashMap<String, ModuleSpec>,
     import_symbols: HashMap<String, SymbolRef>,
     poisoned_imports: std::collections::HashSet<String>,
@@ -110,6 +118,14 @@ struct Resolver {
     /// stays quiet.
     poisoned_params: std::collections::HashSet<u32>,
     loop_depth: usize,
+    /// Bare object type names declared in this module.
+    local_objects: std::collections::HashSet<String>,
+    /// Field names per local object (first declaration wins), for E302 hints
+    /// when a method name matches no associated function.
+    local_fields: HashMap<String, Vec<String>>,
+    /// Associated functions declared in this module: `(Type, method)` maps to
+    /// the method's [`DefId`] (first declaration wins).
+    assoc: HashMap<(String, String), DefId>,
 }
 
 pub fn resolve(prog: &Program) -> (Resolution, Vec<Diagnostic>) {
@@ -161,34 +177,55 @@ fn collect_interface_impl(
             _ => Vec::new(),
         })
         .collect::<std::collections::HashSet<_>>();
-    let mut functions_by_name = HashMap::new();
+    // Every callable unit (free functions plus associated methods keyed
+    // `Type.method`) joins one global-dependence fixed point, so cross-module
+    // associated calls meet the same E208 boundary as free functions.
+    // `(key, params, body)` borrows keep free and associated units uniform.
+    let mut fn_units: Vec<(String, &[vl_syntax::Param], &[Stmt])> = Vec::new();
     let mut direct_dependencies = HashMap::<String, Vec<String>>::new();
     for item in &prog.items {
-        if let Item::Function { name, body, .. } = item {
-            functions_by_name.insert(name.clone(), item);
+        if let Item::Function {
+            name, params, body, ..
+        } = item
+        {
             let mut calls = Vec::new();
             collect_local_calls(body, &mut calls);
-            direct_dependencies.insert(name.clone(), calls);
+            direct_dependencies.entry(name.clone()).or_insert(calls);
+            if !fn_units.iter().any(|(key, _, _)| key == name) {
+                fn_units.push((name.clone(), params, body));
+            }
+        }
+        if let Item::Object {
+            name: owner,
+            methods,
+            ..
+        } = item
+        {
+            for m in methods {
+                let key = format!("{owner}.{}", m.name);
+                let mut calls = Vec::new();
+                collect_local_calls(&m.body, &mut calls);
+                // First declaration wins, like the interface below;
+                // duplicates are E200 elsewhere.
+                direct_dependencies.entry(key.clone()).or_insert(calls);
+                if !fn_units.iter().any(|(k, _, _)| k == &key) {
+                    fn_units.push((key, &m.params, &m.body));
+                }
+            }
         }
     }
     let mut depends_on_global = global_names.clone();
     let mut changed = true;
     while changed {
         changed = false;
-        for item in functions_by_name.values() {
-            let Item::Function {
-                name, params, body, ..
-            } = item
-            else {
-                continue;
-            };
-            let direct = function_depends_on_global(params, body, &global_names);
+        for (key, params, body) in &fn_units {
+            let direct = function_depends_on_global(params, body, &global_names, &local_objects);
             let transitive = direct_dependencies
-                .get(name)
+                .get(key)
                 .into_iter()
                 .flatten()
                 .any(|callee| depends_on_global.contains(callee));
-            if (direct || transitive) && depends_on_global.insert(name.clone()) {
+            if (direct || transitive) && depends_on_global.insert(key.clone()) {
                 changed = true;
             }
         }
@@ -197,7 +234,13 @@ fn collect_interface_impl(
     // Duplicate object names are reported by resolution (E200); the
     // interface keeps the first so importers see a stable catalog.
     for item in &prog.items {
-        let Item::Object { name, fields, .. } = item else {
+        let Item::Object {
+            name,
+            fields,
+            methods,
+            ..
+        } = item
+        else {
             continue;
         };
         if objects
@@ -221,10 +264,64 @@ fn collect_interface_impl(
                 ty: ty.unwrap_or(vl_common::VlType::Void),
             });
         }
+        // Associated functions are public by default, like fields. A method
+        // with an incomplete signature is poisoned under its `Type.method`
+        // key so importers stay quiet on the provider's root cause (mirrors
+        // free functions, which use the bare name).
+        let mut out_methods = Vec::with_capacity(methods.len());
+        for m in methods {
+            let key = format!("{name}.{}", m.name);
+            if m.signature_poisoned || m.ret.is_none() || m.params.iter().any(|p| p.ty.is_none()) {
+                poisoned_exports.push(key.clone());
+                if diagnose_incomplete_signatures {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "exported associated function `{key}` has an incomplete signature"
+                        ))
+                        .with_label(m.name_span, "unsupported cross-module boundary")
+                        .with_code("E208"),
+                    );
+                }
+                continue;
+            }
+            if depends_on_global.contains(&key) {
+                global_dependent_exports.push(key.clone());
+            }
+            let type_param_sigs = m
+                .type_params
+                .iter()
+                .map(|p| vl_common::TypeParamSig {
+                    name: p.name.clone(),
+                    bound: p.bound,
+                })
+                .collect::<Vec<_>>();
+            let sig = vl_common::FuncSig::generic(
+                type_param_sigs,
+                m.params
+                    .iter()
+                    .filter_map(|p| {
+                        p.ty.clone().map(|ty| vl_common::ParamSig {
+                            name: p.name.clone(),
+                            ty: qualify_export_ty(&ty, &prog.module, &local_objects),
+                        })
+                    })
+                    .collect(),
+                m.ret
+                    .clone()
+                    .map(|ty| qualify_export_ty(&ty, &prog.module, &local_objects))
+                    .unwrap_or(vl_common::VlType::Void),
+            );
+            if sig.params.len() != m.params.len() {
+                poisoned_exports.push(key);
+                continue;
+            }
+            out_methods.push(vl_common::Export::source(m.name.clone(), sig));
+        }
         objects.push(vl_common::ObjectExport {
             name: name.clone(),
             qualified,
             fields: out_fields,
+            methods: out_methods,
         });
     }
     for item in &prog.items {
@@ -364,6 +461,12 @@ fn collect_local_calls(stmts: &[Stmt], calls: &mut Vec<String>) {
             Expr::Call { callee, args, .. } => {
                 if callee.len() == 1 {
                     calls.push(callee[0].clone());
+                } else if callee.len() >= 2 {
+                    // Dotted edges (`Type.method(...)`) feed the same fixed
+                    // point so associated calls share the E208 boundary with
+                    // free functions. Value-headed sugar (`r.m(...)`) matches
+                    // no callable key and stays inert.
+                    calls.push(callee.join("."));
                 }
                 for arg in args {
                     visit_expr(arg, calls);
@@ -447,6 +550,7 @@ fn function_depends_on_global(
     params: &[vl_syntax::Param],
     body: &[Stmt],
     globals: &std::collections::HashSet<String>,
+    types: &std::collections::HashSet<String>,
 ) -> bool {
     let mut locals = params
         .iter()
@@ -457,6 +561,7 @@ fn function_depends_on_global(
         expr: &Expr,
         locals: &std::collections::HashSet<String>,
         globals: &std::collections::HashSet<String>,
+        types: &std::collections::HashSet<String>,
     ) -> bool {
         match expr {
             Expr::Var { path, .. } => {
@@ -464,25 +569,39 @@ fn function_depends_on_global(
                     && globals.contains(path[0].as_str())
                     && !locals.contains(path[0].as_str())
             }
-            Expr::ArrayLiteral { elems, .. } => {
-                elems.iter().any(|e| expr_depends(e, locals, globals))
-            }
+            Expr::ArrayLiteral { elems, .. } => elems
+                .iter()
+                .any(|e| expr_depends(e, locals, globals, types)),
             Expr::ObjectLiteral { fields, .. } => fields
                 .iter()
-                .any(|(_, _, e)| expr_depends(e, locals, globals)),
+                .any(|(_, _, e)| expr_depends(e, locals, globals, types)),
             Expr::TupleLiteral { elems, .. } => elems
                 .iter()
-                .any(|(_, _, e)| expr_depends(e, locals, globals)),
-            Expr::TupleIndex { base, .. } => expr_depends(base, locals, globals),
+                .any(|(_, _, e)| expr_depends(e, locals, globals, types)),
+            Expr::TupleIndex { base, .. } => expr_depends(base, locals, globals, types),
             Expr::Index { base, index, .. } => {
-                expr_depends(base, locals, globals) || expr_depends(index, locals, globals)
+                expr_depends(base, locals, globals, types)
+                    || expr_depends(index, locals, globals, types)
             }
             Expr::Field { base, .. }
             | Expr::Unary { rhs: base, .. }
-            | Expr::Cast { inner: base, .. } => expr_depends(base, locals, globals),
-            Expr::Call { args, .. } => args.iter().any(|e| expr_depends(e, locals, globals)),
+            | Expr::Cast { inner: base, .. } => expr_depends(base, locals, globals, types),
+            Expr::Call { callee, args, .. } => {
+                // Instance sugar reads its receiver: a global head is a
+                // global use. A head naming an object type (`Type.method`)
+                // is not a value read.
+                if callee.len() >= 2
+                    && globals.contains(callee[0].as_str())
+                    && !locals.contains(callee[0].as_str())
+                    && !types.contains(callee[0].as_str())
+                {
+                    return true;
+                }
+                args.iter().any(|e| expr_depends(e, locals, globals, types))
+            }
             Expr::Binary { lhs, rhs, .. } => {
-                expr_depends(lhs, locals, globals) || expr_depends(rhs, locals, globals)
+                expr_depends(lhs, locals, globals, types)
+                    || expr_depends(rhs, locals, globals, types)
             }
             Expr::Literal(..) | Expr::String(..) => false,
         }
@@ -492,17 +611,18 @@ fn function_depends_on_global(
         stmts: &[Stmt],
         locals: &mut std::collections::HashSet<String>,
         globals: &std::collections::HashSet<String>,
+        types: &std::collections::HashSet<String>,
     ) -> bool {
         for stmt in stmts {
             let depends = match stmt {
                 Stmt::Let { name, value, .. } => {
-                    let depends = expr_depends(value, locals, globals);
+                    let depends = expr_depends(value, locals, globals, types);
                     locals.insert(name.clone());
                     depends
                 }
                 Stmt::Assign { name, value, .. } => {
                     globals.contains(name.as_str()) && !locals.contains(name.as_str())
-                        || expr_depends(value, locals, globals)
+                        || expr_depends(value, locals, globals, types)
                 }
                 Stmt::IndexAssign {
                     array,
@@ -510,20 +630,22 @@ fn function_depends_on_global(
                     value,
                     ..
                 } => {
-                    expr_depends(array, locals, globals)
-                        || expr_depends(index, locals, globals)
-                        || expr_depends(value, locals, globals)
+                    expr_depends(array, locals, globals, types)
+                        || expr_depends(index, locals, globals, types)
+                        || expr_depends(value, locals, globals, types)
                 }
                 Stmt::FieldAssign { base, value, .. } => {
-                    expr_depends(base, locals, globals) || expr_depends(value, locals, globals)
+                    expr_depends(base, locals, globals, types)
+                        || expr_depends(value, locals, globals, types)
                 }
                 Stmt::TupleAssign { base, value, .. } => {
-                    expr_depends(base, locals, globals) || expr_depends(value, locals, globals)
+                    expr_depends(base, locals, globals, types)
+                        || expr_depends(value, locals, globals, types)
                 }
                 Stmt::Destructure {
                     value, bindings, ..
                 } => {
-                    let depends = expr_depends(value, locals, globals);
+                    let depends = expr_depends(value, locals, globals, types);
                     for b in bindings {
                         locals.insert(b.binding.clone());
                     }
@@ -535,22 +657,22 @@ fn function_depends_on_global(
                     else_body,
                     ..
                 } => {
-                    expr_depends(condition, locals, globals)
-                        || stmts_depend(then_body, &mut locals.clone(), globals)
-                        || else_body
-                            .as_ref()
-                            .is_some_and(|body| stmts_depend(body, &mut locals.clone(), globals))
+                    expr_depends(condition, locals, globals, types)
+                        || stmts_depend(then_body, &mut locals.clone(), globals, types)
+                        || else_body.as_ref().is_some_and(|body| {
+                            stmts_depend(body, &mut locals.clone(), globals, types)
+                        })
                 }
                 Stmt::While {
                     condition, body, ..
                 } => {
-                    expr_depends(condition, locals, globals)
-                        || stmts_depend(body, &mut locals.clone(), globals)
+                    expr_depends(condition, locals, globals, types)
+                        || stmts_depend(body, &mut locals.clone(), globals, types)
                 }
                 Stmt::Return { value, .. } => value
                     .as_ref()
-                    .is_some_and(|value| expr_depends(value, locals, globals)),
-                Stmt::Expr(expr) => expr_depends(expr, locals, globals),
+                    .is_some_and(|value| expr_depends(value, locals, globals, types)),
+                Stmt::Expr(expr) => expr_depends(expr, locals, globals, types),
                 Stmt::Break { .. } | Stmt::Continue { .. } => false,
             };
             if depends {
@@ -560,7 +682,7 @@ fn function_depends_on_global(
         false
     }
 
-    stmts_depend(body, &mut locals, globals)
+    stmts_depend(body, &mut locals, globals, types)
 }
 
 pub fn resolve_with_modules(
@@ -572,12 +694,16 @@ pub fn resolve_with_modules(
         out: Resolution::default(),
         diags: vec![],
         modules: modules.to_vec(),
+        module: prog.module.clone(),
         imports: HashMap::new(),
         import_symbols: HashMap::new(),
         poisoned_imports: std::collections::HashSet::new(),
         import_spans: HashMap::new(),
         poisoned_params: std::collections::HashSet::new(),
         loop_depth: 0,
+        local_objects: std::collections::HashSet::new(),
+        local_fields: HashMap::new(),
+        assoc: HashMap::new(),
     };
 
     for item in &prog.items {
@@ -600,6 +726,33 @@ pub fn resolve_with_modules(
                         .with_bare_label(previous)
                         .with_code("E200"),
                 );
+            }
+        }
+    }
+    // Associated functions are declared under their `Type.method` key (first
+    // declaration wins; later duplicates keep their own defs for body
+    // resolution so only the E200 above fires). The key never enters the
+    // value scope, so a bare `method(...)` never resolves to it.
+    for item in &prog.items {
+        if let Item::Object {
+            name: owner,
+            fields,
+            methods,
+            ..
+        } = item
+        {
+            r.local_objects.insert(owner.clone());
+            r.local_fields
+                .entry(owner.clone())
+                .or_insert_with(|| fields.iter().map(|f| f.name.clone()).collect());
+            for m in methods {
+                let id = r.out.intern_def_as(
+                    format!("{owner}.{}", m.name),
+                    m.name_span,
+                    DefKind::Local,
+                    None,
+                );
+                r.assoc.entry((owner.clone(), m.name.clone())).or_insert(id);
             }
         }
     }
@@ -632,7 +785,11 @@ pub fn resolve_with_modules(
     for item in &prog.items {
         match item {
             Item::Use { .. } => {}
-            Item::Object { .. } => {}
+            Item::Object { methods, .. } => {
+                for m in methods {
+                    r.resolve_fn_body(&m.params, &m.body);
+                }
+            }
             Item::Let { value, .. } => {
                 r.resolve_expr(value);
             }
@@ -640,40 +797,7 @@ pub fn resolve_with_modules(
                 r.resolve_expr(value);
             }
             Item::Function { params, body, .. } => {
-                r.scopes.push(HashMap::new());
-                for p in params {
-                    if r.scopes
-                        .last()
-                        .is_some_and(|scope| scope.contains_key(&p.name))
-                    {
-                        let previous = r
-                            .scopes
-                            .last()
-                            .and_then(|scope| scope.get(&p.name))
-                            .and_then(|id| r.out.defs.iter().find(|d| d.id == *id))
-                            .map(|d| d.span);
-                        let mut diagnostic =
-                            Diagnostic::error(format!("duplicate parameter `{}`", p.name))
-                                .with_label(p.name_span, "redefined here")
-                                .with_code("E200");
-                        if let Some(previous) = previous {
-                            diagnostic = diagnostic.with_bare_label(previous);
-                        }
-                        r.diags.push(diagnostic);
-                        // The surviving binding is ambiguous; suppress E205
-                        // for it so the duplicate stays the one root cause.
-                        if let Some(id) = r.scopes.last().and_then(|s| s.get(&p.name)) {
-                            r.poisoned_params.insert(id.0);
-                        }
-                        continue;
-                    }
-                    let id = r.out.intern_param(p.name.clone(), p.name_span);
-                    r.scopes.last_mut().unwrap().insert(p.name.clone(), id);
-                }
-                for stmt in body {
-                    r.resolve_stmt(stmt);
-                }
-                r.scopes.pop();
+                r.resolve_fn_body(params, body);
             }
         }
     }
@@ -683,6 +807,46 @@ pub fn resolve_with_modules(
 }
 
 impl Resolver {
+    /// Resolve one function-like body: fresh parameter scope, duplicate
+    /// parameter check, then every statement. Shared by free functions and
+    /// associated methods (`self` is an ordinary parameter here).
+    fn resolve_fn_body(&mut self, params: &[vl_syntax::Param], body: &[Stmt]) {
+        self.scopes.push(HashMap::new());
+        for p in params {
+            if self
+                .scopes
+                .last()
+                .is_some_and(|scope| scope.contains_key(&p.name))
+            {
+                let previous = self
+                    .scopes
+                    .last()
+                    .and_then(|scope| scope.get(&p.name))
+                    .and_then(|id| self.out.defs.iter().find(|d| d.id == *id))
+                    .map(|d| d.span);
+                let mut diagnostic = Diagnostic::error(format!("duplicate parameter `{}`", p.name))
+                    .with_label(p.name_span, "redefined here")
+                    .with_code("E200");
+                if let Some(previous) = previous {
+                    diagnostic = diagnostic.with_bare_label(previous);
+                }
+                self.diags.push(diagnostic);
+                // The surviving binding is ambiguous; suppress E205
+                // for it so the duplicate stays the one root cause.
+                if let Some(id) = self.scopes.last().and_then(|s| s.get(&p.name)) {
+                    self.poisoned_params.insert(id.0);
+                }
+                continue;
+            }
+            let id = self.out.intern_param(p.name.clone(), p.name_span);
+            self.scopes.last_mut().unwrap().insert(p.name.clone(), id);
+        }
+        for stmt in body {
+            self.resolve_stmt(stmt);
+        }
+        self.scopes.pop();
+    }
+
     fn poison_import(&mut self, alias: impl Into<String>, span: Span) {
         let alias = alias.into();
         self.poisoned_imports.insert(alias.clone());
@@ -1053,6 +1217,13 @@ impl Resolver {
                     for arg in args {
                         self.resolve_expr(arg);
                     }
+                    return;
+                }
+                // Associated functions live in the type namespace: `Type.func`
+                // resolves through the object tables (no import needed, like
+                // `Array.new`). A `value.method` call whose head is a bound
+                // value defers to typechecking as instance sugar.
+                if self.resolve_assoc_or_sugar_call(callee, *callee_span, args) {
                     return;
                 }
                 // Callee is a plain name use so `fun` items resolve
@@ -1429,6 +1600,320 @@ impl Resolver {
         ))
     }
 
+    /// Resolve `Type.method(args)` and `value.method(args)` call sites.
+    /// Returns true when the site was fully handled here: an associated
+    /// callee recorded, a sugar receiver recorded, or one root-cause
+    /// diagnostic emitted with the arguments still resolved for inner
+    /// errors. Returns false to fall through to [`lookup_path`](Self::lookup_path).
+    ///
+    /// Resolution order at each site: poisoned heads stay quiet, then local
+    /// `Type.method`, then instance sugar when the head is a bound value
+    /// (values shadow module aliases, like bare names), then alias-qualified
+    /// `alias.Type.method`, then fully qualified `mod.Type.method` (no import
+    /// needed, like object types). A head naming a local object type always
+    /// wins over a same-named value.
+    fn resolve_assoc_or_sugar_call(
+        &mut self,
+        callee: &[String],
+        callee_span: Span,
+        args: &[Expr],
+    ) -> bool {
+        if callee.len() < 2 {
+            return false;
+        }
+        let full = callee.join(".");
+        if self.poisoned_imports.contains(&full) || self.poisoned_imports.contains(&callee[0]) {
+            let id = self.external_def(full, callee_span, None, DefKind::ImportedFunction, None);
+            self.out
+                .uses
+                .insert((callee_span.start, callee_span.end), id);
+            for arg in args {
+                self.resolve_expr(arg);
+            }
+            return true;
+        }
+        // Local `Type.method`.
+        if callee.len() == 2 && self.local_objects.contains(&callee[0]) {
+            if let Some(id) = self
+                .assoc
+                .get(&(callee[0].clone(), callee[1].clone()))
+                .cloned()
+            {
+                self.out
+                    .uses
+                    .insert((callee_span.start, callee_span.end), id);
+            } else {
+                self.diags.push(
+                    self.missing_method_diag(
+                        &callee[0],
+                        &callee[1],
+                        callee_span,
+                        self.local_fields
+                            .get(&callee[0])
+                            .is_some_and(|fields| fields.contains(&callee[1])),
+                    ),
+                );
+            }
+            for arg in args {
+                self.resolve_expr(arg);
+            }
+            return true;
+        }
+        // Instance sugar `head.rest.method(args)`: the head is a bound value.
+        // Values shadow module aliases here, exactly like bare names (a
+        // same-named parameter wins over `use` aliases); the receiver path
+        // and the self-type gate are validated by `vl-typecheck`, which
+        // reports loudly when sugar does not apply. Only object type names
+        // take precedence over values. The site records its receiver head
+        // so no E201 fires.
+        if !self.local_objects.contains(&callee[0]) {
+            if let Some(head) = self.lookup(&callee[0]) {
+                self.out
+                    .sugar_receivers
+                    .insert((callee_span.start, callee_span.end), head);
+                for arg in args {
+                    self.resolve_expr(arg);
+                }
+                return true;
+            }
+        }
+        // Alias-qualified `alias.Type.method` (exactly three segments).
+        if callee.len() == 3 && self.imports.contains_key(&callee[0]) {
+            let spec = self
+                .imports
+                .get(&callee[0])
+                .cloned()
+                .expect("checked above");
+            let dotted = format!("{}.{}", callee[1], callee[2]);
+            if spec.poisoned_exports.iter().any(|e| e == &dotted) {
+                let id = self.external_def(
+                    full.clone(),
+                    callee_span,
+                    None,
+                    DefKind::ImportedFunction,
+                    None,
+                );
+                self.out
+                    .uses
+                    .insert((callee_span.start, callee_span.end), id);
+                for arg in args {
+                    self.resolve_expr(arg);
+                }
+                return true;
+            }
+            match spec.objects.iter().find(|o| o.name == callee[1]) {
+                None => {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "module `{}` has no object type `{}`",
+                            spec.path.as_string(),
+                            callee[1]
+                        ))
+                        .with_label(callee_span, "unknown object type")
+                        .with_code("E302"),
+                    );
+                }
+                Some(obj) => match obj.lookup_method(&callee[2]) {
+                    None => {
+                        self.diags.push(self.missing_method_diag(
+                            &obj.qualified,
+                            &callee[2],
+                            callee_span,
+                            obj.fields.iter().any(|f| f.name == callee[2]),
+                        ));
+                    }
+                    Some(export) => {
+                        if spec.global_dependent_exports.iter().any(|e| e == &dotted) {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "imported function `{}.{}` depends on module globals",
+                                    spec.path.as_string(),
+                                    dotted
+                                ))
+                                .with_label(callee_span, "unsupported cross-module boundary")
+                                .with_code("E208"),
+                            );
+                            self.poisoned_imports.insert(full.clone());
+                            let id = self.external_def(
+                                full,
+                                callee_span,
+                                None,
+                                DefKind::ImportedFunction,
+                                None,
+                            );
+                            self.out
+                                .uses
+                                .insert((callee_span.start, callee_span.end), id);
+                            for arg in args {
+                                self.resolve_expr(arg);
+                            }
+                            return true;
+                        }
+                        let id = self.external_def_with_kind(
+                            full,
+                            callee_span,
+                            Some(export.sig.clone()),
+                            Some(export.kind),
+                            DefKind::ImportedFunction,
+                            Some(SymbolRef {
+                                module: spec.path.clone(),
+                                name: dotted,
+                            }),
+                        );
+                        self.out
+                            .uses
+                            .insert((callee_span.start, callee_span.end), id);
+                    }
+                },
+            }
+            for arg in args {
+                self.resolve_expr(arg);
+            }
+            return true;
+        }
+        // Fully qualified `mod.Type.method` without an import: the prefix
+        // names a known object (local `<module>.Type` or catalog-qualified).
+        if callee.len() >= 3 {
+            let method = callee[callee.len() - 1].clone();
+            let prefix = callee[..callee.len() - 1].join(".");
+            if let Some(local) = prefix
+                .strip_prefix(&format!("{}.", self.module))
+                .filter(|rest| self.local_objects.contains(*rest))
+            {
+                if let Some(id) = self
+                    .assoc
+                    .get(&(local.to_string(), method.clone()))
+                    .cloned()
+                {
+                    self.out
+                        .uses
+                        .insert((callee_span.start, callee_span.end), id);
+                } else {
+                    self.diags.push(
+                        self.missing_method_diag(
+                            &prefix,
+                            &method,
+                            callee_span,
+                            self.local_fields
+                                .get(local)
+                                .is_some_and(|fields| fields.contains(&method)),
+                        ),
+                    );
+                }
+                for arg in args {
+                    self.resolve_expr(arg);
+                }
+                return true;
+            }
+            for spec in self.modules.clone() {
+                let Some(obj) = spec.objects.iter().find(|o| o.qualified == prefix) else {
+                    continue;
+                };
+                let dotted = format!("{}.{}", obj.name, method);
+                if spec.poisoned_exports.iter().any(|e| e == &dotted) {
+                    let id = self.external_def(
+                        full.clone(),
+                        callee_span,
+                        None,
+                        DefKind::ImportedFunction,
+                        None,
+                    );
+                    self.out
+                        .uses
+                        .insert((callee_span.start, callee_span.end), id);
+                    for arg in args {
+                        self.resolve_expr(arg);
+                    }
+                    return true;
+                }
+                match obj.lookup_method(&method) {
+                    None => {
+                        self.diags.push(self.missing_method_diag(
+                            &prefix,
+                            &method,
+                            callee_span,
+                            obj.fields.iter().any(|f| f.name == method),
+                        ));
+                    }
+                    Some(export) => {
+                        if spec.global_dependent_exports.iter().any(|e| e == &dotted) {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "imported function `{}.{}` depends on module globals",
+                                    spec.path.as_string(),
+                                    dotted
+                                ))
+                                .with_label(callee_span, "unsupported cross-module boundary")
+                                .with_code("E208"),
+                            );
+                            self.poisoned_imports.insert(full.clone());
+                            let id = self.external_def(
+                                full,
+                                callee_span,
+                                None,
+                                DefKind::ImportedFunction,
+                                None,
+                            );
+                            self.out
+                                .uses
+                                .insert((callee_span.start, callee_span.end), id);
+                            for arg in args {
+                                self.resolve_expr(arg);
+                            }
+                            return true;
+                        }
+                        let id = self.external_def_with_kind(
+                            full,
+                            callee_span,
+                            Some(export.sig.clone()),
+                            Some(export.kind),
+                            DefKind::ImportedFunction,
+                            Some(SymbolRef {
+                                module: spec.path.clone(),
+                                name: dotted,
+                            }),
+                        );
+                        self.out
+                            .uses
+                            .insert((callee_span.start, callee_span.end), id);
+                    }
+                }
+                for arg in args {
+                    self.resolve_expr(arg);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// One E302 for `Type.method` when `Type` names a known object but the
+    /// method does not exist. When the name matches a field, the note steers
+    /// toward field access instead of a call.
+    fn missing_method_diag(
+        &self,
+        owner: &str,
+        method: &str,
+        span: Span,
+        is_field: bool,
+    ) -> Diagnostic {
+        let mut diag = Diagnostic::error(format!(
+            "object `{owner}` has no associated function `{method}`"
+        ))
+        .with_label(span, "unknown associated function")
+        .with_code("E302");
+        if is_field {
+            diag = diag.with_note(format!(
+                "`{method}` is a field of `{owner}`; read it without `(...)`"
+            ));
+        } else {
+            diag = diag.with_note(format!(
+                "declare it inside the object body: `fun {method}(...)` in `type {owner} = object {{ ... }}`"
+            ));
+        }
+        diag
+    }
+
     fn external_def(
         &mut self,
         name: String,
@@ -1439,7 +1924,6 @@ impl Resolver {
     ) -> DefId {
         self.external_def_with_kind(name, span, sig, None, kind, symbol)
     }
-
     fn external_def_with_kind(
         &mut self,
         name: String,
@@ -1773,6 +2257,117 @@ mod tests {
             print.sig.params[0].ty,
             vl_common::VlType::Object("vl.person.Person".into())
         );
+    }
+
+    #[test]
+    fn associated_functions_are_exported_qualified() {
+        let (toks, _) = vl_lex::lex(
+            "type Counter = object { value: u64, fun init(v: u64): *Counter { return Counter { value = v }; }, fun get(self: Counter): u64 { return self.value; }, };",
+        );
+        let (provider, _) = vl_syntax::parse_with_module(&toks, "", "demo.count");
+        let (interface, diags) = collect_interface(&provider);
+        assert!(diags.is_empty(), "{diags:?}");
+        let counter = interface
+            .objects
+            .iter()
+            .find(|o| o.name == "Counter")
+            .expect("Counter export");
+        assert_eq!(counter.methods.len(), 2);
+        let init = counter.lookup_method("init").expect("init export");
+        assert_eq!(
+            init.sig.ret,
+            vl_common::VlType::Mutable(Box::new(vl_common::VlType::Object(
+                "demo.count.Counter".into()
+            )))
+        );
+        let get = counter.lookup_method("get").expect("get export");
+        assert_eq!(
+            get.sig.params[0].ty,
+            vl_common::VlType::Object("demo.count.Counter".into())
+        );
+    }
+
+    #[test]
+    fn associated_type_func_resolves_to_its_def() {
+        let (res, diags) = resolve_src(
+            "type C = object { value: u64, fun f(self: C): u64 { return self.value; }, }; fun main() { var c: *C = C { value = 1 }; C.f(c); }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let def = res.defs.iter().find(|d| d.name == "C.f").expect("C.f def");
+        assert_eq!(def.kind, DefKind::Local);
+    }
+
+    #[test]
+    fn sugar_receiver_is_recorded_without_e201() {
+        let (res, diags) = resolve_src(
+            "type C = object { value: u64, fun f(self: C): u64 { return self.value; }, }; fun main() { var c: *C = C { value = 1 }; c.f(); }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_eq!(res.sugar_receivers.len(), 1);
+        let head = res.sugar_receivers.values().next().expect("receiver");
+        let def = res.defs.iter().find(|d| d.id == *head).expect("head def");
+        assert_eq!(def.name, "c");
+    }
+
+    #[test]
+    fn missing_associated_function_is_one_e302() {
+        let (_, diags) = resolve_src(
+            "type C = object { value: u64, }; fun main() { var c: *C = C { value = 1 }; C.bogus(c); }",
+        );
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E302"));
+    }
+
+    #[test]
+    fn sugar_receiver_shadows_module_alias() {
+        // A value-headed `foo.m()` prefers the bound value (like bare
+        // names), even when `foo` is also a module alias. Typechecking
+        // validates loudly; no silent module call happens here.
+        let module = ModuleSpec::new(&["foo"], &[("m", &[], vl_common::VlType::Void)]);
+        let (toks, _) = vl_lex::lex(
+            "use foo; type L = object { v: u64, fun m(self: L): u64 { return self.v; }, }; fun f(foo: *L) { foo.m(); }",
+        );
+        let (prog, pdiags) = vl_syntax::parse(&toks, "");
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, diags) = resolve_with_modules(&prog, &[module]);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_eq!(res.sugar_receivers.len(), 1);
+    }
+
+    #[test]
+    fn sugar_receiver_on_global_marks_dependence() {
+        let (toks, _) = vl_lex::lex(
+            "type C = object { v: u64, fun bump(self: *C): *C { return self; }, fun use_it(self: C): u64 { g.bump(); return self.v; }, }; val g: *C = C { v = 1 };",
+        );
+        let (prog, _) = vl_syntax::parse_with_module(&toks, "", "demo");
+        let (interface, diags) = collect_interface(&prog);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(
+            interface
+                .global_dependent_exports
+                .iter()
+                .any(|e| e == "C.use_it"),
+            "sugar on a global must mark the method: {:?}",
+            interface.global_dependent_exports
+        );
+    }
+
+    #[test]
+    fn assoc_call_edge_marks_transitive_dependence() {
+        let (toks, _) = vl_lex::lex(
+            "val shared: u64 = 1; type C = object { v: u64, fun inner(self: C): u64 { return shared; }, fun outer(self: C): u64 { return C.inner(self); }, };",
+        );
+        let (prog, _) = vl_syntax::parse_with_module(&toks, "", "demo");
+        let (interface, diags) = collect_interface(&prog);
+        assert!(diags.is_empty(), "{diags:?}");
+        for want in ["C.inner", "C.outer"] {
+            assert!(
+                interface.global_dependent_exports.iter().any(|e| e == want),
+                "{want} missing in {:?}",
+                interface.global_dependent_exports
+            );
+        }
     }
 
     #[test]
