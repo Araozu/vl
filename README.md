@@ -153,6 +153,14 @@ reflection to them.
 Functions can declare type parameters (`fun first[T](a: Array[T]): T`);
 calls infer them (`first(a)`) or pass them explicitly (`first::[u64](a)`)
 (see `examples/generics.vl`).
+Tuples are fixed-arity heterogeneous values with copy semantics
+(see `examples/tuples.vl`): `#(u64, String)` is unnamed (backtick indexing),
+`#(x: u64, y: String)` is named (`u.x` access), `#(1u64, "a")` /
+`#(x = 1u64, y = "b")` are literals, and `val #(a, b) = t;` /
+`val #(x: x2) = u;` destructure them (rename named fields with
+`field: binding`). Element writes need a mutable `*#(...)` view; rebinding
+a whole tuple copies it, so later writes never affect the source. Tuples
+need two or more elements.
 `var` bindings are rebindable and `val` bindings are fixed. An unannotated
 `var` receiving fresh reference data infers a mutable view (`*Foo`), while an
 unannotated `val` infers a read-only view (`Foo`); explicit `Foo`/`*Foo`

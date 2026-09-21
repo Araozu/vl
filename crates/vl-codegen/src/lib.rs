@@ -193,6 +193,10 @@ enum NaraKind {
     /// element kind: value elements use `vat` ops, reference elements
     /// (`String`, `File`, nested arrays) use `rfat` ops.
     Array(Box<NaraKind>),
+    /// Fixed-arity heterogeneous tuple (a memory container). Each position
+    /// maps to a value or reference slot by its own element kind; the
+    /// vector holds the erased element kinds in source order.
+    Tuple(Vec<NaraKind>),
 }
 
 impl NaraKind {
@@ -213,6 +217,13 @@ impl NaraKind {
             vl_typecheck::Ty::File => Some(NaraKind::File),
             vl_typecheck::Ty::Object(name) => Some(NaraKind::Object(name.clone())),
             vl_typecheck::Ty::Array(elem) => Some(NaraKind::Array(Box::new(Self::of_ty(elem)?))),
+            vl_typecheck::Ty::Tuple(fields) => {
+                let mut kinds = Vec::with_capacity(fields.len());
+                for (_, ty) in fields {
+                    kinds.push(Self::of_ty(ty)?);
+                }
+                Some(NaraKind::Tuple(kinds))
+            }
             // Capability-only: same representation as the read-only view.
             vl_typecheck::Ty::Mutable(inner) => Self::of_ty(inner),
             vl_typecheck::Ty::Param(_) | vl_typecheck::Ty::Void | vl_typecheck::Ty::Error => None,
@@ -220,10 +231,16 @@ impl NaraKind {
     }
 
     /// Reference kinds live in `rf`, everything else in `rv`.
+    /// Tuples are heap containers (hence `rf`) with value copy semantics
+    /// at the language level (deep-copied on `Copy`/param entry).
     fn is_ref(&self) -> bool {
         matches!(
             self,
-            NaraKind::String | NaraKind::File | NaraKind::Object(_) | NaraKind::Array(_)
+            NaraKind::String
+                | NaraKind::File
+                | NaraKind::Object(_)
+                | NaraKind::Array(_)
+                | NaraKind::Tuple(_)
         )
     }
 
@@ -285,6 +302,184 @@ fn object_slot<'a>(
         }
     }
     None
+}
+
+/// Tuple position -> (uses-reference-lane, lane-local slot).
+/// Naravm containers keep value and reference fields in separate arrays,
+/// so the source index is not the runtime index: count preceding elements
+/// of the same lane.
+fn tuple_slot(kinds: &[NaraKind], index: usize) -> Option<(bool, usize)> {
+    let kind = kinds.get(index)?;
+    let want_ref = kind.is_ref();
+    let mut slot = 0;
+    for (i, k) in kinds.iter().enumerate() {
+        if i == index {
+            return Some((want_ref, slot));
+        }
+        if k.is_ref() == want_ref {
+            slot += 1;
+        }
+    }
+    None
+}
+
+/// Lane counts for a tuple layout (for `createi`).
+fn tuple_lanes(kinds: &[NaraKind]) -> (usize, usize) {
+    let mut values = 0;
+    let mut refs = 0;
+    for k in kinds {
+        if k.is_ref() {
+            refs += 1;
+        } else {
+            values += 1;
+        }
+    }
+    (values, refs)
+}
+
+/// Erased element kinds for a tuple instruction's `tys` list.
+fn nara_tuple_kinds(
+    tys: &[vl_typecheck::Ty],
+    span: Span,
+    e: &mut NaraEmit,
+) -> Option<Vec<NaraKind>> {
+    let mut kinds = Vec::with_capacity(tys.len());
+    for ty in tys {
+        match NaraKind::of_ty(ty) {
+            Some(k) => kinds.push(k),
+            None => {
+                e.diags.push(
+                    Diagnostic::error("Naravm backend found a non-runtime tuple element type")
+                        .with_label(span, "tuple emitted here")
+                        .with_code("E500"),
+                );
+                return None;
+            }
+        }
+    }
+    Some(kinds)
+}
+
+/// Deep-copy a tuple container (`src_rf`) into `dst_rf` (already allocated).
+/// Value semantics: every element is copied slot-to-slot so the destination
+/// owns an independent container. Plain reference elements (`String`,
+/// arrays, objects) share their referents (like object fields); nested
+/// tuples recurse so no tuple container is ever aliased.
+fn nara_tuple_copy_into(
+    e: &mut NaraEmit,
+    dst_rf: u8,
+    src_rf: u8,
+    kinds: &[NaraKind],
+    span: Span,
+) -> bool {
+    let (values, refs) = tuple_lanes(kinds);
+    if values > u8::MAX as usize || refs > u8::MAX as usize {
+        e.diags.push(
+            Diagnostic::error("Naravm tuple has more than 255 elements in one register lane")
+                .with_label(span, "tuple copied here")
+                .with_note("split the tuple into smaller tuples")
+                .with_code("E404"),
+        );
+        return false;
+    }
+    e.bytecode
+        .extend_from_slice(&[0x27, dst_rf, values as u8, refs as u8]); // createi
+                                                                       // One scratch per lane, reused across elements; freed after the copy.
+    let scratch_rv = if values > 0 {
+        match e.fresh_rv(span) {
+            Some(rv) => Some(rv),
+            None => return false,
+        }
+    } else {
+        None
+    };
+    let scratch_rf = if refs > 0 {
+        match e.fresh_rf(span) {
+            Some(rf) => Some(rf),
+            None => {
+                if let Some(rv) = scratch_rv {
+                    e.free_rv.push(rv);
+                }
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+    for (i, kind) in kinds.iter().enumerate() {
+        let Some((is_ref, slot)) = tuple_slot(kinds, i) else {
+            if let Some(rv) = scratch_rv {
+                e.free_rv.push(rv);
+            }
+            if let Some(rf) = scratch_rf {
+                e.free_rf.push(rf);
+            }
+            return false;
+        };
+        let Ok(slot) = u8::try_from(slot) else {
+            e.diags.push(
+                Diagnostic::error("Naravm tuple slot is out of range (compiler bug)")
+                    .with_label(span, "tuple copied here")
+                    .with_code("E500"),
+            );
+            if let Some(rv) = scratch_rv {
+                e.free_rv.push(rv);
+            }
+            if let Some(rf) = scratch_rf {
+                e.free_rf.push(rf);
+            }
+            return false;
+        };
+        if is_ref || kind.is_ref() {
+            // Nested tuples recurse: the nested container is duplicated so
+            // the copy owns every tuple level. Other references share.
+            if let NaraKind::Tuple(nested) = kind {
+                let nested = nested.clone();
+                let (Some(nested_src), Some(nested_dst)) = (e.fresh_rf(span), e.fresh_rf(span))
+                else {
+                    if let Some(rv) = scratch_rv {
+                        e.free_rv.push(rv);
+                    }
+                    if let Some(rf) = scratch_rf {
+                        e.free_rf.push(rf);
+                    }
+                    return false;
+                };
+                e.bytecode
+                    .extend_from_slice(&[0x2e, nested_src, src_rf, slot]); // getrfati
+                if !nara_tuple_copy_into(e, nested_dst, nested_src, &nested, span) {
+                    e.free_rf.push(nested_src);
+                    e.free_rf.push(nested_dst);
+                    if let Some(rv) = scratch_rv {
+                        e.free_rv.push(rv);
+                    }
+                    if let Some(rf) = scratch_rf {
+                        e.free_rf.push(rf);
+                    }
+                    return false;
+                }
+                e.bytecode
+                    .extend_from_slice(&[0x2f, dst_rf, slot, nested_dst]); // setrfati
+                e.free_rf.push(nested_src);
+                e.free_rf.push(nested_dst);
+                continue;
+            }
+            let tmp = scratch_rf.expect("ref scratch exists when a ref element is copied");
+            e.bytecode.extend_from_slice(&[0x2e, tmp, src_rf, slot]); // getrfati
+            e.bytecode.extend_from_slice(&[0x2f, dst_rf, slot, tmp]); // setrfati
+        } else {
+            let tmp = scratch_rv.expect("value scratch exists when a value element is copied");
+            e.bytecode.extend_from_slice(&[0x2c, tmp, src_rf, slot]); // getvati
+            e.bytecode.extend_from_slice(&[0x2d, dst_rf, slot, tmp]); // setvati
+        }
+    }
+    if let Some(rv) = scratch_rv {
+        e.free_rv.push(rv);
+    }
+    if let Some(rf) = scratch_rf {
+        e.free_rf.push(rf);
+    }
+    true
 }
 
 struct NaraEmit {
@@ -583,6 +778,18 @@ fn nara_last_use_fragment(
                     touch(*arg, idx);
                 }
             }
+            I::TupleLit { elems, .. } => {
+                for arg in elems {
+                    touch(*arg, idx);
+                }
+            }
+            I::TupleGet { tuple, .. } => {
+                touch(*tuple, idx);
+            }
+            I::TupleSet { tuple, value, .. } => {
+                touch(*tuple, idx);
+                touch(*value, idx);
+            }
             I::NewArray { len, .. } => {
                 touch(*len, idx);
             }
@@ -673,6 +880,8 @@ fn free_fragment_regs(e: &mut NaraEmit, instrs: &[Instr], result: &vl_lir::Reg) 
             | I::NewArray { dst, .. }
             | I::ArrayLit { dst, .. }
             | I::ArrayGet { dst, .. }
+            | I::TupleLit { dst, .. }
+            | I::TupleGet { dst, .. }
             | I::GlobalLoad { dst, .. }
             | I::Cast { dst, .. } => {
                 lir_regs.insert(*dst);
@@ -1255,6 +1464,18 @@ fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::R
                     touch(*elem, idx);
                 }
             }
+            I::TupleLit { elems, .. } => {
+                for elem in elems {
+                    touch(*elem, idx);
+                }
+            }
+            I::TupleGet { tuple, .. } => {
+                touch(*tuple, idx);
+            }
+            I::TupleSet { tuple, value, .. } => {
+                touch(*tuple, idx);
+                touch(*value, idx);
+            }
             I::ArrayGet { array, index, .. } => {
                 touch(*array, idx);
                 touch(*index, idx);
@@ -1354,6 +1575,16 @@ fn nara_free_dead(e: &mut NaraEmit, ins: &Instr, idx: usize) {
         }
         I::ArrayLit { elems, .. } => {
             dead.extend(elems.iter().copied());
+        }
+        I::TupleLit { elems, .. } => {
+            dead.extend(elems.iter().copied());
+        }
+        I::TupleGet { tuple, .. } => {
+            dead.push(*tuple);
+        }
+        I::TupleSet { tuple, value, .. } => {
+            dead.push(*tuple);
+            dead.push(*value);
         }
         I::ArrayGet { array, index, .. } => {
             dead.push(*array);
@@ -1496,6 +1727,27 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                     .is_some_and(|d| Some(d) == e.rf_map.get(src).copied())
             {
                 e.kinds.insert(*dst, kind);
+                return;
+            }
+            // Tuples copy by value: duplicate the container so later
+            // element writes through one binding never affect the other.
+            if let NaraKind::Tuple(kinds) = &kind {
+                let kinds = kinds.clone();
+                let (Some(s), Some(d)) = (
+                    e.rf_map.get(src).copied(),
+                    e.rf_map.get(dst).copied().or_else(|| {
+                        let rf = e.fresh_rf(*span)?;
+                        e.rf_map.insert(*dst, rf);
+                        Some(rf)
+                    }),
+                ) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.kinds.insert(*dst, kind);
+                if !nara_tuple_copy_into(e, d, s, &kinds, *span) {
+                    e.invalid.insert(*dst);
+                }
                 return;
             }
             if kind.is_ref() {
@@ -1810,11 +2062,32 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             };
             e.rf_map.insert(*dst, rf);
             e.kinds.insert(*dst, array_kind);
+            // Tuple elements are value types: duplicate each element
+            // container so the array owns its copies (other references share).
+            let tuple_elem = match &elem_kind {
+                NaraKind::Tuple(kinds) => Some(kinds.clone()),
+                _ => None,
+            };
             for (i, elem) in elems.iter().enumerate() {
                 if is_ref {
                     let Some(v) = e.ref_reg(*elem, *span) else {
                         e.invalid.insert(*dst);
                         return;
+                    };
+                    // Tuple elements copy into a temp owned by the array.
+                    let (v, owned) = if let Some(nested) = &tuple_elem {
+                        let Some(tmp) = e.fresh_rf(*span) else {
+                            e.invalid.insert(*dst);
+                            return;
+                        };
+                        if !nara_tuple_copy_into(e, tmp, v, nested, *span) {
+                            e.free_rf.push(tmp);
+                            e.invalid.insert(*dst);
+                            return;
+                        }
+                        (tmp, true)
+                    } else {
+                        (v, false)
                     };
                     if i <= u8::MAX as usize {
                         e.bytecode.extend_from_slice(&[0x2f, rf, i as u8, v]); // setrfati
@@ -1826,6 +2099,10 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                         };
                         e.bytecode.extend_from_slice(&[0x02, s, idx as u8]); // lv
                         e.bytecode.extend_from_slice(&[0x2b, rf, s, v]); // setrfat
+                    }
+                    // The array now references the copy; recycle the temp.
+                    if owned {
+                        e.free_rf.push(v);
                     }
                 } else {
                     let Some(v) = e.value_reg(*elem, *span) else {
@@ -2157,12 +2434,237 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 let Some(v) = e.ref_reg(*value, *span) else {
                     return;
                 };
-                e.bytecode.extend_from_slice(&[0x2b, a, i, v]); // setrfat
+                // Tuple array elements copy: the array owns its element.
+                if let NaraKind::Tuple(nested) = &elem_kind {
+                    let nested = nested.clone();
+                    let Some(tmp) = e.fresh_rf(*span) else {
+                        return;
+                    };
+                    if !nara_tuple_copy_into(e, tmp, v, &nested, *span) {
+                        e.free_rf.push(tmp);
+                        return;
+                    }
+                    e.bytecode.extend_from_slice(&[0x2b, a, i, tmp]); // setrfat
+                    e.free_rf.push(tmp);
+                } else {
+                    e.bytecode.extend_from_slice(&[0x2b, a, i, v]); // setrfat
+                }
             } else {
                 let Some(v) = e.value_reg(*value, *span) else {
                     return;
                 };
                 e.bytecode.extend_from_slice(&[0x29, a, i, v]); // setvat
+            }
+        }
+        Instr::TupleLit {
+            dst,
+            elems,
+            tys,
+            span,
+        } => {
+            let Some(kinds) = nara_tuple_kinds(tys, *span, e) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let tuple_kind = NaraKind::Tuple(kinds.clone());
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, tuple_kind);
+                return;
+            }
+            for elem in elems {
+                if e.invalid.contains(elem) {
+                    e.invalid.insert(*dst);
+                    return;
+                }
+            }
+            let (values, refs) = tuple_lanes(&kinds);
+            if values > u8::MAX as usize || refs > u8::MAX as usize {
+                e.diags.push(
+                    Diagnostic::error(
+                        "Naravm tuple has more than 255 elements in one register lane",
+                    )
+                    .with_label(*span, "tuple allocated here")
+                    .with_note("split the tuple into smaller tuples")
+                    .with_code("E404"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            }
+            let Some(rf) = e.fresh_rf(*span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            e.bytecode
+                .extend_from_slice(&[0x27, rf, values as u8, refs as u8]); // createi
+            e.rf_map.insert(*dst, rf);
+            e.kinds.insert(*dst, tuple_kind);
+            for (i, elem) in elems.iter().enumerate() {
+                let Some((is_ref, slot)) = tuple_slot(&kinds, i) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                let Ok(slot) = u8::try_from(slot) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                if is_ref {
+                    let Some(v) = e.ref_reg(*elem, *span) else {
+                        e.invalid.insert(*dst);
+                        return;
+                    };
+                    // Nested tuple elements are duplicated so the literal
+                    // owns every tuple level; other references share.
+                    if let Some(NaraKind::Tuple(nested)) = kinds.get(i).cloned() {
+                        let Some(tmp) = e.fresh_rf(*span) else {
+                            e.invalid.insert(*dst);
+                            return;
+                        };
+                        if !nara_tuple_copy_into(e, tmp, v, &nested, *span) {
+                            e.free_rf.push(tmp);
+                            e.invalid.insert(*dst);
+                            return;
+                        }
+                        e.bytecode.extend_from_slice(&[0x2f, rf, slot, tmp]); // setrfati
+                        e.free_rf.push(tmp);
+                    } else {
+                        e.bytecode.extend_from_slice(&[0x2f, rf, slot, v]); // setrfati
+                    }
+                } else {
+                    let Some(v) = e.value_reg(*elem, *span) else {
+                        e.invalid.insert(*dst);
+                        return;
+                    };
+                    e.bytecode.extend_from_slice(&[0x2d, rf, slot, v]); // setvati
+                }
+            }
+        }
+        Instr::TupleGet {
+            dst,
+            tuple,
+            index,
+            tys,
+            span,
+        } => {
+            let Some(kinds) = nara_tuple_kinds(tys, *span, e) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some((is_ref, slot)) = tuple_slot(&kinds, *index) else {
+                e.diags.push(
+                    Diagnostic::error("Naravm tuple index out of range (compiler bug)")
+                        .with_label(*span, "tuple read emitted here")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(elem_kind) = kinds.get(*index).cloned() else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Ok(slot) = u8::try_from(slot) else {
+                e.diags.push(
+                    Diagnostic::error("Naravm tuple slot is out of range (compiler bug)")
+                        .with_label(*span, "tuple read emitted here")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            };
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, elem_kind);
+                return;
+            }
+            let Some(obj) = e.rf_map.get(tuple).copied() else {
+                if !e.invalid.contains(tuple) {
+                    e.diags.push(
+                        Diagnostic::error("Naravm backend expected a tuple reference")
+                            .with_label(*span, "tuple read emitted here")
+                            .with_code("E500"),
+                    );
+                }
+                e.invalid.insert(*dst);
+                return;
+            };
+            if is_ref {
+                let Some(d) = e.fresh_rf(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x2e, d, obj, slot]); // getrfati
+                e.rf_map.insert(*dst, d);
+            } else {
+                let Some(d) = e.fresh_rv(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x2c, d, obj, slot]); // getvati
+                e.rv_map.insert(*dst, d);
+            }
+            e.kinds.insert(*dst, elem_kind);
+        }
+        Instr::TupleSet {
+            tuple,
+            index,
+            value,
+            tys,
+            span,
+        } => {
+            if e.invalid.contains(tuple) || e.invalid.contains(value) {
+                return;
+            }
+            let Some(kinds) = nara_tuple_kinds(tys, *span, e) else {
+                return;
+            };
+            let Some((is_ref, slot)) = tuple_slot(&kinds, *index) else {
+                e.diags.push(
+                    Diagnostic::error("Naravm tuple index out of range (compiler bug)")
+                        .with_label(*span, "tuple write emitted here")
+                        .with_code("E500"),
+                );
+                return;
+            };
+            let Ok(slot) = u8::try_from(slot) else {
+                e.diags.push(
+                    Diagnostic::error("Naravm tuple slot is out of range (compiler bug)")
+                        .with_label(*span, "tuple write emitted here")
+                        .with_code("E500"),
+                );
+                return;
+            };
+            let Some(obj) = e.rf_map.get(tuple).copied() else {
+                e.diags.push(
+                    Diagnostic::error("Naravm backend expected a tuple reference")
+                        .with_label(*span, "tuple write emitted here")
+                        .with_code("E500"),
+                );
+                return;
+            };
+            let elem_kind = kinds.get(*index).cloned().unwrap_or(NaraKind::U64);
+            if is_ref || elem_kind.is_ref() {
+                let Some(src) = e.ref_reg(*value, *span) else {
+                    return;
+                };
+                // Nested tuple values copy: the slot owns its container.
+                if let NaraKind::Tuple(nested) = &elem_kind {
+                    let nested = nested.clone();
+                    let Some(tmp) = e.fresh_rf(*span) else {
+                        return;
+                    };
+                    if !nara_tuple_copy_into(e, tmp, src, &nested, *span) {
+                        e.free_rf.push(tmp);
+                        return;
+                    }
+                    e.bytecode.extend_from_slice(&[0x2f, obj, slot, tmp]); // setrfati
+                    e.free_rf.push(tmp);
+                } else {
+                    e.bytecode.extend_from_slice(&[0x2f, obj, slot, src]); // setrfati
+                }
+            } else {
+                let Some(src) = e.value_reg(*value, *span) else {
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x2d, obj, slot, src]); // setvati
             }
         }
         Instr::Ret { src, span } => nara_ret(e, ctx, *src, *span),
@@ -2196,6 +2698,35 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 e.kinds.insert(*dst, kind);
                 return;
             }
+            // Tuple globals copy by value on load so callee element
+            // writes never mutate shared module state.
+            if let NaraKind::Tuple(kinds) = &kind {
+                let kinds = kinds.clone();
+                if !e.last_use.contains_key(dst) {
+                    e.kinds.insert(*dst, kind);
+                    return;
+                }
+                let Some(tmp) = e.fresh_rf(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode
+                    .extend_from_slice(&[0x2e, tmp, MODULE_STATE_RF, slot]); // getrfati
+                let Some(rf) = e.fresh_rf(*span) else {
+                    e.free_rf.push(tmp);
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.rf_map.insert(*dst, rf);
+                e.kinds.insert(*dst, kind);
+                if !nara_tuple_copy_into(e, rf, tmp, &kinds, *span) {
+                    e.invalid.insert(*dst);
+                    e.free_rf.push(tmp);
+                    return;
+                }
+                e.free_rf.push(tmp);
+                return;
+            }
             if is_ref {
                 let Some(rf) = e.fresh_rf(*span) else {
                     e.invalid.insert(*dst);
@@ -2224,6 +2755,26 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 );
                 return;
             };
+            // Tuple globals copy by value on store so later local element
+            // writes never mutate the stored global.
+            if let Some(gty) = ctx.global_tys.get(global).cloned() {
+                if let Some(NaraKind::Tuple(kinds)) = NaraKind::of_ty(&gty) {
+                    let Some(s) = e.ref_reg(*src, *span) else {
+                        return;
+                    };
+                    let Some(tmp) = e.fresh_rf(*span) else {
+                        return;
+                    };
+                    if !nara_tuple_copy_into(e, tmp, s, &kinds, *span) {
+                        e.free_rf.push(tmp);
+                        return;
+                    }
+                    e.bytecode
+                        .extend_from_slice(&[0x2f, MODULE_STATE_RF, slot, tmp]); // setrfati
+                    e.free_rf.push(tmp);
+                    return;
+                }
+            }
             if is_ref {
                 let Some(rf) = e.ref_reg(*src, *span) else {
                     return;
@@ -2319,7 +2870,15 @@ fn nara_param(e: &mut NaraEmit, ctx: &NaraFnCtx, dst: vl_lir::Reg, index: usize,
             return;
         };
         e.rf_map.insert(dst, rf);
-        e.kinds.insert(dst, kind);
+        e.kinds.insert(dst, kind.clone());
+        // Tuple parameters copy by value so callee element writes never
+        // affect the caller's container.
+        if let NaraKind::Tuple(kinds) = kind {
+            if !nara_tuple_copy_into(e, rf, src, &kinds, span) {
+                e.invalid.insert(dst);
+            }
+            return;
+        }
         e.bytecode.extend_from_slice(&[0x05, rf, src]); // cprf
     } else {
         if e.param_vi >= 15 {
@@ -2951,6 +3510,39 @@ mod tests {
             uses[&n],
             back_edge
         );
+    }
+
+    #[test]
+    fn naravm_emits_tuples_with_container_ops_and_value_copy() {
+        // Unnamed + named literals, reads, writes, destructure, and a
+        // rebinding copy (which must deep-copy the container, hence two
+        // `createi` allocations for one literal shape).
+        let lir = lir_of(
+            "use std; fun main() { val t = #(1u64, \"a\"); val a = t.`0; val u = #(x = 1u64, y = 2u64); val x = u.x; var m = #(1u64, 2u64); m.`0 = 3u64; val #(p, q) = t; var b = m; b.`1 = 9u64; std.print_u64(a + p + m.`1 + b.`1); }",
+        );
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let bytes = artifact.unwrap().bytes.unwrap();
+        assert_eq!(&bytes[..4], b"nara");
+        // createi = 0x27 (literal + copy allocations), getvati = 0x2c,
+        // setvati = 0x2d.
+        for op in [0x27u8, 0x2c, 0x2du8] {
+            assert!(bytes.contains(&op), "no {op:#x} in {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn naravm_emits_nested_tuples() {
+        let lir = lir_of(
+            "fun main() { var t: *#(u64, #(u64, u64)) = #(1u64, #(2u64, 3u64)); t.`1 = #(4u64, 5u64); }",
+        );
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let bytes = artifact.unwrap().bytes.unwrap();
+        assert_eq!(&bytes[..4], b"nara");
+        for op in [0x27u8, 0x2c, 0x2d] {
+            assert!(bytes.contains(&op), "no {op:#x} in {bytes:?}");
+        }
     }
 
     #[test]

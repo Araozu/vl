@@ -11,7 +11,9 @@ Parser recovers per-item (and per-stmt inside `fun`); one bad item hides no othe
 program := item*
 item    := use_item | binding_item | function_item | object_item
 use_item := "use" path ("." "{" ident ("," ident)* "}")? ";"
-binding_item := ("var" | "val") ident (":" type)? "=" expr ";"
+binding_item := ("var" | "val") (ident | destructure) (":" type)? "=" expr ";"
+destructure := "#" "(" destructure_binding ("," destructure_binding)* ","? ")"
+destructure_binding := ident (":" ident)?
 function_item := "fun" ident type_params? "(" params? ")" (":" type)? block
 type_params := "[" type_param ("," type_param)* "]"
 type_param := ident ("extends" ("Numeric" | "Comparable"))?
@@ -22,14 +24,19 @@ params   := param ("," param)*          ; no trailing comma
 param    := ident ":" type
 type     := mutable_type | type_atom
 mutable_type := "*" type_atom           ; one capability qualifier (`*Foo`, `*Array[T]`)
-type_atom := "u64" | "i64" | "f64" | "bool" | "u8" | "String" | "File" | ident | "Array" "[" type "]" | "void"
+type_atom := "u64" | "i64" | "f64" | "bool" | "u8" | "String" | "File" | ident | "Array" "[" type "]" | tuple_type | "void"
+tuple_type := "#" "(" tuple_type_elem ("," tuple_type_elem)* ","? ")"
+tuple_type_elem := (ident ":")? type
 block    := "{" stmt* "}"
-stmt     := binding_stmt | assign_stmt | index_assign_stmt | field_assign_stmt | if_stmt | while_stmt | break_stmt | continue_stmt | return_stmt | expr_stmt
-binding_stmt := ("var" | "val") ident (":" type)? "=" expr ";"
+stmt     := binding_stmt | assign_stmt | index_assign_stmt | field_assign_stmt | tuple_assign_stmt | destructure_stmt | if_stmt | while_stmt | break_stmt | continue_stmt | return_stmt | expr_stmt
+binding_stmt := ("var" | "val") (ident | destructure) (":" type)? "=" expr ";"
+destructure_stmt := ("var" | "val") destructure (":" type)? "=" expr ";"
 assign_stmt := ident "=" expr ";"
 index_assign_stmt := assignable "[" expr "]" "=" expr ";"
 field_assign_stmt := assignable "." ident "=" expr ";"
-assignable := ident ("[" expr "]" | "." ident)*
+tuple_assign_stmt := assignable backtick_index "=" expr ";"
+assignable := ident ("[" expr "]" | "." ident | backtick_index)*
+backtick_index := "." "`" int   ; unnamed tuples only, e.g. t.`0
 if_stmt  := "if" "(" expr ")" branch ("else" branch)?
 while_stmt := "while" "(" expr ")" branch
 break_stmt := "break" ";"
@@ -47,8 +54,10 @@ term     := factor (("+" | "-") factor)* ; left-assoc
 factor   := unary (("*" | "/") unary)*   ; left-assoc
 unary    := ("-" | "!") unary | postfix
 call     := path ("::" "[" type ("," type)* "]")? "(" args? ")"
-postfix  := primary ("[" expr "]" | "." ident)*
-primary  := literal | string | array_literal | object_literal | call | path | "(" expr ")"
+postfix  := primary ("[" expr "]" | "." ident | backtick_index)*
+primary  := literal | string | array_literal | tuple_literal | object_literal | call | path | "(" expr ")"
+tuple_literal := "#" "(" tuple_elem ("," tuple_elem)* ","? ")"
+tuple_elem := (ident "=")? expr
 object_literal := ident "{" (ident "=" expr ("," ident "=" expr)* ","?)? "}"
 array_literal := "[" (expr ("," expr)* ","?)? "]"
 args     := expr ("," expr)*
@@ -59,7 +68,7 @@ path     := ident ("." ident)*
 Terminal names are `vl-lex` `TokenKind`s: `Var Val Fun Type Object If Else While Break
 Continue Return As Extends Eq EqEq Bang BangEq Lt LtEq Gt GtEq AmpAmp PipePipe
 Plus Minus Star Slash Semi LParen RParen LBrace RBrace LBracket RBracket Comma
-Dot Colon ColonColon Ident Int I64 U64 F64 U8 Bool String Invalid Eof`.
+Dot Colon Hash Backtick ColonColon Ident Int I64 U64 F64 U8 Bool String Invalid Eof`.
 
 ### Notes
 
@@ -76,7 +85,15 @@ Dot Colon ColonColon Ident Int I64 U64 F64 U8 Bool String Invalid Eof`.
 * Assignment statements are recognized from identifier-led postfix expressions;
   field and index writes may therefore chain postfix operations, while a
   parenthesized assignment base remains an expression-statement parse error.
-* `*` in a type is a capability qualifier (`*Foo`, `*Array[T]`,
+* Tuples are fixed-arity heterogeneous values with copy semantics:
+  `#(u64, String)` (unnamed) and `#(x: u64, y: String)` (named) need 2+
+  elements, uniform named-ness, and no `void` (one diagnostic each).
+  Literals mirror types with `=` (`#(1u64, "a")` / `#(x = 1u64)`).
+  Unnamed access is backtick indexing (dot + backtick + bare int);
+  named access is plain field. Destructuring is `val #(a, b) = t;` /
+  `val #(x: x2) = u;` (rename via `field: binding`); element writes need
+  a `*` tuple view.
+* `*` in a type is a capability qualifier (`*Foo`, `*Array[T]`, `*#(...)`,
   `Array[*Foo]`); `*` in an expression stays multiplication (`a * b`).
   `mutable_type` goes through `type_atom` (not `type`), so `**Foo` is an
   immediate `E106`. Type spans include the leading `*`.
@@ -87,20 +104,26 @@ Dot Colon ColonColon Ident Int I64 U64 F64 U8 Bool String Invalid Eof`.
 Program { items: Vec<Item> }
 Item ::= Use { path, names, span }
        | Let { kind: Var | Val, name, name_span, ty, ty_span, value: Expr, span }
+       | Destructure { kind: Var | Val, bindings: Vec<DestructureBinding>, bindings_span, ty, ty_span, value: Expr, span }
        | Function { name, name_span, type_params: Vec<TypeParam>, params: Vec<Param>, ret: Option<VlType>, ret_span, body: Vec<Stmt>, span }
        | Object { name, name_span, fields: Vec<ObjectField>, span }
 TypeParam ::= { name, span, bound: Option<GenericBound> }
 Param ::= { name, name_span, ty: Option<VlType>, ty_span }
+DestructureBinding ::= { field: Option<String>, field_span, binding: String, binding_span }
 Stmt ::= Let { kind: Var | Val, name, name_span, ty, ty_span, value: Expr, span }
        | Assign { name, name_span, value: Expr, span }
        | IndexAssign { array, index, value, span }
        | FieldAssign { base, field, field_span, value, span }
+       | TupleAssign { base, index: usize, index_span, value, span }
+       | Destructure { kind: Var | Val, bindings: Vec<DestructureBinding>, bindings_span, ty, ty_span, value: Expr, span }
        | If { condition, then_body, else_body, span }
        | While { condition, body, span }
        | Break { span } | Continue { span }
        | Return { value: Option<Expr>, span }
        | Expr(Expr)
 Expr ::= Literal(Scalar, Span) | String(Vec<u8>, Span) | ArrayLiteral { elems, span }
+         | TupleLiteral { elems: Vec<(Option<String>, Option<Span>, Expr)>, span }
+         | TupleIndex { base, index: usize, index_span, span }
          | ObjectLiteral { name, name_span, fields: Vec<(String, Span, Expr)>, span }
          | Index { base, index, span }
          | Field { base, name, span } | Var { path, span }

@@ -1,0 +1,66 @@
+fn main:
+    0: %0 = const 1u64
+    1: %1 = string [97]
+    2: %2 = tuple_lit [%0, %1] : #(u64, String)
+    3: %3 = copy %2
+    4: %4 = tuple_get %3[0] : #(u64, String)
+    5: %5 = copy %4
+    6: %6 = tuple_get %3[1] : #(u64, String)
+    7: %7 = copy %6
+    8: %8 = call std::print_u64(%5)
+    9: %9 = call std::print(%7)
+   10: %10 = const 2u64
+   11: %11 = string [98]
+   12: %12 = tuple_lit [%10, %11] : #(u64, String)
+   13: %13 = copy %12
+   14: %14 = tuple_get %13[0] : #(u64, String)
+   15: %15 = call std::print_u64(%14)
+   16: %16 = tuple_get %13[1] : #(u64, String)
+   17: %17 = call std::print(%16)
+   18: %18 = tuple_get %3[0] : #(u64, String)
+   19: %19 = copy %18
+   20: %20 = tuple_get %3[1] : #(u64, String)
+   21: %21 = copy %20
+   22: %22 = call std::print_u64(%19)
+   23: %23 = call std::print(%21)
+   24: %24 = tuple_get %13[0] : #(u64, String)
+   25: %25 = copy %24
+   26: %26 = tuple_get %13[1] : #(u64, String)
+   27: %27 = copy %26
+   28: %28 = call std::print_u64(%25)
+   29: %29 = call std::print(%27)
+   30: %30 = const 3u64
+   31: %31 = const 4u64
+   32: %32 = tuple_lit [%30, %31] : #(u64, u64)
+   33: %33 = copy %32
+   34: %34 = const 30u64
+   35: tuple_set %33[0], %34 : #(u64, u64)
+   36: %35 = tuple_get %33[0] : #(u64, u64)
+   37: %36 = copy %35
+   38: %37 = tuple_get %33[1] : #(u64, u64)
+   39: %38 = copy %37
+   40: %39 = call std::print_u64(%36)
+   41: %40 = call std::print_u64(%38)
+   42: %41 = const 1u64
+   43: %42 = const 2u64
+   44: %43 = tuple_lit [%41, %42] : #(u64, u64)
+   45: %44 = copy %43
+   46: %45 = const 10u64
+   47: tuple_set %44[0], %45 : #(u64, u64)
+   48: %46 = tuple_get %44[0] : #(u64, u64)
+   49: %47 = call std::print_u64(%46)
+   50: %48 = tuple_get %44[1] : #(u64, u64)
+   51: %49 = call std::print_u64(%48)
+   52: %50 = const 1u64
+   53: %51 = const 2u64
+   54: %52 = tuple_lit [%50, %51] : #(u64, u64)
+   55: %53 = copy %52
+   56: %54 = copy %53
+   57: %55 = const 99u64
+   58: tuple_set %54[0], %55 : #(u64, u64)
+   59: %56 = tuple_get %53[0] : #(u64, u64)
+   60: %57 = call std::print_u64(%56)
+   61: %58 = tuple_get %54[0] : #(u64, u64)
+   62: %59 = call std::print_u64(%58)
+   63: %60 = const 0u64
+   64: ret %60

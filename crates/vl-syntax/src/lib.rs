@@ -3,7 +3,9 @@
 //! Grammar (v0 surface):
 //! ```text
 //! program := item*
-//! item    := `use` ... | (`var` | `val`) ident (`:` type)? `=` expr `;` | `fun` ident type-params? `(` params? `)` (`:` type)? block | `type` ident `=` `object` `{` object-fields? `}` `;`
+//! item    := `use` ... | (`var` | `val`) (ident | destructure) (`:` type)? `=` expr `;` | `fun` ident type-params? `(` params? `)` (`:` type)? block | `type` ident `=` `object` `{` object-fields? `}` `;`
+//! destructure := `#` `(` destructure-binding (`,` destructure-binding)* `)`
+//! destructure-binding := ident (`:` ident)?
 //! type-params := `[` type-param (`,` type-param)* `]`
 //! type-param  := ident (`extends` (`Numeric` | `Comparable`))?
 //! object-fields := object-field (`,` object-field)* `,`?
@@ -12,9 +14,10 @@
 //! param   := ident `:` type
 //! type    := mutable_type | type_atom
 //! mutable_type := `*` type_atom
-//! type_atom := `u64` | `i64` | `f64` | `bool` | `u8` | `String` | `File` | object-name | `Array` `[` type `]` | type-param | `void` (`void` only as return)
+//! type_atom := `u64` | `i64` | `f64` | `bool` | `u8` | `String` | `File` | object-name | `Array` `[` type `]` | tuple-type | type-param | `void` (`void` only as return)
+//! tuple-type := `#` `(` [(ident `:`)? type] (`,` …)* `)` — 2+ elements, uniform named-ness, no `void`
 //! block   := `{` stmt* `}`
-//! stmt    := (`var` | `val`) ident (`:` type)? `=` expr `;` | ident `=` expr `;` | index `=` expr `;` | field `=` expr `;`
+//! stmt    := (`var` | `val`) (ident | destructure) (`:` type)? `=` expr `;` | ident `=` expr `;` | index `=` expr `;` | field `=` expr `;` | tuple-index `=` expr `;`
 //!          | `if` `(` expr `)` branch (`else` branch)?
 //!          | `while` `(` expr `)` branch | `break` `;` | `continue` `;`
 //!          | `return` expr? `;` | expr `;`
@@ -29,8 +32,10 @@
 //! term    := factor ((`+`|`-`) factor)*
 //! factor  := unary ((`*`|`/`) unary)*
 //! unary   := (`-`|`!`) unary | postfix
-//! postfix := primary (`[` expr `]` | `.` ident)*
-//! primary := literal | string | array-literal | object-literal | call | path | `(` expr `)`
+//! postfix := primary (`[` expr `]` | `.` ident | backtick-index)*
+//! backtick-index := `.` `` ` `` int — e.g. ``t.`0`` (unnamed tuples only)
+//! primary := literal | string | array-literal | tuple-literal | object-literal | call | path | `(` expr `)`
+//! tuple-literal := `#` `(` [(ident `=`)? expr] (`,` …)* `)` — `=` mirrors object literals
 //! array-literal := `[` (expr (`,` expr)* `,`?)? `]`
 //! object-literal := ident `{` (ident `=` expr (`,` ident `=` expr)* `,`?)? `}`
 //! call    := path (`::` `[` type (`,` type)* `]`)? `(` args? `)`
@@ -46,6 +51,13 @@
 //! Objects are named reference types: `type Name = object { field: type, };`
 //! creates a heap object, `Name { field = value }` initializes one, and field
 //! assignment mutates the shared object visible through every alias.
+//!
+//! Tuples are fixed-arity heterogeneous values with copy semantics:
+//! `#(u64, String)` is unnamed (backtick indexing, ``t.`0``),
+//! `#(x: u64, y: String)` is named (field access, `u.x`),
+//! `#(1u64, "a")` / `#(x = 1u64)` are literals, `val #(a, b) = t;` /
+//! `val #(x: x2) = u;` destructure, and element writes need a `*` view.
+//! Rebinding a whole tuple copies its container.
 //!
 //! Generic functions declare type parameters after the name
 //! (`fun first[T](a: Array[T]): T { ... }`, optionally bounded as
@@ -121,6 +133,17 @@ pub struct ObjectField {
     pub ty_span: Option<Span>,
 }
 
+/// One destructured binding in `val #(a, b) = t;` / `val #(x: x2) = u;`.
+/// `field` is `None` for a positional (unnamed-tuple) binding and
+/// `Some(field)` for a named-tuple binding (`x` in `x` / `x: x2`).
+#[derive(Debug, Clone)]
+pub struct DestructureBinding {
+    pub field: Option<String>,
+    pub field_span: Option<Span>,
+    pub binding: String,
+    pub binding_span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub enum Item {
     Use {
@@ -141,6 +164,17 @@ pub enum Item {
         /// Optional annotation (`var x: T = ...`). `None` with `ty_span`
         /// `None` means absent (infer); `None` with `Some` means invalid
         /// (already reported; downstream poisons quietly).
+        ty: Option<VlType>,
+        ty_span: Option<Span>,
+        value: Expr,
+        span: Span,
+    },
+    /// Tuple destructuring: `val #(a, b) = t;` / `val #(x: x2) = u;`.
+    /// Each binding becomes a fresh `Local` def (see `vl-semantic`).
+    Destructure {
+        kind: BindingKind,
+        bindings: Vec<DestructureBinding>,
+        bindings_span: Span,
         ty: Option<VlType>,
         ty_span: Option<Span>,
         value: Expr,
@@ -197,6 +231,25 @@ pub enum Stmt {
         value: Box<Expr>,
         span: Span,
     },
+    /// Unnamed tuple element write: ``t.`0 = v;``. Named field writes
+    /// (`t.x = v;`) reuse [`Stmt::FieldAssign`] (resolved by type).
+    TupleAssign {
+        base: Box<Expr>,
+        index: usize,
+        index_span: Span,
+        value: Box<Expr>,
+        span: Span,
+    },
+    /// Tuple destructuring statement (see [`Item::Destructure`]).
+    Destructure {
+        kind: BindingKind,
+        bindings: Vec<DestructureBinding>,
+        bindings_span: Span,
+        ty: Option<VlType>,
+        ty_span: Option<Span>,
+        value: Expr,
+        span: Span,
+    },
     If {
         condition: Expr,
         then_body: Vec<Stmt>,
@@ -247,6 +300,20 @@ pub enum Expr {
     Field {
         base: Box<Expr>,
         name: String,
+        span: Span,
+    },
+    /// Tuple literal: `#(1u64, "a")` / `#(x = 1u64, y = "a")`.
+    /// Each element is `(name, name_span, value)` with `None` for unnamed.
+    TupleLiteral {
+        elems: Vec<(Option<String>, Option<Span>, Expr)>,
+        span: Span,
+    },
+    /// Unnamed tuple element read: ``t.`0``. Named reads (`u.x`) reuse
+    /// [`Expr::Field`] (resolved by type).
+    TupleIndex {
+        base: Box<Expr>,
+        index: usize,
+        index_span: Span,
         span: Span,
     },
     Var {
@@ -314,6 +381,8 @@ impl Expr {
             Expr::String(_, s) => *s,
             Expr::ArrayLiteral { span, .. } => *span,
             Expr::ObjectLiteral { span, .. } => *span,
+            Expr::TupleLiteral { span, .. } => *span,
+            Expr::TupleIndex { span, .. } => *span,
             Expr::Index { span, .. } => *span,
             Expr::Field { span, .. } => *span,
             Expr::Var { span, .. } => *span,
@@ -573,6 +642,9 @@ impl<'a> Parser<'a> {
 
     fn parse_binding_item(&mut self, kind: BindingKind) -> Option<Item> {
         let binding_tok = self.bump(); // `var` or `val`
+        if matches!(self.peek().kind, TokenKind::Hash) {
+            return self.parse_destructure_item(kind, binding_tok.span);
+        }
         let (name, name_span) = self.parse_ident()?;
         let (ty, ty_span) = self.parse_binding_ann(&[]);
         // A failed annotation whose follow is not `=` already reported once;
@@ -662,7 +734,8 @@ impl<'a> Parser<'a> {
         }
         // Missing inner type (`*;`, `*,`, `*)`, ...): one error, recover at
         // the declaration boundary without consuming the boundary token.
-        if !matches!(self.peek().kind, TokenKind::Ident(_)) {
+        // Tuples (`*#(...)`) start with `#`, not an identifier.
+        if !matches!(self.peek().kind, TokenKind::Ident(_) | TokenKind::Hash) {
             let t = self.peek().clone();
             let span = Span::new(star.span.start, star.span.end.max(t.span.start));
             self.diags.push(
@@ -782,6 +855,9 @@ impl<'a> Parser<'a> {
     /// Parse one `type_atom` (no leading `*`): primitives, `String`/`File`,
     /// object names, `Array[type]`, type parameters, `void`.
     fn parse_type_atom(&mut self, allowed: &[String], strict: bool) -> Option<(VlType, Span)> {
+        if matches!(self.peek().kind, TokenKind::Hash) {
+            return self.parse_tuple_type(allowed, strict);
+        }
         let t = self.peek().clone();
         match t.kind {
             TokenKind::Ident(name) => {
@@ -918,6 +994,382 @@ impl<'a> Parser<'a> {
             VlType::Array(Box::new(elem)),
             Span::new(head.span.start, close.span.end),
         ))
+    }
+
+    /// Skip to the closing `)` of a broken `#(...)` shape (depth-aware
+    /// over nested `(`/`)` and `[`/`]`), consuming it when present. Stops
+    /// before declaration boundaries (`;`, `}`, EOF) so outer recovery keeps
+    /// them. Used after an inner element already reported once, so the shape
+    /// yields exactly one diagnostic.
+    fn skip_to_tuple_close(&mut self) {
+        let mut depth = 0usize;
+        while !self.at_eof() {
+            match &self.peek().kind {
+                TokenKind::LParen | TokenKind::LBracket => {
+                    depth += 1;
+                    self.bump();
+                }
+                TokenKind::RParen | TokenKind::RBracket => {
+                    if depth == 0 {
+                        // Only `)` closes the tuple; a stray `]` is not ours.
+                        if matches!(self.peek().kind, TokenKind::RParen) {
+                            self.bump();
+                        }
+                        return;
+                    }
+                    depth -= 1;
+                    self.bump();
+                }
+                TokenKind::Semi | TokenKind::RBrace => return,
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+    }
+
+    /// Parse a tuple type (`#(u64, String)` / `#(x: u64, y: String)`).
+    /// Rejects empty `#()`, single `#(T)` (parenthesize instead), `void`
+    /// elements, mixed named/unnamed, and duplicate names — one error each,
+    /// poisoned to `None` with recovery at `,`/`)`.
+    fn parse_tuple_type(&mut self, allowed: &[String], strict: bool) -> Option<(VlType, Span)> {
+        use vl_common::TupleField;
+        let hash = self.bump(); // `#`
+        self.expect(&TokenKind::LParen, "`(` after `#`")?;
+        if matches!(self.peek().kind, TokenKind::RParen) {
+            let close = self.bump();
+            let span = Span::new(hash.span.start, close.span.end);
+            self.diags.push(
+                Diagnostic::error("tuple needs at least two elements")
+                    .with_label(span, "write `#(T, U, ...)` with two or more element types")
+                    .with_code("E104"),
+            );
+            return None;
+        }
+        let mut fields: Vec<TupleField> = Vec::new();
+        let mut name_spans: Vec<Option<Span>> = Vec::new();
+        loop {
+            // Named element lookahead: `ident :` (a `:` that is not `::`).
+            let named = matches!(self.peek().kind, TokenKind::Ident(_))
+                && matches!(
+                    self.toks.get(self.pos + 1).map(|t| &t.kind),
+                    Some(TokenKind::Colon)
+                )
+                && !matches!(
+                    self.toks.get(self.pos + 2).map(|t| &t.kind),
+                    Some(TokenKind::Colon)
+                );
+            // Disambiguate `ident ::` (qualified object type) from `ident :`:
+            // only treat as named when the token after `:` cannot start `::`.
+            let is_qualified = matches!(self.peek().kind, TokenKind::Ident(_))
+                && matches!(
+                    self.toks.get(self.pos + 1).map(|t| &t.kind),
+                    Some(TokenKind::Dot)
+                );
+            let (name, name_span): (Option<String>, Option<Span>) = if named && !is_qualified {
+                let (n, ns) = self.parse_ident()?;
+                self.bump(); // `:`
+                (Some(n), Some(ns))
+            } else {
+                (None, None)
+            };
+            let fallback = self.peek().clone();
+            let (ty, ty_span) = match self.parse_type(allowed, strict) {
+                Some(v) => v,
+                None => {
+                    // Inner type already reported; skip to the closing `)`
+                    // and stop. The inner diagnostic is the one root cause —
+                    // no arity/shape follow-ons for the same broken shape.
+                    self.skip_to_tuple_close();
+                    return None;
+                }
+            };
+            let _ = (fallback, ty_span);
+            if ty.is_void() {
+                self.diags.push(
+                    Diagnostic::error("a tuple element cannot be `void`")
+                        .with_label(ty_span, "`void` is not a value type")
+                        .with_code("E104"),
+                );
+                return None;
+            }
+            fields.push(TupleField {
+                name,
+                ty: Box::new(ty),
+            });
+            name_spans.push(name_span);
+            match &self.peek().kind {
+                TokenKind::Comma => {
+                    self.bump();
+                    if matches!(self.peek().kind, TokenKind::RParen) {
+                        break;
+                    }
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        let close = self.expect(&TokenKind::RParen, "`)` after tuple elements")?;
+        let span = Span::new(hash.span.start, close.span.end);
+        if fields.len() < 2 {
+            self.diags.push(
+                Diagnostic::error("tuple needs at least two elements")
+                    .with_label(
+                        span,
+                        "single-element `#(T)` is not a tuple; parenthesize instead",
+                    )
+                    .with_code("E104"),
+            );
+            return None;
+        }
+        let named_count = fields.iter().filter(|f| f.name.is_some()).count();
+        if named_count > 0 && named_count != fields.len() {
+            self.diags.push(
+                Diagnostic::error("cannot mix named and unnamed tuple elements")
+                    .with_label(span, "write all `#(T, U)` or all `#(x: T, y: U)`")
+                    .with_code("E104"),
+            );
+            return None;
+        }
+        // Duplicate named elements: one E200, poison the whole type.
+        {
+            let mut seen = std::collections::HashSet::new();
+            for (f, ns) in fields.iter().zip(name_spans.iter()) {
+                if let Some(name) = &f.name {
+                    if !seen.insert(name.clone()) {
+                        self.diags.push(
+                            Diagnostic::error(format!("duplicate tuple field `{name}`"))
+                                .with_label(ns.unwrap_or(span), "redefined here")
+                                .with_code("E200"),
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+        Some((VlType::Tuple(fields), span))
+    }
+
+    /// Parse a tuple literal (`#(1u64, "a")` / `#(x = 1u64)`).
+    /// `=` mirrors object literals (not `:`). Rejects empty/single/mixed
+    /// shapes with one E103 each.
+    fn parse_tuple_literal(&mut self) -> Option<Expr> {
+        let hash = self.bump(); // `#`
+        self.expect(&TokenKind::LParen, "`(` after `#`")?;
+        if matches!(self.peek().kind, TokenKind::RParen) {
+            let close = self.bump();
+            let span = Span::new(hash.span.start, close.span.end);
+            self.diags.push(
+                Diagnostic::error("tuple literal needs at least two elements")
+                    .with_label(span, "write `#(a, b, ...)` with two or more values")
+                    .with_code("E103"),
+            );
+            return None;
+        }
+        let mut elems: Vec<(Option<String>, Option<Span>, Expr)> = Vec::new();
+        loop {
+            // Named element lookahead: `ident =` (not `==`).
+            let named = matches!(self.peek().kind, TokenKind::Ident(_))
+                && matches!(
+                    self.toks.get(self.pos + 1).map(|t| &t.kind),
+                    Some(TokenKind::Eq)
+                )
+                && !matches!(
+                    self.toks.get(self.pos + 2).map(|t| &t.kind),
+                    Some(TokenKind::Eq)
+                );
+            let (name, name_span): (Option<String>, Option<Span>) = if named {
+                let (n, ns) = self.parse_ident()?;
+                self.bump(); // `=`
+                (Some(n), Some(ns))
+            } else {
+                (None, None)
+            };
+            let value = match self.parse_expr() {
+                Some(v) => v,
+                None => {
+                    // Inner expression already reported; skip to the closing
+                    // `)` and stop so the same broken shape yields one error.
+                    self.skip_to_tuple_close();
+                    return None;
+                }
+            };
+            elems.push((name, name_span, value));
+            match &self.peek().kind {
+                TokenKind::Comma => {
+                    self.bump();
+                    if matches!(self.peek().kind, TokenKind::RParen) {
+                        break;
+                    }
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        let close = self.expect(&TokenKind::RParen, "`)` after tuple elements")?;
+        let span = Span::new(hash.span.start, close.span.end);
+        if elems.len() < 2 {
+            self.diags.push(
+                Diagnostic::error("tuple literal needs at least two elements")
+                    .with_label(
+                        span,
+                        "single-element `#(x)` is not a tuple; parenthesize instead",
+                    )
+                    .with_code("E103"),
+            );
+            return None;
+        }
+        let named_count = elems.iter().filter(|(n, _, _)| n.is_some()).count();
+        if named_count > 0 && named_count != elems.len() {
+            self.diags.push(
+                Diagnostic::error("cannot mix named and unnamed tuple elements")
+                    .with_label(span, "write all `#(a, b)` or all `#(x = a, y = b)`")
+                    .with_code("E103"),
+            );
+            return None;
+        }
+        {
+            let mut seen = std::collections::HashSet::new();
+            for (name, ns, _) in &elems {
+                if let Some(name) = name {
+                    if !seen.insert(name.clone()) {
+                        self.diags.push(
+                            Diagnostic::error(format!("duplicate tuple field `{name}`"))
+                                .with_label(ns.unwrap_or(span), "redefined here")
+                                .with_code("E103"),
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(Expr::TupleLiteral { elems, span })
+    }
+
+    /// Parse `#(pats)` after `var`/`val` plus the optional annotation and
+    /// `= expr ;` tail shared by items and statements.
+    fn parse_destructure_pattern(&mut self) -> Option<(Vec<DestructureBinding>, Span)> {
+        let hash = self.bump(); // `#`
+        self.expect(&TokenKind::LParen, "`(` after `#`")?;
+        if matches!(self.peek().kind, TokenKind::RParen) {
+            let close = self.bump();
+            let span = Span::new(hash.span.start, close.span.end);
+            self.diags.push(
+                Diagnostic::error("destructure pattern needs at least two bindings")
+                    .with_label(span, "write `#(a, b, ...)`")
+                    .with_code("E103"),
+            );
+            return None;
+        }
+        let mut bindings = Vec::new();
+        loop {
+            let (first, first_span) = self.parse_ident()?;
+            let (field, field_span, binding, binding_span) =
+                if matches!(self.peek().kind, TokenKind::Colon)
+                    && !matches!(
+                        self.toks.get(self.pos + 1).map(|t| &t.kind),
+                        Some(TokenKind::Colon)
+                    )
+                {
+                    self.bump(); // `:`
+                    let (second, second_span) = self.parse_ident()?;
+                    (Some(first), Some(first_span), second, second_span)
+                } else {
+                    let span = first_span;
+                    (None, None, first, span)
+                };
+            bindings.push(DestructureBinding {
+                field,
+                field_span,
+                binding,
+                binding_span,
+            });
+            match &self.peek().kind {
+                TokenKind::Comma => {
+                    self.bump();
+                    if matches!(self.peek().kind, TokenKind::RParen) {
+                        break;
+                    }
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        let close = self.expect(&TokenKind::RParen, "`)` after destructure pattern")?;
+        let span = Span::new(hash.span.start, close.span.end);
+        if bindings.len() < 2 {
+            self.diags.push(
+                Diagnostic::error("destructure pattern needs at least two bindings")
+                    .with_label(span, "single-element `#(a)` is not a destructure pattern")
+                    .with_code("E103"),
+            );
+            return None;
+        }
+        {
+            let mut seen = std::collections::HashSet::new();
+            for b in &bindings {
+                if !seen.insert(b.binding.clone()) {
+                    self.diags.push(
+                        Diagnostic::error(format!("duplicate destructure binding `{}`", b.binding))
+                            .with_label(b.binding_span, "redefined here")
+                            .with_code("E200"),
+                    );
+                    return None;
+                }
+            }
+        }
+        Some((bindings, span))
+    }
+
+    fn parse_destructure_item(
+        &mut self,
+        kind: BindingKind,
+        binding_span_start: Span,
+    ) -> Option<Item> {
+        let start = binding_span_start.start;
+        let (bindings, bindings_span) = self.parse_destructure_pattern()?;
+        let (ty, ty_span) = self.parse_binding_ann(&[]);
+        if ty.is_none() && ty_span.is_some() && !matches!(self.peek().kind, TokenKind::Eq) {
+            return None;
+        }
+        self.expect(&TokenKind::Eq, "`=`")?;
+        let value = self.parse_expr()?;
+        let semi = self.expect(&TokenKind::Semi, "`;`")?;
+        Some(Item::Destructure {
+            kind,
+            bindings,
+            bindings_span,
+            ty,
+            ty_span,
+            value,
+            span: Span::new(start, semi.span.end),
+        })
+    }
+
+    fn parse_destructure_stmt(
+        &mut self,
+        kind: BindingKind,
+        binding_span_start: Span,
+        allowed: &[String],
+    ) -> Option<Stmt> {
+        let start = binding_span_start.start;
+        let (bindings, bindings_span) = self.parse_destructure_pattern()?;
+        let (ty, ty_span) = self.parse_binding_ann(allowed);
+        if ty.is_none() && ty_span.is_some() && !matches!(self.peek().kind, TokenKind::Eq) {
+            return None;
+        }
+        self.expect(&TokenKind::Eq, "`=`")?;
+        let value = self.parse_expr()?;
+        let semi = self.expect(&TokenKind::Semi, "`;`")?;
+        Some(Stmt::Destructure {
+            kind,
+            bindings,
+            bindings_span,
+            ty,
+            ty_span,
+            value,
+            span: Span::new(start, semi.span.end),
+        })
     }
 
     fn parse_param(&mut self, allowed: &[String]) -> Option<Param> {
@@ -1181,6 +1633,9 @@ impl<'a> Parser<'a> {
             } else {
                 BindingKind::Val
             };
+            if matches!(self.peek().kind, TokenKind::Hash) {
+                return self.parse_destructure_stmt(kind, binding_tok.span, allowed);
+            }
             let (name, name_span) = self.parse_ident()?;
             let (ty, ty_span) = self.parse_binding_ann(allowed);
             // Failed annotation already reported once; recover at the
@@ -1234,6 +1689,18 @@ impl<'a> Parser<'a> {
                         base,
                         field: name,
                         field_span: span,
+                        value: Box::new(value),
+                        span: Span::new(span.start, semi.span.end),
+                    }),
+                    Expr::TupleIndex {
+                        base,
+                        index,
+                        index_span,
+                        span,
+                    } => Some(Stmt::TupleAssign {
+                        base,
+                        index,
+                        index_span,
                         value: Box::new(value),
                         span: Span::new(span.start, semi.span.end),
                     }),
@@ -1377,10 +1844,13 @@ impl<'a> Parser<'a> {
     fn parse_path(&mut self) -> Option<Vec<String>> {
         let mut path = vec![self.parse_ident()?.0];
         while matches!(self.peek().kind, TokenKind::Dot) {
-            if matches!(
+            // `use a.{b}` keeps the trailing dot; ``t.`0`` is a tuple index,
+            // not a path segment — leave both for their owners.
+            let next_is_ident = matches!(
                 self.toks.get(self.pos + 1).map(|t| &t.kind),
-                Some(TokenKind::LBrace)
-            ) {
+                Some(TokenKind::Ident(_))
+            );
+            if !next_is_ident {
                 break;
             }
             self.bump();
@@ -1590,6 +2060,45 @@ impl<'a> Parser<'a> {
                 };
                 indexed = true;
             } else if matches!(self.peek().kind, TokenKind::Dot) {
+                // Unnamed tuple index (``.`0``) takes precedence over a field.
+                if matches!(
+                    self.toks.get(self.pos + 1).map(|t| &t.kind),
+                    Some(TokenKind::Backtick)
+                ) {
+                    self.bump(); // `.`
+                    self.bump(); // backtick
+                    let idx_tok = self.peek().clone();
+                    let index: usize = match &idx_tok.kind {
+                        TokenKind::Int(v) if *v >= 0 => *v as usize,
+                        TokenKind::U64(v) => *v as usize,
+                        TokenKind::I64(v) if *v >= 0 => *v as usize,
+                        TokenKind::U8(v) => *v as usize,
+                        _ => {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "expected a tuple index, found {}",
+                                    describe(&idx_tok.kind)
+                                ))
+                                .with_label(
+                                    idx_tok.span,
+                                    "write ``.`0``, ``.`1``, ... (backtick + bare integer)",
+                                )
+                                .with_code("E103"),
+                            );
+                            return None;
+                        }
+                    };
+                    self.bump();
+                    let start = base.span().start;
+                    let span = Span::new(start, idx_tok.span.end);
+                    base = Expr::TupleIndex {
+                        base: Box::new(base),
+                        index,
+                        index_span: idx_tok.span,
+                        span,
+                    };
+                    continue;
+                }
                 self.bump();
                 let (name, name_span) = self.parse_ident()?;
                 let start = base.span().start;
@@ -1648,6 +2157,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary(&mut self) -> Option<Expr> {
+        if matches!(self.peek().kind, TokenKind::Hash) {
+            return self.parse_tuple_literal();
+        }
         let t = self.peek().clone();
         match t.kind {
             TokenKind::Int(v) => {
@@ -1870,6 +2382,8 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::Comma => "`,`".into(),
         TokenKind::Dot => "`.`".into(),
         TokenKind::Colon => "`:`".into(),
+        TokenKind::Hash => "`#`".into(),
+        TokenKind::Backtick => "`` ` ``".into(),
         TokenKind::ColonColon => "`::`".into(),
         TokenKind::Invalid => "invalid token".into(),
         TokenKind::Eof => "end of file".into(),
@@ -2204,6 +2718,86 @@ mod tests {
                 assert_eq!(*ret, Some(VlType::Array(Box::new(VlType::String))));
             }
             other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_tuple_types_nested_and_mutable() {
+        let (prog, diags) = parse_src(
+            "type C = object { value: u64, }; fun f(a: #(u64, String), b: #(x: u64, y: String), c: Array[#(u64, bool)], d: *#(u64, u64), e: #(u64, #(bool, String))): #(u64, String) { return a; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[1] {
+            Item::Function { params, ret, .. } => {
+                assert!(matches!(params[0].ty, Some(VlType::Tuple(_))));
+                assert!(matches!(params[3].ty, Some(VlType::Mutable(_))));
+                assert!(matches!(ret, Some(VlType::Tuple(_))));
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_tuple_literal_and_backtick_access() {
+        let (prog, diags) = parse_src(
+            "fun main() { val t = #(1u64, \"a\"); val a = t.`0; val u = #(x = 1u64, y = 2u64); val x = u.x; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { body, .. } => {
+                assert!(
+                    matches!(&body[0], Stmt::Let { value: Expr::TupleLiteral { elems, .. }, .. } if elems.len() == 2)
+                );
+                assert!(matches!(
+                    &body[1],
+                    Stmt::Let {
+                        value: Expr::TupleIndex { index: 0, .. },
+                        ..
+                    }
+                ));
+                assert!(
+                    matches!(&body[3], Stmt::Let { value: Expr::Field { name, .. }, .. } if name == "x")
+                );
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_destructure_and_tuple_assign() {
+        let (prog, diags) = parse_src(
+            "fun main() { val #(a, b) = t; val #(x: x2, y: y2) = u; m.`0 = 1u64; n.x = 2u64; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { body, .. } => {
+                assert!(
+                    matches!(&body[0], Stmt::Destructure { bindings, .. } if bindings.len() == 2)
+                );
+                assert!(
+                    matches!(&body[1], Stmt::Destructure { bindings, .. } if bindings[0].field.as_deref() == Some("x"))
+                );
+                assert!(matches!(&body[2], Stmt::TupleAssign { index: 0, .. }));
+                assert!(matches!(&body[3], Stmt::FieldAssign { field, .. } if field == "x"));
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_shape_errors_are_single_diagnostics() {
+        // Each malformed shape reports exactly once (the empty type and the
+        // empty literal are two independent shapes, hence two errors).
+        for (src, want) in [
+            ("val t: #() = #();", 2),
+            ("val t: #(u64) = #(1u64);", 2),
+            ("val t: #(u64, String) = #(x = 1u64, \"a\");", 1),
+            ("val t: #(x: u64, x: String) = #(x = 1u64, x = \"a\");", 2),
+            ("fun main() { val #(a) = t; }", 1),
+        ] {
+            let (_prog, diags) = parse_src(src);
+            let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+            assert_eq!(errors.len(), want, "{src}: {diags:?}");
         }
     }
 

@@ -1086,4 +1086,61 @@ fn stdlib_generic_does_not_pull_unused_natives() {
         "{:?}",
         lir.imports
     );
+
+fn tuples_match_golden_lir() {
+    let src = std::fs::read_to_string("examples/tuples.vl").unwrap();
+    let lir = frontend(&src).expect("tuples.vl must compile");
+    let golden = std::fs::read_to_string("tests/golden/tuples.lir").unwrap();
+    assert_eq!(lir.dump(), golden);
+}
+
+#[test]
+fn tuples_compile_and_run_on_naravm() {
+    use vl_codegen::Target;
+    let src = std::fs::read_to_string("examples/tuples.vl").unwrap();
+    let lir = frontend(&src).expect("tuples.vl must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("tuple_lit"), "{dump}");
+    assert!(dump.contains("tuple_get"), "{dump}");
+    assert!(dump.contains("tuple_set"), "{dump}");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+    // Tuple containers lower to memory-container ops: `createi` (0x27)
+    // allocates, `getvati` (0x2c) reads, `setvati` (0x2d) writes.
+    for op in [0x27u8, 0x2c, 0x2d] {
+        assert!(bytes.contains(&op), "no {op:#x} in {bytes:?}");
+    }
+}
+
+#[test]
+fn tuple_copies_do_not_alias() {
+    let lir = frontend("fun main() { var a = #(1u64, 2u64); var b = a; b.`0 = 99u64; }")
+        .expect("tuple copy must compile");
+    let dump = lir.dump();
+    // One literal plus a copy (bind) and a positional write.
+    assert!(dump.contains("tuple_lit"), "{dump}");
+    assert!(dump.contains("tuple_set"), "{dump}");
+}
+
+#[test]
+fn err_tuple_examples_fail() {
+    for (file, code) in [
+        ("examples/err_tuple_arity.vl", "E309"),
+        ("examples/err_tuple_index.vl", "E302"),
+        ("examples/err_tuple_readonly.vl", "E310"),
+    ] {
+        let src = std::fs::read_to_string(file).unwrap();
+        let err = frontend(&src).expect_err(&format!("{file} must fail"));
+        assert_eq!(
+            err.iter().filter(|d| d.is_error()).count(),
+            1,
+            "{file}: {err:?}"
+        );
+        assert!(
+            err.iter().any(|d| d.code.as_deref() == Some(code)),
+            "{file}: {err:?}"
+        );
+}
 }

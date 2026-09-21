@@ -18,6 +18,15 @@ use std::str::FromStr;
 /// `Mutable(inner)` is a mutable view of a GC-managed reference (`*Foo`,
 /// `*Array[T]`). It is a capability qualifier, not a machine pointer: passing
 /// or assigning either spelling copies the GC reference.
+/// One tuple element: `T` (unnamed, `name` is `None`) or `name: T`
+/// (named, `name` is `Some`). A tuple is uniformly named or unnamed;
+/// mixing is a parse error.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TupleField {
+    pub name: Option<String>,
+    pub ty: Box<VlType>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum VlType {
     U64,
@@ -30,6 +39,10 @@ pub enum VlType {
     /// A user-defined nominal object type. Objects have reference semantics.
     Object(String),
     Array(Box<VlType>),
+    /// Fixed-arity heterogeneous tuple (`#(u64, String)` / `#(x: u64)`).
+    /// Value semantics (copy on bind/assign); heap container on the target.
+    /// `*` over a tuple is a mutable view granting element-wise mutation.
+    Tuple(Vec<TupleField>),
     Param(String),
     Void,
     /// Mutable view (`*T`) of a GC-managed reference type.
@@ -48,6 +61,19 @@ impl fmt::Display for VlType {
             VlType::File => write!(f, "File"),
             VlType::Object(name) => write!(f, "{name}"),
             VlType::Array(elem) => write!(f, "Array[{elem}]"),
+            VlType::Tuple(fields) => {
+                write!(f, "#(")?;
+                for (i, field) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    match &field.name {
+                        Some(name) => write!(f, "{name}: {}", field.ty)?,
+                        None => write!(f, "{}", field.ty)?,
+                    }
+                }
+                write!(f, ")")
+            }
             VlType::Param(name) => write!(f, "{name}"),
             VlType::Void => write!(f, "void"),
             VlType::Mutable(inner) => write!(f, "*{inner}"),
@@ -97,12 +123,13 @@ impl VlType {
     /// `void` is not a value: it cannot be a parameter, a `var`/`val` binding, a
     /// call argument, or an operand. It may only appear as a function return
     /// (value discarded) or as a bare expression statement.
-    /// Recurses through `Mutable`/`Array` so `*void` still counts as void.
+    /// Recurses through `Mutable`/`Array`/`Tuple` so `*void` still counts as void.
     pub fn is_void(&self) -> bool {
         match self {
             VlType::Void => true,
             VlType::Mutable(inner) => inner.is_void(),
             VlType::Array(elem) => elem.is_void(),
+            VlType::Tuple(fields) => fields.iter().any(|f| f.ty.is_void()),
             _ => false,
         }
     }
@@ -117,14 +144,26 @@ impl VlType {
         }
     }
 
-    /// GC-managed reference types: `String`, `File`, user objects, and
-    /// `Array[T]`. A mutable view counts as a reference when its inner type
+    /// Tuple element types in order (erased names); `None` for non-tuples.
+    /// Looks through an outer `*` so `*#(...)` still yields its elements.
+    pub fn tuple_elems(&self) -> Option<Vec<VlType>> {
+        match self {
+            VlType::Tuple(fields) => Some(fields.iter().map(|f| (*f.ty).clone()).collect()),
+            VlType::Mutable(inner) => inner.tuple_elems(),
+            _ => None,
+        }
+    }
+
+    /// GC-managed reference types: `String`, `File`, user objects,
+    /// `Array[T]`, and tuples (heap containers; value semantics via copy).
+    /// A mutable view counts as a reference when its inner type
     /// is a reference.
     pub fn is_reference_type(&self) -> bool {
         match self {
             VlType::String | VlType::File => true,
             VlType::Object(_) => true,
             VlType::Array(_) => true,
+            VlType::Tuple(_) => true,
             VlType::Mutable(inner) => inner.is_reference_type(),
             _ => false,
         }
@@ -150,6 +189,15 @@ impl VlType {
         match self {
             VlType::Mutable(inner) => inner.erase_capability(),
             VlType::Array(elem) => VlType::Array(Box::new(elem.erase_capability())),
+            VlType::Tuple(fields) => VlType::Tuple(
+                fields
+                    .iter()
+                    .map(|f| TupleField {
+                        name: f.name.clone(),
+                        ty: Box::new(f.ty.erase_capability()),
+                    })
+                    .collect(),
+            ),
             _ => self.clone(),
         }
     }
@@ -185,7 +233,7 @@ impl VlType {
                     | VlType::F64
                     | VlType::Bool
                     | VlType::U8 => Some(format!("`*{inner}` is not a reference type")),
-                    VlType::String | VlType::File | VlType::Object(_) | VlType::Array(_) => {
+                    VlType::String | VlType::File | VlType::Object(_) | VlType::Array(_) | VlType::Tuple(_) => {
                         // The payload itself may still be malformed
                         // (e.g. `*Array[*u64]`).
                         inner.mutable_wellformed_error()
@@ -193,6 +241,7 @@ impl VlType {
                 }
             }
             VlType::Array(elem) => elem.mutable_wellformed_error(),
+            VlType::Tuple(fields) => fields.iter().find_map(|f| f.ty.mutable_wellformed_error()),
             _ => None,
         }
     }
@@ -352,6 +401,52 @@ mod tests {
             )))))
             .mutable_wellformed_error()
             .is_some()
+        );
+    }
+
+    #[test]
+    fn tuple_display_and_predicates() {
+        let unnamed = VlType::Tuple(vec![
+            TupleField {
+                name: None,
+                ty: Box::new(VlType::U64),
+            },
+            TupleField {
+                name: None,
+                ty: Box::new(VlType::String),
+            },
+        ]);
+        assert_eq!(unnamed.to_string(), "#(u64, String)");
+        let named = VlType::Tuple(vec![TupleField {
+            name: Some("x".into()),
+            ty: Box::new(VlType::U64),
+        }]);
+        assert_eq!(named.to_string(), "#(x: u64)");
+        // Tuples are heap containers (reference lane) with value copy semantics.
+        assert!(unnamed.is_reference_type());
+        assert!(!unnamed.is_void());
+        assert!(VlType::Tuple(vec![TupleField {
+            name: None,
+            ty: Box::new(VlType::Void)
+        }])
+        .is_void());
+        assert_eq!(
+            unnamed.tuple_elems(),
+            Some(vec![VlType::U64, VlType::String])
+        );
+        assert_eq!(
+            VlType::Mutable(Box::new(unnamed.clone())).tuple_elems(),
+            Some(vec![VlType::U64, VlType::String])
+        );
+        assert_eq!(VlType::U64.tuple_elems(), None);
+        // Capability erasure recurses; `*` over tuples is well-formed.
+        assert_eq!(
+            VlType::Mutable(Box::new(unnamed.clone())).erase_capability(),
+            unnamed
+        );
+        assert_eq!(
+            VlType::Mutable(Box::new(unnamed)).mutable_wellformed_error(),
+            None
         );
     }
 

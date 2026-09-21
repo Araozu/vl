@@ -32,7 +32,7 @@ pub use module::{
 };
 pub use source::{FileId, Source, Sources};
 pub use span::Span;
-pub use ty::{GenericBound, ParseTyError, VlType};
+pub use ty::{GenericBound, ParseTyError, TupleField, VlType};
 
 /// Convenience alias: pipeline stages return values plus diagnostics
 /// instead of failing fast, so one run can surface many errors.

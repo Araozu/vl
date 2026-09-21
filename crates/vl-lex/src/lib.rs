@@ -56,6 +56,10 @@ pub enum TokenKind {
     Comma,
     Dot,
     Colon,
+    /// Tuple introducer (`#(...)`).
+    Hash,
+    /// Unnamed tuple index introducer (``.`0`` = `Dot, Backtick, Int(0)`).
+    Backtick,
     /// Turbofish separator (`::`): `f::[T](args)`, `Array.new::[u64](n)`.
     ColonColon,
     /// A token whose source span already has a lexer diagnostic. Parsers
@@ -223,6 +227,14 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
             }
             '.' => {
                 tokens.push(Token::new(TokenKind::Dot, Span::new(i, i + 1)));
+                i += 1;
+            }
+            '#' => {
+                tokens.push(Token::new(TokenKind::Hash, Span::new(i, i + 1)));
+                i += 1;
+            }
+            '`' => {
+                tokens.push(Token::new(TokenKind::Backtick, Span::new(i, i + 1)));
                 i += 1;
             }
             '0'..='9' => {
@@ -572,6 +584,22 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
         assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::ColonColon)));
         assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Colon)));
+    }
+
+    #[test]
+    fn lexes_tuple_hash_and_backtick_index() {
+        let (toks, diags) = lex("val t = #(1u64, 2u64); t.`0;");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Hash)));
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Backtick)));
+        // `t.`0`` lexes as Dot, Backtick, Int(0).
+        let kinds: Vec<&TokenKind> = toks.iter().map(|t| &t.kind).collect();
+        let dot = kinds
+            .iter()
+            .position(|k| matches!(k, TokenKind::Dot))
+            .expect("dot in tuple index");
+        assert!(matches!(kinds[dot + 1], TokenKind::Backtick));
+        assert!(matches!(kinds[dot + 2], TokenKind::Int(0)));
     }
 
     #[test]

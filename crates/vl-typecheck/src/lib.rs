@@ -43,6 +43,10 @@ pub enum Ty {
     Object(String),
     /// Fixed-length heap array of `T` (reference type, like `String`).
     Array(Box<Ty>),
+    /// Fixed-arity heterogeneous tuple (`#(u64, String)`). Value semantics
+    /// (copy on bind/assign); each element is `(name, type)` with `None`
+    /// for unnamed positions. Uniformly named or unnamed.
+    Tuple(Vec<(Option<String>, Ty)>),
     /// Opaque use of an enclosing generic function's type parameter.
     Param(String),
     Void,
@@ -67,6 +71,19 @@ impl std::fmt::Display for Ty {
             Ty::File => write!(f, "File"),
             Ty::Object(name) => write!(f, "{name}"),
             Ty::Array(elem) => write!(f, "Array[{elem}]"),
+            Ty::Tuple(fields) => {
+                write!(f, "#(")?;
+                for (i, (name, ty)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    match name {
+                        Some(name) => write!(f, "{name}: {ty}")?,
+                        None => write!(f, "{ty}")?,
+                    }
+                }
+                write!(f, ")")
+            }
             Ty::Param(name) => write!(f, "{name}"),
             Ty::Void => write!(f, "void"),
             Ty::Error => write!(f, "<error>"),
@@ -94,6 +111,12 @@ impl Ty {
             VlType::File => Ty::File,
             VlType::Object(name) => Ty::Object(name.clone()),
             VlType::Array(elem) => Ty::Array(Box::new(Self::from_vl_in(elem, env))),
+            VlType::Tuple(fields) => Ty::Tuple(
+                fields
+                    .iter()
+                    .map(|f| (f.name.clone(), Self::from_vl_in(&f.ty, env)))
+                    .collect(),
+            ),
             VlType::Param(name) => env.get(name).cloned().unwrap_or(Ty::Error),
             VlType::Void => Ty::Void,
             VlType::Mutable(inner) => Ty::Mutable(Box::new(Self::from_vl_in(inner, env))),
@@ -108,6 +131,7 @@ impl Ty {
     pub fn is_concrete(&self) -> bool {
         match self {
             Ty::Array(elem) => elem.is_concrete(),
+            Ty::Tuple(fields) => fields.iter().all(|(_, ty)| ty.is_concrete()),
             Ty::Mutable(inner) => inner.is_concrete(),
             Ty::Param(_) | Ty::Error | Ty::Int => false,
             _ => true,
@@ -132,6 +156,16 @@ impl Ty {
         }
     }
 
+    /// Tuple element types in order; `None` for non-tuples.
+    /// Looks through `*` so `*#(...)` still yields its elements.
+    pub fn tuple_elems(&self) -> Option<Vec<(Option<String>, Ty)>> {
+        match self {
+            Ty::Tuple(fields) => Some(fields.clone()),
+            Ty::Mutable(inner) => inner.tuple_elems(),
+            _ => None,
+        }
+    }
+
     /// True for `*T`.
     pub fn is_mutable_view(&self) -> bool {
         matches!(self, Ty::Mutable(_))
@@ -150,6 +184,12 @@ impl Ty {
         match self {
             Ty::Mutable(inner) => inner.erase_capability(),
             Ty::Array(elem) => Ty::Array(Box::new(elem.erase_capability())),
+            Ty::Tuple(fields) => Ty::Tuple(
+                fields
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), ty.erase_capability()))
+                    .collect(),
+            ),
             _ => self.clone(),
         }
     }
@@ -160,11 +200,14 @@ impl Ty {
     }
 
     /// GC-managed reference (including mutable views of one).
+    /// Tuples are heap containers (hence `is_ref` on the target) with
+    /// value copy semantics at the language level.
     pub fn is_reference_type(&self) -> bool {
         match self {
             Ty::String | Ty::File => true,
             Ty::Object(_) => true,
             Ty::Array(_) => true,
+            Ty::Tuple(_) => true,
             Ty::Mutable(inner) => inner.is_reference_type(),
             _ => false,
         }
@@ -172,11 +215,13 @@ impl Ty {
 
     /// `void` through an optional outer `*` (`void` or `*void`).
     /// `*void` is invalid (E106) but still counts as void for recovery.
+    /// A tuple containing `void` also counts as void.
     pub fn is_void(&self) -> bool {
         match self {
             Ty::Void => true,
             Ty::Mutable(inner) => inner.is_void(),
             Ty::Array(elem) => elem.is_void(),
+            Ty::Tuple(fields) => fields.iter().any(|(_, ty)| ty.is_void()),
             _ => false,
         }
     }
@@ -188,6 +233,12 @@ impl Ty {
 pub fn subst_ty(ty: &Ty, env: &HashMap<String, Ty>) -> Ty {
     match ty {
         Ty::Array(elem) => Ty::Array(Box::new(subst_ty(elem, env))),
+        Ty::Tuple(fields) => Ty::Tuple(
+            fields
+                .iter()
+                .map(|(name, ty)| (name.clone(), subst_ty(ty, env)))
+                .collect(),
+        ),
         Ty::Mutable(inner) => Ty::Mutable(Box::new(subst_ty(inner, env))),
         Ty::Param(name) => env.get(name).cloned().unwrap_or(Ty::Param(name.clone())),
         _ => ty.clone(),
@@ -232,6 +283,16 @@ fn mangle_ty(ty: &Ty) -> String {
         Ty::File => "File".into(),
         Ty::Object(name) => format!("Object_{}", sanitize_object_name(name)),
         Ty::Array(elem) => format!("Array_{}", mangle_ty(elem)),
+        Ty::Tuple(fields) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|(name, ty)| match name {
+                    Some(name) => format!("{name}_{}", mangle_ty(ty)),
+                    None => mangle_ty(ty),
+                })
+                .collect();
+            format!("Tuple_{}", parts.join("_"))
+        }
         Ty::Mutable(inner) => format!("Mut_{}", mangle_ty(inner)),
         Ty::Param(name) => sanitize_object_name(name),
         Ty::Void => "void".into(),
@@ -515,6 +576,12 @@ fn template_expr_ids(e: &HirExpr, out: &mut HashSet<u32>) {
             template_expr_ids(base, out);
             template_expr_ids(index, out);
         }
+        HirExpr::TupleLiteral { elems, .. } => {
+            for (_, value) in elems {
+                template_expr_ids(value, out);
+            }
+        }
+        HirExpr::TupleIndex { base, .. } => template_expr_ids(base, out),
         HirExpr::Field { base, .. } => template_expr_ids(base, out),
         HirExpr::Call { args, .. } => {
             for a in args {
@@ -554,6 +621,17 @@ fn template_stmt_ids(s: &HirStmt, out: &mut HashSet<u32>) {
         } => {
             out.insert(id.0);
             template_expr_ids(base, out);
+            template_expr_ids(value, out);
+        }
+        HirStmt::TupleAssign {
+            id, base, value, ..
+        } => {
+            out.insert(id.0);
+            template_expr_ids(base, out);
+            template_expr_ids(value, out);
+        }
+        HirStmt::Destructure { id, value, .. } => {
+            out.insert(id.0);
             template_expr_ids(value, out);
         }
         HirStmt::Expr(e) => template_expr_ids(e, out),
@@ -647,6 +725,9 @@ fn ty_has_unknown_qualified(ty: &Ty, objects: &HashMap<String, ObjectSigTy>) -> 
     match ty {
         Ty::Object(name) => name.contains('.') && !objects.contains_key(name),
         Ty::Array(elem) => ty_has_unknown_qualified(elem, objects),
+        Ty::Tuple(fields) => fields
+            .iter()
+            .any(|(_, ty)| ty_has_unknown_qualified(ty, objects)),
         Ty::Mutable(inner) => ty_has_unknown_qualified(inner, objects),
         _ => false,
     }
@@ -677,6 +758,11 @@ fn validate_qualified_types(
                 );
             }
             VlType::Array(elem) => check_ty(elem, span, objects, diags),
+            VlType::Tuple(fields) => {
+                for f in fields {
+                    check_ty(&f.ty, span, objects, diags);
+                }
+            }
             VlType::Mutable(inner) => check_ty(inner, span, objects, diags),
             _ => {}
         }
@@ -718,6 +804,12 @@ fn validate_qualified_types(
                 check_expr(base, objects, diags);
                 check_expr(index, objects, diags);
             }
+            HirExpr::TupleLiteral { elems, .. } => {
+                for (_, value) in elems {
+                    check_expr(value, objects, diags);
+                }
+            }
+            HirExpr::TupleIndex { base, .. } => check_expr(base, objects, diags),
             HirExpr::Field { base, .. } => check_expr(base, objects, diags),
             HirExpr::Binary { lhs, rhs, .. } => {
                 check_expr(lhs, objects, diags);
@@ -758,6 +850,18 @@ fn validate_qualified_types(
                     check_expr(base, objects, diags);
                     check_expr(value, objects, diags);
                 }
+                HirStmt::TupleAssign { base, value, .. } => {
+                    check_expr(base, objects, diags);
+                    check_expr(value, objects, diags);
+                }
+                HirStmt::Destructure {
+                    ty, ty_span, value, ..
+                } => {
+                    if let (Some(ty), Some(span)) = (ty, ty_span) {
+                        check_ty(ty, *span, objects, diags);
+                    }
+                    check_expr(value, objects, diags);
+                }
                 HirStmt::If {
                     condition,
                     then_body,
@@ -796,6 +900,14 @@ fn validate_qualified_types(
                 }
             }
             HirItem::Let {
+                ty, ty_span, value, ..
+            } => {
+                if let (Some(ty), Some(span)) = (ty, ty_span) {
+                    check_ty(ty, *span, objects, &mut diags);
+                }
+                check_expr(value, objects, &mut diags);
+            }
+            HirItem::Destructure {
                 ty, ty_span, value, ..
             } => {
                 if let (Some(ty), Some(span)) = (ty, ty_span) {
@@ -1087,6 +1199,30 @@ impl Checker {
                     // Name resolution already reported this; stay quiet.
                 }
             }
+            HirItem::Destructure {
+                id,
+                kind,
+                bindings,
+                ty,
+                ty_span,
+                value,
+                span,
+            } => {
+                let base = self.check_destructure(*kind, bindings, ty, ty_span, value, *span);
+                self.record(*id, base.clone());
+                for b in bindings {
+                    if let Some(def) = &b.def {
+                        self.bindings
+                            .insert(def.0, self.binding_element_ty(&base, b));
+                        if *kind == BindingKind::Val {
+                            self.fixed_defs.insert(def.0);
+                        }
+                        self.typed
+                            .globals
+                            .push(format!("{kind:?}#{}#{}", id.0, b.index));
+                    }
+                }
+            }
             HirItem::Fn {
                 id,
                 def,
@@ -1194,6 +1330,231 @@ impl Checker {
                 let _ = def;
             }
         }
+    }
+
+    /// Element type for one destructure binding given the checked base
+    /// tuple type (or `Error` when the base was poisoned).
+    fn binding_element_ty(&self, base: &Ty, b: &vl_hir::HirDestructureBinding) -> Ty {
+        if ty_has_error(base) {
+            return Ty::Error;
+        }
+        let Some(elems) = base.tuple_elems() else {
+            return Ty::Error;
+        };
+        if elems.iter().all(|(n, _)| n.is_none()) {
+            return elems
+                .get(b.index)
+                .map(|(_, t)| project_capability(base, t))
+                .unwrap_or(Ty::Error);
+        }
+        // Named: explicit `field:` wins, else the binding name is the field.
+        let want = b.field.as_deref().unwrap_or(b.binding.as_str());
+        if let Some((_, t)) = elems.iter().find(|(n, _)| n.as_deref() == Some(want)) {
+            return project_capability(base, t);
+        }
+        Ty::Error
+    }
+
+    /// Check `val #(pats) = value;` (items and statements share this).
+    /// Returns the base tuple type (or `Error`). On success each binding is
+    /// entered in `bindings`/`fixed_defs`; on any shape error all bindings
+    /// become `Error` with exactly one diagnostic.
+    fn check_destructure(
+        &mut self,
+        kind: BindingKind,
+        bindings: &[vl_hir::HirDestructureBinding],
+        ty: &Option<VlType>,
+        ty_span: &Option<Span>,
+        value: &HirExpr,
+        span: Span,
+    ) -> Ty {
+        // Poison every binding quietly (the one root cause is reported by the caller).
+        let poison = |checker: &mut Self| {
+            for b in bindings {
+                if let Some(def) = &b.def {
+                    checker.bindings.insert(def.0, Ty::Error);
+                    if kind == BindingKind::Val {
+                        checker.fixed_defs.insert(def.0);
+                    }
+                }
+            }
+        };
+        // Failed annotation (parser-reported): infer inner errors only.
+        if ty.is_none() && ty_span.is_some() {
+            let _ = self.infer_expr(value);
+            poison(self);
+            return Ty::Error;
+        }
+        let ann = ty.as_ref().map(|v| Ty::from_vl_in(v, &self.type_env));
+        if let Some(a) = &ann {
+            if ty_has_error(a) {
+                let _ = self.infer_expr(value);
+                poison(self);
+                return Ty::Error;
+            }
+            if ty_has_unknown_qualified(a, &self.typed.objects) {
+                let _ = self.infer_expr(value);
+                poison(self);
+                return Ty::Error;
+            }
+            let asp = ty_span.unwrap_or(value.span());
+            if !validate_capability(a, asp, &mut self.diags) {
+                let _ = self.infer_expr(value);
+                poison(self);
+                return Ty::Error;
+            }
+            if a.is_void() {
+                self.diags.push(
+                    Diagnostic::error("a binding cannot be `void`")
+                        .with_label(asp, "`void` is not a value")
+                        .with_code("E104"),
+                );
+                let _ = self.infer_expr(value);
+                poison(self);
+                return Ty::Error;
+            }
+        }
+        let base = match &ann {
+            Some(a) => self.infer_expr_expected(value, a),
+            None => self.infer_expr(value),
+        };
+        if ty_has_error(&base) {
+            poison(self);
+            return Ty::Error;
+        }
+        if base == Ty::Void || base.is_void() {
+            self.diags.push(
+                Diagnostic::error("cannot destructure a `void` value")
+                    .with_label(value.span(), "`void` is not a value")
+                    .with_code("E308"),
+            );
+            poison(self);
+            return Ty::Error;
+        }
+        let Some(elems) = base.tuple_elems() else {
+            self.diags.push(
+                Diagnostic::error(format!("cannot destructure `{base}`"))
+                    .with_label(value.span(), "only tuples support destructuring")
+                    .with_code("E309"),
+            );
+            poison(self);
+            return Ty::Error;
+        };
+        if elems.len() != bindings.len() {
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "tuple `{base}` has {} element(s), pattern binds {}",
+                    elems.len(),
+                    bindings.len()
+                ))
+                .with_label(span, "arity mismatch in destructure pattern")
+                .with_code("E309"),
+            );
+            // Still infer element types for inner uses? Poison to stay quiet.
+            poison(self);
+            return Ty::Error;
+        }
+        if let Some(a) = &ann {
+            if !can_coerce(&base, a) {
+                self.diags.push(
+                    Diagnostic::error(format!("cannot destructure `{base}` as `{a}`"))
+                        .with_label(value.span(), format!("expected `{a}` here"))
+                        .with_code("E309"),
+                );
+                poison(self);
+                return Ty::Error;
+            }
+        }
+        let unnamed = elems.iter().all(|(n, _)| n.is_none());
+        // Validate pattern shape against the tuple kind.
+        for (i, b) in bindings.iter().enumerate() {
+            if unnamed {
+                if b.field.is_some() {
+                    self.diags.push(
+                        Diagnostic::error(format!("tuple `{base}` is unnamed"))
+                            .with_label(
+                                span,
+                                "remove `field:` from the pattern; write `#(a, b, ...)`",
+                            )
+                            .with_code("E309"),
+                    );
+                    poison(self);
+                    return Ty::Error;
+                }
+                let _ = i;
+            } else {
+                // Named tuple: explicit `field:` or shorthand binding name.
+                // Shorthand validation needs the source name, which lives in
+                // the resolver def; check existence positionally here and let
+                // LIR resolve the exact slot by field-or-index.
+                if let Some(field) = &b.field {
+                    if !elems
+                        .iter()
+                        .any(|(n, _)| n.as_deref() == Some(field.as_str()))
+                    {
+                        self.diags.push(
+                            Diagnostic::error(format!("tuple `{base}` has no field `{field}`"))
+                                .with_label(span, "unknown tuple field in pattern")
+                                .with_code("E309"),
+                        );
+                        poison(self);
+                        return Ty::Error;
+                    }
+                } else {
+                    // Shorthand: the binding name must be an existing field.
+                    if !elems
+                        .iter()
+                        .any(|(n, _)| n.as_deref() == Some(b.binding.as_str()))
+                    {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "tuple `{base}` has no field `{}`",
+                                b.binding
+                            ))
+                            .with_label(b.binding_span, "unknown tuple field in pattern")
+                            .with_code("E309"),
+                        );
+                        poison(self);
+                        return Ty::Error;
+                    }
+                }
+            }
+        }
+        // Success: enter each binding with its projected element type.
+        // Unnamed tuples bind positionally; named tuples resolve by explicit
+        // `field:` or by the binding name (shorthand) so reordered patterns
+        // like `#(y, x)` still bind the right element types.
+        for b in bindings {
+            let ty = if unnamed {
+                elems
+                    .get(b.index)
+                    .map(|(_, t)| project_capability(&base, t))
+                    .unwrap_or(Ty::Error)
+            } else {
+                let want = b.field.as_deref().unwrap_or(b.binding.as_str());
+                elems
+                    .iter()
+                    .find(|(n, _)| n.as_deref() == Some(want))
+                    .map(|(_, t)| project_capability(&base, t))
+                    .unwrap_or(Ty::Error)
+            };
+            if ty_has_error(&ty) {
+                poison(self);
+                return Ty::Error;
+            }
+            if let Some(def) = &b.def {
+                // Default untyped int elements through the u64 lane.
+                let ty = if ty == Ty::Int { Ty::U64 } else { ty };
+                self.bindings.insert(def.0, ty);
+                if kind == BindingKind::Val {
+                    self.fixed_defs.insert(def.0);
+                }
+            }
+        }
+        // Default any lingering `int` elements is handled per binding above;
+        // the base itself may still hold `Int` for literal bases, which the
+        // binding-type defaulting path already coerced during inference.
+        base
     }
 
     /// Check a binding initializer against its optional annotation. Returns
@@ -1695,6 +2056,77 @@ impl Checker {
                 span,
             } => {
                 let bt = self.infer_expr(base);
+                // Named-tuple field write (`t.x = v;`); unnamed writes use TupleAssign.
+                if let Some(elems) = bt.tuple_elems() {
+                    if ty_has_error(&bt) {
+                        let _ = self.infer_expr(value);
+                        self.record(*id, Ty::Error);
+                        return;
+                    }
+                    if elems.iter().all(|(n, _)| n.is_none()) {
+                        self.diags.push(
+                            Diagnostic::error(format!("tuple `{bt}` is unnamed; assign by index"))
+                                .with_label(*span, "write ``t.`i` = v;`` for unnamed tuples")
+                                .with_code("E302"),
+                        );
+                        let _ = self.infer_expr(value);
+                        self.record(*id, Ty::Error);
+                        return;
+                    }
+                    if !bt.is_mutable_view() {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "cannot assign field `{field}` through read-only view `{bt}`"
+                            ))
+                            .with_label(
+                                base.span(),
+                                format!("this expression has read-only type `{bt}`"),
+                            )
+                            .with_note(format!(
+                                "use a `*{bt}` parameter or binding when this function must mutate it"
+                            ))
+                            .with_code("E310"),
+                        );
+                        let _ = self.infer_expr(value);
+                        self.record(*id, Ty::Error);
+                        return;
+                    }
+                    let Some((_, want)) = elems
+                        .iter()
+                        .find(|(n, _)| n.as_deref() == Some(field.as_str()))
+                    else {
+                        self.diags.push(
+                            Diagnostic::error(format!("tuple `{bt}` has no field `{field}`"))
+                                .with_label(*span, "unknown tuple field")
+                                .with_code("E302"),
+                        );
+                        let _ = self.infer_expr(value);
+                        self.record(*id, Ty::Error);
+                        return;
+                    };
+                    let want = want.clone();
+                    if ty_has_error(&want) {
+                        let _ = self.infer_expr(value);
+                        self.record(*id, Ty::Error);
+                        return;
+                    }
+                    let got = self.infer_expr_expected(value, &want);
+                    if ty_has_error(&got) || !can_coerce(&got, &want) {
+                        if !ty_has_error(&got) {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "tuple field `{field}` expects `{want}`, got `{got}`"
+                                ))
+                                .with_label(value.span(), format!("expected `{want}` here"))
+                                .with_code("E302"),
+                            );
+                        }
+                        self.record(*id, Ty::Error);
+                    } else {
+                        self.record(*id, want);
+                    }
+                    return;
+                }
                 let Some(object_name) = object_base(&bt) else {
                     if !ty_has_error(&bt) {
                         self.diags.push(
@@ -1784,6 +2216,97 @@ impl Checker {
                 } else {
                     self.record(*id, want.clone());
                 }
+            }
+            HirStmt::TupleAssign {
+                id,
+                base,
+                index,
+                value,
+                span,
+            } => {
+                let bt = self.infer_expr(base);
+                if ty_has_error(&bt) {
+                    let _ = self.infer_expr(value);
+                    self.record(*id, Ty::Error);
+                    return;
+                }
+                let Some(elems) = bt.tuple_elems() else {
+                    self.diags.push(
+                        Diagnostic::error(format!("cannot assign tuple element on `{bt}`"))
+                            .with_label(*span, "only tuples support backtick element writes")
+                            .with_code("E302"),
+                    );
+                    let _ = self.infer_expr(value);
+                    self.record(*id, Ty::Error);
+                    return;
+                };
+                if elems.iter().any(|(n, _)| n.is_some()) {
+                    self.diags.push(
+                        Diagnostic::error(format!("tuple `{bt}` is named; assign by field"))
+                            .with_label(*span, "write `t.field = v;` for named tuples")
+                            .with_code("E302"),
+                    );
+                    let _ = self.infer_expr(value);
+                    self.record(*id, Ty::Error);
+                    return;
+                }
+                let Some((_, want)) = elems.get(*index).cloned() else {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "tuple index ``.`{index}`` out of range for `{bt}`"
+                        ))
+                        .with_label(*span, format!("this tuple has {} element(s)", elems.len()))
+                        .with_code("E302"),
+                    );
+                    let _ = self.infer_expr(value);
+                    self.record(*id, Ty::Error);
+                    return;
+                };
+                if !bt.is_mutable_view() {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "cannot assign element through read-only view `{bt}`"
+                        ))
+                        .with_label(
+                            base.span(),
+                            format!("this expression has read-only type `{bt}`"),
+                        )
+                        .with_note(format!(
+                            "use a `*{bt}` binding when this code must mutate it",
+                        ))
+                        .with_code("E310"),
+                    );
+                    let _ = self.infer_expr(value);
+                    self.record(*id, Ty::Error);
+                    return;
+                }
+                let got = self.infer_expr_expected(value, &want);
+                if ty_has_error(&got) || !can_coerce(&got, &want) {
+                    if !ty_has_error(&got) {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "tuple element ``.`{index}`` expects `{want}`, got `{got}`"
+                            ))
+                            .with_label(value.span(), format!("expected `{want}` here"))
+                            .with_code("E302"),
+                        );
+                    }
+                    self.record(*id, Ty::Error);
+                    return;
+                }
+                self.record(*id, want);
+            }
+            HirStmt::Destructure {
+                id,
+                kind,
+                bindings,
+                ty,
+                ty_span,
+                value,
+                span,
+            } => {
+                let base = self.check_destructure(*kind, bindings, ty, ty_span, value, *span);
+                self.record(*id, base);
             }
             HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
             HirStmt::While {
@@ -1950,6 +2473,7 @@ impl Checker {
         match v {
             VlType::Param(_) => true,
             VlType::Array(elem) => Self::vl_has_unbound_param(elem),
+            VlType::Tuple(fields) => fields.iter().any(|f| Self::vl_has_unbound_param(&f.ty)),
             VlType::Mutable(inner) => Self::vl_has_unbound_param(inner),
             _ => false,
         }
@@ -2293,6 +2817,74 @@ impl Checker {
                 }
             }
         }
+        // Contextual tuple elements: `#(T, U)` / `#(x: T)` expected
+        // infers each fresh element with its expected element type, so
+        // `#(1, "a")` against `#(u64, String)` coerces the `int` literal.
+        if let HirExpr::TupleLiteral { id, elems, .. } = expr {
+            let expected_elems_opt: Option<&Vec<(Option<String>, Ty)>> = match expected {
+                Ty::Tuple(fields) => Some(fields),
+                Ty::Mutable(inner) => match &**inner {
+                    Ty::Tuple(fields) => Some(fields),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(expected_elems) = expected_elems_opt {
+                if !ty_has_error(expected)
+                    && expected_elems.len() == elems.len()
+                    && !elems.is_empty()
+                {
+                    let mut ok = true;
+                    let mut elem_tys = Vec::with_capacity(elems.len());
+                    for ((_, value), (_, want)) in elems.iter().zip(expected_elems.iter()) {
+                        if ty_has_error(want) {
+                            ok = false;
+                            break;
+                        }
+                        let t = self.infer_expr_expected(value, want);
+                        if ty_has_error(&t) {
+                            ok = false;
+                            break;
+                        }
+                        elem_tys.push(t);
+                    }
+                    if !ok {
+                        return self.record(*id, Ty::Error);
+                    }
+                    // Field names must match positionally as well as types:
+                    // `#(a = 1u64)` against `#(x: u64, ...)` is a shape
+                    // mismatch, not a silent rename. On conflict fall through
+                    // to general handling (one error at the boundary).
+                    let mut conflict = elems
+                        .iter()
+                        .zip(expected_elems.iter())
+                        .any(|((got_name, _), (want_name, _))| got_name != want_name);
+                    for ((name, _), (got, want)) in elems
+                        .iter()
+                        .zip(elem_tys.iter().zip(expected_elems.iter().map(|(_, t)| t)))
+                    {
+                        let _ = name;
+                        if !can_coerce(got, want) {
+                            conflict = true;
+                            break;
+                        }
+                    }
+                    if !conflict {
+                        if expected.is_mutable_view() {
+                            return self.record(*id, expected.clone());
+                        } else {
+                            let built: Vec<(Option<String>, Ty)> = elems
+                                .iter()
+                                .zip(elem_tys)
+                                .map(|((name, _), ty)| (name.clone(), ty))
+                                .collect();
+                            return self.record(*id, Ty::Tuple(built));
+                        }
+                    }
+                    // Fall through to general handling on conflict (one E309/E302 at the boundary).
+                }
+            }
+        }
         self.coerce_expr_literals(expr, expected);
         let inferred = self.infer_expr(expr);
         // Fresh allocations adopt an expected mutable capability
@@ -2375,6 +2967,31 @@ impl Checker {
                         if matches!(expected, Ty::Object(_)) {
                             self.record(*id, expected.clone());
                         }
+                    }
+                }
+            }
+            HirExpr::TupleLiteral { id, elems, .. } => {
+                let expected_elems_opt: Option<&Vec<(Option<String>, Ty)>> = match expected {
+                    Ty::Tuple(fields) => Some(fields),
+                    Ty::Mutable(inner) => match &**inner {
+                        Ty::Tuple(fields) => Some(fields),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(expected_elems) = expected_elems_opt {
+                    // Only coerce when names agree positionally; a renamed
+                    // shape falls through to general inference so the
+                    // boundary reports one mismatch instead of renaming.
+                    let names_match = elems
+                        .iter()
+                        .zip(expected_elems.iter())
+                        .all(|((got_name, _), (want_name, _))| got_name == want_name);
+                    if names_match && expected_elems.len() == elems.len() {
+                        for ((_, value), (_, want)) in elems.iter().zip(expected_elems.iter()) {
+                            self.coerce_expr_literals(value, want);
+                        }
+                        self.record(*id, expected.clone());
                     }
                 }
             }
@@ -2599,6 +3216,104 @@ impl Checker {
                     self.record(*id, Ty::Object(name.clone()))
                 }
             }
+            HirExpr::TupleLiteral { id, elems, span } => {
+                if elems.len() < 2 {
+                    self.diags.push(
+                        Diagnostic::error("tuple literal needs at least two elements")
+                            .with_label(*span, "write `#(a, b, ...)` with two or more values")
+                            .with_code("E302"),
+                    );
+                    for (_, value) in elems {
+                        self.infer_expr(value);
+                    }
+                    return self.record(*id, Ty::Error);
+                }
+                let named_count = elems.iter().filter(|(n, _)| n.is_some()).count();
+                if named_count > 0 && named_count != elems.len() {
+                    self.diags.push(
+                        Diagnostic::error("cannot mix named and unnamed tuple elements")
+                            .with_label(*span, "write all `#(a, b)` or all `#(x = a, y = b)`")
+                            .with_code("E302"),
+                    );
+                    for (_, value) in elems {
+                        self.infer_expr(value);
+                    }
+                    return self.record(*id, Ty::Error);
+                }
+                let mut out = Vec::with_capacity(elems.len());
+                let mut poisoned = false;
+                let mut seen = HashSet::new();
+                for (name, value) in elems {
+                    if let Some(name) = name {
+                        if !seen.insert(name.clone()) {
+                            self.diags.push(
+                                Diagnostic::error(format!("duplicate tuple field `{name}`"))
+                                    .with_label(value.span(), "field repeated here")
+                                    .with_code("E302"),
+                            );
+                            poisoned = true;
+                        }
+                    }
+                    let t = self.infer_expr(value);
+                    if ty_has_error(&t) {
+                        poisoned = true;
+                    } else if t == Ty::Void || t.is_void() {
+                        self.diags.push(
+                            Diagnostic::error("a tuple element cannot be `void`")
+                                .with_label(value.span(), "`void` is not a value type")
+                                .with_code("E302"),
+                        );
+                        poisoned = true;
+                    }
+                    out.push((name.clone(), t));
+                }
+                if poisoned {
+                    return self.record(*id, Ty::Error);
+                }
+                self.record(*id, Ty::Tuple(out))
+            }
+            HirExpr::TupleIndex {
+                id,
+                base,
+                index,
+                span,
+            } => {
+                let bt = self.infer_expr(base);
+                if ty_has_error(&bt) {
+                    return self.record(*id, Ty::Error);
+                }
+                let Some(elems) = bt.tuple_elems() else {
+                    self.diags.push(
+                        Diagnostic::error(format!("cannot index `{bt}` with ``.`{index}``"))
+                            .with_label(*span, "only tuples support backtick indexing")
+                            .with_code("E302"),
+                    );
+                    return self.record(*id, Ty::Error);
+                };
+                // Named tuples expose fields (`.name`), not positions.
+                if elems.iter().any(|(n, _)| n.is_some()) {
+                    self.diags.push(
+                        Diagnostic::error(format!("tuple `{bt}` is named; use `.field` access"))
+                            .with_label(
+                                *span,
+                                "unnamed ``.`i``` indexing is only for unnamed tuples",
+                            )
+                            .with_code("E302"),
+                    );
+                    return self.record(*id, Ty::Error);
+                }
+                let Some((_, elem)) = elems.get(*index) else {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "tuple index ``.`{index}`` out of range for `{bt}`"
+                        ))
+                        .with_label(*span, format!("this tuple has {} element(s)", elems.len()))
+                        .with_code("E302"),
+                    );
+                    return self.record(*id, Ty::Error);
+                };
+                self.record(*id, project_capability(&bt, elem))
+            }
             HirExpr::Index {
                 id, base, index, ..
             } => {
@@ -2634,6 +3349,34 @@ impl Checker {
                 span,
             } => {
                 let bt = self.infer_expr(base);
+                // Named-tuple field access (`u.x`) resolves positionally.
+                if let Some(elems) = bt.tuple_elems() {
+                    if ty_has_error(&bt) {
+                        return self.record(*id, Ty::Error);
+                    }
+                    if elems.iter().all(|(n, _)| n.is_none()) {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "tuple `{bt}` is unnamed; use backtick indexing"
+                            ))
+                            .with_label(*span, "write ``.`0``, ``.`1``, ... for unnamed tuples")
+                            .with_code("E302"),
+                        );
+                        return self.record(*id, Ty::Error);
+                    }
+                    let Some((_, elem)) = elems
+                        .iter()
+                        .find(|(n, _)| n.as_deref() == Some(name.as_str()))
+                    else {
+                        self.diags.push(
+                            Diagnostic::error(format!("tuple `{bt}` has no field `{name}`"))
+                                .with_label(*span, "unknown tuple field")
+                                .with_code("E302"),
+                        );
+                        return self.record(*id, Ty::Error);
+                    };
+                    return self.record(*id, project_capability(&bt, elem));
+                }
                 let Some(object_name) = object_base(&bt) else {
                     if !ty_has_error(&bt) {
                         self.diags.push(
@@ -3369,17 +4112,19 @@ pub(crate) fn ty_has_error(ty: &Ty) -> bool {
     match ty {
         Ty::Error => true,
         Ty::Array(elem) => ty_has_error(elem),
+        Ty::Tuple(fields) => fields.iter().any(|(_, ty)| ty_has_error(ty)),
         Ty::Mutable(inner) => ty_has_error(inner),
         _ => false,
     }
 }
 
 /// Does a type still hold an unresolved `int` literal (top level or nested
-/// in `Array`)? Such types must be defaulted (`u64` lane) before lowering.
+/// in `Array`/`Tuple`)? Such types must be defaulted (`u64` lane) before lowering.
 fn ty_contains_int(ty: &Ty) -> bool {
     match ty {
         Ty::Int => true,
         Ty::Array(elem) => ty_contains_int(elem),
+        Ty::Tuple(fields) => fields.iter().any(|(_, ty)| ty_contains_int(ty)),
         Ty::Mutable(inner) => ty_contains_int(inner),
         _ => false,
     }
@@ -3447,6 +4192,12 @@ pub(crate) fn default_inferred_ty(ty: Ty) -> Ty {
     match ty {
         Ty::Int => Ty::U64,
         Ty::Array(elem) => Ty::Array(Box::new(default_inferred_ty(*elem))),
+        Ty::Tuple(fields) => Ty::Tuple(
+            fields
+                .into_iter()
+                .map(|(n, t)| (n, default_inferred_ty(t)))
+                .collect(),
+        ),
         Ty::Mutable(inner) => Ty::Mutable(Box::new(default_inferred_ty(*inner))),
         _ => ty,
     }
@@ -3484,6 +4235,32 @@ impl ConstraintSet {
                 true
             }
             (Ty::Array(f), Ty::Array(a)) => self.collect(f, a, name, span, diags),
+            (Ty::Tuple(fs), Ty::Tuple(as_)) => {
+                if fs.len() != as_.len() {
+                    diags.push(
+                        Diagnostic::error(format!("`{name}` expects `{formal}`, got `{actual}`"))
+                            .with_label(span, format!("expected `{formal}` here"))
+                            .with_code("E306"),
+                    );
+                    return false;
+                }
+                for ((nf, tf), (na, ta)) in fs.iter().zip(as_.iter()) {
+                    if nf != na {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "`{name}` expects `{formal}`, got `{actual}`"
+                            ))
+                            .with_label(span, format!("expected `{formal}` here"))
+                            .with_code("E306"),
+                        );
+                        return false;
+                    }
+                    if !self.collect(tf, ta, name, span, diags) {
+                        return false;
+                    }
+                }
+                true
+            }
             (Ty::Mutable(f), Ty::Mutable(a)) => self.collect(f, a, name, span, diags),
             // Read-only array formal accepts a mutable array actual via
             // downgrade for inference (`Array[T]` with `*Array[u64]` infers
@@ -3602,6 +4379,8 @@ pub fn stmt_flow(stmt: &HirStmt) -> Flow {
         | HirStmt::Assign { .. }
         | HirStmt::IndexAssign { .. }
         | HirStmt::FieldAssign { .. }
+        | HirStmt::TupleAssign { .. }
+        | HirStmt::Destructure { .. }
         | HirStmt::Expr(_) => Flow::FallsThrough,
         HirStmt::While { .. } => Flow::FallsThrough,
         HirStmt::If {
@@ -3682,6 +4461,8 @@ fn stmt_span(stmt: &HirStmt) -> Span {
         | HirStmt::Assign { span, .. }
         | HirStmt::IndexAssign { span, .. }
         | HirStmt::FieldAssign { span, .. }
+        | HirStmt::TupleAssign { span, .. }
+        | HirStmt::Destructure { span, .. }
         | HirStmt::If { span, .. }
         | HirStmt::While { span, .. }
         | HirStmt::Break { span }
@@ -3798,6 +4579,16 @@ fn common_type(a: &Ty, b: &Ty) -> Option<Ty> {
         // `Array[*Foo]` vs `Array[Foo]` therefore has no common type.
         (Ty::Array(x), Ty::Array(y)) => invariant_common(x, y).map(|e| Ty::Array(Box::new(e))),
         (Ty::Mutable(x), Ty::Mutable(y)) => common_type(x, y).map(|e| Ty::Mutable(Box::new(e))),
+        (Ty::Tuple(x), Ty::Tuple(y)) if x.len() == y.len() => {
+            let mut out = Vec::with_capacity(x.len());
+            for ((nx, tx), (ny, ty)) in x.iter().zip(y.iter()) {
+                if nx != ny {
+                    return None;
+                }
+                out.push((nx.clone(), common_type(tx, ty)?));
+            }
+            Some(Ty::Tuple(out))
+        }
         _ => None,
     }
 }
@@ -3816,6 +4607,16 @@ fn invariant_common(a: &Ty, b: &Ty) -> Option<Ty> {
     }
     match (a, b) {
         (Ty::Array(x), Ty::Array(y)) => invariant_common(x, y).map(|e| Ty::Array(Box::new(e))),
+        (Ty::Tuple(x), Ty::Tuple(y)) if x.len() == y.len() => {
+            let mut out = Vec::with_capacity(x.len());
+            for ((nx, tx), (ny, ty)) in x.iter().zip(y.iter()) {
+                if nx != ny {
+                    return None;
+                }
+                out.push((nx.clone(), invariant_common(tx, ty)?));
+            }
+            Some(Ty::Tuple(out))
+        }
         _ => None,
     }
 }
@@ -3850,6 +4651,7 @@ fn object_base(ty: &Ty) -> Option<String> {
 fn is_fresh_allocation(expr: &vl_hir::HirExpr) -> bool {
     match expr {
         vl_hir::HirExpr::ObjectLiteral { .. } => true,
+        vl_hir::HirExpr::TupleLiteral { .. } => true,
         vl_hir::HirExpr::ArrayLiteral { .. } => true,
         vl_hir::HirExpr::Call { name, .. } if name == "Array.new" => true,
         vl_hir::HirExpr::String { .. } => true,
@@ -3900,7 +4702,7 @@ fn validate_capability(ty: &Ty, span: Span, diags: &mut Vec<Diagnostic>) -> bool
                     );
                     return false;
                 }
-                Ty::String | Ty::File | Ty::Object(_) | Ty::Array(_) | Ty::Error => {
+                Ty::String | Ty::File | Ty::Object(_) | Ty::Array(_) | Ty::Tuple(_) | Ty::Error => {
                     // Payload may still be malformed (`*Array[*u64]`).
                     return validate_capability(inner, span, diags);
                 }
@@ -3915,6 +4717,14 @@ fn validate_capability(ty: &Ty, span: Span, diags: &mut Vec<Diagnostic>) -> bool
             }
         }
         Ty::Array(elem) => return validate_capability(elem, span, diags),
+        Ty::Tuple(fields) => {
+            for (_, ty) in fields {
+                if !validate_capability(ty, span, diags) {
+                    return false;
+                }
+            }
+            return true;
+        }
         _ => {}
     }
     true
@@ -3942,12 +4752,13 @@ pub(crate) fn is_capability_valid(ty: &Ty) -> bool {
                 Ty::String | Ty::File | Ty::Object(_) | Ty::Error => {
                     return is_capability_valid(inner);
                 }
-                Ty::Array(_) => {
+                Ty::Array(_) | Ty::Tuple(_) => {
                     return is_capability_valid(inner);
                 }
             }
         }
         Ty::Array(elem) => return is_capability_valid(elem),
+        Ty::Tuple(fields) => return fields.iter().all(|(_, ty)| is_capability_valid(ty)),
         _ => {}
     }
     true
@@ -4004,7 +4815,7 @@ fn ty_satisfies_bound(
 ) -> bool {
     match ty {
         Ty::Param(name) => bound_implies(outer_bounds.get(name).copied(), bound),
-        Ty::Array(_) => false,
+        Ty::Array(_) | Ty::Tuple(_) => false,
         _ => bound_satisfied(bound, ty),
     }
 }
@@ -4019,6 +4830,49 @@ mod tests {
         let (res, _) = vl_semantic::resolve(&prog);
         let hir = vl_hir::lower(&prog, &res);
         check(&hir)
+    }
+
+    #[test]
+    fn tuples_check_clean_with_access_assign_and_destructure() {
+        let (_, diags) = check_src(
+            "fun main() { val t: #(u64, String) = #(1u64, \"a\"); val a = t.`0; val u: #(x: u64, y: String) = #(x = 1u64, y = \"b\"); val x = u.x; val #(p, q) = t; val #(x: x2, y: y2) = u; var m: *#(u64, u64) = #(1u64, 2u64); m.`0 = 3u64; var n: *#(x: u64, y: u64) = #(x = 1u64, y = 2u64); n.x = 9u64; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn tuple_shape_mismatches_are_single_errors() {
+        for (src, code) in [
+            (
+                "fun main() { val t: #(u64, String) = #(1u64, \"a\", 2u64); }",
+                "E309",
+            ),
+            (
+                "fun main() { val t = #(1u64, \"a\"); val x = t.`5; }",
+                "E302",
+            ),
+            (
+                "fun main() { val t = #(1u64, \"a\"); t.`0 = 2u64; }",
+                "E310",
+            ),
+            (
+                "fun main() { val t = #(1u64, \"a\"); val #(a, b, c) = t; }",
+                "E309",
+            ),
+            (
+                "fun main() { val u = #(x = 1u64, y = 2u64); val z = u.zzz; }",
+                "E302",
+            ),
+            (
+                "fun main() { val u = #(x = 1u64, y = 2u64); val v = u.`0; }",
+                "E302",
+            ),
+        ] {
+            let (_, diags) = check_src(src);
+            let errors: Vec<_> = diags.iter().filter(|d| d.is_error()).collect();
+            assert_eq!(errors.len(), 1, "{src}: {diags:?}");
+            assert_eq!(errors[0].code.as_deref(), Some(code), "{src}: {diags:?}");
+        }
     }
 
     #[test]
