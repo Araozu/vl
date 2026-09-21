@@ -133,6 +133,21 @@ fn hir_expr_has_generic_call(expr: &vl_hir::HirExpr, typed: &vl_typecheck::Typed
         vl_hir::HirExpr::Binary { lhs, rhs, .. } => {
             hir_expr_has_generic_call(lhs, typed) || hir_expr_has_generic_call(rhs, typed)
         }
+        vl_hir::HirExpr::MethodCall {
+            id, receiver, args, ..
+        } => {
+            // Suspended until stdlib sources declare associated functions;
+            // structurally identical to `Call` when they do.
+            if let Some(d) = typed.method_defs.get(&id.0) {
+                if let Some(sig) = typed.func_sigs.get(d) {
+                    if !sig.type_params.is_empty() {
+                        return true;
+                    }
+                }
+            }
+            hir_expr_has_generic_call(receiver, typed)
+                || args.iter().any(|a| hir_expr_has_generic_call(a, typed))
+        }
         vl_hir::HirExpr::Literal { .. }
         | vl_hir::HirExpr::String { .. }
         | vl_hir::HirExpr::Var { .. } => false,

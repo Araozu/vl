@@ -659,6 +659,38 @@ fn collect_import_expr(
                 collect_import_expr(arg, typed, out)
             }
         }
+        HirExpr::MethodCall {
+            id, receiver, args, ..
+        } => {
+            // Foreign sugar targets import like foreign calls; the receiver
+            // counts as the first parameter for the import signature.
+            if let Some(sym) = typed.method_symbols.get(&id.0) {
+                let reference = FunctionRef {
+                    module: sym.module.as_string(),
+                    function: sym.name.clone(),
+                };
+                if !out.iter().any(|i| i.symbol == reference) {
+                    let mut param_tys = vec![typed
+                        .type_of_id(receiver.id())
+                        .map(|t| rt(&t))
+                        .unwrap_or(Ty::Error)];
+                    param_tys.extend(
+                        args.iter()
+                            .filter_map(|a| typed.type_of_id(a.id()).map(|t| rt(&t))),
+                    );
+                    let ret = typed.type_of_id(*id).map(|t| rt(&t)).unwrap_or(Ty::Error);
+                    out.push(FunctionImport {
+                        symbol: reference,
+                        param_tys,
+                        ret,
+                    });
+                }
+            }
+            collect_import_expr(receiver, typed, out);
+            for arg in args {
+                collect_import_expr(arg, typed, out)
+            }
+        }
         HirExpr::ArrayLiteral { elems, .. } => {
             for e in elems {
                 collect_import_expr(e, typed, out)
@@ -1902,6 +1934,75 @@ fn collect_project_imports(
                     walk_expr(prog, typed, plan, outer, e, by_symbol);
                 }
             }
+            HirExpr::MethodCall {
+                id, receiver, args, ..
+            } => {
+                walk_expr(prog, typed, plan, outer, receiver, by_symbol);
+                for arg in args {
+                    walk_expr(prog, typed, plan, outer, arg, by_symbol);
+                }
+                let target = match outer {
+                    Some(key) => plan.nested_targets.get(&(key.clone(), id.0)).cloned(),
+                    None => plan.root_targets.get(&(prog.module.clone(), id.0)).cloned(),
+                };
+                // Generic sugar without a plan mapping is never imported
+                // unmangled (same rule as generic calls); only non-generic
+                // sugar records a direct `method_targets` entry.
+                if target.is_none() && !typed.method_targets.contains_key(&id.0) {
+                    return;
+                }
+                if let Some(target) = target {
+                    if target.key.template.module == prog.module {
+                        return;
+                    }
+                    if let Some((param_tys, ret)) = import_sig_for_target(plan, &target) {
+                        push_import(
+                            by_symbol,
+                            FunctionRef {
+                                module: target.key.template.module.clone(),
+                                function: target.key.mangled(),
+                            },
+                            param_tys,
+                            ret,
+                        );
+                    }
+                    return;
+                }
+                // No plan mapping: monomorphic foreign sugar (or local sugar).
+                let Some(target) = typed.method_targets.get(&id.0) else {
+                    return;
+                };
+                let vl_typecheck::MethodTarget::Foreign(sym) = target else {
+                    return;
+                };
+                if sym.module.as_string() == prog.module {
+                    return;
+                }
+                let reference = FunctionRef {
+                    module: sym.module.as_string(),
+                    function: sym.name.clone(),
+                };
+                let mut param_tys: Vec<Ty> = vec![typed
+                    .type_of_id(receiver.id())
+                    .map(|t| rt(&t))
+                    .unwrap_or(Ty::Error)];
+                param_tys.extend(
+                    args.iter()
+                        .filter_map(|a| typed.type_of_id(a.id()).map(|t| rt(&t))),
+                );
+                if param_tys.len() != args.len() + 1 {
+                    return;
+                }
+                let ret = typed.type_of_id(*id).map(|t| rt(&t)).unwrap_or(Ty::Error);
+                fn bad(ty: &Ty) -> bool {
+                    matches!(ty, Ty::Mutable(_) | Ty::Param(_) | Ty::Int | Ty::Error)
+                        || matches!(ty, Ty::Array(elem) if bad(elem))
+                }
+                if param_tys.iter().any(bad) || bad(&ret) {
+                    return;
+                }
+                push_import(by_symbol, reference, param_tys, ret);
+            }
             HirExpr::ObjectLiteral { fields, .. } => {
                 for (_, e) in fields {
                     walk_expr(prog, typed, plan, outer, e, by_symbol);
@@ -2350,6 +2451,112 @@ impl Lowerer<'_> {
                         }),
                 };
                 let mut arg_regs = Vec::with_capacity(args.len());
+                for arg in args {
+                    arg_regs.push(self.lower_expr(arg, typed)?);
+                }
+                let dst = self.reg();
+                self.instrs.push(Instr::Call {
+                    dst,
+                    callee,
+                    args: arg_regs,
+                    span: *span,
+                });
+                Some(dst)
+            }
+            HirExpr::MethodCall {
+                id,
+                receiver,
+                args,
+                span,
+                ..
+            } => {
+                // Instance sugar lowers exactly like the explicit
+                // `Owner.method(receiver, args...)` call: concrete targets
+                // first (world plan), then monomorphized names, then the
+                // recorded direct target. Only non-generic sugar records a
+                // direct target, so a missing mapping here means poison
+                // (already reported) — never an unmangled generic template.
+                if let Some(plan) = self.plan {
+                    let target = match &self.outer_key {
+                        Some(outer) => plan.nested_targets.get(&(outer.clone(), id.0)).cloned(),
+                        None => plan
+                            .root_targets
+                            .get(&(self.module.to_owned(), id.0))
+                            .cloned(),
+                    };
+                    if let Some(target) = target {
+                        let callee = FunctionRef {
+                            module: target.key.template.module.clone(),
+                            function: target.key.mangled(),
+                        };
+                        let mut arg_regs = Vec::with_capacity(args.len() + 1);
+                        arg_regs.push(self.lower_expr(receiver, typed)?);
+                        for arg in args {
+                            arg_regs.push(self.lower_expr(arg, typed)?);
+                        }
+                        let dst = self.reg();
+                        self.instrs.push(Instr::Call {
+                            dst,
+                            callee,
+                            args: arg_regs,
+                            span: *span,
+                        });
+                        return Some(dst);
+                    }
+                }
+                let mapped = match &self.outer {
+                    Some(outer) => self.typed.inst_calls.get(&(outer.clone(), id.0)).cloned(),
+                    None => self.typed.root_calls.get(&id.0).cloned(),
+                };
+                let mapped = mapped.or_else(|| {
+                    self.typed
+                        .imported_root_calls
+                        .get(&id.0)
+                        .map(|key| key.mangled())
+                });
+                let mapped = mapped.or_else(|| match &self.outer {
+                    Some(outer) => self
+                        .typed
+                        .imported_inst_calls
+                        .get(&(outer.clone(), id.0))
+                        .map(|key| key.mangled()),
+                    None => None,
+                });
+                let callee = match mapped {
+                    Some(function) => {
+                        if let Some(key) = self.typed.imported_root_calls.get(&id.0).or_else(|| {
+                            match &self.outer {
+                                Some(outer) => {
+                                    self.typed.imported_inst_calls.get(&(outer.clone(), id.0))
+                                }
+                                None => None,
+                            }
+                        }) {
+                            FunctionRef {
+                                module: key.template.module.clone(),
+                                function: key.mangled(),
+                            }
+                        } else {
+                            FunctionRef {
+                                module: self.typed_module(),
+                                function,
+                            }
+                        }
+                    }
+                    None => match self.typed.method_targets.get(&id.0) {
+                        Some(vl_typecheck::MethodTarget::Local(name)) => FunctionRef {
+                            module: self.typed_module(),
+                            function: name.clone(),
+                        },
+                        Some(vl_typecheck::MethodTarget::Foreign(sym)) => FunctionRef {
+                            module: sym.module.as_string(),
+                            function: sym.name.clone(),
+                        },
+                        None => return None,
+                    },
+                };
+                let mut arg_regs = Vec::with_capacity(args.len() + 1);
+                arg_regs.push(self.lower_expr(receiver, typed)?);
                 for arg in args {
                     arg_regs.push(self.lower_expr(arg, typed)?);
                 }
