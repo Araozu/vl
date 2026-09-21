@@ -245,6 +245,24 @@ pub enum HirExpr {
         args: Vec<HirExpr>,
         span: Span,
     },
+    /// Instance sugar: `receiver.method(args)` where the receiver is a value
+    /// path (`c.bump()`, `a.b.step()`). The resolver records these sites
+    /// (no E201 there); typechecking validates that the method exists on the
+    /// receiver's object type and that its first parameter takes the receiver
+    /// (`self: Counter` / `self: *Counter`), then records the resolved
+    /// target (`Owner.method`, possibly a generic instance) in the typed
+    /// program for LIR. Semantically the call is
+    /// `Owner.method(receiver, args...)`.
+    MethodCall {
+        id: HirId,
+        receiver: Box<HirExpr>,
+        method: String,
+        method_span: Span,
+        /// Explicit type arguments (`c.f::[u64](...)`); empty means infer.
+        type_args: Vec<VlType>,
+        args: Vec<HirExpr>,
+        span: Span,
+    },
     Binary {
         id: HirId,
         op: HirBinOp,
@@ -302,6 +320,7 @@ impl HirExpr {
             | HirExpr::Field { id, .. }
             | HirExpr::Var { id, .. }
             | HirExpr::Call { id, .. }
+            | HirExpr::MethodCall { id, .. }
             | HirExpr::Binary { id, .. }
             | HirExpr::Unary { id, .. }
             | HirExpr::Cast { id, .. } => *id,
@@ -320,6 +339,7 @@ impl HirExpr {
             | HirExpr::Field { span, .. }
             | HirExpr::Var { span, .. }
             | HirExpr::Call { span, .. }
+            | HirExpr::MethodCall { span, .. }
             | HirExpr::Binary { span, .. }
             | HirExpr::Unary { span, .. }
             | HirExpr::Cast { span, .. } => *span,
@@ -352,14 +372,18 @@ impl<'a> Lowerer<'a> {
 
 /// Lower a parsed program with its resolution map. Infallible by design:
 /// unresolved names become `def: None` and are reported by earlier stages.
+///
+/// Associated functions lower to ordinary `Fn` items named `Owner.method`
+/// (so typechecking, monomorphization, and LIR reuse the free-function
+/// paths); the fields-only `Object` item keeps the layout.
 pub fn lower(prog: &AstProgram, res: &vl_semantic::Resolution) -> HirProgram {
     let mut l = Lowerer { next: 0, res };
     let items = prog
         .items
         .iter()
-        .filter_map(|i| match i {
-            AstItem::Use { .. } => None,
-            _ => Some(l.lower_item(i)),
+        .flat_map(|i| match i {
+            AstItem::Use { .. } => Vec::new(),
+            _ => l.lower_item(i),
         })
         .collect();
     HirProgram {
@@ -369,19 +393,58 @@ pub fn lower(prog: &AstProgram, res: &vl_semantic::Resolution) -> HirProgram {
 }
 
 impl<'a> Lowerer<'a> {
-    fn lower_item(&mut self, item: &AstItem) -> HirItem {
+    fn lower_item(&mut self, item: &AstItem) -> Vec<HirItem> {
         match item {
             AstItem::Use { .. } => unreachable!("use items are filtered before lowering"),
             AstItem::Object {
-                name, fields, span, ..
-            } => HirItem::Object {
-                name: name.clone(),
-                fields: fields
-                    .iter()
-                    .map(|f| (f.name.clone(), f.ty.clone(), f.name_span))
-                    .collect(),
-                span: *span,
-            },
+                name,
+                fields,
+                methods,
+                span,
+                ..
+            } => {
+                let mut out = Vec::with_capacity(1 + methods.len());
+                out.push(HirItem::Object {
+                    name: name.clone(),
+                    fields: fields
+                        .iter()
+                        .map(|f| (f.name.clone(), f.ty.clone(), f.name_span))
+                        .collect(),
+                    span: *span,
+                });
+                for m in methods {
+                    out.push(HirItem::Fn {
+                        id: self.id(),
+                        def: self.def_at_site(m.name_span),
+                        name: format!("{name}.{}", m.name),
+                        type_params: m
+                            .type_params
+                            .iter()
+                            .map(|p| HirTypeParam {
+                                name: p.name.clone(),
+                                bound: p.bound,
+                            })
+                            .collect(),
+                        params: m
+                            .params
+                            .iter()
+                            .map(|p| {
+                                (
+                                    p.name.clone(),
+                                    self.def_at_site(p.name_span),
+                                    p.ty.clone(),
+                                    p.name_span,
+                                )
+                            })
+                            .collect(),
+                        ret: m.ret.clone(),
+                        ret_span: m.ret_span,
+                        body: m.body.iter().map(|s| self.lower_stmt(s)).collect(),
+                        span: m.span,
+                    });
+                }
+                out
+            }
             AstItem::Let {
                 value,
                 span,
@@ -392,7 +455,7 @@ impl<'a> Lowerer<'a> {
                 ..
             } => {
                 let def = self.def_at_site(*name_span);
-                HirItem::Let {
+                vec![HirItem::Let {
                     id: self.id(),
                     def,
                     kind: *kind,
@@ -400,7 +463,7 @@ impl<'a> Lowerer<'a> {
                     ty_span: *ty_span,
                     value: self.lower_expr(value),
                     span: *span,
-                }
+                }]
             }
             AstItem::Destructure {
                 kind,
@@ -422,7 +485,7 @@ impl<'a> Lowerer<'a> {
                         binding_span: b.binding_span,
                     })
                     .collect();
-                HirItem::Destructure {
+                vec![HirItem::Destructure {
                     id: self.id(),
                     kind: *kind,
                     bindings: lowered,
@@ -430,7 +493,7 @@ impl<'a> Lowerer<'a> {
                     ty_span: *ty_span,
                     value: self.lower_expr(value),
                     span: *span,
-                }
+                }]
             }
             AstItem::Function {
                 name,
@@ -442,7 +505,7 @@ impl<'a> Lowerer<'a> {
                 body,
                 span,
                 ..
-            } => HirItem::Fn {
+            } => vec![HirItem::Fn {
                 id: self.id(),
                 def: self.def_at_site(*name_span),
                 name: name.clone(),
@@ -468,7 +531,7 @@ impl<'a> Lowerer<'a> {
                 ret_span: *ret_span,
                 body: body.iter().map(|s| self.lower_stmt(s)).collect(),
                 span: *span,
-            },
+            }],
         }
     }
 
@@ -680,6 +743,40 @@ impl<'a> Lowerer<'a> {
                 span,
                 ..
             } => {
+                // Instance sugar (`receiver.method(args)`): rebuild the
+                // receiver value path (all segments but the last) so
+                // typechecking sees a real receiver expression. The resolver
+                // recorded the head binding; field segments resolve by type.
+                if let Some(head) = self
+                    .res
+                    .sugar_receivers
+                    .get(&(callee_span.start, callee_span.end))
+                    .cloned()
+                {
+                    let mut receiver = HirExpr::Var {
+                        id: self.id(),
+                        def: Some(head),
+                        name: callee[0].clone(),
+                        span: *callee_span,
+                    };
+                    for seg in &callee[1..callee.len() - 1] {
+                        receiver = HirExpr::Field {
+                            id: self.id(),
+                            base: Box::new(receiver),
+                            name: seg.clone(),
+                            span: *callee_span,
+                        };
+                    }
+                    return HirExpr::MethodCall {
+                        id: self.id(),
+                        receiver: Box::new(receiver),
+                        method: callee[callee.len() - 1].clone(),
+                        method_span: *callee_span,
+                        type_args: type_args.clone(),
+                        args: args.iter().map(|a| self.lower_expr(a)).collect(),
+                        span: *span,
+                    };
+                }
                 let def = self.def_at(*callee_span);
                 let resolved = def
                     .as_ref()
@@ -1036,6 +1133,59 @@ mod tests {
             HirItem::Fn { body, .. } => {
                 assert!(matches!(&body[0], HirStmt::Return { value: None, .. }))
             }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn associated_functions_lower_to_namespaced_fns() {
+        let src = "type Counter = object { value: u64, fun bump(self: *Counter): *Counter { return self; }, }; fun main() { var c: *Counter = Counter { value = 1 }; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        assert_eq!(hir.items.len(), 3);
+        assert!(matches!(hir.items[0], HirItem::Object { .. }));
+        match &hir.items[1] {
+            HirItem::Fn {
+                name, def, params, ..
+            } => {
+                assert_eq!(name, "Counter.bump");
+                assert!(def.is_some());
+                assert_eq!(params.len(), 1);
+            }
+            other => panic!("expected method fn, got {other:?}"),
+        }
+        assert!(matches!(&hir.items[2], HirItem::Fn { name, .. } if name == "main"));
+    }
+
+    #[test]
+    fn sugar_call_lowers_to_method_call_with_receiver() {
+        let src = "type C = object { value: u64, fun f(self: C): u64 { return self.value; }, }; fun main() { var c: *C = C { value = 1 }; c.f(); }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match hir.items.last().expect("main") {
+            HirItem::Fn { body, .. } => match body.last().expect("call") {
+                HirStmt::Expr(HirExpr::MethodCall {
+                    receiver,
+                    method,
+                    args,
+                    ..
+                }) => {
+                    assert_eq!(method, "f");
+                    assert!(args.is_empty());
+                    assert!(
+                        matches!(&**receiver, HirExpr::Var { def: Some(_), name, .. } if name == "c")
+                    );
+                }
+                other => panic!("expected method call, got {other:?}"),
+            },
             other => panic!("expected fn, got {other:?}"),
         }
     }
