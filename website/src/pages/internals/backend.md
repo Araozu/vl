@@ -27,7 +27,11 @@ the built-in `File` handle, `Array[T]`, and nominal user-defined `object`
 types, producing typed HIR and diagnostics. Array literals must hold one
 uniform element type; indexing requires an `Array[T]` base and a `u64` index.
 Object literals must initialize every declared field exactly once, and field
-reads and writes are checked against the object's nominal layout. Objects and
+reads and writes are checked against the object's nominal layout. Associated
+functions lower to ordinary `Fn` items named `Owner.method`, so they typecheck
+like free functions; `receiver.method(args)` sugar is validated against the
+first parameter (the self-type gate) and then treated as
+`Owner.method(receiver, args...)`. Objects and
 arrays remain reference values through this stage. Generic functions check
 once with opaque parameters and monomorphize per concrete call (`f$u64`, ...).
 

@@ -148,8 +148,11 @@ and named literals such as `Counter { value = 1, label = "count" }`. Object valu
 have reference semantics: assignment, parameters, and returns alias the same
 heap object, and `p.field = value;` mutates it through every mutable `*Foo` alias. Fields are
 comma-separated and every field must be initialized. Objects are nominal data
-types; VL does not currently attach methods, inheritance, or runtime type
-reflection to them.
+types with Zig-style associated functions declared inside the body
+(`fun bump(self: *Counter): *Counter { ... }`), called through the type
+(`Counter.bump(c)`) or — only when the first parameter takes the object
+itself — as instance sugar (`c.bump()`); fields and functions share one
+member namespace. VL has no inheritance or runtime type reflection for objects.
 Functions can declare type parameters (`fun first[T](a: Array[T]): T`);
 calls infer them (`first(a)`) or pass them explicitly (`first::[u64](a)`)
 (see `examples/generics.vl`).

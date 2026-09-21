@@ -132,6 +132,11 @@ fun main() {
 Arguments are evaluated from left to right. User functions may be called from
 any other function, including a function defined earlier or later in the file.
 
+Object types can also own functions: an associated function declared inside an
+`object` body is called through the type (`Counter.bump(counter)`), or as
+instance sugar (`counter.bump()`) when its first parameter takes the object
+itself. See [associated functions](/docs/objects#associated-functions).
+
 ## Recursion
 
 Recursion is when a function calls itself. A recursive function needs a base

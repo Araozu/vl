@@ -603,6 +603,189 @@ fn objects_compile_with_reference_field_semantics() {
 }
 
 #[test]
+fn associated_functions_compile_with_sugar_and_run_on_naravm() {
+    use vl_codegen::Target;
+    let src = std::fs::read_to_string("examples/associated.vl").unwrap();
+    let lir = frontend(&src).expect("associated.vl must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("fn Counter.init:"), "{dump}");
+    assert!(dump.contains("fn Counter.bump:"), "{dump}");
+    assert!(dump.contains("fn Counter.get:"), "{dump}");
+    // `counter.bump()` sugar lowers to the explicit namespaced call.
+    assert!(
+        dump.contains("call") && dump.contains("Counter.bump"),
+        "{dump}"
+    );
+    assert!(!dump.contains("MethodCall"), "{dump}");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+}
+
+#[test]
+fn associated_generic_methods_monomorphize() {
+    let lir = frontend(
+        "use std; type Box = object { tag: u64, fun wrap[T](self: Box, v: T): T { return v; }, }; fun main() { var b: *Box = Box { tag = 1 }; std.print_u64(b.wrap(7)); std.print(b.wrap(\"s\")); std.print_u64(Box.wrap::[u64](b, 8)); }",
+    )
+    .expect("generic methods must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("fn Box.wrap$u64:"), "{dump}");
+    assert!(dump.contains("fn Box.wrap$String:"), "{dump}");
+    assert!(!dump.contains("fn Box.wrap:\n"), "{dump}");
+    // The receiver counts as the first call argument.
+    assert!(
+        dump.contains("call") && dump.contains("Box.wrap$u64"),
+        "{dump}"
+    );
+}
+
+#[test]
+fn associated_sugar_gate_is_one_error_each() {
+    for (src, code, hint) in [
+        (
+            "type C = object { value: u64, fun bump(self: *C): *C { return self; }, }; fun main() { val c: C = C { value = 1 }; c.bump(); }",
+            "E306",
+            "read-only",
+        ),
+        (
+            "type C = object { value: u64, }; fun main() { var c: *C = C { value = 1 }; c.bump(); }",
+            "E302",
+            "no associated function",
+        ),
+        (
+            "type O = object { v: u64, }; type A = object { x: u64, fun f(o: O): u64 { return o.v; }, }; fun main() { var a: *A = A { x = 1 }; a.f(); }",
+            "E303",
+            "first parameter",
+        ),
+        (
+            "type C = object { value: u64, fun value(self: C): u64 { return self.value; } };",
+            "E200",
+            "duplicate member",
+        ),
+        (
+            "type C = object { value: u64, }; fun main() { C.bump(); }",
+            "E302",
+            "no associated function",
+        ),
+    ] {
+        let err = frontend(src).expect_err("must fail");
+        assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1, "{src}: {err:?}");
+        assert!(
+            err.iter().any(|d| d.code.as_deref() == Some(code)),
+            "{src}: {err:?}"
+        );
+        assert!(
+            err.iter().any(|d| format!("{d:?}").contains(hint)),
+            "{src}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn cross_module_associated_functions_compile_to_lir_and_naravm() {
+    use vl_codegen::Target;
+    let programs = frontend_project(&[
+        (
+            "vl.person",
+            "type Person = object { name: String, age: u64, fun hello(self: Person): String { return self.name; }, fun birthday(self: *Person): *Person { self.age = self.age + 1; return self; }, fun pick[T](self: Person, a: T, b: T): T { if (self.age == 0) { return a; } return b; }, };",
+        ),
+        (
+            "vl.main",
+            "use vl.person; fun main() { var rose: *vl.person.Person = vl.person.Person { name = \"Rose\", age = 25 }; rose.birthday(); person.Person.birthday(rose); val greeting = rose.hello(); val choice = rose.pick(1u64, 2u64); greeting; choice; }",
+        ),
+    ])
+    .expect("cross-module associated functions must compile");
+    assert_eq!(programs.len(), 2);
+    let provider = &programs[0];
+    let importer = &programs[1];
+    let provider_dump = provider.dump();
+    assert!(
+        provider_dump.contains("fn Person.hello:"),
+        "{provider_dump}"
+    );
+    assert!(
+        provider_dump.contains("fn Person.birthday:"),
+        "{provider_dump}"
+    );
+    assert!(
+        provider_dump.contains("fn Person.pick$u64:"),
+        "{provider_dump}"
+    );
+    let importer_dump = importer.dump();
+    // Explicit alias-qualified, fully qualified, and sugar calls all lower
+    // to owner-module calls.
+    assert!(
+        importer_dump.contains("call vl.person::Person.birthday"),
+        "{importer_dump}"
+    );
+    assert!(
+        importer_dump.contains("call vl.person::Person.hello"),
+        "{importer_dump}"
+    );
+    assert!(
+        importer_dump.contains("call vl.person::Person.pick$u64"),
+        "{importer_dump}"
+    );
+    assert!(
+        importer
+            .imports
+            .iter()
+            .any(|i| i.symbol.module == "vl.person" && i.symbol.function == "Person.birthday"),
+        "{:?}",
+        importer.imports
+    );
+    for lir in &programs {
+        let (artifact, diags) = vl_codegen::NaraVmTarget.emit(lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+    }
+}
+
+#[test]
+fn qualified_receiver_never_falls_back_to_same_named_local() {
+    // `vl.main` declares its own `C`, but a `vl.a.C` receiver must resolve
+    // to `vl.a`'s method (nominal identity), not the local one.
+    let programs = frontend_project(&[
+        (
+            "vl.a",
+            "type C = object { v: u64, fun m(self: C): u64 { return self.v; }, };",
+        ),
+        (
+            "vl.main",
+            "type C = object { v: u64, fun m(self: C): u64 { return 7; }, }; fun main() { val x: vl.a.C = vl.a.C { v = 3 }; val y = x.m(); y; }",
+        ),
+    ])
+    .expect("qualified sugar must resolve to the foreign method");
+    assert!(
+        programs[1].dump().contains("call vl.a::C.m"),
+        "{}",
+        programs[1].dump()
+    );
+    assert!(
+        !programs[1].dump().contains("call vl.main::C.m"),
+        "{}",
+        programs[1].dump()
+    );
+}
+
+#[test]
+fn global_dependent_foreign_method_is_e208_through_sugar() {
+    let err = frontend_project(&[
+        (
+            "vl.a",
+            "val shared: u64 = 1; type C = object { v: u64, fun m(self: C): u64 { return shared; }, };",
+        ),
+        (
+            "vl.main",
+            "fun main() { val x: vl.a.C = vl.a.C { v = 3 }; val y = x.m(); y; }",
+        ),
+    ])
+    .expect_err("global-dependent foreign sugar must be E208");
+    assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1, "{err:?}");
+    assert_eq!(err[0].code.as_deref(), Some("E208"), "{err:?}");
+}
+
+#[test]
 fn array_new_needs_no_import() {
     let lir =
         frontend("fun main() { val a: *Array[u64] = Array.new::[u64](2u64); a[0u64] = 1u64; }")

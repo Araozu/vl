@@ -1,0 +1,37 @@
+// Associated functions live inside the object body, Zig-style.
+//
+// A `fun` member is called through its type (`Counter.init(1)`). When the
+// first parameter takes the object itself (`self: Counter` for readers,
+// `self: *Counter` for writers), the call may also spell the receiver first:
+// `c.bump()` is sugar for `Counter.bump(c)` — and only in that case.
+use std;
+
+type Counter = object {
+    value: u64,
+
+    fun init(v: u64): *Counter {
+        return Counter { value = v };
+    },
+
+    fun bump(self: *Counter): *Counter {
+        self.value = self.value + 1;
+        return self;
+    },
+
+    fun get(self: Counter): u64 {
+        return self.value;
+    },
+
+    fun add(self: *Counter, amount: u64): *Counter {
+        self.value = self.value + amount;
+        return self;
+    },
+};
+
+fun main() {
+    var counter = Counter.init(1);
+    counter.bump();
+    var same = Counter.bump(counter);
+    same.add(10);
+    std.print_u64(counter.get() + same.get());
+}

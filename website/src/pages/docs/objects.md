@@ -109,8 +109,76 @@ is assigned. Array elements are read through either capability but written
 only through a mutable `*Array[T]` access path (projected transitively, as
 above).
 
-Objects are nominal data types. VL currently gives them fields and reference
-semantics only: there are no implicit constructors, methods, inheritance,
-runtime casts, or identity/equality operators for objects.
+Objects are nominal data types. Besides fields and reference semantics, VL
+gives objects Zig-style associated functions declared inside the body. There
+is no inheritance, no implicit constructor, and no runtime type reflection.
+
+## Associated functions
+
+Declare a `fun` member inside the `object` body. Fields and functions share
+one member namespace, so a duplicate member name is an error. The comma after
+a field may be omitted before a `fun` member; a trailing comma after a `fun`
+member is allowed but never required.
+
+```vl
+type Counter = object {
+    value: u64,
+
+    fun init(v: u64): *Counter {
+        return Counter { value = v };
+    },
+
+    fun bump(self: *Counter): *Counter {
+        self.value = self.value + 1;
+        return self;
+    },
+
+    fun get(self: Counter): u64 {
+        return self.value;
+    },
+};
+```
+
+Calls spell the owner explicitly, exactly like the `Array.new` builtin:
+
+```vl
+fun main() {
+    var counter = Counter.init(1);
+    var same = Counter.bump(counter);
+}
+```
+
+Nominal identity is spelling-sensitive, as for every other call: a value
+annotated `Counter` and a value annotated `my.mod.Counter` do not coerce into
+each other even inside the defining module, so spell the type the same way on
+both sides of a call.
+
+There is no implicit `self`: the receiver is an ordinary first parameter.
+Readers take `self: Counter`; writers take `self: *Counter`, and the usual
+capability rules apply (a read-only view never upgrades to `*Counter`).
+
+## Instance sugar
+
+When — and only when — the first parameter takes the receiver's object type,
+the call may spell the receiver first: `counter.bump()` is sugar for
+`Counter.bump(counter)`. A method whose first parameter is some other type
+(or takes no parameters at all) can only be called through the type.
+
+```vl
+fun main() {
+    var counter = Counter.init(1);
+    counter.bump(); // Counter.bump(counter)
+    counter.get();  // Counter.get(counter)
+}
+```
+
+Associated functions may declare their own type parameters and are
+monomorphized per call like free generic functions
+(`box.wrap(7)` infers `Box.wrap$u64`). Across modules they live in the type
+namespace: with `use vl.person;` in scope, call `person.Person.birthday(rose)`
+or the fully qualified `vl.person.Person.birthday(rose)`; sugar on a foreign
+value (`rose.birthday()`) resolves through the receiver's type and needs no
+import. Cross-module calls meet the same module-global boundary as free
+functions.
 
 Continue with [modules and strings](/docs/modules).

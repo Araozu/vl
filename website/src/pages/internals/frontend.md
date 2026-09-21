@@ -28,11 +28,14 @@ possible.
 
 Parses tokens into the syntax tree and recovers per item so one malformed item
 does not prevent the rest of a file from being inspected. The grammar includes
-named object declarations (`type Name = object { ... };`), named object
-literals, and field reads and writes.
+named object declarations (`type Name = object { ... };`), associated
+functions declared inside the object body, named object literals, and field
+reads and writes.
 
 ## `vl-semantic`
 
 Resolves names and imports, reporting undefined names and duplicate definitions
-before later stages consume the tree. It resolves object type names while
-leaving object layout and field-type checks to `vl-typecheck`.
+before later stages consume the tree. It resolves object type names and
+`Type.method` callees while leaving object layout and field-type checks to
+`vl-typecheck`. A `receiver.method(args)` call whose head is a bound value is
+recorded as instance sugar; the self-type gate is validated later.
