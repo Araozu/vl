@@ -136,7 +136,7 @@ fun main() {
   (type_declaration
     name: (type_identifier)
     body: (object_type
-      (object_fields
+      (object_member
         (object_field
           name: (identifier)
           type: (type
@@ -251,3 +251,111 @@ fun main() {
                       (primary_expression
                         (literal
                           (integer_literal))))))))))))))
+
+===============================
+associated functions and sugar
+===============================
+
+type Counter = object {
+  value: u64,
+  fun init(v: u64): *Counter {
+    return Counter { value = v };
+  },
+  fun bump(self: *Counter): *Counter {
+    return self;
+  },
+};
+
+fun main() {
+  var counter = Counter.init(1u64);
+  counter.bump();
+}
+
+---
+
+(source_file
+  (type_declaration
+    name: (type_identifier)
+    body: (object_type
+      (object_member
+        (object_field
+          name: (identifier)
+          type: (type
+            (type_atom
+              (primitive_type)))))
+      (object_member
+        (function_declaration
+          name: (identifier)
+          (parameters
+            (parameter
+              name: (identifier)
+              type: (type
+                (type_atom
+                  (primitive_type)))))
+          return_type: (type
+            (mutable_type
+              inner: (type_atom
+                (type_identifier))))
+          body: (block
+            (statement
+              (return_statement
+                (expression
+                  (postfix_expression
+                    (primary_expression
+                      (object_literal
+                        name: (type_identifier)
+                        (object_initializer
+                          name: (identifier)
+                          value: (expression
+                            (postfix_expression
+                              (primary_expression
+                                (path
+                                  (identifier)))))))))))))))
+      (object_member
+        (function_declaration
+          name: (identifier)
+          (parameters
+            (parameter
+              name: (identifier)
+              type: (type
+                (mutable_type
+                  inner: (type_atom
+                    (type_identifier))))))
+          return_type: (type
+            (mutable_type
+              inner: (type_atom
+                (type_identifier))))
+          body: (block
+            (statement
+              (return_statement
+                (expression
+                  (postfix_expression
+                    (primary_expression
+                      (path
+                        (identifier))))))))))))
+  (function_declaration
+    name: (identifier)
+    body: (block
+      (statement
+        (variable_declaration
+          kind: (binding_keyword)
+          name: (identifier)
+          value: (expression
+            (postfix_expression
+              (primary_expression
+                (path
+                  (type_identifier)))
+              (identifier)
+              (expression
+                (postfix_expression
+                  (primary_expression
+                    (literal
+                      (u64_literal)))))))))
+      (statement
+        (expression_statement
+          (expression
+            (postfix_expression
+              (primary_expression
+                (path
+                  (identifier)
+                  (identifier))))))))))

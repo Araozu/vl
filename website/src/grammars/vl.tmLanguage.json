@@ -57,6 +57,8 @@
       },
       "patterns": [
         { "include": "#comment" },
+        { "include": "#function-definition" },
+        { "include": "#block" },
         {
           "name": "meta.field.declaration.vl",
           "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(:)",
@@ -74,6 +76,32 @@
           "name": "punctuation.separator.vl",
           "match": ","
         }
+      ]
+    },
+    "block": {
+      "name": "meta.block.vl",
+      "begin": "\\{",
+      "beginCaptures": {
+        "0": { "name": "punctuation.bracket.curly.vl" }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.bracket.curly.vl" }
+      },
+      "patterns": [
+        { "include": "#block" },
+        { "include": "#comment" },
+        { "include": "#string" },
+        { "include": "#object-literal" },
+        { "include": "#keyword" },
+        { "include": "#boolean" },
+        { "include": "#number" },
+        { "include": "#turbofish" },
+        { "include": "#function-call" },
+        { "include": "#capability" },
+        { "include": "#type" },
+        { "include": "#operator" },
+        { "include": "#punctuation" }
       ]
     },
     "object-literal": {

@@ -84,10 +84,15 @@ module.exports = grammar({
     object_type: $ => seq(
       'object',
       '{',
-      optional($.object_fields),
+      repeat(seq($.object_member, optional(','))),
       '}',
     ),
-    object_fields: $ => commaSep1($.object_field),
+    // Fields and associated `fun` members share one namespace; commas are
+    // separators, optional before `fun` or `}` (highlighting stays permissive).
+    object_member: $ => choice(
+      $.object_field,
+      $.function_declaration,
+    ),
     object_field: $ => seq(
       field('name', $.identifier),
       ':',
@@ -201,7 +206,14 @@ module.exports = grammar({
       '=',
       field('value', $.expression),
     ),
-    path: $ => prec.left(seq($.identifier, repeat(seq('.', $.identifier)))),
+    // Dotted paths may start from a type name (`Counter.init`, `a.b.c`)
+    // so namespaced and sugar calls highlight; a bare `Type` stays invalid
+    // VL but parses permissively here (highlighting only). `Type { ... }`
+    // still parses as an object literal via the `{` lookahead.
+    path: $ => prec.left(seq(
+      choice($.identifier, $.type_identifier),
+      repeat(seq('.', $.identifier)),
+    )),
     module_path: $ => seq(
       $.identifier,
       repeat(choice(
