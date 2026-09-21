@@ -1,10 +1,11 @@
 // Standard library v1: VM natives plus VL helpers in real modules.
 //
 // Thin externs (`std.string`, `std.math`, `std.fmt`) map to natives the VM
-// already registers; helpers (`math.max_u64`, `string.is_empty`, ...) live
-// in embedded `std/*.vl` sources merged into the same module view and
-// linked inline. Everything needs an explicit `use`. Fallible natives
-// (`byte_at`, `slice`) and `std.fs` stay out until VL has an error story.
+// already registers; helpers (`math.max_u64`, `string.is_empty`, ...,
+// plus the generic `math.max[T extends Numeric]`) live in embedded `std/*.vl`
+// sources merged into the same module view and linked inline. Everything
+// needs an explicit `use`. Fallible natives (`byte_at`, `slice`) and `std.fs`
+// stay out until VL has an error story.
 use std;
 use std.string;
 use std.math;
@@ -17,6 +18,8 @@ fun main() {
     std.print_u64(math.mod_u64(17u64, 5u64));
     std.print_u64(string.to_u64("42"));
     std.print(fmt.u64_to_string(math.max_u64(3u64, 9u64)));
+    std.print(fmt.u64_to_string(math.max(3u64, 9u64)));
+    std.print(fmt.u64_to_string(math.max::[u64](1u64, 2u64)));
     if (string.is_empty("x")) {
         std.print("unreachable\n");
     } else {

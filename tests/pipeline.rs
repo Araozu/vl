@@ -20,8 +20,20 @@ fn frontend(src: &str) -> Result<vl_lir::LirProgram, Vec<vl_common::Diagnostic>>
     if diags.iter().any(|d| d.is_error()) {
         return Err(diags);
     }
-    let mut lir = vl_lir::lower(&hir, &typed);
-    stdlib.link(&mut lir);
+    // Single-file world for stdlib generics (same machinery as the driver).
+    let mut world_refs = vec![(&hir, &typed)];
+    for (shir, styped) in stdlib.checked_modules() {
+        world_refs.push((shir, styped));
+    }
+    let (plan, world_diags) = vl_typecheck::world::plan_world(&world_refs);
+    for (_, diag) in world_diags {
+        diags.push(diag);
+    }
+    if diags.iter().any(|d| d.is_error()) {
+        return Err(diags);
+    }
+    let mut lir = vl_lir::lower_project(&hir, &typed, &plan);
+    stdlib.link_with_plan(&mut lir, &plan);
     Ok(lir)
 }
 
@@ -254,8 +266,9 @@ fn unknown_module_export_is_a_single_error() {
 }
 
 /// Drive N source modules like the project driver does: parse every file,
-/// collect all interfaces into one catalog, then resolve/check/lower each.
-/// Returns one LIR program per module, in `units` order.
+/// collect all interfaces into one catalog, resolve/check all units, run the
+/// world fixed point, then lower each with its plan. Returns one LIR program
+/// per module, in `units` order.
 fn frontend_project(
     units: &[(&str, &str)],
 ) -> Result<Vec<vl_lir::LirProgram>, Vec<vl_common::Diagnostic>> {
@@ -276,19 +289,62 @@ fn frontend_project(
         diags.append(&mut d);
         modules.push(interface.as_spec());
     }
-    let mut out = Vec::new();
+    if diags.iter().any(|d| d.is_error()) {
+        return Err(diags);
+    }
+    let catalog = modules.clone();
+    let mut hirs = Vec::new();
+    let mut typeds = Vec::new();
     for ast in &parsed {
-        let (res, mut d) = vl_semantic::resolve_with_modules(ast, &modules);
+        let (res, mut d) = vl_semantic::resolve_with_modules(ast, &catalog);
         diags.append(&mut d);
+        if d.iter().any(|diag| diag.is_error()) {
+            continue;
+        }
         let hir = vl_hir::lower(ast, &res);
         let (typed, mut d) = vl_typecheck::check_with_modules(&hir, &modules);
         diags.append(&mut d);
         diags.append(&mut typed.validate_normalized(&hir, &diags));
-        if diags.iter().any(|d| d.is_error()) {
+        hirs.push(hir);
+        typeds.push(typed);
+    }
+    if diags.iter().any(|d| d.is_error()) {
+        return Err(diags);
+    }
+    let mut world_refs: Vec<(&vl_hir::HirProgram, &vl_typecheck::TypedProgram)> =
+        Vec::with_capacity(hirs.len() + stdlib.checked_modules().len());
+    for (hir, typed) in hirs.iter().zip(typeds.iter()) {
+        world_refs.push((hir, typed));
+    }
+    for (hir, typed) in stdlib.checked_modules() {
+        world_refs.push((hir, typed));
+    }
+    let (plan, world_diags) = vl_typecheck::world::plan_world(&world_refs);
+    for (_, diag) in world_diags {
+        diags.push(diag);
+    }
+    if diags.iter().any(|d| d.is_error()) {
+        return Err(diags);
+    }
+    let mut out = Vec::new();
+    for (hir, typed) in hirs.iter().zip(typeds.iter()) {
+        let mut lir = vl_lir::lower_project(hir, typed, &plan);
+        stdlib.link_with_plan(&mut lir, &plan);
+        if let Some(bad) = lir.validate_runtime() {
+            diags.push(vl_common::Diagnostic::error(format!("internal: {bad}")).with_code("E500"));
             return Err(diags);
         }
-        let mut lir = vl_lir::lower(&hir, &typed);
-        stdlib.link(&mut lir);
+        // No `Param`, template, or unmangled generic import may reach the backend.
+        for f in &lir.functions {
+            assert!(!f.name.contains("Param"), " Param leaked: {}", f.name);
+        }
+        for import in &lir.imports {
+            assert!(
+                !import.symbol.function.contains("Param"),
+                "generic import leaked: {}",
+                import.symbol.function
+            );
+        }
         out.push(lir);
     }
     Ok(out)
@@ -854,4 +910,180 @@ fn stdlib_example_compiles_and_runs_on_naravm() {
     let bytes = artifact.unwrap().bytes.unwrap();
     assert_eq!(&bytes[..4], b"nara");
     assert!(bytes.contains(&0x20), "expected calli instructions");
+}
+
+#[test]
+fn cross_module_generic_id_for_two_types() {
+    use vl_codegen::Target;
+    let programs = frontend_project(&[
+        ("demo.lib", "fun id[T](value: T): T { return value; }"),
+        (
+            "demo.main",
+            "use demo.lib.id; fun main() { val a = id(1u64); val b = id::[String](\"hi\"); a; b; }",
+        ),
+    ])
+    .expect("cross-module generics must compile");
+    assert_eq!(programs.len(), 2);
+    let provider = &programs[0];
+    let importer = &programs[1];
+    let provider_dump = provider.dump();
+    assert!(provider_dump.contains("fn id$u64:"), "{provider_dump}");
+    assert!(provider_dump.contains("fn id$String:"), "{provider_dump}");
+    assert!(!provider_dump.contains("fn id:\n"), "{provider_dump}");
+    let importer_dump = importer.dump();
+    assert!(
+        importer_dump.contains("call demo.lib::id$u64"),
+        "{importer_dump}"
+    );
+    assert!(
+        importer_dump.contains("call demo.lib::id$String"),
+        "{importer_dump}"
+    );
+    assert!(
+        !importer_dump.contains("call demo.lib::id("),
+        "{importer_dump}"
+    );
+    // Imports are concrete with concrete signatures.
+    assert!(importer
+        .imports
+        .iter()
+        .any(|i| i.symbol.module == "demo.lib" && i.symbol.function == "id$u64"));
+    for lir in &programs {
+        let (artifact, diags) = vl_codegen::NaraVmTarget.emit(lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+    }
+}
+
+#[test]
+fn cross_module_generic_forwarding_chain() {
+    let programs = frontend_project(&[
+        ("demo.lib", "fun id[T](value: T): T { return value; }"),
+        (
+            "demo.mid",
+            "use demo.lib; fun wrap[T](x: T): T { return lib.id(x); }",
+        ),
+        (
+            "demo.main",
+            "use demo.mid; fun main() { val x = mid.wrap(1u64); }",
+        ),
+    ])
+    .expect("forwarding chain must compile");
+    assert!(programs[2].dump().contains("call demo.mid::wrap$u64"));
+    assert!(programs[1].dump().contains("call demo.lib::id$u64"));
+    assert!(programs[0].dump().contains("fn id$u64:"));
+}
+
+#[test]
+fn cross_module_generic_import_forms_agree() {
+    for src in [
+        "use demo.lib; fun main() { val x = lib.id(1u64); }",
+        "use demo.lib.id; fun main() { val x = id(1u64); }",
+        "use demo.lib.{id}; fun main() { val x = id(1u64); }",
+    ] {
+        let programs = frontend_project(&[
+            ("demo.lib", "fun id[T](value: T): T { return value; }"),
+            ("demo.main", src),
+        ])
+        .expect("all import forms must compile");
+        assert!(programs[1].dump().contains("id$u64"), "{src}");
+    }
+}
+
+#[test]
+fn cross_module_generic_dumps_are_deterministic() {
+    let units = [
+        ("demo.lib", "fun id[T](value: T): T { return value; }"),
+        (
+            "demo.main",
+            "use demo.lib.id; fun main() { val a = id(1u64); val b = id(\"hi\"); a; b; }",
+        ),
+    ];
+    let a = frontend_project(&units).expect("must compile");
+    let mut reversed = units.to_vec();
+    reversed.reverse();
+    // `frontend_project` preserves input order for outputs but the plan is
+    // sorted; provider instances must match regardless of source order.
+    let b = frontend_project(&reversed).expect("must compile");
+    let (a_lib, a_main) = (&a[0].dump(), &a[1].dump());
+    // Find lib/main by module, not position (reversed input swaps positions).
+    let (b_lib, b_main) = if b[0].module == "demo.lib" {
+        (&b[0].dump(), &b[1].dump())
+    } else {
+        (&b[1].dump(), &b[0].dump())
+    };
+    // Compare as sets of lines (instruction order within functions is stable;
+    // function order is sorted, so dumps must be identical).
+    assert_eq!(a_lib, b_lib);
+    assert_eq!(a_main, b_main);
+}
+
+#[test]
+fn stdlib_generic_max_infers_and_links_lazily() {
+    use vl_codegen::Target;
+    let lir = frontend(
+        "use std.math; fun main() { val a = math.max(3u64, 9u64); val b = math.max::[i64](-1i64, 5i64); a; b; }",
+    )
+    .expect("stdlib generic max must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("std$math$max$u64"), "{dump}");
+    assert!(dump.contains("std$math$max$i64"), "{dump}");
+    assert!(!dump.contains("std.math::max("), "{dump}");
+    assert!(!dump.contains("std$math$is_even"), "{dump}");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+}
+
+#[test]
+fn stdlib_generic_max_reuses_one_instance() {
+    let lir = frontend(
+        "use std.math; fun main() { val a = math.max(1u64, 2u64); val b = math.max(3u64, 4u64); a; b; }",
+    )
+    .expect("must compile");
+    assert_eq!(lir.dump().matches("fn std$math$max$u64:").count(), 1);
+}
+
+#[test]
+fn stdlib_generic_bound_violation_is_one_error() {
+    let err =
+        frontend("use std.math; fun main() { math.max(\"a\", \"b\"); }").expect_err("must fail");
+    assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1, "{err:?}");
+    assert_eq!(err[0].code.as_deref(), Some("E303"), "{err:?}");
+}
+
+#[test]
+fn project_generic_calls_stdlib_generic_transitively() {
+    let programs = frontend_project(&[
+        (
+            "demo.lib",
+            "use std.math; fun double_max[T extends Numeric](a: T, b: T): T { return math.max(a, b); }",
+        ),
+        (
+            "demo.main",
+            "use demo.lib; fun main() { val m = lib.double_max(3u64, 9u64); }",
+        ),
+    ])
+    .expect("project->stdlib generics must compile");
+    let lib_dump = programs[0].dump();
+    assert!(lib_dump.contains("double_max$u64"), "{lib_dump}");
+    // The stdlib instance links into the consumer (no cross-artifact std call).
+    assert!(
+        lib_dump.contains("std$math$max$u64"),
+        "stdlib instance must link locally: {lib_dump}"
+    );
+    assert!(!lib_dump.contains("std.math::max$"), "{lib_dump}");
+}
+
+#[test]
+fn stdlib_generic_does_not_pull_unused_natives() {
+    let lir = frontend("use std.math; fun main() { val m = math.max(1u64, 2u64); m; }")
+        .expect("must compile");
+    // `max` needs no natives; `mod_u64` (used only by `is_even`) must stay out.
+    assert!(!lir.dump().contains("mod_u64"), "{}", lir.dump());
+    assert!(
+        !lir.imports.iter().any(|i| i.symbol.function == "mod_u64"),
+        "{:?}",
+        lir.imports
+    );
 }

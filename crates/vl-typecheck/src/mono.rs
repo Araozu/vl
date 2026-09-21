@@ -80,10 +80,15 @@ impl Monomorphizer<'_> {
             // Cap the worklist with a diagnostic instead of hanging.
             if self.visited.len() >= MAX_INSTANCES {
                 let span = fn_span_for(self.prog, def);
+                let name = instance_name(self.prog, def).unwrap_or_else(|| format!("def#{def}"));
                 self.diags.push(
-                    Diagnostic::error(
-                        "generic instantiation limit exceeded (possible polymorphic recursion)",
-                    )
+                    Diagnostic::error(format!(
+                        "generic instantiation limit exceeded ({} of {} instances, at `{}::{}`; possible polymorphic recursion)",
+                        self.visited.len(),
+                        MAX_INSTANCES,
+                        self.prog.module,
+                        name,
+                    ))
                     .with_label(span, "recursive instantiations keep growing here")
                     .with_note(
                         "avoid calls that wrap a type parameter in a larger type (`grow([x])`)",

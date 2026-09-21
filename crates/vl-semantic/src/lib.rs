@@ -22,9 +22,13 @@ pub struct Def {
     pub name: String,
     pub span: Span,
     pub kind: DefKind,
-    /// Compiler-owned extern signature. `Some` for `External` defs resolved
-    /// from the module catalog; `None` for locals and poisoned imports.
+    /// Compiler-owned signature. `Some` for `External`/`ImportedFunction` defs
+    /// resolved from the module catalog (possibly generic for source imports);
+    /// `None` for locals and poisoned imports.
     pub sig: Option<vl_common::FuncSig>,
+    /// Source-versus-target linkage for imported calls. `None` for locals,
+    /// poisoned imports, and synthetic builtins such as `Array.new`.
+    pub export_kind: Option<vl_common::ExportKind>,
     /// Binding mode for value definitions. Functions and parameters leave
     /// this unset because their fixed-binding rules are independent.
     pub binding: Option<BindingKind>,
@@ -70,6 +74,7 @@ impl Resolution {
             span,
             kind,
             sig: None,
+            export_kind: None,
             binding,
             symbol: None,
         });
@@ -129,7 +134,6 @@ fn collect_interface_impl(
     diagnose_incomplete_signatures: bool,
 ) -> (ModuleInterface, Vec<Diagnostic>) {
     let mut functions: Vec<vl_common::Export> = Vec::new();
-    let mut generic_functions = Vec::new();
     let mut objects: Vec<vl_common::ObjectExport> = Vec::new();
     let mut diags = Vec::new();
     let mut poisoned_exports = Vec::new();
@@ -242,7 +246,6 @@ fn collect_interface_impl(
                     .with_code("E200"),
             );
             functions.retain(|export| export.name != *name);
-            generic_functions.retain(|export| export != name);
             if !poisoned_exports.contains(name) {
                 poisoned_exports.push(name.clone());
             }
@@ -255,9 +258,8 @@ fn collect_interface_impl(
             global_dependent_exports.push(name.clone());
         }
         if *signature_poisoned || ret.is_none() || params.iter().any(|p| p.ty.is_none()) {
-            // Malformed signatures are poisoned before generic coordination.
-            // Otherwise importers report E207 for a generic export instead of
-            // staying quiet on the provider's parser/type root cause.
+            // Malformed signatures are poisoned so importers stay quiet on
+            // the provider's parser root cause.
             poisoned_exports.push(name.clone());
             if diagnose_incomplete_signatures {
                 diags.push(
@@ -270,15 +272,20 @@ fn collect_interface_impl(
             }
             continue;
         }
-        if !type_params.is_empty() {
-            generic_functions.push(name.clone());
-            continue;
-        }
         // Exported signatures qualify local object references
         // (`Person` -> `vl.person.Person`) so importers resolve nominal
-        // identity without the provider's scope.
-        let sig = vl_common::FuncSig {
-            params: params
+        // identity without the provider's scope. `Param` passes through
+        // unchanged; `Array` and `*` recurse.
+        let type_param_sigs = type_params
+            .iter()
+            .map(|p| vl_common::TypeParamSig {
+                name: p.name.clone(),
+                bound: p.bound,
+            })
+            .collect::<Vec<_>>();
+        let sig = vl_common::FuncSig::generic(
+            type_param_sigs,
+            params
                 .iter()
                 .filter_map(|p| {
                     p.ty.clone().map(|ty| vl_common::ParamSig {
@@ -287,26 +294,21 @@ fn collect_interface_impl(
                     })
                 })
                 .collect(),
-            ret: ret
-                .clone()
+            ret.clone()
                 .map(|ty| qualify_export_ty(&ty, &prog.module, &local_objects))
                 .unwrap_or(vl_common::VlType::Void),
-        };
+        );
         if sig.params.len() != params.len() {
             poisoned_exports.push(name.clone());
             continue;
         }
-        functions.push(vl_common::Export {
-            name: name.clone(),
-            sig,
-        });
+        functions.push(vl_common::Export::source(name.clone(), sig));
     }
     (
         ModuleInterface {
             path: ModulePath::from_dotted(&prog.module),
             origin: ModuleOrigin::Source,
             functions,
-            generic_functions,
             objects,
             parse_poisoned: false,
             poisoned_exports,
@@ -1047,17 +1049,6 @@ impl Resolver {
                         self.poison_import(leaf, span);
                         return;
                     }
-                    if parent.generic_exports.iter().any(|name| name == &leaf) {
-                        self.diags.push(
-                            Diagnostic::error(format!(
-                                "generic source export `{key}` is not supported across modules"
-                            ))
-                            .with_label(span, "generic import is unsupported")
-                            .with_code("E207"),
-                        );
-                        self.poison_import(leaf.clone(), span);
-                        return;
-                    }
                     if parent.lookup(&leaf).is_some() {
                         if parent
                             .global_dependent_exports
@@ -1070,17 +1061,6 @@ impl Resolver {
                                 ))
                                 .with_label(span, "unsupported cross-module boundary")
                                 .with_code("E208"),
-                            );
-                            self.poison_import(leaf.clone(), span);
-                            return;
-                        }
-                        if parent.generic_exports.iter().any(|name| name == &leaf) {
-                            self.diags.push(
-                                Diagnostic::error(format!(
-                                    "generic source export `{key}` is not supported across modules"
-                                ))
-                                .with_label(span, "generic import is unsupported")
-                                .with_code("E207"),
                             );
                             self.poison_import(leaf.clone(), span);
                             return;
@@ -1098,7 +1078,6 @@ impl Resolver {
                             ModuleSpec {
                                 path: vl_common::ModulePath::new(vec![parent_key, leaf]),
                                 exports: vec![],
-                                generic_exports: vec![],
                                 objects: vec![],
                                 parse_poisoned: parent.parse_poisoned,
                                 poisoned_exports: vec![],
@@ -1155,15 +1134,6 @@ impl Resolver {
                     if self.reserve_import_alias(name, span) {
                         continue;
                     }
-                    if module.generic_exports.iter().any(|export| export == name) {
-                        self.diags.push(
-                            Diagnostic::error(format!("generic source export `{key}.{name}` is not supported across modules"))
-                                .with_label(span, "generic import is unsupported")
-                                .with_code("E207"),
-                        );
-                        self.poison_import(name.clone(), span);
-                        continue;
-                    }
                     if module.lookup(name).is_none() {
                         if module.poisoned_exports.iter().any(|export| export == name) {
                             self.poison_import(name.clone(), span);
@@ -1213,14 +1183,17 @@ impl Resolver {
     /// (`use std.print;` then `print()`). The synthetic import path encodes
     /// the parent module + leaf (`std.print`), which we split to find the
     /// original export.
-    fn sig_for_bare_import(&self, alias: &str) -> Option<vl_common::FuncSig> {
+    fn sig_for_bare_import(
+        &self,
+        alias: &str,
+    ) -> Option<(vl_common::FuncSig, vl_common::ExportKind)> {
         if let Some(symbol) = self.import_symbols.get(alias) {
             return self
                 .modules
                 .iter()
                 .find(|m| m.path == symbol.module)
                 .and_then(|m| m.lookup(&symbol.name))
-                .map(|e| e.sig.clone());
+                .map(|e| (e.sig.clone(), e.kind));
         }
         // An exact module import is an alias, not a synthetic import of the
         // parent's same-named export. It is qualified-callable only.
@@ -1241,7 +1214,7 @@ impl Resolver {
             .modules
             .iter()
             .find(|m| m.path.as_string() == parent_key)?;
-        parent.lookup(leaf).map(|e| e.sig.clone())
+        parent.lookup(leaf).map(|e| (e.sig.clone(), e.kind))
     }
 
     fn lookup_path(&mut self, path: &[String], span: Span) -> Option<DefId> {
@@ -1260,21 +1233,29 @@ impl Resolver {
             }
             if self.import_symbols.contains_key(&path[0]) {
                 let symbol = self.import_symbols.get(&path[0]).cloned();
-                let sig = self.sig_for_bare_import(&path[0]);
-                return Some(self.external_def(
+                let resolved = self.sig_for_bare_import(&path[0]);
+                let (sig, export_kind) = resolved
+                    .map(|(s, k)| (Some(s), Some(k)))
+                    .unwrap_or((None, None));
+                return Some(self.external_def_with_kind(
                     path[0].clone(),
                     span,
                     sig,
+                    export_kind,
                     DefKind::ImportedFunction,
                     symbol,
                 ));
             }
             if self.imports.contains_key(&path[0]) {
-                let sig = self.sig_for_bare_import(&path[0]);
-                return Some(self.external_def(
+                let resolved = self.sig_for_bare_import(&path[0]);
+                let (sig, export_kind) = resolved
+                    .map(|(s, k)| (Some(s), Some(k)))
+                    .unwrap_or((None, None));
+                return Some(self.external_def_with_kind(
                     path[0].clone(),
                     span,
                     sig,
+                    export_kind,
                     if self.import_symbols.contains_key(&path[0]) {
                         DefKind::ImportedFunction
                     } else {
@@ -1320,25 +1301,6 @@ impl Resolver {
         let module = self.imports.get(&path[0]).cloned()?;
         if path.len() != 2 {
             return None;
-        }
-        if module.generic_exports.iter().any(|name| name == &path[1]) {
-            self.diags.push(
-                Diagnostic::error(format!(
-                    "generic source export `{}.{}` is not supported across modules",
-                    module.path.as_string(),
-                    path[1]
-                ))
-                .with_label(span, "generic call is unsupported")
-                .with_code("E207"),
-            );
-            self.poisoned_imports.insert(path.join("."));
-            return Some(self.external_def(
-                path.join("."),
-                span,
-                None,
-                DefKind::ImportedFunction,
-                None,
-            ));
         }
         let Some(export) = module.lookup(&path[1]) else {
             if module.poisoned_exports.iter().any(|name| name == &path[1]) {
@@ -1386,29 +1348,13 @@ impl Resolver {
                 None,
             ));
         }
-        if module.generic_exports.iter().any(|name| name == &path[1]) {
-            self.diags.push(
-                Diagnostic::error(format!(
-                    "generic source export `{}.{}` is not supported across modules",
-                    module.path.as_string(),
-                    path[1]
-                ))
-                .with_label(span, "generic call is unsupported")
-                .with_code("E207"),
-            );
-            return Some(self.external_def(
-                path.join("."),
-                span,
-                None,
-                DefKind::ImportedFunction,
-                None,
-            ));
-        }
         let sig = export.sig.clone();
-        Some(self.external_def(
+        let export_kind = export.kind;
+        Some(self.external_def_with_kind(
             path.join("."),
             span,
             Some(sig),
+            Some(export_kind),
             DefKind::ImportedFunction,
             Some(SymbolRef {
                 module: module.path.clone(),
@@ -1425,6 +1371,18 @@ impl Resolver {
         kind: DefKind,
         symbol: Option<SymbolRef>,
     ) -> DefId {
+        self.external_def_with_kind(name, span, sig, None, kind, symbol)
+    }
+
+    fn external_def_with_kind(
+        &mut self,
+        name: String,
+        span: Span,
+        sig: Option<vl_common::FuncSig>,
+        export_kind: Option<vl_common::ExportKind>,
+        kind: DefKind,
+        symbol: Option<SymbolRef>,
+    ) -> DefId {
         let id = DefId(self.out.defs.len() as u32);
         self.out.defs.push(Def {
             id: id.clone(),
@@ -1432,6 +1390,7 @@ impl Resolver {
             span,
             kind,
             sig,
+            export_kind,
             binding: None,
             symbol,
         });
@@ -1889,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_generic_exports_are_poisoned_before_generic_exports() {
+    fn malformed_generic_exports_are_poisoned() {
         for source in [
             "fun broken[T](value:): u64 { return 1u64; }",
             "fun broken[T](value: u64): Nope { return 1u64; }",
@@ -1901,7 +1860,7 @@ mod tests {
                 "source should be malformed: {source}"
             );
             let (interface, _) = collect_interface_quiet(&provider);
-            assert!(interface.generic_functions.is_empty(), "{source}");
+            assert!(interface.functions.is_empty(), "{source}");
             assert!(
                 interface
                     .poisoned_exports
@@ -1910,6 +1869,84 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn generic_export_collects_complete_signature() {
+        let (toks, _) = vl_lex::lex("fun id[T](value: T): T { return value; }");
+        let (provider, _) = vl_syntax::parse_with_module(&toks, "", "demo.lib");
+        let (interface, diags) = collect_interface(&provider);
+        assert!(diags.is_empty(), "{diags:?}");
+        let export = interface
+            .functions
+            .iter()
+            .find(|e| e.name == "id")
+            .expect("id export");
+        assert_eq!(export.sig.type_params.len(), 1);
+        assert_eq!(export.sig.type_params[0].name, "T");
+        assert_eq!(export.kind, vl_common::ExportKind::Source);
+    }
+
+    #[test]
+    fn generic_imports_resolve_through_all_forms() {
+        use vl_common::{Export, FuncSig, ParamSig, TypeParamSig};
+        let sig = FuncSig::generic(
+            vec![TypeParamSig {
+                name: "T".into(),
+                bound: None,
+            }],
+            vec![ParamSig {
+                name: "value".into(),
+                ty: vl_common::VlType::Param("T".into()),
+            }],
+            vl_common::VlType::Param("T".into()),
+        );
+        let module =
+            ModuleSpec::new_source(&["demo", "lib"], vec![Export::source("id".into(), sig)]);
+        for src in [
+            "use demo.lib; fun main() { lib.id(1u64); }",
+            "use demo.lib.id; fun main() { id(1u64); }",
+            "use demo.lib.{id}; fun main() { id(1u64); }",
+        ] {
+            let (toks, _) = vl_lex::lex(src);
+            let (program, parse_diags) = vl_syntax::parse(&toks, "");
+            assert!(parse_diags.is_empty(), "{src}: {parse_diags:?}");
+            let (resolution, diags) = resolve_with_modules(&program, std::slice::from_ref(&module));
+            assert!(diags.iter().all(|d| !d.is_error()), "{src}: {diags:?}");
+            let def = resolution
+                .defs
+                .iter()
+                .find(|d| d.kind == DefKind::ImportedFunction)
+                .expect("imported def");
+            let sig = def.sig.as_ref().expect("generic sig");
+            assert_eq!(sig.type_params.len(), 1, "{src}");
+            assert!(def.symbol.is_some(), "{src}");
+        }
+    }
+
+    #[test]
+    fn global_dependent_generic_import_is_one_e208() {
+        use vl_common::{Export, FuncSig, ParamSig, TypeParamSig};
+        let sig = FuncSig::generic(
+            vec![TypeParamSig {
+                name: "T".into(),
+                bound: None,
+            }],
+            vec![ParamSig {
+                name: "value".into(),
+                ty: vl_common::VlType::Param("T".into()),
+            }],
+            vl_common::VlType::Param("T".into()),
+        );
+        let mut module =
+            ModuleSpec::new_source(&["demo", "lib"], vec![Export::source("id".into(), sig)]);
+        module.global_dependent_exports.push("id".into());
+        let (toks, _) = vl_lex::lex("use demo.lib.id; fun main() { id(1u64); }");
+        let (program, _) = vl_syntax::parse(&toks, "");
+        let (_, diags) = resolve_with_modules(&program, &[module]);
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E208"), "{diags:?}");
     }
 
     #[test]
@@ -1953,13 +1990,25 @@ mod tests {
     }
 
     #[test]
-    fn qualified_generic_import_is_e207() {
-        let mut module = ModuleSpec::new(&["demo", "lib"], &[]);
-        module.generic_exports.push("id".into());
+    fn qualified_generic_import_resolves() {
+        use vl_common::{Export, FuncSig, ParamSig, TypeParamSig};
+        let sig = FuncSig::generic(
+            vec![TypeParamSig {
+                name: "T".into(),
+                bound: None,
+            }],
+            vec![ParamSig {
+                name: "value".into(),
+                ty: vl_common::VlType::Param("T".into()),
+            }],
+            vl_common::VlType::Param("T".into()),
+        );
+        let module =
+            ModuleSpec::new_source(&["demo", "lib"], vec![Export::source("id".into(), sig)]);
         let (toks, _) = vl_lex::lex("use demo.lib; fun main() { lib.id(1u64); }");
         let (program, _) = vl_syntax::parse(&toks, "");
         let (_, diags) = resolve_with_modules(&program, &[module]);
-        assert!(diags.iter().any(|d| d.code.as_deref() == Some("E207")));
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
         assert!(!diags.iter().any(|d| d.code.as_deref() == Some("E201")));
     }
 
