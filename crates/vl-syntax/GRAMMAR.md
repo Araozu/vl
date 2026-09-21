@@ -17,9 +17,11 @@ destructure_binding := ident (":" ident)?
 function_item := "fun" ident type_params? "(" params? ")" (":" type)? block
 type_params := "[" type_param ("," type_param)* "]"
 type_param := ident ("extends" ("Numeric" | "Comparable"))?
-object_item := "type" ident "=" "object" "{" object_fields? "}" ";"
-object_fields := object_field ("," object_field)* ","?
-object_field := ident ":" type
+object_item := "type" ident "=" "object" "{" object_member* "}" ";"
+object_member := object_field | assoc_fn
+object_field := ident ":" type ","?    ; the comma may be omitted before `fun` or `}`
+assoc_fn := "fun" ident type_params? "(" params? ")" (":" type)? block ","?
+                                       ; a trailing comma after a `fun` member is allowed, never required
 params   := param ("," param)*          ; no trailing comma
 param    := ident ":" type
 type     := mutable_type | type_atom
@@ -97,6 +99,14 @@ Dot Colon Hash Backtick ColonColon Ident Int I64 U64 F64 U8 Bool String Invalid 
   `Array[*Foo]`); `*` in an expression stays multiplication (`a * b`).
   `mutable_type` goes through `type_atom` (not `type`), so `**Foo` is an
   immediate `E106`. Type spans include the leading `*`.
+* Objects declare associated functions inside the body
+  (`type Counter = object { value: u64, fun bump(self: *Counter): *Counter { ... } };`).
+  Fields and `fun` members share one namespace: a duplicate member name is one
+  `E200` (`duplicate member`). The comma after a field may be omitted before a
+  `fun` member or `}`; a trailing comma after a `fun` member is allowed but
+  never required. Calls spell the owner explicitly (`Counter.bump(c)`); a
+  `receiver.method(args)` call is accepted only when the method's first
+  parameter takes the receiver's object type (checked by `vl-typecheck`).
 
 ## AST
 
@@ -106,7 +116,9 @@ Item ::= Use { path, names, span }
        | Let { kind: Var | Val, name, name_span, ty, ty_span, value: Expr, span }
        | Destructure { kind: Var | Val, bindings: Vec<DestructureBinding>, bindings_span, ty, ty_span, value: Expr, span }
        | Function { name, name_span, type_params: Vec<TypeParam>, params: Vec<Param>, ret: Option<VlType>, ret_span, body: Vec<Stmt>, span }
-       | Object { name, name_span, fields: Vec<ObjectField>, span }
+       | Object { name, name_span, fields: Vec<ObjectField>, methods: Vec<AssociatedFn>, span }
+AssociatedFn ::= { name, name_span, type_params: Vec<TypeParam>, params: Vec<Param>, ret: Option<VlType>, ret_span, body: Vec<Stmt>, span }
+       ; same shape as Function; the owner lives on the enclosing Object
 TypeParam ::= { name, span, bound: Option<GenericBound> }
 Param ::= { name, name_span, ty: Option<VlType>, ty_span }
 DestructureBinding ::= { field: Option<String>, field_span, binding: String, binding_span }

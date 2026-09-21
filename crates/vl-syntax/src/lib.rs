@@ -3,7 +3,10 @@
 //! Grammar (v0 surface):
 //! ```text
 //! program := item*
-//! item    := `use` ... | (`var` | `val`) (ident | destructure) (`:` type)? `=` expr `;` | `fun` ident type-params? `(` params? `)` (`:` type)? block | `type` ident `=` `object` `{` object-fields? `}` `;`
+//! item    := `use` ... | (`var` | `val`) (ident | destructure) (`:` type)? `=` expr `;` | `fun` ident type-params? `(` params? `)` (`:` type)? block | `type` ident `=` `object` `{` object-member* `}` `;`
+//! object-member := object-field | assoc-fn
+//! object-field  := ident `:` type `,`? (the comma may be omitted before `fun` or `}`)
+//! assoc-fn      := `fun` ident type-params? `(` params? `)` (`:` type)? block `,`?
 //! destructure := `#` `(` destructure-binding (`,` destructure-binding)* `)`
 //! destructure-binding := ident (`:` ident)?
 //! type-params := `[` type-param (`,` type-param)* `]`
@@ -51,6 +54,12 @@
 //! Objects are named reference types: `type Name = object { field: type, };`
 //! creates a heap object, `Name { field = value }` initializes one, and field
 //! assignment mutates the shared object visible through every alias.
+//! Objects may also declare associated functions inside the body
+//! (`fun init(v: u64): Counter { ... }`), called as `Counter.init(v)` or,
+//! when the first parameter takes the object itself (`self: Counter` or
+//! `self: *Counter`), as instance sugar (`counter.init(v)` is sugar for
+//! `Counter.init(counter, v)` only in that case). Fields and associated
+//! functions share one member namespace: redeclaring a name is an error.
 //!
 //! Tuples are fixed-arity heterogeneous values with copy semantics:
 //! `#(u64, String)` is unnamed (backtick indexing, ``t.`0``),
@@ -133,6 +142,43 @@ pub struct ObjectField {
     pub ty_span: Option<Span>,
 }
 
+/// One associated function declared inside an object body
+/// (`fun init(v: u64): Counter { ... }` in
+/// `type Counter = object { ..., fun init ... };`).
+/// The shape mirrors a top-level [`Item::Function`]; the owning object name
+/// lives on the enclosing [`Item::Object`]. Calls spell the owner explicitly
+/// (`Counter.init(v)`); there is no implicit `self`.
+#[derive(Debug, Clone)]
+pub struct AssociatedFn {
+    pub name: String,
+    pub name_span: Span,
+    /// Declared type parameters (`[]` when monomorphic).
+    pub type_params: Vec<TypeParam>,
+    pub params: Vec<Param>,
+    /// `None` when the return annotation was missing (already reported).
+    pub ret: Option<VlType>,
+    pub ret_span: Option<Span>,
+    /// A parser error occurred in the function header. The recovered
+    /// declaration must not be published as an export.
+    pub signature_poisoned: bool,
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+/// Parser-internal shared result of `parse_fn_rest`: one `fun` header + body,
+/// wrapped by callers into [`Item::Function`] or [`AssociatedFn`].
+struct ParsedFn {
+    name: String,
+    name_span: Span,
+    type_params: Vec<TypeParam>,
+    params: Vec<Param>,
+    ret: Option<VlType>,
+    ret_span: Option<Span>,
+    signature_poisoned: bool,
+    body: Vec<Stmt>,
+    span: Span,
+}
+
 /// One destructured binding in `val #(a, b) = t;` / `val #(x: x2) = u;`.
 /// `field` is `None` for a positional (unnamed-tuple) binding and
 /// `Some(field)` for a named-tuple binding (`x` in `x` / `x: x2`).
@@ -155,6 +201,9 @@ pub enum Item {
         name: String,
         name_span: Span,
         fields: Vec<ObjectField>,
+        /// Associated functions declared inside the object body. Fields and
+        /// methods share one member namespace (duplicates are E200).
+        methods: Vec<AssociatedFn>,
         span: Span,
     },
     Let {
@@ -574,7 +623,53 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::Object, "`object` after `=`")?;
         self.expect(&TokenKind::LBrace, "`{` after `object`")?;
         let mut fields = Vec::new();
+        let mut methods = Vec::new();
+        // One member namespace: a field and an associated function may not
+        // share a name, so `c.name` (field) and `Type.name(...)` (call) never
+        // compete for the same member.
+        let mut member_spans: Vec<(String, Span)> = Vec::new();
+        let check_member = |name: &str,
+                            span: Span,
+                            member_spans: &[(String, Span)],
+                            diags: &mut Vec<Diagnostic>| {
+            if let Some(previous) = member_spans.iter().find(|(n, _)| n == name) {
+                diags.push(
+                    Diagnostic::error(format!("duplicate member `{name}`"))
+                        .with_label(span, "redefined here")
+                        .with_bare_label(previous.1)
+                        .with_code("E200"),
+                );
+            }
+        };
         while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
+            if matches!(self.peek().kind, TokenKind::Fun) {
+                let fun_tok = self.bump(); // `fun`
+                let parsed = self.parse_fn_rest(fun_tok)?;
+                check_member(
+                    &parsed.name,
+                    parsed.name_span,
+                    &member_spans,
+                    &mut self.diags,
+                );
+                member_spans.push((parsed.name.clone(), parsed.name_span));
+                methods.push(AssociatedFn {
+                    name: parsed.name,
+                    name_span: parsed.name_span,
+                    type_params: parsed.type_params,
+                    params: parsed.params,
+                    ret: parsed.ret,
+                    ret_span: parsed.ret_span,
+                    signature_poisoned: parsed.signature_poisoned,
+                    body: parsed.body,
+                    span: parsed.span,
+                });
+                // A trailing comma after a `fun` member is allowed but never
+                // required: `fun f() {...},` and `fun f() {...}` both parse.
+                if matches!(self.peek().kind, TokenKind::Comma) {
+                    self.bump();
+                }
+                continue;
+            }
             let (field_name, field_span) = self.parse_ident()?;
             self.expect(&TokenKind::Colon, "`:` after field name")?;
             let fallback = self.peek().clone();
@@ -599,17 +694,17 @@ impl<'a> Parser<'a> {
                 }
             };
             // Failed type already reported once; only keep the poisoned field
-            // when the follow (`,` or `}`) is present, else recover.
-            if type_failed && !matches!(self.peek().kind, TokenKind::Comma | TokenKind::RBrace) {
+            // when the follow (`,`, `fun`, or `}`) is present, else recover.
+            if type_failed
+                && !matches!(
+                    self.peek().kind,
+                    TokenKind::Comma | TokenKind::RBrace | TokenKind::Fun
+                )
+            {
                 return None;
             }
-            if fields.iter().any(|f: &ObjectField| f.name == field_name) {
-                self.diags.push(
-                    Diagnostic::error(format!("duplicate object field `{field_name}`"))
-                        .with_label(field_span, "redefined here")
-                        .with_code("E200"),
-                );
-            }
+            check_member(&field_name, field_span, &member_spans, &mut self.diags);
+            member_spans.push((field_name.clone(), field_span));
             fields.push(ObjectField {
                 name: field_name,
                 name_span: field_span,
@@ -620,15 +715,18 @@ impl<'a> Parser<'a> {
                 self.bump();
                 continue;
             }
-            if !matches!(self.peek().kind, TokenKind::RBrace) {
-                let t = self.peek().clone();
-                self.diags.push(
-                    Diagnostic::error(format!("expected `,` or `}}`, found {}", describe(&t.kind)))
-                        .with_label(t.span, "separate object fields with commas")
-                        .with_code("E100"),
-                );
-                return None;
+            // The comma may be omitted before a `fun` member or `}`:
+            // `type C = object { v: u64, fun f() {...} };` parses.
+            if matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Fun) {
+                continue;
             }
+            let t = self.peek().clone();
+            self.diags.push(
+                Diagnostic::error(format!("expected `,` or `}}`, found {}", describe(&t.kind)))
+                    .with_label(t.span, "separate object members with commas")
+                    .with_code("E100"),
+            );
+            return None;
         }
         let close = self.expect(&TokenKind::RBrace, "`}` after object fields")?;
         let semi = self.expect(&TokenKind::Semi, "`;` after object declaration")?;
@@ -636,6 +734,7 @@ impl<'a> Parser<'a> {
             name,
             name_span,
             fields,
+            methods,
             span: Span::new(type_tok.span.start, semi.span.end.max(close.span.end)),
         })
     }
@@ -1521,7 +1620,25 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_function_item(&mut self) -> Option<Item> {
-        let function_tok = self.bump(); // `function`
+        let function_tok = self.bump(); // `fun`
+        let parsed = self.parse_fn_rest(function_tok)?;
+        Some(Item::Function {
+            name: parsed.name,
+            name_span: parsed.name_span,
+            type_params: parsed.type_params,
+            params: parsed.params,
+            ret: parsed.ret,
+            ret_span: parsed.ret_span,
+            signature_poisoned: parsed.signature_poisoned,
+            body: parsed.body,
+            span: parsed.span,
+        })
+    }
+
+    /// Shared `fun` header + body parser used by top-level `fun` items and by
+    /// associated functions inside `object` bodies. The caller has already
+    /// consumed the leading `fun` token.
+    fn parse_fn_rest(&mut self, function_tok: Token) -> Option<ParsedFn> {
         let (name, name_span) = self.parse_ident()?;
         let header_diag_count = self.diags.len();
         let type_params = self.parse_type_params()?;
@@ -1577,7 +1694,7 @@ impl<'a> Parser<'a> {
             }
         }
         let close = self.expect(&TokenKind::RBrace, "`}`")?;
-        Some(Item::Function {
+        Some(ParsedFn {
             name,
             name_span,
             type_params,
@@ -2471,6 +2588,65 @@ mod tests {
             }
             other => panic!("expected function, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_associated_functions_inside_object() {
+        let (prog, diags) = parse_src(
+            "type Counter = object { value: u64, fun init(v: u64): Counter { return Counter { value = v }; }, fun bump(self: *Counter): *Counter { self.value = self.value + 1; return self; } };",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Object {
+                fields, methods, ..
+            } => {
+                assert_eq!(fields.len(), 1);
+                assert_eq!(methods.len(), 2);
+                assert_eq!(methods[0].name, "init");
+                assert_eq!(methods[0].params.len(), 1);
+                assert_eq!(methods[0].ret, Some(VlType::Object("Counter".into())));
+                assert_eq!(methods[1].name, "bump");
+                assert!(!methods[1].signature_poisoned);
+            }
+            other => panic!("expected object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn associated_function_comma_before_fun_is_optional() {
+        for src in [
+            "type C = object { value: u64, fun f(self: C): u64 { return self.value; } };",
+            "type C = object { value: u64 fun f(self: C): u64 { return self.value; } };",
+            "type C = object { fun f(self: C): u64 { return self.value; } value: u64, };",
+        ] {
+            let (prog, diags) = parse_src(src);
+            assert!(diags.is_empty(), "{src}: {diags:?}");
+            assert!(
+                matches!(&prog.items[0], Item::Object { methods, .. } if methods.len() == 1),
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_field_and_method_is_one_error() {
+        let (_prog, diags) = parse_src(
+            "type C = object { value: u64, fun value(self: C): u64 { return self.value; } };",
+        );
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E200"));
+        assert!(errors[0].message.contains("duplicate member"), "{diags:?}");
+    }
+
+    #[test]
+    fn duplicate_method_names_are_one_error() {
+        let (_prog, diags) = parse_src(
+            "type C = object { value: u64, fun f(self: C): u64 { return 1; } fun f(self: C): u64 { return 2; } };",
+        );
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E200"));
     }
 
     #[test]
