@@ -332,6 +332,26 @@ fn calls_in_item(
                     out.push((id.0, d.0, type_args.clone(), actuals));
                 }
             }
+            HirExpr::MethodCall {
+                id,
+                receiver,
+                type_args,
+                args,
+                ..
+            } => {
+                walk_expr(typed, receiver, out);
+                for arg in args {
+                    walk_expr(typed, arg, out);
+                }
+                // Local method target (foreign sugar resolves through the
+                // world fixed point instead); the receiver counts as the
+                // first actual, mirroring the checker's combined arity.
+                if let Some(d) = typed.method_defs.get(&id.0) {
+                    let mut actuals = vec![expr_ty(typed, receiver)];
+                    actuals.extend(args.iter().map(|a| expr_ty(typed, a)));
+                    out.push((id.0, *d, type_args.clone(), actuals));
+                }
+            }
             HirExpr::ArrayLiteral { elems, .. } => {
                 for elem in elems {
                     walk_expr(typed, elem, out);

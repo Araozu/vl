@@ -183,6 +183,41 @@ fn calls_in_template(prog: &HirProgram, typed: &TypedProgram, def: u32) -> Vec<N
                     }
                 }
             }
+            HirExpr::MethodCall {
+                id,
+                receiver,
+                type_args,
+                args,
+                ..
+            } => {
+                walk_expr(prog, typed, receiver, out);
+                for arg in args {
+                    walk_expr(prog, typed, arg, out);
+                }
+                // Sugar callee identity mirrors `Call`: local methods resolve
+                // via the recorded template def, foreign ones via the
+                // recorded provider symbol. The receiver counts as the first
+                // actual, mirroring the checker's combined arity.
+                let mut actuals = vec![expr_ty(typed, receiver)];
+                actuals.extend(args.iter().map(|a| expr_ty(typed, a)));
+                if let Some(d) = typed.method_defs.get(&id.0) {
+                    if let Some(name) = instance_name(prog, *d) {
+                        out.push(NestedCall {
+                            call_id: id.0,
+                            callee: TemplateKey::new(prog.module.clone(), name),
+                            type_args: type_args.clone(),
+                            actuals,
+                        });
+                    }
+                } else if let Some(sym) = typed.method_symbols.get(&id.0) {
+                    out.push(NestedCall {
+                        call_id: id.0,
+                        callee: TemplateKey::new(sym.module.as_string(), sym.name.clone()),
+                        type_args: type_args.clone(),
+                        actuals,
+                    });
+                }
+            }
             HirExpr::ArrayLiteral { elems, .. } => {
                 for elem in elems {
                     walk_expr(prog, typed, elem, out);
@@ -595,6 +630,12 @@ pub fn validate_plan(
                 }
                 HirExpr::Field { base, .. } => expr_ids(base, out),
                 HirExpr::Call { args, .. } => {
+                    for a in args {
+                        expr_ids(a, out);
+                    }
+                }
+                HirExpr::MethodCall { receiver, args, .. } => {
+                    expr_ids(receiver, out);
                     for a in args {
                         expr_ids(a, out);
                     }

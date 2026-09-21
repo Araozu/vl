@@ -363,6 +363,47 @@ impl FuncSigTy {
 
 pub use vl_common::TemplateKey;
 
+/// One instance-sugar call site, bundled so checking stays under the
+/// argument-count lint.
+struct MethodCallParts<'a> {
+    id: vl_hir::HirId,
+    receiver: &'a HirExpr,
+    method: &'a str,
+    method_span: Span,
+    type_args: &'a [VlType],
+    args: &'a [HirExpr],
+    span: Span,
+}
+/// One foreign associated function from the module catalog: its owner module
+/// plus its shared (possibly generic) signature.
+#[derive(Debug, Clone)]
+struct ForeignMethod {
+    owner_module: String,
+    /// Short `Type.method` spelling for messages and cross-module identity.
+    dotted: String,
+    sig: FuncSigTy,
+    global_dependent: bool,
+}
+
+/// Result of locating an associated function for a receiver object type.
+#[derive(Debug, Clone)]
+enum AssocLookup {
+    /// Same-module method: template def plus HIR `Fn` name and signature.
+    Local {
+        def: u32,
+        fn_name: String,
+        sig: FuncSigTy,
+    },
+    Foreign(ForeignMethod),
+    /// Known to exist but unavailable across the boundary (provider root
+    /// cause already reported): poison quietly.
+    Poisoned,
+    /// No such method on the object. `has_field` steers toward field access.
+    Missing {
+        has_field: bool,
+    },
+}
+
 /// Identity of one concrete instantiation: its template plus structural type
 /// arguments. The emitted symbol is derived from this key only at the LIR
 /// boundary; never use a pre-mangled string as semantic identity upstream.
@@ -452,6 +493,29 @@ pub struct TypedProgram {
     /// Concrete imported requests discovered in monomorphic code and global
     /// initializers, awaiting the project-wide fixed point.
     pub pending_imported: Vec<InstanceKey>,
+    /// Resolved instance-sugar call site (`HirId.0`) -> call target. Every
+    /// successfully checked `MethodCall` lands here; generic sugar calls
+    /// additionally land in `root_calls` / `imported_root_calls` so
+    /// monomorphization reuses the ordinary generic paths.
+    pub method_targets: HashMap<u32, MethodTarget>,
+    /// Sugar call site (`HirId.0`) -> local method template `DefId.0`.
+    /// Feeds the monomorphization worklist for method calls inside generic
+    /// templates (mirrors `Call.def` for ordinary calls).
+    pub method_defs: HashMap<u32, u32>,
+    /// Sugar call site (`HirId.0`) -> foreign provider identity.
+    /// Feeds import collection and the world fixed point for foreign method
+    /// calls (mirrors `Call.symbol` for ordinary calls).
+    pub method_symbols: HashMap<u32, vl_common::SymbolRef>,
+}
+
+/// Resolved target of one instance-sugar call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MethodTarget {
+    /// Same-module method: HIR `Fn` name (`Owner.method`).
+    Local(String),
+    /// Foreign associated function: provider identity (`Type.method` in the
+    /// owner module).
+    Foreign(vl_common::SymbolRef),
 }
 
 impl TypedProgram {
@@ -584,6 +648,12 @@ fn template_expr_ids(e: &HirExpr, out: &mut HashSet<u32>) {
         HirExpr::TupleIndex { base, .. } => template_expr_ids(base, out),
         HirExpr::Field { base, .. } => template_expr_ids(base, out),
         HirExpr::Call { args, .. } => {
+            for a in args {
+                template_expr_ids(a, out);
+            }
+        }
+        HirExpr::MethodCall { receiver, args, .. } => {
+            template_expr_ids(receiver, out);
             for a in args {
                 template_expr_ids(a, out);
             }
@@ -790,6 +860,21 @@ fn validate_qualified_types(
                     check_expr(arg, objects, diags);
                 }
             }
+            HirExpr::MethodCall {
+                type_args,
+                receiver,
+                args,
+                span,
+                ..
+            } => {
+                for arg in type_args {
+                    check_ty(arg, *span, objects, diags);
+                }
+                check_expr(receiver, objects, diags);
+                for arg in args {
+                    check_expr(arg, objects, diags);
+                }
+            }
             HirExpr::ArrayLiteral { elems, .. } => {
                 for elem in elems {
                     check_expr(elem, objects, diags);
@@ -965,6 +1050,9 @@ pub fn check_with_modules(
         module: prog.module.clone(),
         pending_instances: Vec::new(),
         pending_imported: Vec::new(),
+        assoc_local: HashMap::new(),
+        assoc_foreign: HashMap::new(),
+        assoc_poisoned: HashSet::new(),
         fixed_defs: HashSet::new(),
     };
     // Merge foreign layouts first so local declarations can reference
@@ -989,6 +1077,32 @@ pub fn check_with_modules(
             cx.typed
                 .objects
                 .insert(export.qualified.clone(), ObjectSigTy { fields: out_fields });
+            // Associated functions join the foreign method table under their
+            // qualified owner so instance sugar (`p.method()`) resolves
+            // without an import, like object layouts. Poisoned and
+            // global-dependent marks mirror the free-function boundary.
+            for method in &export.methods {
+                cx.assoc_foreign.insert(
+                    (export.qualified.clone(), method.name.clone()),
+                    ForeignMethod {
+                        owner_module: spec.path.as_string(),
+                        dotted: format!("{}.{}", export.name, method.name),
+                        sig: FuncSigTy::from_shared(&method.sig),
+                        global_dependent: spec
+                            .global_dependent_exports
+                            .iter()
+                            .any(|e| e == &format!("{}.{}", export.name, method.name)),
+                    },
+                );
+            }
+            for poisoned in &spec.poisoned_exports {
+                if let Some((owner, method)) = poisoned.split_once('.') {
+                    if owner == export.name {
+                        cx.assoc_poisoned
+                            .insert((export.qualified.clone(), method.to_string()));
+                    }
+                }
+            }
         }
     }
     // Pass 0: collect object layouts so field types and object literals can
@@ -1109,6 +1223,21 @@ pub fn check_with_modules(
             );
         }
     }
+    // Associated methods are `Fn` items named `Owner.method`: index their
+    // template defs for instance-sugar lookup (first declaration wins, like
+    // the resolver's table, so duplicates agree on the surviving target).
+    for item in &prog.items {
+        if let HirItem::Fn {
+            def: Some(d), name, ..
+        } = item
+        {
+            if let Some((owner, method)) = name.split_once('.') {
+                cx.assoc_local
+                    .entry((owner.to_string(), method.to_string()))
+                    .or_insert(d.0);
+            }
+        }
+    }
     for item in &prog.items {
         cx.check_item(item);
     }
@@ -1145,6 +1274,13 @@ struct Checker {
     pending_instances: Vec<(u32, Vec<Ty>)>,
     /// Concrete imported requests awaiting the project-wide fixed point.
     pending_imported: Vec<InstanceKey>,
+    /// `(Owner, method)` -> method template `DefId.0` for this module's own
+    /// associated functions (owner spelled as in the HIR `Fn` name).
+    assoc_local: HashMap<(String, String), u32>,
+    /// `(qualified Owner, method)` -> foreign associated function.
+    assoc_foreign: HashMap<(String, String), ForeignMethod>,
+    /// `(qualified Owner, method)` known-but-unavailable across the boundary.
+    assoc_poisoned: HashSet<(String, String)>,
     /// Fixed `val` bindings share the assignment-poisoning path with params.
     fixed_defs: HashSet<u32>,
 }
@@ -2443,6 +2579,407 @@ impl Checker {
             }
         }
         self.record(id, ret)
+    }
+
+    /// Locate an associated function for a receiver object type.
+    ///
+    /// Qualified receivers never fall back to a same-named local: an owner
+    /// spelled `other.Counter` consults only the foreign table, and a bare
+    /// `Counter` consults only the local table (foreign values are always
+    /// qualified, so nominal identity cannot cross modules by accident).
+    fn find_assoc_method(&self, obj: &str, method: &str) -> AssocLookup {
+        if let Some(short) = obj.strip_prefix(&format!("{}.", self.module)) {
+            // Own-module qualification (`my.mod.Counter`): the local table,
+            // keyed by the bare HIR spelling.
+            if let Some(def) = self
+                .assoc_local
+                .get(&(short.to_string(), method.to_string()))
+            {
+                if let Some(sig) = self.typed.func_sigs.get(def).cloned() {
+                    return AssocLookup::Local {
+                        def: *def,
+                        fn_name: format!("{short}.{method}"),
+                        sig,
+                    };
+                }
+            }
+            return AssocLookup::Missing {
+                has_field: self
+                    .typed
+                    .objects
+                    .get(obj)
+                    .or_else(|| self.typed.objects.get(short))
+                    .is_some_and(|sig| sig.fields.iter().any(|(f, _)| f == method)),
+            };
+        }
+        if obj.contains('.') {
+            // Foreign qualification: the foreign table only, never a
+            // same-named local.
+            if let Some(foreign) = self
+                .assoc_foreign
+                .get(&(obj.to_string(), method.to_string()))
+            {
+                return AssocLookup::Foreign(foreign.clone());
+            }
+            if self
+                .assoc_poisoned
+                .contains(&(obj.to_string(), method.to_string()))
+            {
+                return AssocLookup::Poisoned;
+            }
+            return AssocLookup::Missing {
+                has_field: self
+                    .typed
+                    .objects
+                    .get(obj)
+                    .is_some_and(|sig| sig.fields.iter().any(|(f, _)| f == method)),
+            };
+        }
+        // Bare receivers are always local.
+        if let Some(def) = self.assoc_local.get(&(obj.to_string(), method.to_string())) {
+            if let Some(sig) = self.typed.func_sigs.get(def).cloned() {
+                return AssocLookup::Local {
+                    def: *def,
+                    fn_name: format!("{obj}.{method}"),
+                    sig,
+                };
+            }
+        }
+        AssocLookup::Missing {
+            has_field: self
+                .typed
+                .objects
+                .get(obj)
+                .is_some_and(|sig| sig.fields.iter().any(|(f, _)| f == method)),
+        }
+    }
+
+    /// Check one instance-sugar call `receiver.method(args)`: the receiver
+    /// counts as the first argument. The sugar gate requires the method's
+    /// first parameter to take the receiver's object type (capability-aware);
+    /// everything else checks exactly like an explicit `Owner.method` call,
+    /// including generic inference, monomorphization, and E208.
+    fn check_method_call(&mut self, call: MethodCallParts<'_>) -> Ty {
+        let MethodCallParts {
+            id,
+            receiver,
+            method,
+            method_span,
+            type_args,
+            args,
+            span,
+        } = call;
+        let r_ty = self.infer_expr(receiver);
+        // Argument types first, with the same bare-`Array.new` / empty-`[]`
+        // deferral as ordinary calls (context comes from the formal below).
+        let mut arg_tys = Vec::with_capacity(args.len());
+        let mut poisoned = false;
+        for arg in args {
+            if let HirExpr::Call {
+                name: inner,
+                type_args: inner_args,
+                args: inner_call_args,
+                ..
+            } = arg
+            {
+                if inner == "Array.new" && inner_args.is_empty() {
+                    for a in inner_call_args {
+                        let _ = self.infer_expr(a);
+                    }
+                    arg_tys.push(Ty::Error);
+                    continue;
+                }
+            }
+            if let HirExpr::ArrayLiteral { elems, .. } = arg {
+                if elems.is_empty() {
+                    arg_tys.push(Ty::Error);
+                    continue;
+                }
+            }
+            let t = self.infer_expr(arg);
+            if ty_has_error(&t) {
+                poisoned = true;
+            }
+            arg_tys.push(t);
+        }
+        if ty_has_error(&r_ty) {
+            return self.record(id, Ty::Error);
+        }
+        let Some(obj_name) = object_base(&r_ty) else {
+            if !ty_has_error(&r_ty) {
+                self.diags.push(
+                    Diagnostic::error(format!("cannot call method `{method}` on `{r_ty}`"))
+                        .with_label(method_span, "expected an object value here")
+                        .with_code("E302"),
+                );
+            }
+            return self.record(id, Ty::Error);
+        };
+        // (display name, template def or foreign owner, callable signature).
+        enum Target {
+            Local {
+                def: u32,
+                display: String,
+            },
+            Foreign {
+                owner: String,
+                display: String,
+                sym: vl_common::SymbolRef,
+            },
+        }
+        let (target, sig) = match self.find_assoc_method(&obj_name, method) {
+            AssocLookup::Local { def, fn_name, sig } => (
+                Target::Local {
+                    def,
+                    display: fn_name,
+                },
+                sig,
+            ),
+            AssocLookup::Foreign(foreign) => {
+                if foreign.owner_module != self.module && foreign.global_dependent {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "imported function `{}.{}` depends on module globals",
+                            foreign.owner_module, foreign.dotted
+                        ))
+                        .with_label(span, "unsupported cross-module boundary")
+                        .with_code("E208"),
+                    );
+                    return self.record(id, Ty::Error);
+                }
+                let display = format!("{}.{}", foreign.owner_module, foreign.dotted);
+                let sym = vl_common::SymbolRef {
+                    module: vl_common::ModulePath::from_dotted(&foreign.owner_module),
+                    name: foreign.dotted.clone(),
+                };
+                (
+                    Target::Foreign {
+                        owner: foreign.owner_module.clone(),
+                        display,
+                        sym,
+                    },
+                    foreign.sig,
+                )
+            }
+            AssocLookup::Poisoned => {
+                return self.record(id, Ty::Error);
+            }
+            AssocLookup::Missing { has_field } => {
+                let mut diag = Diagnostic::error(format!(
+                    "object `{obj_name}` has no associated function `{method}`"
+                ))
+                .with_label(method_span, "unknown associated function")
+                .with_code("E302");
+                if has_field {
+                    diag = diag.with_note(format!(
+                        "`{method}` is a field of `{obj_name}`; read it without `(...)`"
+                    ));
+                }
+                self.diags.push(diag);
+                return self.record(id, Ty::Error);
+            }
+        };
+        if ty_has_error(&sig.ret) || sig.param_tys.iter().any(ty_has_error) {
+            // Definition already poisoned (missing annotations); quiet.
+            return self.record(id, Ty::Error);
+        }
+        // Generic inference sees the receiver as argument zero.
+        let mut full_tys = Vec::with_capacity(arg_tys.len() + 1);
+        full_tys.push(r_ty.clone());
+        full_tys.extend(arg_tys.iter().cloned());
+        let display = match &target {
+            Target::Local { display, .. } => display.clone(),
+            Target::Foreign { display, .. } => display.clone(),
+        };
+        let Some(resolved) = self.resolve_type_args(&display, span, &sig, type_args, &full_tys)
+        else {
+            return self.record(id, Ty::Error);
+        };
+        let (param_tys, ret_ty) = sig.instantiate(&resolved);
+        if param_tys.len() != args.len() + 1 {
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "`{display}` expects {} argument(s), got {}",
+                    param_tys.len(),
+                    args.len() + 1
+                ))
+                .with_label(span, "wrong number of arguments")
+                .with_code("E303"),
+            );
+            return self.record(id, Ty::Error);
+        }
+        if poisoned {
+            return self.record(id, Ty::Error);
+        }
+        // The sugar gate: the first parameter must take the receiver's
+        // object. A different object is E303 (sugar does not apply); the same
+        // object with an unmet `*` capability is E306 like any other argument.
+        let p0 = &param_tys[0];
+        match object_base(p0) {
+            Some(p0obj) if same_object_name(&p0obj, &obj_name, &self.module) => {
+                if !can_coerce(&r_ty, p0) {
+                    if r_ty.readonly_view() == p0.readonly_view()
+                        && r_ty.is_mutable_view() != p0.is_mutable_view()
+                    {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "cannot pass read-only `{r_ty}` to mutable parameter `{}: {p0}`",
+                                sig.param_names[0]
+                            ))
+                            .with_label(receiver.span(), "mutation authority is required here")
+                            .with_note(format!("a read-only view cannot be upgraded to `{p0}`"))
+                            .with_code("E306"),
+                        );
+                    } else {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "`{display}` parameter `{}` expects `{p0}`, got `{r_ty}`",
+                                sig.param_names[0]
+                            ))
+                            .with_label(receiver.span(), format!("expected `{p0}` here"))
+                            .with_code("E306"),
+                        );
+                    }
+                    return self.record(id, Ty::Error);
+                }
+            }
+            _ => {
+                let want = p0.clone();
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "`{display}` first parameter expects `{want}`, got receiver `{r_ty}`"
+                    ))
+                    .with_label(
+                        receiver.span(),
+                        "instance sugar passes the receiver as the first argument",
+                    )
+                    .with_note(format!(
+                        "call `{display}(...)` explicitly, or declare the first parameter as `{obj_name}`"
+                    ))
+                    .with_code("E303"),
+                );
+                return self.record(id, Ty::Error);
+            }
+        }
+        // Remaining arguments check exactly like an explicit call, with the
+        // receiver prepended so positions and names line up.
+        let mut full_args: Vec<&HirExpr> = Vec::with_capacity(args.len() + 1);
+        full_args.push(receiver);
+        full_args.extend(args.iter());
+        let mut full_got: Vec<Ty> = Vec::with_capacity(arg_tys.len() + 1);
+        full_got.push(r_ty.clone());
+        full_got.extend(arg_tys.iter().cloned());
+        for (i, (arg, original_got)) in full_args.iter().zip(full_got.iter()).enumerate() {
+            let is_bare_new = matches!(arg, HirExpr::Call { name, type_args, .. } if name == "Array.new" && type_args.is_empty());
+            let is_empty_array =
+                matches!(arg, HirExpr::ArrayLiteral { elems, .. } if elems.is_empty());
+            if ty_has_error(original_got) && !(is_bare_new || is_empty_array) {
+                continue;
+            }
+            let want = &param_tys[i];
+            if ty_has_error(want) {
+                continue;
+            }
+            let got = self.infer_expr_expected(arg, want);
+            if ty_has_error(&got) {
+                continue;
+            }
+            if got == Ty::Void || *want == Ty::Void {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "`{display}` parameter `{}` cannot be `void`",
+                        sig.param_names[i]
+                    ))
+                    .with_label(arg.span(), "unexpected `void` here")
+                    .with_code("E308"),
+                );
+                return self.record(id, Ty::Error);
+            }
+            if !can_coerce(&got, want) {
+                if got.readonly_view() == want.readonly_view()
+                    && got.is_mutable_view() != want.is_mutable_view()
+                {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "cannot pass read-only `{got}` to mutable parameter `{}: {want}`",
+                            sig.param_names[i]
+                        ))
+                        .with_label(arg.span(), "mutation authority is required here")
+                        .with_note(format!("a read-only view cannot be upgraded to `{want}`"))
+                        .with_code("E306"),
+                    );
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "`{display}` parameter `{}` expects `{want}`, got `{got}`",
+                            sig.param_names[i]
+                        ))
+                        .with_label(arg.span(), format!("expected `{want}` here"))
+                        .with_code("E306"),
+                    );
+                }
+                return self.record(id, Ty::Error);
+            }
+        }
+        // Monomorphization mirrors ordinary calls: concrete generic targets
+        // outside generic bodies record instances; nested ones resolve per
+        // outer instance in the worklist / world fixed point.
+        if !sig.type_params.is_empty()
+            && resolved.iter().all(|t| t.is_concrete())
+            && self.type_env.is_empty()
+        {
+            match &target {
+                Target::Local { def, display } => {
+                    let mangled = mangle(display, &resolved);
+                    self.typed.root_calls.insert(id.0, mangled.clone());
+                    if !self.typed.instances.contains_key(&mangled) {
+                        self.pending_instances.push((*def, resolved.clone()));
+                    }
+                }
+                Target::Foreign { owner, sym, .. } => {
+                    let canonical: Vec<Ty> = resolved
+                        .iter()
+                        .map(|t| canonicalize_for_key(t, &self.module, &self.typed.objects))
+                        .collect();
+                    let key = InstanceKey::new(
+                        TemplateKey::new(owner.clone(), sym.name.clone()),
+                        canonical,
+                    );
+                    if !self.typed.imported_root_calls.values().any(|k| k == &key)
+                        && !self.pending_imported.iter().any(|k| k == &key)
+                    {
+                        self.pending_imported.push(key.clone());
+                    }
+                    self.typed.imported_root_calls.insert(id.0, key);
+                }
+            }
+        }
+        // LIR targets: locals by HIR `Fn` name, foreign by provider symbol.
+        // Generic templates skip the direct target (no unmangled emission);
+        // their concrete instances resolve through the maps above. Local
+        // template defs and foreign symbols are always recorded so the
+        // monomorphization worklist and the world fixed point see sugar
+        // calls nested inside generic bodies (mirroring `Call.def` /
+        // `Call.symbol` for ordinary calls).
+        match target {
+            Target::Local { def, display } => {
+                self.typed.method_defs.insert(id.0, def);
+                if sig.type_params.is_empty() {
+                    self.typed
+                        .method_targets
+                        .insert(id.0, MethodTarget::Local(display));
+                }
+            }
+            Target::Foreign { sym, .. } => {
+                self.typed.method_symbols.insert(id.0, sym.clone());
+                if sig.type_params.is_empty() {
+                    self.typed
+                        .method_targets
+                        .insert(id.0, MethodTarget::Foreign(sym));
+                }
+            }
+        }
+        self.record(id, ret_ty)
     }
 
     /// Convert one explicit type argument with unbound-name reporting.
@@ -3773,6 +4310,24 @@ impl Checker {
                 }
                 self.record(*id, ret_ty)
             }
+            HirExpr::MethodCall {
+                id,
+                receiver,
+                method,
+                method_span,
+                type_args,
+                args,
+                span,
+                ..
+            } => self.check_method_call(MethodCallParts {
+                id: *id,
+                receiver,
+                method,
+                method_span: *method_span,
+                type_args,
+                args,
+                span: *span,
+            }),
             HirExpr::Unary {
                 id,
                 op,
@@ -4644,6 +5199,23 @@ fn object_base(ty: &Ty) -> Option<String> {
     }
 }
 
+/// Nominal object identity tolerating bare/qualified spelling: `Counter` in
+/// `my.mod` is `my.mod.Counter`, and a qualified name matches its own short
+/// tail. Used by the instance-sugar self gate.
+fn same_object_name(a: &str, b: &str, current_module: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let qualified = |n: &str| {
+        if n.contains('.') {
+            n.to_string()
+        } else {
+            format!("{current_module}.{n}")
+        }
+    };
+    qualified(a) == qualified(b)
+}
+
 /// Compiler-known fresh allocations whose initial capability may be selected
 /// by an expected type: object literals, array literals (including `[]`),
 /// `Array.new` constructions, and string literals. Variables, fields, index
@@ -4830,6 +5402,60 @@ mod tests {
         let (res, _) = vl_semantic::resolve(&prog);
         let hir = vl_hir::lower(&prog, &res);
         check(&hir)
+    }
+
+    #[test]
+    fn associated_calls_check_clean_with_sugar() {
+        let (typed, diags) = check_src(
+            "type C = object { value: u64, fun init(v: u64): *C { return C { value = v }; }, fun bump(self: *C): *C { self.value = self.value + 1; return self; }, fun get(self: C): u64 { return self.value; }, }; fun main() { var c = C.init(1); c.bump(); C.bump(c); val g = c.get(); g; }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        // Sugar targets resolve to the namespaced method names.
+        assert!(typed
+            .method_targets
+            .values()
+            .any(|t| *t == MethodTarget::Local("C.bump".into())));
+        assert!(typed
+            .method_targets
+            .values()
+            .any(|t| *t == MethodTarget::Local("C.get".into())));
+    }
+
+    #[test]
+    fn associated_sugar_gate_reports_once() {
+        for (src, code) in [
+            (
+                "type C = object { value: u64, fun bump(self: *C): *C { return self; }, }; fun main() { val c: C = C { value = 1 }; c.bump(); }",
+                "E306",
+            ),
+            (
+                "type C = object { value: u64, }; fun main() { var c: *C = C { value = 1 }; c.nope(); }",
+                "E302",
+            ),
+            (
+                "type O = object { v: u64, }; type A = object { x: u64, fun f(o: O): u64 { return o.v; }, }; fun main() { var a: *A = A { x = 1 }; a.f(); }",
+                "E303",
+            ),
+            (
+                "type C = object { value: u64, fun get(self: C): u64 { return self.value; }, }; fun main() { var c: *C = C { value = 1 }; c.get(1u64); }",
+                "E303",
+            ),
+        ] {
+            let (_, diags) = check_src(src);
+            let errors: Vec<_> = diags.iter().filter(|d| d.is_error()).collect();
+            assert_eq!(errors.len(), 1, "{src}: {diags:?}");
+            assert_eq!(errors[0].code.as_deref(), Some(code), "{src}: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn associated_generic_method_records_instances() {
+        let (typed, diags) = check_src(
+            "type B = object { tag: u64, fun wrap[T](self: B, v: T): T { return v; }, }; fun main() { var b: *B = B { tag = 1 }; b.wrap(7u64); B.wrap(b, \"s\"); }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(typed.instances.contains_key("B.wrap$u64"));
+        assert!(typed.instances.contains_key("B.wrap$String"));
     }
 
     #[test]
