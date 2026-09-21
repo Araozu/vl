@@ -193,6 +193,12 @@ fn calls_in_template(prog: &HirProgram, typed: &TypedProgram, def: u32) -> Vec<N
                     walk_expr(prog, typed, value, out);
                 }
             }
+            HirExpr::TupleLiteral { elems, .. } => {
+                for (_, value) in elems {
+                    walk_expr(prog, typed, value, out);
+                }
+            }
+            HirExpr::TupleIndex { base, .. } => walk_expr(prog, typed, base, out),
             HirExpr::Index { base, index, .. } => {
                 walk_expr(prog, typed, base, out);
                 walk_expr(prog, typed, index, out);
@@ -232,6 +238,11 @@ fn calls_in_template(prog: &HirProgram, typed: &TypedProgram, def: u32) -> Vec<N
                 walk_expr(prog, typed, base, out);
                 walk_expr(prog, typed, value, out);
             }
+            HirStmt::TupleAssign { base, value, .. } => {
+                walk_expr(prog, typed, base, out);
+                walk_expr(prog, typed, value, out);
+            }
+            HirStmt::Destructure { value, .. } => walk_expr(prog, typed, value, out),
             HirStmt::If {
                 condition,
                 then_body,
@@ -572,6 +583,12 @@ pub fn validate_plan(
                         expr_ids(v, out);
                     }
                 }
+                HirExpr::TupleLiteral { elems, .. } => {
+                    for (_, v) in elems {
+                        expr_ids(v, out);
+                    }
+                }
+                HirExpr::TupleIndex { base, .. } => expr_ids(base, out),
                 HirExpr::Index { base, index, .. } => {
                     expr_ids(base, out);
                     expr_ids(index, out);
@@ -614,6 +631,17 @@ pub fn validate_plan(
                 } => {
                     out.insert(id.0);
                     expr_ids(base, out);
+                    expr_ids(value, out);
+                }
+                HirStmt::TupleAssign {
+                    id, base, value, ..
+                } => {
+                    out.insert(id.0);
+                    expr_ids(base, out);
+                    expr_ids(value, out);
+                }
+                HirStmt::Destructure { id, value, .. } => {
+                    out.insert(id.0);
                     expr_ids(value, out);
                 }
                 HirStmt::Expr(e) => expr_ids(e, out),

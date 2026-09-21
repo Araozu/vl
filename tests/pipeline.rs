@@ -1086,7 +1086,9 @@ fn stdlib_generic_does_not_pull_unused_natives() {
         "{:?}",
         lir.imports
     );
+}
 
+#[test]
 fn tuples_match_golden_lir() {
     let src = std::fs::read_to_string("examples/tuples.vl").unwrap();
     let lir = frontend(&src).expect("tuples.vl must compile");
@@ -1142,5 +1144,5 @@ fn err_tuple_examples_fail() {
             err.iter().any(|d| d.code.as_deref() == Some(code)),
             "{file}: {err:?}"
         );
-}
+    }
 }

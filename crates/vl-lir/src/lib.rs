@@ -1153,6 +1153,8 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                 loop_stack: Vec::new(),
                 env: HashMap::new(),
                 outer: None,
+                plan: None,
+                outer_key: None,
                 typed,
                 module: prog.module.as_str(),
             };
@@ -1609,7 +1611,7 @@ pub fn lower_project(
     for item in &prog.items {
         match item {
             HirItem::Object { .. } => {}
-            HirItem::Let { .. } => {}
+            HirItem::Let { .. } | HirItem::Destructure { .. } => {}
             HirItem::Fn {
                 name,
                 type_params,
@@ -1905,6 +1907,14 @@ fn collect_project_imports(
                     walk_expr(prog, typed, plan, outer, e, by_symbol);
                 }
             }
+            HirExpr::TupleLiteral { elems, .. } => {
+                for (_, e) in elems {
+                    walk_expr(prog, typed, plan, outer, e, by_symbol);
+                }
+            }
+            HirExpr::TupleIndex { base, .. } => {
+                walk_expr(prog, typed, plan, outer, base, by_symbol);
+            }
             HirExpr::Index { base, index, .. } => {
                 walk_expr(prog, typed, plan, outer, base, by_symbol);
                 walk_expr(prog, typed, plan, outer, index, by_symbol);
@@ -1949,6 +1959,13 @@ fn collect_project_imports(
             }
             HirStmt::FieldAssign { base, value, .. } => {
                 walk_expr(prog, typed, plan, outer, base, by_symbol);
+                walk_expr(prog, typed, plan, outer, value, by_symbol);
+            }
+            HirStmt::TupleAssign { base, value, .. } => {
+                walk_expr(prog, typed, plan, outer, base, by_symbol);
+                walk_expr(prog, typed, plan, outer, value, by_symbol);
+            }
+            HirStmt::Destructure { value, .. } => {
                 walk_expr(prog, typed, plan, outer, value, by_symbol);
             }
             HirStmt::If {

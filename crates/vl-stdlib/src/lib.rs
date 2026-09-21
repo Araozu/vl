@@ -120,6 +120,10 @@ fn hir_expr_has_generic_call(expr: &vl_hir::HirExpr, typed: &vl_typecheck::Typed
         vl_hir::HirExpr::ObjectLiteral { fields, .. } => fields
             .iter()
             .any(|(_, v)| hir_expr_has_generic_call(v, typed)),
+        vl_hir::HirExpr::TupleLiteral { elems, .. } => elems
+            .iter()
+            .any(|(_, v)| hir_expr_has_generic_call(v, typed)),
+        vl_hir::HirExpr::TupleIndex { base, .. } => hir_expr_has_generic_call(base, typed),
         vl_hir::HirExpr::Index { base, index, .. } => {
             hir_expr_has_generic_call(base, typed) || hir_expr_has_generic_call(index, typed)
         }
@@ -156,6 +160,10 @@ fn hir_stmt_has_generic_call(stmt: &vl_hir::HirStmt, typed: &vl_typecheck::Typed
         vl_hir::HirStmt::FieldAssign { base, value, .. } => {
             hir_expr_has_generic_call(base, typed) || hir_expr_has_generic_call(value, typed)
         }
+        vl_hir::HirStmt::TupleAssign { base, value, .. } => {
+            hir_expr_has_generic_call(base, typed) || hir_expr_has_generic_call(value, typed)
+        }
+        vl_hir::HirStmt::Destructure { value, .. } => hir_expr_has_generic_call(value, typed),
         vl_hir::HirStmt::If {
             condition,
             then_body,
