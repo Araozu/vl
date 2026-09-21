@@ -3,6 +3,11 @@ services:
     image: ${{ (project_name + "_full") | upper | replace("-", "_") }}_REGISTRY_URL:${{ (project_name + "_full") | upper | replace("-", "_") }}_VERSION
     container_name: {{ project_name }}-full-{{ project_stage }}
     restart: unless-stopped
+    volumes:
+      # Luna WASM artifact installed on the host by the naravm
+      # `ai-luna/wasm32` CI stage; served as same-origin `/naravm.wasm`
+      # so the playground can execute compiled vmfiles in the browser.
+      - /var/bin/naravm-luna-ai.wasm:/usr/share/nginx/html/naravm.wasm:ro
     environment:
       - TZ=America/Lima
     networks:

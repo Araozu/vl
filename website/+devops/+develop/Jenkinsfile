@@ -30,7 +30,10 @@ pipeline {
         stage('Build and push Docker image') {
             steps {
                 // Context is website/: the Astro site root.
+                // Bake the host Luna WASM artifact into the image as a
+                // fallback; the compose volume overrides it at runtime.
                 dir ("website") {
+                    sh "cp /var/bin/naravm-luna-ai.wasm public/naravm.wasm || echo 'luna wasm not on build host, image relies on runtime volume'"
                     script {
                         docker.build(
                             "${FULL_REGISTRY_URL}:${BUILD_REF}",

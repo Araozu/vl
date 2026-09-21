@@ -25,8 +25,13 @@ pnpm build
 
 ## Deploy (`+devops/`)
 
-The playground calls the separate `vlc` service at `https://vlc.nara-lang.org`.
-Set `PUBLIC_VLC_URL` when building the site to use another compiler endpoint.
+The playground compiles via the separate `vlc` service at
+`https://vlc.nara-lang.org` and runs the returned vmfile in the browser with
+`/naravm.wasm` (host file `/var/bin/naravm-luna-ai.wasm`, see
+`+devops/docker/nginx.conf` and `+develop/docker-compose.full.yml.j2`).
+Set `PUBLIC_VLC_URL` to use another compiler endpoint and
+`PUBLIC_NARAVM_WASM_URL` to use another WASM URL. Local dev needs the artifact:
+`cp ~/projects/zig/naravm/zig-out/naravm-wasm32.wasm public/naravm.wasm`.
 
 Same shape as `nikki.nara-lang.org`: multi-stage Dockerfile (pnpm build →
 nginx serves `dist/`), Jenkins pipeline per stage, Ansible to the target host,

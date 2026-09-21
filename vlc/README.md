@@ -24,5 +24,5 @@ curl -X POST http://localhost:8080/v1/compile \
 
 The production service is deployed as `https://vlc.nara-lang.org`. Its
 `+devops/` directory contains the Docker, Jenkins, Compose, and Ansible setup.
-It only compiles artifacts; execution stays out of the browser until the
-Naravm Wasm32 build is ready.
+It only compiles artifacts; the docs site executes the returned vmfile in the
+browser with `/naravm.wasm` (host artifact `/var/bin/naravm-luna-ai.wasm`).

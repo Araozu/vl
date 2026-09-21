@@ -1,3 +1,6 @@
 node_modules/
 dist/
 .astro/
+# Luna WASM artifact baked at CI time from /var/bin/naravm-luna-ai.wasm;
+# local dev copies it in with: cp ~/projects/zig/naravm/zig-out/naravm-wasm32.wasm public/naravm.wasm
+public/naravm.wasm

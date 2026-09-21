@@ -1,5 +1,6 @@
 <script lang="ts">
   import { compileVl, formatCompileLines } from '../lib/vl-compile';
+  import { runNaravmBytecode, formatRunLines } from '../lib/naravm-run';
   let source = $state('use std.println;\n\nfun main() {\n    println("Hello, world!");\n}');
   let output = $state<string[]>(['// Naravm compiler ready — press Run']);
   let compiling = $state(false);
@@ -16,7 +17,16 @@
         return;
       }
       artifact = result.bytes;
-      output = formatCompileLines(result);
+      const lines = formatCompileLines(result);
+      try {
+        const runResult = await runNaravmBytecode(result.bytes);
+        output = [...lines, ...formatRunLines(runResult)];
+      } catch (error) {
+        output = [
+          ...lines,
+          `execution unavailable — ${error instanceof Error ? error.message : 'wasm failed'}`,
+        ];
+      }
     } catch (error) {
       output = [`compiler unavailable — ${error instanceof Error ? error.message : 'request failed'}`];
     } finally {

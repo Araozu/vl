@@ -4,9 +4,11 @@
 // rendered both by Astro Markdown fences and `<Code>` plus the
 // YAML-generated std pages) and adds a little Run button that does the same
 // thing as the index Playground: compile via the hosted compiler service and
-// show the build output inline. VM execution stays stubbed — see vl-compile.ts.
+// run the returned vmfile in the browser with the Naravm WASM artifact
+// (`/naravm.wasm`, see `./naravm-run`).
 
 import { compileVl, formatCompileLines } from './vl-compile';
+import { runNaravmBytecode, formatRunLines } from './naravm-run';
 
 function enhance(root: ParentNode) {
   const blocks = root.querySelectorAll('pre[data-language="vl"]');
@@ -48,7 +50,21 @@ function enhance(root: ParentNode) {
       renderLines(['// compiling…']);
       try {
         const result = await compileVl(source);
-        renderLines(formatCompileLines(result));
+        if (!result.ok) {
+          renderLines(formatCompileLines(result));
+          return;
+        }
+        const lines = formatCompileLines(result);
+        button.textContent = 'Running…';
+        try {
+          const run = await runNaravmBytecode(result.bytes);
+          renderLines([...lines, ...formatRunLines(run)]);
+        } catch (error) {
+          renderLines([
+            ...lines,
+            `execution unavailable — ${error instanceof Error ? error.message : 'wasm failed'}`,
+          ]);
+        }
       } catch (error) {
         renderLines([
           `compiler unavailable — ${error instanceof Error ? error.message : 'request failed'}`,

@@ -2,8 +2,8 @@
 //
 // Used by both the index Playground and the per-snippet Run buttons so every
 // "Run" does the same thing: POST the source to `<vlc>/v1/compile` and report
-// the build result. VM execution stays stubbed until the WASM VM lands — a
-// successful build only reports the artifact, it never tries to execute it.
+// the build result. Execution happens client-side: the caller feeds the
+// returned vmfile bytes to `runNaravmBytecode` in `./naravm-run`.
 
 export interface VlCompileOk {
   ok: true;
@@ -43,8 +43,9 @@ export async function compileVl(source: string, filename = 'snippet.vl'): Promis
 }
 
 /// Format a compile result exactly like the index Playground does:
-/// one status line, the Naravm-ready stub line, then diagnostics (if any).
-/// No execution is attempted — the WASM VM is still a stub.
+/// one status line, the artifact size, then diagnostics (if any).
+/// Callers append `formatRunLines` from `./naravm-run` after a successful
+/// build to show program output.
 export function formatCompileLines(result: VlCompileResult): string[] {
   if (!result.ok) {
     return [
@@ -54,7 +55,6 @@ export function formatCompileLines(result: VlCompileResult): string[] {
   }
   return [
     `build ok — ${result.target}, ${result.bytes.byteLength} byte vmfile`,
-    'The artifact is ready for Naravm.',
     ...(result.diagnostics ? result.diagnostics.split('\n') : []),
   ];
 }
