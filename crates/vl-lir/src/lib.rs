@@ -827,7 +827,10 @@ fn collect_import_expr(
             collect_import_expr(lhs, typed, out);
             collect_import_expr(rhs, typed, out);
         }
-        HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
+        HirExpr::Literal { .. }
+        | HirExpr::String { .. }
+        | HirExpr::Null { .. }
+        | HirExpr::Var { .. } => {}
     }
 }
 
@@ -2170,7 +2173,10 @@ fn collect_project_imports(
                 walk_expr(prog, typed, plan, outer, lhs, by_symbol);
                 walk_expr(prog, typed, plan, outer, rhs, by_symbol);
             }
-            HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
+            HirExpr::Literal { .. }
+            | HirExpr::String { .. }
+            | HirExpr::Null { .. }
+            | HirExpr::Var { .. } => {}
         }
     }
 
@@ -2307,6 +2313,49 @@ impl Lowerer<'_> {
         // Poisoned nodes (and, defensively, types that stayed generic) lower
         // to nothing — the error was already reported.
         self.resolved_ty(expr.id())?;
+        // Implicit `T` -> `?T` (auto-`Some`): the node's recorded type is
+        // the inner `T`; emit the inner value then wrap as `Option.Some`.
+        if typed.nullable_wraps.contains(&expr.id().0) {
+            return self.lower_nullable_wrap(expr, typed);
+        }
+        self.lower_expr_inner(expr, typed)
+    }
+
+    /// Emit `Option.Some(inner)` for an auto-wrapped `?T` value. The node's
+    /// recorded type is the inner `T` (kept for literal lanes); the union
+    /// arguments come from it directly.
+    fn lower_nullable_wrap(
+        &mut self,
+        expr: &HirExpr,
+        typed: &vl_typecheck::TypedProgram,
+    ) -> Option<Reg> {
+        let inner_ty = self.resolved_ty(expr.id())?;
+        let inner_erased = rt(&inner_ty);
+        let value = self.lower_expr_inner(expr, typed)?;
+        let (tag, tys) =
+            self.variant_layout("Option", "Some", std::slice::from_ref(&inner_erased))?;
+        if tys.len() != 1 {
+            return None;
+        }
+        let dst = self.reg();
+        // Union name is always the builtin `Option` here (desugared `?T`).
+        self.instrs.push(Instr::NewVariant {
+            dst,
+            union: "Option".to_string(),
+            variant: "Some".to_string(),
+            tag,
+            args: vec![value],
+            tys,
+            span: expr.span(),
+        });
+        Some(dst)
+    }
+
+    fn lower_expr_inner(
+        &mut self,
+        expr: &HirExpr,
+        typed: &vl_typecheck::TypedProgram,
+    ) -> Option<Reg> {
         match expr {
             HirExpr::Literal { value, span, .. } => {
                 let dst = self.reg();
@@ -2329,6 +2378,33 @@ impl Lowerer<'_> {
                 self.instrs.push(Instr::StringConst {
                     dst,
                     value: value.clone(),
+                    span: *span,
+                });
+                Some(dst)
+            }
+            HirExpr::Null { id, span } => {
+                // `null` desugars to builtin `Option.None` (tag 0, no
+                // payload). The node's recorded type is the nullable.
+                let union_ty = match self.resolved_ty(*id)? {
+                    Ty::Union(u) => (*u).clone(),
+                    Ty::Mutable(inner) => match *inner {
+                        Ty::Union(u) => (*u).clone(),
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                let (tag, tys) = self.variant_layout(&union_ty.name, "None", &union_ty.args)?;
+                if !tys.is_empty() {
+                    return None;
+                }
+                let dst = self.reg();
+                self.instrs.push(Instr::NewVariant {
+                    dst,
+                    union: union_ty.name,
+                    variant: "None".to_string(),
+                    tag,
+                    args: Vec::new(),
+                    tys,
                     span: *span,
                 });
                 Some(dst)
@@ -2772,6 +2848,45 @@ impl Lowerer<'_> {
                 HirBinOp::And => self.lower_and(lhs, rhs, typed, *span),
                 HirBinOp::Or => self.lower_or(lhs, rhs, typed, *span),
                 _ => {
+                    // `x == null` / `x != null`: tag comparison against the
+                    // `None` tag (0). Typechecking ensured one side is `null`
+                    // and the other is a nullable.
+                    if matches!(op, HirBinOp::Eq | HirBinOp::Ne)
+                        && (matches!(&**lhs, HirExpr::Null { .. })
+                            || matches!(&**rhs, HirExpr::Null { .. }))
+                    {
+                        let value_side = if matches!(&**lhs, HirExpr::Null { .. }) {
+                            rhs
+                        } else {
+                            lhs
+                        };
+                        let scrut = self.lower_expr(value_side, typed)?;
+                        let tag_reg = self.reg();
+                        self.instrs.push(Instr::TagOf {
+                            dst: tag_reg,
+                            scrut,
+                            span: *span,
+                        });
+                        let zero = self.reg();
+                        self.instrs.push(Instr::Const {
+                            dst: zero,
+                            value: vl_common::Scalar::U64(0),
+                            span: *span,
+                        });
+                        let dst = self.reg();
+                        let op = match op {
+                            HirBinOp::Eq => LirOp::Eq,
+                            _ => LirOp::Ne,
+                        };
+                        self.instrs.push(Instr::BinOp {
+                            dst,
+                            op,
+                            lhs: tag_reg,
+                            rhs: zero,
+                            span: *span,
+                        });
+                        return Some(dst);
+                    }
                     let l = self.lower_expr(lhs, typed)?;
                     let r = self.lower_expr(rhs, typed)?;
                     let dst = self.reg();
@@ -3460,7 +3575,16 @@ impl Lowerer<'_> {
     /// union arguments. `None` when unknown (typechecking already reported;
     /// lowering stands down).
     fn variant_layout(&self, union: &str, variant: &str, args: &[Ty]) -> Option<(u32, Vec<Ty>)> {
-        let sig = self.typed.unions.get(union)?;
+        // Builtin `Option` backs `?T` / `null` without a declaration.
+        let builtin;
+        let sig = match self.typed.unions.get(union) {
+            Some(sig) => sig,
+            None if union == "Option" => {
+                builtin = vl_typecheck::builtin_option_sig();
+                &builtin
+            }
+            None => return None,
+        };
         let (tag, payload) = sig
             .variants
             .iter()
@@ -3622,6 +3746,26 @@ mod tests {
         assert!(dump.contains("array_get"), "{dump}");
         assert!(dump.contains("array_set"), "{dump}");
         assert!(!dump.contains("Array.new"), "{dump}");
+    }
+
+    #[test]
+    fn nullables_lower_to_builtin_option_variants() {
+        let src = "fun f(x: ?u64): u64 { match (x) { Option.Some(v) { return v; } null { return 0u64; } } } fun main() { val a: ?u64 = null; val b: ?u64 = 5u64; val c = f(a); if (b == null) { b; } c; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        // One implicit `Some` wrap (the `5u64` binding); `null` needs none.
+        assert_eq!(typed.nullable_wraps.len(), 1, "{typed:?}");
+        let dump = lower(&hir, &typed).dump();
+        assert!(dump.contains("new_variant Option.None#0"), "{dump}");
+        assert!(dump.contains("new_variant Option.Some#1"), "{dump}");
+        assert!(dump.contains("tag_of"), "{dump}");
+        // `== null` is a tag comparison against the `None` tag.
+        assert!(dump.contains("ne") || dump.contains("eq"), "{dump}");
     }
 
     #[test]

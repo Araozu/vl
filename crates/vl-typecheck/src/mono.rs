@@ -384,7 +384,10 @@ fn calls_in_item(
             }
             HirExpr::Unary { inner, .. } => walk_expr(typed, inner, out),
             HirExpr::Cast { inner, .. } => walk_expr(typed, inner, out),
-            HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
+            HirExpr::Literal { .. }
+            | HirExpr::String { .. }
+            | HirExpr::Null { .. }
+            | HirExpr::Var { .. } => {}
         }
     }
     fn walk_stmt(

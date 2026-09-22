@@ -11,6 +11,14 @@ use vl_common::{
 };
 use vl_syntax::{BindingKind, Expr, Item, Program, Stmt};
 
+/// Builtin nullable union: `?T` / `null` sugar desugars to
+/// `Option` with `None` (tag 0, no payload) and `Some(T)` (tag 1).
+/// Available in every module without a declaration; a local
+/// `type Option` shadows it.
+pub fn builtin_option_variants() -> Vec<String> {
+    vec!["None".to_string(), "Some".to_string()]
+}
+
 /// A definition site: which item/scope and which binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefId(pub u32);
@@ -512,6 +520,9 @@ fn qualify_export_ty(
         vl_common::VlType::Array(elem) => {
             vl_common::VlType::Array(Box::new(qualify_export_ty(elem, module, local_objects)))
         }
+        vl_common::VlType::Nullable(inner) => {
+            vl_common::VlType::Nullable(Box::new(qualify_export_ty(inner, module, local_objects)))
+        }
         vl_common::VlType::Tuple(fields) => vl_common::VlType::Tuple(
             fields
                 .iter()
@@ -578,7 +589,7 @@ fn collect_local_calls(stmts: &[Stmt], calls: &mut Vec<String>) {
                 visit_expr(lhs, calls);
                 visit_expr(rhs, calls);
             }
-            Expr::Literal(..) | Expr::String(..) | Expr::Var { .. } => {}
+            Expr::Literal(..) | Expr::String(..) | Expr::Null(_) | Expr::Var { .. } => {}
         }
     }
     for stmt in stmts {
@@ -705,7 +716,7 @@ fn function_depends_on_global(
                 expr_depends(lhs, locals, globals, types)
                     || expr_depends(rhs, locals, globals, types)
             }
-            Expr::Literal(..) | Expr::String(..) => false,
+            Expr::Literal(..) | Expr::String(..) | Expr::Null(_) => false,
         }
     }
 
@@ -1290,7 +1301,7 @@ impl Resolver {
 
     fn resolve_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Literal(_, _) | Expr::String(_, _) => {}
+            Expr::Literal(_, _) | Expr::String(_, _) | Expr::Null(_) => {}
             Expr::ObjectLiteral { fields, .. } => {
                 for (_, _, value) in fields {
                     self.resolve_expr(value);
@@ -1822,10 +1833,16 @@ impl Resolver {
     /// identifies local values.
     fn canonical_union_head(&self, parts: &[String]) -> Option<(String, Vec<String>)> {
         if parts.len() == 1 {
-            return self
-                .local_unions
-                .get(&parts[0])
-                .map(|v| (parts[0].clone(), v.clone()));
+            if let Some(variants) = self.local_unions.get(&parts[0]) {
+                return Some((parts[0].clone(), variants.clone()));
+            }
+            // Builtin `Option` (nullable `?T` / `null` sugar): available in
+            // every module without a `type Option` declaration. A local
+            // `type Option` shadows it (first declaration wins above).
+            if parts[0] == "Option" {
+                return Some(("Option".to_string(), builtin_option_variants()));
+            }
+            return None;
         }
         // Alias-qualified `alias.Union` (exactly two segments).
         if parts.len() == 2 && self.imports.contains_key(&parts[0]) {
@@ -1939,9 +1956,15 @@ impl Resolver {
         // type names, the union head wins over same-named values. Unknown
         // variants are one E302 here; arity and payload types are validated
         // by typechecking from the recorded site.
-        if callee.len() == 2 && self.local_unions.contains_key(&callee[0]) {
+        if callee.len() == 2
+            && (self.local_unions.contains_key(&callee[0]) || callee[0] == "Option")
+        {
             let union = callee[0].clone();
-            let variants = self.local_unions[&union].clone();
+            let variants = self
+                .local_unions
+                .get(&union)
+                .cloned()
+                .unwrap_or_else(builtin_option_variants);
             for arg in args {
                 self.resolve_expr(arg);
             }
@@ -2661,6 +2684,48 @@ mod tests {
         let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
         assert_eq!(errors.len(), 1, "{diags:?}");
         assert_eq!(errors[0].code.as_deref(), Some("E302"));
+    }
+
+    #[test]
+    fn builtin_option_variants_resolve_without_a_declaration() {
+        // `?T` / `null` sugar rests on a builtin `Option`: no `type Option`
+        // item needed for `Option.Some` / `Option.None` uses.
+        let (resolution, diags) = resolve_src(
+            "fun main() { val a = Option.Some(1u64); val n = Option.None; val m: ?u64 = null; a; n; m; }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let mut uses: Vec<(String, String)> = resolution
+            .variants
+            .values()
+            .map(|u| (u.union.clone(), u.variant.clone()))
+            .collect();
+        uses.sort();
+        assert_eq!(
+            uses,
+            vec![
+                ("Option".to_string(), "None".to_string()),
+                ("Option".to_string(), "Some".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn local_option_declaration_shadows_the_builtin() {
+        // First declaration wins: resolving `Option.Some` still records the
+        // bare `Option` spelling either way.
+        let (resolution, diags) =
+            resolve_src("type Option = union { None, }; fun main() { val n = Option.None; n; }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(resolution
+            .variants
+            .values()
+            .any(|u| u.union == "Option" && u.variant == "None"));
+    }
+
+    #[test]
+    fn null_literal_needs_no_resolution() {
+        let (_, diags) = resolve_src("fun main() { val x: ?u64 = null; x; }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
     }
 
     #[test]

@@ -15,8 +15,9 @@
 //! object-field := ident `:` type
 //! params  := param (`,` param)*
 //! param   := ident `:` type
-//! type    := mutable_type | type_atom
-//! mutable_type := `*` type_atom
+//! type    := nullable_type | mutable_type | type_atom
+//! nullable_type := `?` type              ; `?T` desugars to the builtin `Option` union
+//! mutable_type := `*` (type_atom | nullable_type)
 //! type_atom := `u64` | `i64` | `f64` | `bool` | `u8` | `String` | `File` | object-name | union-type | `Array` `[` type `]` | tuple-type | type-param | `void` (`void` only as return)
 //! union-type := ident (`[` type (`,` type)* `]`)? ; `Option` or `Option[u64]` when `ident` names a union
 //! union-item := `type` ident type-params? `=` `union` `{` union-variants? `}` `;`
@@ -29,8 +30,9 @@
 //!          | `match` `(` expr `)` `{` match-arm* (`else` block)? `}`
 //!          | `while` `(` expr `)` branch | `break` `;` | `continue` `;`
 //!          | `return` expr? `;` | expr `;`
-//! match-arm := path (`(` ident (`,` ident)* `,`? `)`)? block
+//! match-arm := (path (`(` ident (`,` ident)* `,`? `)`)? | `null`) block
 //!             ; `path` is `Union.Variant` (2+ segments); bindings are implicit `val`s
+//!             ; `null` matches the empty case of a `?T` scrutinee (sugar for `Option.None`)
 //! branch  := block | stmt
 //! index   := ident (`[` expr `]`)+
 //! expr    := or
@@ -44,7 +46,8 @@
 //! unary   := (`-`|`!`) unary | postfix
 //! postfix := primary (`[` expr `]` | `.` ident | backtick-index)*
 //! backtick-index := `.` `` ` `` int — e.g. ``t.`0`` (unnamed tuples only)
-//! primary := literal | string | array-literal | tuple-literal | object-literal | call | path | `(` expr `)`
+//! primary := literal | string | `null` | array-literal | tuple-literal | object-literal | call | path | `(` expr `)`
+//!           ; `null` is the empty value of any `?T` (sugar for builtin `Option.None`)
 //! tuple-literal := `#` `(` [(ident `=`)? expr] (`,` …)* `)` — `=` mirrors object literals
 //! array-literal := `[` (expr (`,` expr)* `,`?)? `]`
 //! object-literal := ident `{` (ident `=` expr (`,` ident `=` expr)* `,`?)? `}`
@@ -97,6 +100,10 @@
 //! `match (opt) { Option.Some(v) { ... } Option.None { ... } else { ... } }`.
 //! Arm bindings are implicit `val`s; `else` is required in this milestone
 //! (full exhaustiveness checking without `else` is a follow-up).
+//! Nullables are sugar over the builtin `Option` union (no declaration
+//! needed): `?u64` is the type, `null` the empty value, a plain `u64` value
+//! wraps as `Some` implicitly, `x == null` / `x != null` test the tag, and a
+//! `null` arm matches the empty case in `match`.
 //! Semicolons are mandatory: every binding, every `return`, and every
 //! expression statement ends with `;` (no bare trailing value like Rust).
 //! There are no implicit returns: a function yields a value only through an
@@ -424,6 +431,10 @@ pub enum Expr {
         path: Vec<String>,
         span: Span,
     },
+    /// Null literal (`null`): the empty value of any `?T`. Desugars to the
+    /// builtin `Option.None` variant; typechecking infers `T` from context
+    /// (an annotation is required, like a bare `Option.None`).
+    Null(Span),
     Call {
         callee: Vec<String>,
         callee_span: Span,
@@ -490,6 +501,7 @@ impl Expr {
             Expr::Index { span, .. } => *span,
             Expr::Field { span, .. } => *span,
             Expr::Var { span, .. } => *span,
+            Expr::Null(span) => *span,
             Expr::Call { span, .. } => *span,
             Expr::Unary { span, .. } | Expr::Binary { span, .. } | Expr::Cast { span, .. } => *span,
         }
@@ -1068,10 +1080,53 @@ impl<'a> Parser<'a> {
     /// declaration boundary. `*T` over an unconstrained parameter parses
     /// fine and is rejected later by type checking.
     fn parse_type(&mut self, allowed: &[String], strict: bool) -> Option<(VlType, Span)> {
+        if matches!(self.peek().kind, TokenKind::Question) {
+            return self.parse_nullable_type(allowed, strict);
+        }
         if matches!(self.peek().kind, TokenKind::Star) {
             return self.parse_mutable_type(allowed, strict);
         }
         self.parse_type_atom(allowed, strict)
+    }
+
+    /// Parse `?T` (nullable): surface sugar for the builtin `Option` union
+    /// with one argument. Recurses through `parse_type` so `??T`, `?*Foo`,
+    /// and `?Array[?u64]` all work. `?void` is one E104.
+    fn parse_nullable_type(&mut self, allowed: &[String], strict: bool) -> Option<(VlType, Span)> {
+        let question = self.bump(); // `?`
+                                    // Missing inner type (`?;`, `?,`, `?)`, ...): one error, recover at
+                                    // the declaration boundary without consuming the boundary token
+                                    // (mirrors `parse_mutable_type`; recursing would add a second
+                                    // diagnostic from the inner type parser).
+        if !matches!(
+            self.peek().kind,
+            TokenKind::Ident(_) | TokenKind::Hash | TokenKind::Star | TokenKind::Question
+        ) {
+            let t = self.peek().clone();
+            let span = Span::new(question.span.start, question.span.end.max(t.span.start));
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "expected a type after `?`, found {}",
+                    describe(&t.kind)
+                ))
+                .with_label(span, "write `?T`, e.g. `?u64`")
+                .with_code("E104"),
+            );
+            return None;
+        }
+        // A plausible type start that fails to parse already reported once
+        // (unknown type, bad `Array`); stay quiet here, like `*T`.
+        let (inner, inner_span) = self.parse_type(allowed, strict)?;
+        let span = Span::new(question.span.start, inner_span.end);
+        if inner.is_void() {
+            self.diags.push(
+                Diagnostic::error("a nullable type cannot be `void`")
+                    .with_label(span, "`?void` is not a value type")
+                    .with_code("E104"),
+            );
+            return None;
+        }
+        Some((VlType::Nullable(Box::new(inner)), span))
     }
 
     /// Parse `*type_atom` (one capability qualifier). Called only when the
@@ -1094,8 +1149,11 @@ impl<'a> Parser<'a> {
         }
         // Missing inner type (`*;`, `*,`, `*)`, ...): one error, recover at
         // the declaration boundary without consuming the boundary token.
-        // Tuples (`*#(...)`) start with `#`, not an identifier.
-        if !matches!(self.peek().kind, TokenKind::Ident(_) | TokenKind::Hash) {
+        // Tuples (`*#(...)`) start with `#`, nullables (`*?T`) with `?`.
+        if !matches!(
+            self.peek().kind,
+            TokenKind::Ident(_) | TokenKind::Hash | TokenKind::Question
+        ) {
             let t = self.peek().clone();
             let span = Span::new(star.span.start, star.span.end.max(t.span.start));
             self.diags.push(
@@ -1107,6 +1165,14 @@ impl<'a> Parser<'a> {
                 .with_code("E106"),
             );
             return None;
+        }
+        // `*?T` goes through the nullable path so the `?` prefix is kept;
+        // everything else stays a plain `type_atom` (so `**Foo` stays an
+        // immediate error above).
+        if matches!(self.peek().kind, TokenKind::Question) {
+            let (inner, inner_span) = self.parse_nullable_type(allowed, strict)?;
+            let span = Span::new(star.span.start, inner_span.end);
+            return Some((VlType::Mutable(Box::new(inner)), span));
         }
         match self.parse_type_atom(allowed, strict) {
             None => None, // Inner already reported (unknown type, bad Array); stay quiet.
@@ -2235,6 +2301,66 @@ impl<'a> Parser<'a> {
                 break;
             }
             let arm_start = self.peek().span.start;
+            // `null` arm: sugar for the `None` case of a `?T` scrutinee.
+            // Single-segment, no bindings; desugars downstream to
+            // `Option.None`.
+            if matches!(self.peek().kind, TokenKind::Null) {
+                let null_tok = self.bump();
+                let path_end = null_tok.span.end;
+                // An optional binding list is parsed and then rejected with
+                // one E100 (instead of abandoning the whole `match`, which
+                // would cascade recovery errors after it).
+                let mut null_bindings = Vec::new();
+                if matches!(self.peek().kind, TokenKind::LParen) {
+                    self.bump(); // `(`
+                    if !matches!(self.peek().kind, TokenKind::RParen) {
+                        loop {
+                            let (name, name_span) = self.parse_ident()?;
+                            null_bindings.push((name, name_span));
+                            if !matches!(self.peek().kind, TokenKind::Comma) {
+                                break;
+                            }
+                            self.bump();
+                            if matches!(self.peek().kind, TokenKind::RParen) {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(&TokenKind::RParen, "`)` after match bindings")?;
+                    if !null_bindings.is_empty() {
+                        self.diags.push(
+                            Diagnostic::error("`null` pattern takes no bindings")
+                                .with_label(
+                                    Span::new(arm_start, path_end),
+                                    "write `null { ... }` for the empty case",
+                                )
+                                .with_code("E100"),
+                        );
+                    }
+                }
+                if !matches!(self.peek().kind, TokenKind::LBrace) {
+                    let t = self.peek().clone();
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "expected `{{` for match arm body, found {}",
+                            describe(&t.kind)
+                        ))
+                        .with_label(t.span, "arm bodies are brace blocks")
+                        .with_code("E100"),
+                    );
+                    return None;
+                }
+                let body = self.parse_block(allowed)?;
+                let end = self.toks[self.pos.saturating_sub(1)].span.end;
+                arms.push(MatchArm {
+                    path: vec!["null".to_string()],
+                    path_span: Span::new(arm_start, path_end),
+                    bindings: Vec::new(),
+                    body,
+                    span: Span::new(arm_start, end),
+                });
+                continue;
+            }
             let path = self.parse_path()?;
             if path.len() < 2 {
                 self.diags.push(
@@ -2743,6 +2869,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Some(Expr::String(value, t.span))
             }
+            TokenKind::Null => {
+                self.bump();
+                Some(Expr::Null(t.span))
+            }
             TokenKind::Ident(_) => {
                 let path = self.parse_path()?;
                 let end = self.toks[self.pos.saturating_sub(1)].span.end;
@@ -2940,6 +3070,8 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::Hash => "`#`".into(),
         TokenKind::Backtick => "`` ` ``".into(),
         TokenKind::ColonColon => "`::`".into(),
+        TokenKind::Question => "`?`".into(),
+        TokenKind::Null => "`null`".into(),
         TokenKind::Invalid => "invalid token".into(),
         TokenKind::Eof => "end of file".into(),
     }
@@ -3431,6 +3563,115 @@ mod tests {
             diags.iter().any(|d| d.code.as_deref() == Some("E100")),
             "{diags:?}"
         );
+    }
+
+    #[test]
+    fn nullable_type_parses_to_nullable_spelling() {
+        let (prog, diags) = parse_src("fun f(x: ?u64): ?Array[?String] { x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { params, ret, .. } => {
+                assert_eq!(
+                    params[0].ty.clone(),
+                    Some(VlType::Nullable(Box::new(VlType::U64)))
+                );
+                assert_eq!(
+                    ret.clone(),
+                    Some(VlType::Nullable(Box::new(VlType::Array(Box::new(
+                        VlType::Nullable(Box::new(VlType::String))
+                    )))))
+                );
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doubly_nullable_nests() {
+        let (prog, diags) = parse_src("fun f(x: ??u64) { x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { params, .. } => {
+                assert_eq!(
+                    params[0].ty.clone(),
+                    Some(VlType::Nullable(Box::new(VlType::Nullable(Box::new(
+                        VlType::U64
+                    )))))
+                );
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nullable_void_is_one_error() {
+        let (_, diags) = parse_src("fun f(x: ?void) { x; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert_eq!(diags[0].code.as_deref(), Some("E104"));
+    }
+
+    #[test]
+    fn nullable_missing_inner_is_one_error() {
+        let (_, diags) = parse_src("fun f(x: ?) { x; }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert_eq!(diags[0].code.as_deref(), Some("E104"));
+    }
+
+    #[test]
+    fn mutable_nullable_parses() {
+        let (prog, diags) =
+            parse_src("type C = object { v: u64, }; fun f(x: *?C): ?*C { return x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[1] {
+            Item::Function { params, ret, .. } => {
+                assert!(matches!(params[0].ty.clone(), Some(VlType::Mutable(_))));
+                assert!(matches!(ret.clone(), Some(VlType::Nullable(_))));
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_literal_parses() {
+        let (prog, diags) = parse_src("fun main() { val x = null; x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { body, .. } => {
+                assert!(matches!(
+                    &body[0],
+                    Stmt::Let {
+                        value: Expr::Null(_),
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_match_arm_parses_without_bindings() {
+        let (prog, diags) =
+            parse_src("fun main() { match (o) { Option.Some(v) { v; } null { 1u64; } } }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { body, .. } => match &body[0] {
+                Stmt::Match { arms, .. } => {
+                    assert_eq!(arms.len(), 2);
+                    assert_eq!(arms[1].path, vec!["null".to_string()]);
+                    assert!(arms[1].bindings.is_empty());
+                }
+                other => panic!("expected match, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_arm_with_bindings_is_one_error() {
+        let (_, diags) = parse_src("fun main() { match (o) { null(v) { v; } } }");
+        assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert_eq!(diags[0].code.as_deref(), Some("E100"));
     }
 
     #[test]

@@ -64,6 +64,10 @@ pub enum TokenKind {
     Backtick,
     /// Turbofish separator (`::`): `f::[T](args)`, `Array.new::[u64](n)`.
     ColonColon,
+    /// Nullable type prefix (`?T` desugars to the builtin `Option` union).
+    Question,
+    /// Null literal (`null` desugars to the builtin `Option.None`).
+    Null,
     /// A token whose source span already has a lexer diagnostic. Parsers
     /// consume it without inventing follow-on syntax errors.
     Invalid,
@@ -239,6 +243,10 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                 tokens.push(Token::new(TokenKind::Backtick, Span::new(i, i + 1)));
                 i += 1;
             }
+            '?' => {
+                tokens.push(Token::new(TokenKind::Question, Span::new(i, i + 1)));
+                i += 1;
+            }
             '0'..='9' => {
                 let start = i;
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
@@ -397,6 +405,7 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                     "extends" => TokenKind::Extends,
                     "true" => TokenKind::Bool(true),
                     "false" => TokenKind::Bool(false),
+                    "null" => TokenKind::Null,
                     _ => TokenKind::Ident(word.to_string()),
                 };
                 tokens.push(Token::new(kind, Span::new(start, i)));
@@ -626,6 +635,18 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
         assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::As)));
         assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Extends)));
+    }
+
+    #[test]
+    fn question_and_null_lex_as_nullable_tokens() {
+        let (toks, diags) = lex("val x: ?u64 = null;");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Question)));
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Null)));
+        // `nullable` stays an identifier: only the exact word is a keyword.
+        let (toks, diags) = lex("nullable nullx;");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(toks.iter().all(|t| !matches!(t.kind, TokenKind::Null)));
     }
 
     #[test]

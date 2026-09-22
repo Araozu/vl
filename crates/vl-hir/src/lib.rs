@@ -277,6 +277,9 @@ pub enum HirExpr {
         name: String,
         span: Span,
     },
+    /// Null literal (`null`): empty value of any `?T`. Desugars to the
+    /// builtin `Option.None`; typechecking infers the argument from context.
+    Null { id: HirId, span: Span },
     Call {
         id: HirId,
         /// Resolved callee (`None` when resolution failed; quiet downstream).
@@ -364,6 +367,7 @@ impl HirExpr {
         match self {
             HirExpr::Literal { id, .. }
             | HirExpr::String { id, .. }
+            | HirExpr::Null { id, .. }
             | HirExpr::ArrayLiteral { id, .. }
             | HirExpr::ObjectLiteral { id, .. }
             | HirExpr::Variant { id, .. }
@@ -384,6 +388,7 @@ impl HirExpr {
         match self {
             HirExpr::Literal { span, .. }
             | HirExpr::String { span, .. }
+            | HirExpr::Null { span, .. }
             | HirExpr::ArrayLiteral { span, .. }
             | HirExpr::ObjectLiteral { span, .. }
             | HirExpr::Variant { span, .. }
@@ -759,6 +764,19 @@ impl<'a> Lowerer<'a> {
                 arms: arms
                     .iter()
                     .map(|arm| {
+                        // `null` arm: sugar for the `None` case of a `?T`
+                        // scrutinee. Desugars here to the builtin
+                        // `Option.None` so typechecking and LIR reuse the
+                        // ordinary union paths ("sugar all the way").
+                        if arm.path == ["null"] {
+                            return HirMatchArm {
+                                union: "Option".to_string(),
+                                variant: "None".to_string(),
+                                bindings: Vec::new(),
+                                body: arm.body.iter().map(|s| self.lower_stmt(s)).collect(),
+                                span: arm.span,
+                            };
+                        }
                         let (variant, union_path) = arm
                             .path
                             .split_last()
@@ -807,6 +825,10 @@ impl<'a> Lowerer<'a> {
                 id: self.id(),
                 value: value.clone(),
                 span: *s,
+            },
+            AstExpr::Null(span) => HirExpr::Null {
+                id: self.id(),
+                span: *span,
             },
             AstExpr::ArrayLiteral { elems, span } => HirExpr::ArrayLiteral {
                 id: self.id(),
@@ -1356,6 +1378,53 @@ mod tests {
                     assert_eq!(arms[0].bindings[0].binding, "v");
                     assert!(arms[0].bindings[0].def.is_some());
                     assert!(else_body.is_some());
+                }
+                other => panic!("expected match, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_lowers_to_a_null_node() {
+        let src = "fun main() { val x: ?u64 = null; x; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Fn { body, .. } => match &body[0] {
+                HirStmt::Let { value, ty, .. } => {
+                    assert!(matches!(value, HirExpr::Null { .. }));
+                    assert!(matches!(ty, Some(VlType::Nullable(_))));
+                }
+                other => panic!("expected let, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_match_arm_desugars_to_option_none() {
+        let src =
+            "fun main() { val x: ?u64 = null; match (x) { Option.Some(v) { v; } null { 0u64; } } }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Fn { body, .. } => match &body[1] {
+                HirStmt::Match { arms, .. } => {
+                    assert_eq!(arms.len(), 2);
+                    assert_eq!(arms[0].union, "Option");
+                    assert_eq!(arms[0].variant, "Some");
+                    assert_eq!(arms[1].union, "Option");
+                    assert_eq!(arms[1].variant, "None");
+                    assert!(arms[1].bindings.is_empty());
                 }
                 other => panic!("expected match, got {other:?}"),
             },

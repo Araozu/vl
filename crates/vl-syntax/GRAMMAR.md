@@ -27,8 +27,9 @@ assoc_fn := "fun" ident type_params? "(" params? ")" (":" type)? block ","?
                                        ; a trailing comma after a `fun` member is allowed, never required
 params   := param ("," param)*          ; no trailing comma
 param    := ident ":" type
-type     := mutable_type | type_atom
-mutable_type := "*" type_atom           ; one capability qualifier (`*Foo`, `*Array[T]`)
+type     := nullable_type | mutable_type | type_atom
+nullable_type := "?" type               ; nullable sugar (`?u64` desugars to the builtin `Option` union)
+mutable_type := "*" (type_atom | nullable_type)   ; one capability qualifier (`*Foo`, `*Array[T]`, `*?Foo`)
 type_atom := "u64" | "i64" | "f64" | "bool" | "u8" | "String" | "File" | ident | union_type | "Array" "[" type "]" | tuple_type | "void"
 union_type := ident ("[" type ("," type)* "]")?   ; bare `Option` or applied `Option[u64]` when `ident` names a union
 tuple_type := "#" "(" tuple_type_elem ("," tuple_type_elem)* ","? ")"
@@ -45,8 +46,9 @@ assignable := ident ("[" expr "]" | "." ident | backtick_index)*
 backtick_index := "." "`" int   ; unnamed tuples only, e.g. t.`0
 if_stmt  := "if" "(" expr ")" branch ("else" branch)?
 match_stmt := "match" "(" expr ")" "{" match_arm* ("else" branch)? "}"
-match_arm := path ("(" ident ("," ident)* ","? ")")? block
+match_arm := (path ("(" ident ("," ident)* ","? ")")? | "null") block
            ; `path` is `Union.Variant` (2+ segments); bindings are implicit `val`s; `else` must be last
+           ; `null` matches the empty case of a `?T` scrutinee (sugar for `Option.None`, no bindings)
 while_stmt := "while" "(" expr ")" branch
 break_stmt := "break" ";"
 continue_stmt := "continue" ";"
@@ -64,7 +66,8 @@ factor   := unary (("*" | "/") unary)*   ; left-assoc
 unary    := ("-" | "!") unary | postfix
 call     := path ("::" "[" type ("," type)* "]")? "(" args? ")"
 postfix  := primary ("[" expr "]" | "." ident | backtick_index)*
-primary  := literal | string | array_literal | tuple_literal | object_literal | call | path | "(" expr ")"
+primary  := literal | string | "null" | array_literal | tuple_literal | object_literal | call | path | "(" expr ")"
+         ; `null` is the empty value of any `?T` (sugar for the builtin `Option.None`; needs an annotation)
 tuple_literal := "#" "(" tuple_elem ("," tuple_elem)* ","? ")"
 tuple_elem := (ident "=")? expr
 object_literal := ident "{" (ident "=" expr ("," ident "=" expr)* ","?)? "}"
@@ -77,7 +80,7 @@ path     := ident ("." ident)*
 Terminal names are `vl-lex` `TokenKind`s: `Var Val Fun Type Object Union Match If Else While Break
 Continue Return As Extends Eq EqEq Bang BangEq Lt LtEq Gt GtEq AmpAmp PipePipe
 Plus Minus Star Slash Semi LParen RParen LBrace RBrace LBracket RBracket Comma
-Dot Colon Hash Backtick ColonColon Ident Int I64 U64 F64 U8 Bool String Invalid Eof`.
+Dot Colon Hash Backtick ColonColon Question Null Ident Int I64 U64 F64 U8 Bool String Invalid Eof`.
 
 ### Notes
 
@@ -114,6 +117,15 @@ Dot Colon Hash Backtick ColonColon Ident Int I64 U64 F64 U8 Bool String Invalid 
   `Option[u64]` (applied). Only names declared as `union` in the file parse
   this way; other `Name[...]` spellings are a typecheck error. Annotations for
   a generic union without arguments are rejected by typechecking (arity error).
+  The builtin `Option` (backing `?T` / `null`) is available without a
+  declaration; a local `type Option` shadows it.
+* Nullable types (`?T`) desugar to the builtin `Option` union, so every later
+  stage only sees unions ("sugar all the way"). `?` prefixes any `type`
+  (`??T`, `Array[?u64]`, `?*Foo`); `?void` and a missing inner type are one
+  `E104` each. A plain `T` value where `?T` is expected wraps as
+  `Option.Some` implicitly; `null` is the empty case. `x == null` / `x != null`
+  compare the discriminant tag; other `==` operands follow the usual
+  comparability rules.
 * Variant construction reuses call/field syntax: `Option.Some(1u64)` parses as
   a call and `Option.None` as a field path; both resolve to variants in later
   stages (an optional turbofish `Option.Some::[u64](...)` passes explicit args).

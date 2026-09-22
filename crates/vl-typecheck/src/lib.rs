@@ -84,6 +84,14 @@ impl std::fmt::Display for Ty {
             Ty::File => write!(f, "File"),
             Ty::Object(name) => write!(f, "{name}"),
             Ty::Union(u) => {
+                // The builtin nullable (`?T` sugar over `Option[T]`) keeps
+                // its surface spelling in diagnostics and dumps; every other
+                // union prints nominally. Only the single-argument `Option`
+                // is the nullable (a multi-arg union also named `Option`
+                // stays nominal).
+                if u.name == "Option" && u.args.len() == 1 {
+                    return write!(f, "?{}", u.args[0]);
+                }
                 write!(f, "{}", u.name)?;
                 if !u.args.is_empty() {
                     write!(f, "[")?;
@@ -140,6 +148,13 @@ impl Ty {
             VlType::Union { name, args } => Ty::Union(Box::new(UnionTy {
                 name: name.clone(),
                 args: args.iter().map(|a| Self::from_vl_in(a, env)).collect(),
+            })),
+            // `?T` desugars here to the builtin `Option` union so every
+            // later stage (LIR, backends) only sees unions ("sugar all
+            // the way"). `??T` nests as `Option[Option[T]]`.
+            VlType::Nullable(inner) => Ty::Union(Box::new(UnionTy {
+                name: "Option".to_string(),
+                args: vec![Self::from_vl_in(inner, env)],
             })),
             VlType::Array(elem) => Ty::Array(Box::new(Self::from_vl_in(elem, env))),
             VlType::Tuple(fields) => Ty::Tuple(
@@ -374,6 +389,35 @@ pub struct UnionVariantSigTy {
     pub payload: Vec<Ty>,
 }
 
+/// Builtin nullable union backing `?T` / `null`: `Option[T]` with
+/// `None` (tag 0, no payload) and `Some(T)` (tag 1). Available without a
+/// declaration; a local `type Option` shadows it in `typed.unions`.
+pub fn builtin_option_sig() -> UnionSigTy {
+    UnionSigTy {
+        type_params: vec!["T".to_string()],
+        variants: vec![
+            UnionVariantSigTy {
+                name: "None".to_string(),
+                payload: Vec::new(),
+            },
+            UnionVariantSigTy {
+                name: "Some".to_string(),
+                payload: vec![Ty::Param("T".to_string())],
+            },
+        ],
+    }
+}
+
+/// True when `ty` is a nullable (`Option[T]`) instantiation, returning its
+/// single argument. Looks through an outer `*` so `*?T` counts.
+pub fn nullable_inner_ty(ty: &Ty) -> Option<&Ty> {
+    match ty {
+        Ty::Union(u) if u.name == "Option" && u.args.len() == 1 => Some(&u.args[0]),
+        Ty::Mutable(inner) => nullable_inner_ty(inner),
+        _ => None,
+    }
+}
+
 /// Compiler-owned signature of one user function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncSigTy {
@@ -576,6 +620,10 @@ pub struct TypedProgram {
     /// Feeds import collection and the world fixed point for foreign method
     /// calls (mirrors `Call.symbol` for ordinary calls).
     pub method_symbols: HashMap<u32, vl_common::SymbolRef>,
+    /// HIR value nodes implicitly wrapped as `Option.Some` for a `?T`
+    /// expectation (`val x: ?u64 = 5;`). LIR emits a `NewVariant Some`
+    /// around the lowered inner value; the recorded type is the nullable.
+    pub nullable_wraps: std::collections::HashSet<u32>,
 }
 
 /// Resolved target of one instance-sugar call.
@@ -739,7 +787,10 @@ fn template_expr_ids(e: &HirExpr, out: &mut HashSet<u32>) {
         }
         HirExpr::Unary { inner, .. } => template_expr_ids(inner, out),
         HirExpr::Cast { inner, .. } => template_expr_ids(inner, out),
-        HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
+        HirExpr::Literal { .. }
+        | HirExpr::String { .. }
+        | HirExpr::Null { .. }
+        | HirExpr::Var { .. } => {}
     }
 }
 
@@ -927,53 +978,67 @@ fn normalize_union_ty(
             if args.iter().any(ty_has_error) {
                 return Ty::Error;
             }
-            let Some(sig) = unions.get(&name) else {
-                if objects.contains_key(&name) {
-                    diags.push(
-                        Diagnostic::error(format!("unknown type `{name}` with type arguments"))
-                            .with_label(
-                                span,
-                                format!("`{name}` is an object and takes no `[...]` arguments"),
-                            )
-                            .with_note("only `union` types take `[...]` type arguments")
-                            .with_code("E105"),
-                    );
-                } else {
-                    let mut diag = Diagnostic::error(format!(
-                        "unknown type `{name}`{}",
-                        if args.is_empty() {
-                            String::new()
+            // Builtin `Option` backs `?T` / `null` without a declaration;
+            // a local `type Option` shadows it (checked first).
+            let builtin =
+                (name == "Option" && !unions.contains_key(&name)).then(builtin_option_sig);
+            let sig: &UnionSigTy = match unions.get(&name) {
+                Some(sig) => sig,
+                None => match &builtin {
+                    Some(b) => b,
+                    None => {
+                        if objects.contains_key(&name) {
+                            diags.push(
+                                Diagnostic::error(format!(
+                                    "unknown type `{name}` with type arguments"
+                                ))
+                                .with_label(
+                                    span,
+                                    format!("`{name}` is an object and takes no `[...]` arguments"),
+                                )
+                                .with_note("only `union` types take `[...]` type arguments")
+                                .with_code("E105"),
+                            );
                         } else {
-                            format!(
-                                "[{}]",
-                                args.iter()
-                                    .map(|a| a.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )
+                            let mut diag = Diagnostic::error(format!(
+                                "unknown type `{name}`{}",
+                                if args.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "[{}]",
+                                        args.iter()
+                                            .map(|a| a.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )
+                                }
+                            ))
+                            .with_label(span, "no union with this name is in scope")
+                            .with_code("E105");
+                            // Foreign unions need their qualified spelling
+                            // (`m.Option[u64]`); suggest it when unambiguous.
+                            if !name.contains('.') {
+                                let mut qualified: Vec<&String> = unions
+                                    .keys()
+                                    .filter(|k| {
+                                        k.rsplit('.').next().is_some_and(|short| short == name)
+                                    })
+                                    .collect();
+                                qualified.sort();
+                                qualified.dedup();
+                                if qualified.len() == 1 {
+                                    diag = diag.with_note(format!(
+                                        "did you mean `{}`? (unions from other modules need their qualified spelling)",
+                                        qualified[0]
+                                    ));
+                                }
+                            }
+                            diags.push(diag);
                         }
-                    ))
-                    .with_label(span, "no union with this name is in scope")
-                    .with_code("E105");
-                    // Foreign unions need their qualified spelling
-                    // (`m.Option[u64]`); suggest it when unambiguous.
-                    if !name.contains('.') {
-                        let mut qualified: Vec<&String> = unions
-                            .keys()
-                            .filter(|k| k.rsplit('.').next().is_some_and(|short| short == name))
-                            .collect();
-                        qualified.sort();
-                        qualified.dedup();
-                        if qualified.len() == 1 {
-                            diag = diag.with_note(format!(
-                                "did you mean `{}`? (unions from other modules need their qualified spelling)",
-                                qualified[0]
-                            ));
-                        }
+                        return Ty::Error;
                     }
-                    diags.push(diag);
-                }
-                return Ty::Error;
+                },
             };
             if args.len() != sig.type_params.len() {
                 diags.push(
@@ -998,8 +1063,12 @@ fn normalize_union_ty(
         Ty::Object(name) => {
             // A bare object spelling naming a union: the parser resolves
             // file-local bare unions itself, so only qualified spellings
-            // (`m.Option`) and odd orders land here.
-            if let Some(sig) = unions.get(&name) {
+            // (`m.Option`), the builtin `Option` (bare `Option` without
+            // arguments), and odd orders land here.
+            let builtin =
+                (name == "Option" && !unions.contains_key(&name)).then(builtin_option_sig);
+            let sig_opt: Option<&UnionSigTy> = unions.get(&name).or(builtin.as_ref());
+            if let Some(sig) = sig_opt {
                 if sig.type_params.is_empty() {
                     return Ty::Union(Box::new(UnionTy {
                         name,
@@ -1084,6 +1153,7 @@ fn validate_qualified_types(
                 );
             }
             VlType::Array(elem) => check_ty(elem, span, objects, unions, diags),
+            VlType::Nullable(inner) => check_ty(inner, span, objects, unions, diags),
             VlType::Union { args, .. } => {
                 // Union heads are validated during conversion
                 // (`normalize_union_ty` owns E105/E302); only dotted names
@@ -1180,7 +1250,10 @@ fn validate_qualified_types(
                 check_expr(rhs, objects, unions, diags);
             }
             HirExpr::Unary { inner, .. } => check_expr(inner, objects, unions, diags),
-            HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
+            HirExpr::Literal { .. }
+            | HirExpr::String { .. }
+            | HirExpr::Null { .. }
+            | HirExpr::Var { .. } => {}
         }
     }
     fn check_stmts(
@@ -1823,8 +1896,16 @@ impl Checker {
     }
 
     /// Look up a union by spelling (bare `Option` or qualified `m.Option`).
+    /// Falls back to the builtin `Option` backing `?T` / `null` when no
+    /// local declaration shadows it.
     fn union_sig(&self, name: &str) -> Option<UnionSigTy> {
-        self.typed.unions.get(name).cloned()
+        if let Some(sig) = self.typed.unions.get(name) {
+            return Some(sig.clone());
+        }
+        if name == "Option" {
+            return Some(builtin_option_sig());
+        }
+        None
     }
 
     fn check_item(&mut self, item: &HirItem) {
@@ -3262,12 +3343,13 @@ impl Checker {
         for (i, (arg, got)) in args.iter().zip(arg_tys.iter()).enumerate() {
             // Bare `Array.new(n)` without an element type defers its error
             // until the formal is known (contextual `Array`/` *Array`
-            // supplies it); empty `[]` defers the same way. All other
-            // poisoned args stay quiet.
+            // supplies it); empty `[]` and `null` defer the same way. All
+            // other poisoned args stay quiet.
             let is_bare_new = matches!(arg, HirExpr::Call { name, type_args, .. } if name == "Array.new" && type_args.is_empty());
             let is_empty_array =
                 matches!(arg, HirExpr::ArrayLiteral { elems, .. } if elems.is_empty());
-            if ty_has_error(got) && !(is_bare_new || is_empty_array) {
+            let is_null = matches!(arg, HirExpr::Null { .. });
+            if ty_has_error(got) && !(is_bare_new || is_empty_array || is_null) {
                 continue;
             }
             let want = Ty::from_vl_in(&params[i].ty, &self.type_env);
@@ -3410,7 +3492,8 @@ impl Checker {
         } = call;
         let r_ty = self.infer_expr(receiver);
         // Argument types first, with the same bare-`Array.new` / empty-`[]`
-        // deferral as ordinary calls (context comes from the formal below).
+        // / `null` deferral as ordinary calls (context comes from the formal
+        // below).
         let mut arg_tys = Vec::with_capacity(args.len());
         let mut poisoned = false;
         for arg in args {
@@ -3434,6 +3517,10 @@ impl Checker {
                     arg_tys.push(Ty::Error);
                     continue;
                 }
+            }
+            if matches!(arg, HirExpr::Null { .. }) {
+                arg_tys.push(Ty::Error);
+                continue;
             }
             let t = self.infer_expr(arg);
             if ty_has_error(&t) {
@@ -3612,7 +3699,8 @@ impl Checker {
             let is_bare_new = matches!(arg, HirExpr::Call { name, type_args, .. } if name == "Array.new" && type_args.is_empty());
             let is_empty_array =
                 matches!(arg, HirExpr::ArrayLiteral { elems, .. } if elems.is_empty());
-            if ty_has_error(original_got) && !(is_bare_new || is_empty_array) {
+            let is_null = matches!(arg, HirExpr::Null { .. });
+            if ty_has_error(original_got) && !(is_bare_new || is_empty_array || is_null) {
                 continue;
             }
             let want = &param_tys[i];
@@ -3751,6 +3839,7 @@ impl Checker {
         match v {
             VlType::Param(_) => true,
             VlType::Array(elem) => Self::vl_has_unbound_param(elem),
+            VlType::Nullable(inner) => Self::vl_has_unbound_param(inner),
             VlType::Tuple(fields) => fields.iter().any(|f| Self::vl_has_unbound_param(&f.ty)),
             VlType::Union { args, .. } => args.iter().any(Self::vl_has_unbound_param),
             VlType::Mutable(inner) => Self::vl_has_unbound_param(inner),
@@ -3948,8 +4037,8 @@ impl Checker {
             return self.record(id, Ty::Error);
         };
         // Infer payload argument types first (inner errors surface here, like
-        // calls). Bare `Array.new(n)` and empty `[]` defer to the formal,
-        // exactly like call arguments.
+        // calls). Bare `Array.new(n)`, empty `[]`, and `null` defer to the
+        // formal, exactly like call arguments.
         let mut arg_tys = Vec::with_capacity(args.len());
         let mut poisoned = false;
         for arg in args {
@@ -3973,6 +4062,13 @@ impl Checker {
                     arg_tys.push(Ty::Error);
                     continue;
                 }
+            }
+            // `null` carries no type to infer now; the per-payload expected
+            // check below resolves it against the formal (or reports one
+            // E303 when the formal is not nullable).
+            if matches!(arg, HirExpr::Null { .. }) {
+                arg_tys.push(Ty::Error);
+                continue;
             }
             let t = self.infer_expr(arg);
             if ty_has_error(&t) {
@@ -4078,7 +4174,8 @@ impl Checker {
             let is_bare_new = matches!(arg, HirExpr::Call { name, type_args, .. } if name == "Array.new" && type_args.is_empty());
             let is_empty_array =
                 matches!(arg, HirExpr::ArrayLiteral { elems, .. } if elems.is_empty());
-            if ty_has_error(original_got) && !(is_bare_new || is_empty_array) {
+            let is_null = matches!(arg, HirExpr::Null { .. });
+            if ty_has_error(original_got) && !(is_bare_new || is_empty_array || is_null) {
                 continue;
             }
             let want = &wants[i];
@@ -4221,7 +4318,140 @@ impl Checker {
         self.record(id, Ty::Array(Box::new(elem)))
     }
 
+    /// Bare `null` without a `?T` expectation: no `T` to infer (one E303).
+    /// A contextual `null` already recorded its nullable via
+    /// `infer_expr_expected`; honor it. Out-of-line so the hot `infer_expr`
+    /// frame stays small for deeply nested generics.
+    fn check_bare_null(&mut self, id: vl_hir::HirId, span: Span) -> Ty {
+        match self.typed.type_of_id(id) {
+            Some(t) if ty_has_error(&t) => return self.record(id, Ty::Error),
+            Some(t) if nullable_inner_ty(&t).is_some() => return self.record(id, t),
+            _ => {}
+        }
+        self.diags.push(
+            Diagnostic::error("cannot infer the type of `null`")
+                .with_label(span, "null needs a type: `val x: ?T = null;`")
+                .with_code("E303"),
+        );
+        self.record(id, Ty::Error)
+    }
+
+    /// `x == null` / `x != null` (one side is the `null` literal, handled
+    /// before general operand inference so `null` records its nullable
+    /// type). Always returns `Some` (either `Bool` or poisoned `Error`);
+    /// out-of-line so the hot `infer_expr` frame stays small for deeply
+    /// nested generics.
+    fn check_null_comparison(
+        &mut self,
+        id: vl_hir::HirId,
+        _op: vl_hir::HirBinOp,
+        lhs: &vl_hir::HirExpr,
+        rhs: &vl_hir::HirExpr,
+        span: Span,
+    ) -> Option<Ty> {
+        let (value_side, null_side) = if matches!(lhs, vl_hir::HirExpr::Null { .. }) {
+            (rhs, lhs)
+        } else {
+            (lhs, rhs)
+        };
+        if matches!(value_side, vl_hir::HirExpr::Null { .. }) {
+            // `null == null` carries no `T`: one E303 from the left side,
+            // the right poisons quietly (no cascade).
+            let _ = self.infer_expr(lhs);
+            self.record(rhs.id(), Ty::Error);
+            return Some(self.record(id, Ty::Error));
+        }
+        let value_ty = self.infer_expr(value_side);
+        if ty_has_error(&value_ty) {
+            // Root cause already reported; poison the `null` quietly so a
+            // bare-`null` E303 does not cascade beside it.
+            self.record(null_side.id(), Ty::Error);
+            return Some(self.record(id, Ty::Error));
+        }
+        if value_ty == Ty::Void {
+            self.diags.push(
+                Diagnostic::error("cannot use a `void` value in an operation")
+                    .with_label(span, "`void` is not a value")
+                    .with_code("E308"),
+            );
+            self.record(null_side.id(), Ty::Error);
+            return Some(self.record(id, Ty::Error));
+        }
+        if nullable_inner_ty(&value_ty).is_none() {
+            self.diags.push(
+                Diagnostic::error(format!("cannot compare `{value_ty}` with `null`"))
+                    .with_label(span, "only a nullable (`?T`) compares with `null`")
+                    .with_code("E302"),
+            );
+            self.record(null_side.id(), Ty::Error);
+            return Some(self.record(id, Ty::Error));
+        }
+        let _ = self.infer_expr_expected(null_side, &value_ty);
+        Some(self.record(id, Ty::Bool))
+    }
+
+    /// Nullable prefix of `infer_expr_expected`: `null` and auto-`Some`.
+    /// Returns `Some(ty)` when the nullable sugar handled `expr` fully
+    /// (either the `null` literal or an implicit `T` -> `?T` wrap, or a
+    /// poisoned re-visit); `None` to fall through to the general union,
+    /// array, and literal paths below. Split out so the hot
+    /// `infer_expr_expected` frame stays small for deeply nested generics.
+    fn infer_nullable_prefix(&mut self, expr: &HirExpr, expected: &Ty) -> Option<Ty> {
+        if ty_has_error(expected) {
+            return None;
+        }
+        if let HirExpr::Null { id, .. } = expr {
+            // `null` under a `?T` (or `*?T`) expectation: the empty nullable.
+            if nullable_inner_ty(expected).is_some() {
+                return Some(self.record(*id, expected.clone()));
+            }
+            // Bare `null` without a nullable expectation: fall through to
+            // `infer_expr` for the single E303 below.
+            return None;
+        }
+        if matches!(expr, HirExpr::Variant { .. }) {
+            return None;
+        }
+        let inner = nullable_inner_ty(expected)?.clone();
+        // Exact match first: a `?T` value where `?T` is expected needs no
+        // wrap (avoids a spurious inner probe that would mismatch `?T`
+        // vs `T`).
+        let current = self.infer_expr(expr);
+        if ty_has_error(&current) {
+            return Some(self.record(expr.id(), Ty::Error));
+        }
+        if can_coerce(&current, expected) {
+            return None;
+        }
+        let probe = self.infer_expr_expected(expr, &inner);
+        if !ty_has_error(&probe) && !ty_has_error(&inner) && can_coerce(&probe, &inner) {
+            // Keep the node's recorded type as the inner `T` (so literals
+            // lower in the right lane); the wrap set tells LIR to emit
+            // `Option.Some` around it.
+            self.typed.nullable_wraps.insert(expr.id().0);
+            return Some(expected.clone());
+        }
+        if ty_has_error(&probe) {
+            return Some(self.record(expr.id(), Ty::Error));
+        }
+        // Inner rejects the value: fall through to the general mismatch
+        // below (one error at the boundary).
+        None
+    }
+
     fn infer_expr_expected(&mut self, expr: &HirExpr, expected: &Ty) -> Ty {
+        // Fast path guard: only enter the nullable helper when the
+        // expectation could be a `?T` (`Option` union, possibly under `*`)
+        // and the expression is not already a variant construction (which
+        // has its own contextual path below). Keeps the hot generic-nesting
+        // frames free of an extra call.
+        let maybe_nullable = matches!(expected, Ty::Union(_) | Ty::Mutable(_))
+            && !matches!(expr, HirExpr::Variant { .. });
+        if maybe_nullable {
+            if let Some(ty) = self.infer_nullable_prefix(expr, expected) {
+                return ty;
+            }
+        }
         // Contextual variant construction: an expected `Union` (or `*Union`)
         // supplies the union arguments — a nullary `Option.None` under
         // `val x: Option[u64]`, or payload `int` literals.
@@ -4625,6 +4855,11 @@ impl Checker {
                 self.record(*id, ty)
             }
             HirExpr::String { id, .. } => self.record(*id, Ty::String),
+            HirExpr::Null { id, .. } => {
+                // Out-of-line so this hot frame stays small for deeply
+                // nested generics (debug builds keep all locals alive).
+                self.check_bare_null(*id, expr.span())
+            }
             HirExpr::ArrayLiteral { id, elems, .. } => {
                 if elems.is_empty() {
                     // Contextual empty: coercion already recorded the
@@ -5078,6 +5313,12 @@ impl Checker {
                             continue;
                         }
                     }
+                    // `null` likewise defers: only the formal tells whether
+                    // it is the empty `?T` (contextual) or one E303.
+                    if matches!(arg, HirExpr::Null { .. }) {
+                        arg_tys.push(Ty::Error);
+                        continue;
+                    }
                     let t = self.infer_expr(arg);
                     if ty_has_error(&t) {
                         poisoned = true;
@@ -5132,7 +5373,10 @@ impl Checker {
                         for (i, original_got) in arg_tys.iter().enumerate() {
                             let is_bare_new = matches!(&args[i], HirExpr::Call { name, type_args, .. } if name == "Array.new" && type_args.is_empty());
                             let is_empty_array = matches!(&args[i], HirExpr::ArrayLiteral { elems, .. } if elems.is_empty());
-                            if ty_has_error(original_got) && !(is_bare_new || is_empty_array) {
+                            let is_null = matches!(&args[i], HirExpr::Null { .. });
+                            if ty_has_error(original_got)
+                                && !(is_bare_new || is_empty_array || is_null)
+                            {
                                 continue;
                             }
                             let want = &param_tys[i];
@@ -5307,7 +5551,8 @@ impl Checker {
                     let is_bare_new = matches!(&args[i], HirExpr::Call { name, type_args, .. } if name == "Array.new" && type_args.is_empty());
                     let is_empty_array =
                         matches!(&args[i], HirExpr::ArrayLiteral { elems, .. } if elems.is_empty());
-                    if ty_has_error(original_got) && !(is_bare_new || is_empty_array) {
+                    let is_null = matches!(&args[i], HirExpr::Null { .. });
+                    if ty_has_error(original_got) && !(is_bare_new || is_empty_array || is_null) {
                         continue;
                     }
                     let want = &param_tys[i];
@@ -5426,6 +5671,21 @@ impl Checker {
                 rhs,
                 span,
             } => {
+                // `x == null` helper lives out-of-line so this hot frame
+                // stays small for deeply nested generics (debug builds keep
+                // all locals alive; `Ty` values are large).
+                if matches!(op, HirBinOp::Eq | HirBinOp::Ne)
+                    && (matches!(&**lhs, HirExpr::Null { .. })
+                        || matches!(&**rhs, HirExpr::Null { .. }))
+                {
+                    if let Some(ty) = self.check_null_comparison(*id, *op, lhs, rhs, *span) {
+                        return ty;
+                    }
+                    // `None` means already poisoned (diagnostic emitted);
+                    // fall through to avoid a second error? The helper
+                    // always returns `Some` (either Bool or Error), so this
+                    // is unreachable; keep the general path as a fallback.
+                }
                 let lt = self.infer_expr(lhs);
                 let rt = self.infer_expr(rhs);
                 if ty_has_error(&lt) || ty_has_error(&rt) {
@@ -5487,6 +5747,10 @@ impl Checker {
                         self.record(*id, lt)
                     }
                     HirBinOp::Eq | HirBinOp::Ne => {
+                        // `x == null` / `x != null` returned early above
+                        // (before operand inference) so `null` records its
+                        // nullable type; reaching here means neither side is
+                        // `null`.
                         if lt == Ty::Int && rt == Ty::Int {
                             self.coerce_expr_literals(lhs, &Ty::U64);
                             self.coerce_expr_literals(rhs, &Ty::U64);
@@ -6393,6 +6657,7 @@ fn is_fresh_allocation(expr: &vl_hir::HirExpr) -> bool {
     match expr {
         vl_hir::HirExpr::ObjectLiteral { .. } => true,
         vl_hir::HirExpr::Variant { .. } => true,
+        vl_hir::HirExpr::Null { .. } => true,
         vl_hir::HirExpr::TupleLiteral { .. } => true,
         vl_hir::HirExpr::ArrayLiteral { .. } => true,
         vl_hir::HirExpr::Call { name, .. } if name == "Array.new" => true,
@@ -6679,6 +6944,98 @@ mod tests {
                 }))),
             "{tys:?}"
         );
+    }
+
+    #[test]
+    fn nullable_desugars_to_the_builtin_option_union() {
+        // `?u64` needs no `type Option` declaration: it is the builtin
+        // `Option[u64]` (printed with the surface spelling).
+        let (typed, diags) =
+            check_src("fun f(x: ?u64): ?u64 { return x; } fun main() { val a: ?u64 = null; a; }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_eq!(
+            typed
+                .func_sigs
+                .values()
+                .find(|s| s.param_names == vec!["x".to_string()])
+                .expect("sig")
+                .ret
+                .to_string(),
+            "?u64"
+        );
+        // `Option.Some` / `Option.None` spell the same union without a
+        // declaration.
+        let (_, builtin) = check_src(
+            "fun main() { val a = Option.Some(1u64); val n: Option[u64] = Option.None; a; n; }",
+        );
+        assert!(builtin.iter().all(|d| !d.is_error()), "{builtin:?}");
+    }
+
+    #[test]
+    fn plain_values_wrap_as_some_for_nullable_formals() {
+        // `T` where `?T` is expected wraps as `Option.Some` (recorded for
+        // LIR); the node's own type stays the inner lane.
+        let (typed, diags) = check_src("fun main() { val x: ?u64 = 5u64; x; }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_eq!(typed.nullable_wraps.len(), 1, "{typed:?}");
+        // Int literals coerce through the inner type too.
+        let (typed, diags) = check_src("fun main() { val x: ?u64 = 5; x; }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_eq!(typed.nullable_wraps.len(), 1, "{typed:?}");
+        // A nullable value where a nullable is expected needs no wrap.
+        let (typed, diags) = check_src("fun main() { val x: ?u64 = null; val y: ?u64 = x; y; }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(typed.nullable_wraps.is_empty(), "{typed:?}");
+    }
+
+    #[test]
+    fn bare_null_without_context_is_one_e303() {
+        let (_, diags) = check_src("fun main() { val x = null; x; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E303"));
+    }
+
+    #[test]
+    fn null_comparison_needs_a_nullable_operand() {
+        let (typed, diags) = check_src(
+            "fun main() { val x: ?u64 = null; if (x == null) { x; } if (x != null) { x; } }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(typed.types.values().any(|t| *t == Ty::Bool));
+        // One root cause, one error: no cascading bare-`null` E303.
+        let (_, bad) = check_src("fun main() { val x = 1u64; if (x == null) { x; } }");
+        let errors = bad.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{bad:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E302"));
+        let (_, both) = check_src("fun main() { if (null == null) { 1u64; } }");
+        let errors = both.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{both:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E303"));
+    }
+
+    #[test]
+    fn null_call_arguments_resolve_against_the_formal() {
+        let (_, diags) = check_src(
+            "fun f(x: ?u64): u64 { match (x) { Option.Some(v) { return v; } null { return 0u64; } } } fun main() { val a = f(null); a; }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+    }
+
+    #[test]
+    fn null_match_arm_covers_none() {
+        // `null` + `Some` is exhaustive without `else`; `null` + `None` is
+        // one duplicate-arm E200.
+        let (_, full) = check_src(
+            "fun f(x: ?u64): u64 { match (x) { Option.Some(v) { return v; } null { return 0u64; } } } fun main() { val r = f(null); r; }",
+        );
+        assert!(full.iter().all(|d| !d.is_error()), "{full:?}");
+        let (_, dup) = check_src(
+            "fun main() { val x: ?u64 = null; match (x) { Option.None { x; } null { x; } else { x; } } }",
+        );
+        let errors = dup.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{dup:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E200"));
     }
 
     #[test]

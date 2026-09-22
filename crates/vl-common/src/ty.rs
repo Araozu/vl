@@ -45,6 +45,11 @@ pub enum VlType {
         name: String,
         args: Vec<VlType>,
     },
+    /// Nullable sugar (`?T`): surface-only spelling of the builtin
+    /// `Option` union with one argument. Parsers produce this; typechecking
+    /// desugars it to `Union { name: "Option", args: [T] }` so LIR and
+    /// backends only ever see the union representation ("sugar all the way").
+    Nullable(Box<VlType>),
     Array(Box<VlType>),
     /// Fixed-arity heterogeneous tuple (`#(u64, String)` / `#(x: u64)`).
     /// Value semantics (copy on bind/assign); heap container on the target.
@@ -81,6 +86,7 @@ impl fmt::Display for VlType {
                 }
                 Ok(())
             }
+            VlType::Nullable(inner) => write!(f, "?{inner}"),
             VlType::Array(elem) => write!(f, "Array[{elem}]"),
             VlType::Tuple(fields) => {
                 write!(f, "#(")?;
@@ -149,6 +155,7 @@ impl VlType {
         match self {
             VlType::Void => true,
             VlType::Mutable(inner) => inner.is_void(),
+            VlType::Nullable(inner) => inner.is_void(),
             VlType::Array(elem) => elem.is_void(),
             VlType::Tuple(fields) => fields.iter().any(|f| f.ty.is_void()),
             VlType::Union { args, .. } => args.iter().any(|a| a.is_void()),
@@ -185,10 +192,21 @@ impl VlType {
             VlType::String | VlType::File => true,
             VlType::Object(_) => true,
             VlType::Union { .. } => true,
+            VlType::Nullable(_) => true,
             VlType::Array(_) => true,
             VlType::Tuple(_) => true,
             VlType::Mutable(inner) => inner.is_reference_type(),
             _ => false,
+        }
+    }
+
+    /// Inner type of `?T`; `None` for everything else.
+    /// Looks through an outer `*` so `*?T` still yields `T`.
+    pub fn nullable_inner(&self) -> Option<&VlType> {
+        match self {
+            VlType::Nullable(inner) => Some(inner),
+            VlType::Mutable(inner) => inner.nullable_inner(),
+            _ => None,
         }
     }
 
@@ -211,6 +229,7 @@ impl VlType {
     pub fn erase_capability(&self) -> VlType {
         match self {
             VlType::Mutable(inner) => inner.erase_capability(),
+            VlType::Nullable(inner) => VlType::Nullable(Box::new(inner.erase_capability())),
             VlType::Array(elem) => VlType::Array(Box::new(elem.erase_capability())),
             VlType::Union { name, args } => VlType::Union {
                 name: name.clone(),
@@ -260,7 +279,7 @@ impl VlType {
                     | VlType::F64
                     | VlType::Bool
                     | VlType::U8 => Some(format!("`*{inner}` is not a reference type")),
-                    VlType::String | VlType::File | VlType::Object(_) | VlType::Union { .. } | VlType::Array(_) | VlType::Tuple(_) => {
+                    VlType::String | VlType::File | VlType::Object(_) | VlType::Union { .. } | VlType::Nullable(_) | VlType::Array(_) | VlType::Tuple(_) => {
                         // The payload itself may still be malformed
                         // (e.g. `*Array[*u64]`).
                         inner.mutable_wellformed_error()
@@ -268,6 +287,7 @@ impl VlType {
                 }
             }
             VlType::Array(elem) => elem.mutable_wellformed_error(),
+            VlType::Nullable(inner) => inner.mutable_wellformed_error(),
             VlType::Tuple(fields) => fields.iter().find_map(|f| f.ty.mutable_wellformed_error()),
             VlType::Union { args, .. } => args.iter().find_map(|a| a.mutable_wellformed_error()),
             _ => None,
@@ -313,6 +333,33 @@ mod tests {
 
     fn obj(name: &str) -> VlType {
         VlType::Object(name.into())
+    }
+
+    #[test]
+    fn nullable_display_and_predicates() {
+        let t = VlType::Nullable(Box::new(VlType::U64));
+        assert_eq!(t.to_string(), "?u64");
+        assert_eq!(
+            VlType::Nullable(Box::new(VlType::Nullable(Box::new(VlType::U64)))).to_string(),
+            "??u64"
+        );
+        // Nullables are heap reference types (builtin `Option` union).
+        assert!(t.is_reference_type());
+        assert!(!t.is_void());
+        assert_eq!(t.nullable_inner(), Some(&VlType::U64));
+        assert_eq!(VlType::U64.nullable_inner(), None);
+        // `*?T` looks through the capability.
+        assert_eq!(
+            VlType::Mutable(Box::new(t.clone())).nullable_inner(),
+            Some(&VlType::U64)
+        );
+        // Capability erasure and `*` well-formedness recurse.
+        assert_eq!(t.erase_capability(), t);
+        assert_eq!(
+            VlType::Mutable(Box::new(t)).mutable_wellformed_error(),
+            None
+        );
+        assert!(VlType::Nullable(Box::new(VlType::Void)).is_void());
     }
 
     #[test]

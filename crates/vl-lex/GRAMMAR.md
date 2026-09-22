@@ -31,16 +31,18 @@ newline is then whitespace. An unterminated comment at EOF simply stops.
 
 ```text
 keyword    := "var" | "val" | "fun" | "type" | "object" | "union" | "match" | "if" | "else"
-            | "while" | "break" | "continue" | "return" | "as" | "extends"
+            | "while" | "break" | "continue" | "return" | "as" | "extends" | "null"
 ident      := [a-zA-Z_] [a-zA-Z0-9_]*
 number     := digits ("." digits)? suffix?
 suffix     := "u64" | "i64" | "f64" | "u8"
 boolean    := "true" | "false"
+null       := "null"   ; `Null`: nullable empty value (desugars to builtin `Option.None`)
 string     := `"` string_char* `"`
 operator   := "==" | "!=" | "<=" | ">=" | "&&" | "||"
             | "+" | "-" | "*" | "/" | "=" | "!" | "<" | ">"
 delimiter  := "::" | ";" | "(" | ")" | "{" | "}" | "[" | "]"
-            | "," | "." | ":" | "#" | "`"
+            | "," | "." | ":" | "#" | "`" | "?"
+            ; `?` is the nullable prefix (`Question`: `?T` desugars to builtin `Option`)
 tuple_intro := "#"   ; `Hash`: `#(...)` types, literals, and destructure patterns
 tuple_index := "`"   ; `Backtick`: unnamed access is `.` backtick int
 ```
@@ -65,6 +67,8 @@ bytes; no UTF-8 decoding is performed.
 | `extends` | `Extends` | word span |
 | `[a-zA-Z_][a-zA-Z0-9_]*` | `Ident(String)` | word span |
 | `true` / `false` | `Bool(bool)` | word span |
+| `null` | `Null` | word span |
+| `?` | `Question` (nullable prefix `?T`) | one byte |
 | `[0-9]+` | `Int(i64)` | digit span |
 | `[0-9]+i64` / `[0-9]+u64` / `[0-9]+u8` | `I64` / `U64` / `U8` | literal span |
 | `[0-9]+.[0-9]+f64` | `F64(u64)` using `f64::to_bits` | literal span |

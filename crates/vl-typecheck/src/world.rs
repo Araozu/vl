@@ -250,7 +250,10 @@ fn calls_in_template(prog: &HirProgram, typed: &TypedProgram, def: u32) -> Vec<N
             }
             HirExpr::Unary { inner, .. } => walk_expr(prog, typed, inner, out),
             HirExpr::Cast { inner, .. } => walk_expr(prog, typed, inner, out),
-            HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
+            HirExpr::Literal { .. }
+            | HirExpr::String { .. }
+            | HirExpr::Null { .. }
+            | HirExpr::Var { .. } => {}
         }
     }
     fn walk_stmt(prog: &HirProgram, typed: &TypedProgram, s: &HirStmt, out: &mut Vec<NestedCall>) {
@@ -674,7 +677,10 @@ pub fn validate_plan(
                 }
                 HirExpr::Unary { inner, .. } => expr_ids(inner, out),
                 HirExpr::Cast { inner, .. } => expr_ids(inner, out),
-                HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
+                HirExpr::Literal { .. }
+                | HirExpr::String { .. }
+                | HirExpr::Null { .. }
+                | HirExpr::Var { .. } => {}
             }
         }
         fn stmt_ids(s: &HirStmt, out: &mut HashSet<u32>) {
