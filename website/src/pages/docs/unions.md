@@ -122,6 +122,41 @@ VL usually figures out `T` from the carried value (`Option.Some(42u64)` is
 an `Option[u64]`). A bare `None` carries nothing to guess from, so annotate
 it: `val missing: Option[u64] = Option.None;`.
 
+## Nullables: `?T` and `null`
+
+Declaring your own `Option` every time gets old. VL provides the same union
+as a builtin, spelled `?T` for the type and `null` for the empty value — no
+declaration needed:
+
+```vl
+use std;
+
+fun main() {
+    val present: ?u64 = 42u64;
+    val missing: ?u64 = null;
+    match (present) {
+        Option.Some(v) {
+            std.print_u64(v);
+        }
+        null {
+            std.print("nothing\n");
+        }
+    }
+}
+```
+
+`?T` desugars to the builtin `Option` union, so everything below is the
+same tag + payload representation ("sugar all the way"):
+
+- A plain `T` value where `?T` is expected wraps as `Some` automatically
+  (`val present: ?u64 = 42u64;`, function arguments, and `return`).
+- `x == null` and `x != null` test for presence without a `match`.
+- A `null` arm in `match` covers the `None` case (it counts as `None` for
+  exhaustiveness and duplicate-arm checks).
+- `?` composes: `??u64`, `Array[?u64]`, and `?Array[u64]` all work.
+- A bare `null` with nothing to infer from is an error — annotate it
+  (`val missing: ?u64 = null;`), just like a bare `None`.
+
 Union values have reference semantics, like objects: assignment, parameters,
 and returns alias the same heap value. Payloads carried by value (numbers,
 tuples) are copied into the variant on construction, so later writes through

@@ -646,6 +646,105 @@ fn unions_example_constructs_and_matches() {
 }
 
 #[test]
+fn nullable_example_uses_sugar_without_declaring_option() {
+    let src = std::fs::read_to_string("examples/nullable.vl").unwrap();
+    // No `type Option` declaration needed: `?u64` / `null` rest on the
+    // builtin union.
+    assert!(!src.contains("type Option"), "{src}");
+    let lir = frontend(&src).expect("nullable.vl must compile");
+    assert!(lir.objects.is_empty());
+    let dump = lir.dump();
+    assert!(dump.contains("fn unwrap_or:"), "{dump}");
+    assert!(dump.contains("fn main:"), "{dump}");
+    assert!(dump.contains("new_variant Option.Some#1"), "{dump}");
+    assert!(dump.contains("new_variant Option.None#0"), "{dump}");
+    assert!(dump.contains("tag_of"), "{dump}");
+    assert!(dump.contains("payload_get"), "{dump}");
+}
+
+#[test]
+fn nullable_sugar_compiles_to_naravm() {
+    use vl_codegen::Target;
+    let src = std::fs::read_to_string("examples/nullable.vl").unwrap();
+    let lir = frontend(&src).expect("nullable.vl must compile");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+    for op in [0x27u8, 0x2c, 0x2d] {
+        assert!(bytes.contains(&op), "expected opcode {op:#x}");
+    }
+}
+
+#[test]
+fn nullable_values_flow_through_signatures_and_generics() {
+    let src = r#"
+fun wrap[T](v: T): ?T { return v; }
+fun get(o: ?u64, fallback: u64): u64 {
+  match (o) {
+    Option.Some(v) { return v; }
+    null { return fallback; }
+  }
+}
+fun main() {
+  val a: ?u64 = null;
+  val b: ?u64 = 41u64;
+  val c = wrap(b);
+  c;
+  val d = get(a, 0u64);
+  val e = get(null, 0u64);
+  d; e;
+  val nested: ??u64 = null;
+  nested;
+  val arr: Array[?u64] = [null, 1u64];
+  arr;
+  if (b == null) { b; } else { b; }
+  if (b != null) { b; }
+}
+"#;
+    let lir = frontend(src).expect("nullable plumbing must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("new_variant Option.Some#1"), "{dump}");
+    assert!(dump.contains("new_variant Option.None#0"), "{dump}");
+    // `wrap(?u64)` monomorphizes over the nullable union argument.
+    assert!(dump.contains("fn wrap$Union_Option_u64:"), "{dump}");
+    assert!(dump.contains("tag_of"), "{dump}");
+}
+
+#[test]
+fn nullable_errors_are_single_root_causes() {
+    let cases = [
+        // Bare `null` carries no `T` to infer.
+        ("fun main() { val x = null; x; }", "E303"),
+        // Incompatible payload for the inner type.
+        ("fun main() { val x: ?u64 = \"s\"; x; }", "E309"),
+        // Only nullables compare with `null`.
+        (
+            "fun main() { val x = 1u64; if (x == null) { x; } }",
+            "E302",
+        ),
+        // `?void` is not a value type.
+        ("fun f(x: ?void) { x; }", "E104"),
+        // `null` arm alongside `None` is a duplicate.
+        (
+            "fun main() { val x: ?u64 = null; match (x) { Option.None { x; } null { x; } else { x; } } }",
+            "E200",
+        ),
+        // `null` arm on a non-union scrutinee.
+        (
+            "fun main() { val x = 1u64; match (x) { null { x; } else { x; } } }",
+            "E302",
+        ),
+    ];
+    for (src, code) in cases {
+        let err = frontend(src).expect_err("nullable probe must fail");
+        let errors = err.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{src}: {err:?}");
+        assert_eq!(errors[0].code.as_deref(), Some(code), "{src}: {err:?}");
+    }
+}
+
+#[test]
 fn union_construction_and_match_compile_to_naravm() {
     use vl_codegen::Target;
     let src = std::fs::read_to_string("examples/unions.vl").unwrap();

@@ -157,6 +157,7 @@ Functions can declare type parameters (`fun first[T](a: Array[T]): T`);
 calls infer them (`first(a)`) or pass them explicitly (`first::[u64](a)`)
 (see `examples/generics.vl`).
 Sum types use `union` declarations with uppercase variants (`type Option[T] = union { None, Some(T), };`); variants build as `Option.Some(1u64)` / `Option.None` (optional turbofish `Option.Some::[u64](...)`) and are read with `match (o) { Option.Some(v) { ... } Option.None { ... } else { ... } }` (see `examples/unions.vl` and the [unions guide](website/src/pages/docs/unions.md)).
+Nullables model missing values without a declaration: `?u64` is the type of a `u64` or `null`, sugar over the builtin `Option` union (see `examples/nullable.vl`). A plain `u64` value wraps as `Some` implicitly wherever `?u64` is expected, `x == null` / `x != null` test for presence, and `match` takes a `null` arm for the empty case (`match (o) { Option.Some(v) { ... } null { ... } }`).
 Tuples are fixed-arity heterogeneous values with copy semantics
 (see `examples/tuples.vl`): `#(u64, String)` is unnamed (backtick indexing),
 `#(x: u64, y: String)` is named (`u.x` access), `#(1u64, "a")` /

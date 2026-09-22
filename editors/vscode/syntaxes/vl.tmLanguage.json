@@ -100,6 +100,10 @@
         {
           "name": "constant.language.boolean.vl",
           "match": "\\b(?:true|false)\\b"
+        },
+        {
+          "name": "constant.language.null.vl",
+          "match": "\\bnull\\b"
         }
       ]
     },
@@ -139,7 +143,7 @@
       "patterns": [
         {
           "name": "keyword.operator.vl",
-          "match": "==|!=|<=|>=|&&|\\|\\||::|[+\\-*/=!<>]"
+          "match": "==|!=|<=|>=|&&|\\|\\||::|[+\\-*/=!<>?]"
         }
       ]
     }

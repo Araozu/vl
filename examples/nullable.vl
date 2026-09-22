@@ -1,0 +1,27 @@
+// Nullables: `?T` is a value of type `T` or `null`.
+// It desugars to the builtin `Option` union (`None` / `Some(T)`), so the
+// runtime representation is the same tag + payload as any other union.
+use std;
+
+fun unwrap_or(o: ?u64, fallback: u64): u64 {
+  match (o) {
+    Option.Some(v) { return v; }
+    null { return fallback; }
+  }
+}
+
+fun main() {
+  val present: ?u64 = 41u64;
+  val missing: ?u64 = null;
+  missing;
+  val a = unwrap_or(present, 0u64);
+  val b = unwrap_or(null, 0u64);
+  a;
+  b;
+  if (present != null) {
+    std.print_u64(unwrap_or(present, 0u64));
+  }
+  if (missing == null) {
+    std.print("none\n");
+  }
+}
