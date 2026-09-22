@@ -55,10 +55,44 @@ pub struct HirDestructureBinding {
 }
 
 #[derive(Debug, Clone)]
+pub struct HirUnionVariant {
+    pub name: String,
+    pub name_span: Span,
+    pub payload: Vec<(VlType, Span)>,
+}
+
+/// One `match` arm binding: a fresh implicit-`val` local for one payload
+/// position. `def` is `None` when resolution failed (already reported).
+#[derive(Debug, Clone)]
+pub struct HirMatchBinding {
+    pub binding: String,
+    pub def: Option<DefId>,
+    pub binding_span: Span,
+}
+
+/// One `match` arm: `Union.Variant` plus positional payload bindings.
+/// `union` holds every path segment but the last (`["Option"]`,
+/// `["m", "Option"]`); `variant` holds the last.
+#[derive(Debug, Clone)]
+pub struct HirMatchArm {
+    pub union: String,
+    pub variant: String,
+    pub bindings: Vec<HirMatchBinding>,
+    pub body: Vec<HirStmt>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
 pub enum HirItem {
     Object {
         name: String,
         fields: Vec<(String, Option<VlType>, Span)>,
+        span: Span,
+    },
+    Union {
+        name: String,
+        type_params: Vec<HirTypeParam>,
+        variants: Vec<HirUnionVariant>,
         span: Span,
     },
     Let {
@@ -153,6 +187,12 @@ pub enum HirStmt {
         else_body: Option<Vec<HirStmt>>,
         span: Span,
     },
+    Match {
+        scrutinee: HirExpr,
+        arms: Vec<HirMatchArm>,
+        else_body: Option<Vec<HirStmt>>,
+        span: Span,
+    },
     While {
         condition: HirExpr,
         body: Vec<HirStmt>,
@@ -193,6 +233,18 @@ pub enum HirExpr {
         id: HirId,
         name: String,
         fields: Vec<(String, HirExpr)>,
+        span: Span,
+    },
+    /// Union variant construction: `Option.Some(args)` or `Option.None`.
+    /// Lowered from `Call`/`Field` sites recorded by `vl-semantic`
+    /// (`Resolution::variants`); `type_args` carries an explicit turbofish
+    /// (`Option.Some::[u64](...)`), empty when inference should fill in.
+    Variant {
+        id: HirId,
+        union: String,
+        variant: String,
+        type_args: Vec<VlType>,
+        args: Vec<HirExpr>,
         span: Span,
     },
     /// Element read: `array[index]`.
@@ -314,6 +366,7 @@ impl HirExpr {
             | HirExpr::String { id, .. }
             | HirExpr::ArrayLiteral { id, .. }
             | HirExpr::ObjectLiteral { id, .. }
+            | HirExpr::Variant { id, .. }
             | HirExpr::TupleLiteral { id, .. }
             | HirExpr::TupleIndex { id, .. }
             | HirExpr::Index { id, .. }
@@ -333,6 +386,7 @@ impl HirExpr {
             | HirExpr::String { span, .. }
             | HirExpr::ArrayLiteral { span, .. }
             | HirExpr::ObjectLiteral { span, .. }
+            | HirExpr::Variant { span, .. }
             | HirExpr::TupleLiteral { span, .. }
             | HirExpr::TupleIndex { span, .. }
             | HirExpr::Index { span, .. }
@@ -445,6 +499,31 @@ impl<'a> Lowerer<'a> {
                 }
                 out
             }
+            AstItem::Union {
+                name,
+                type_params,
+                variants,
+                span,
+                ..
+            } => vec![HirItem::Union {
+                name: name.clone(),
+                type_params: type_params
+                    .iter()
+                    .map(|p| HirTypeParam {
+                        name: p.name.clone(),
+                        bound: p.bound,
+                    })
+                    .collect(),
+                variants: variants
+                    .iter()
+                    .map(|v| HirUnionVariant {
+                        name: v.name.clone(),
+                        name_span: v.name_span,
+                        payload: v.payload.clone(),
+                    })
+                    .collect(),
+                span: *span,
+            }],
             AstItem::Let {
                 value,
                 span,
@@ -670,6 +749,50 @@ impl<'a> Lowerer<'a> {
                     .map(|body| body.iter().map(|s| self.lower_stmt(s)).collect()),
                 span: *span,
             },
+            AstStmt::Match {
+                scrutinee,
+                arms,
+                else_body,
+                span,
+            } => HirStmt::Match {
+                scrutinee: self.lower_expr(scrutinee),
+                arms: arms
+                    .iter()
+                    .map(|arm| {
+                        let (variant, union_path) = arm
+                            .path
+                            .split_last()
+                            .expect("parser guarantees 2+ segments");
+                        // Import-alias heads were canonicalized by the
+                        // resolver to the module-qualified spelling.
+                        let union = self
+                            .res
+                            .match_patterns
+                            .get(&(arm.path_span.start, arm.path_span.end))
+                            .cloned()
+                            .unwrap_or_else(|| union_path.join("."));
+                        HirMatchArm {
+                            union,
+                            variant: variant.clone(),
+                            bindings: arm
+                                .bindings
+                                .iter()
+                                .map(|(name, span)| HirMatchBinding {
+                                    binding: name.clone(),
+                                    def: self.def_at_site(*span),
+                                    binding_span: *span,
+                                })
+                                .collect(),
+                            body: arm.body.iter().map(|s| self.lower_stmt(s)).collect(),
+                            span: arm.span,
+                        }
+                    })
+                    .collect(),
+                else_body: else_body
+                    .as_ref()
+                    .map(|body| body.iter().map(|s| self.lower_stmt(s)).collect()),
+                span: *span,
+            },
         }
     }
 
@@ -707,12 +830,26 @@ impl<'a> Lowerer<'a> {
                 index: Box::new(self.lower_expr(index)),
                 span: *span,
             },
-            AstExpr::Field { base, name, span } => HirExpr::Field {
-                id: self.id(),
-                base: Box::new(self.lower_expr(base)),
-                name: name.clone(),
-                span: *span,
-            },
+            AstExpr::Field { base, name, span } => {
+                // A nullary variant use (`Option.None`) recorded by the
+                // resolver. Anything else is an ordinary field read.
+                if let Some(use_) = self.res.variants.get(&(span.start, span.end)).cloned() {
+                    return HirExpr::Variant {
+                        id: self.id(),
+                        union: use_.union,
+                        variant: use_.variant,
+                        type_args: Vec::new(),
+                        args: Vec::new(),
+                        span: *span,
+                    };
+                }
+                HirExpr::Field {
+                    id: self.id(),
+                    base: Box::new(self.lower_expr(base)),
+                    name: name.clone(),
+                    span: *span,
+                }
+            }
             AstExpr::TupleLiteral { elems, span } => HirExpr::TupleLiteral {
                 id: self.id(),
                 elems: elems
@@ -743,6 +880,23 @@ impl<'a> Lowerer<'a> {
                 span,
                 ..
             } => {
+                // Union variant construction (`Option.Some(args)`) recorded
+                // by the resolver. It shares call syntax but is not a call.
+                if let Some(use_) = self
+                    .res
+                    .variants
+                    .get(&(callee_span.start, callee_span.end))
+                    .cloned()
+                {
+                    return HirExpr::Variant {
+                        id: self.id(),
+                        union: use_.union,
+                        variant: use_.variant,
+                        type_args: type_args.clone(),
+                        args: args.iter().map(|a| self.lower_expr(a)).collect(),
+                        span: *span,
+                    };
+                }
                 // Instance sugar (`receiver.method(args)`): rebuild the
                 // receiver value path (all segments but the last) so
                 // typechecking sees a real receiver expression. The resolver
@@ -1112,6 +1266,101 @@ mod tests {
             HirItem::Fn { ref body, .. }
                 if body.iter().any(|stmt| matches!(stmt, HirStmt::FieldAssign { .. }))
         ));
+    }
+
+    #[test]
+    fn unions_lower_with_variant_and_payload_spans_intact() {
+        let src = "type U[T] = union { Some(T, u64), };";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.is_empty(), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        let ast_variant = match &prog.items[0] {
+            vl_syntax::Item::Union { variants, .. } => &variants[0],
+            other => panic!("expected AST union, got {other:?}"),
+        };
+        match &hir.items[0] {
+            HirItem::Union { variants, .. } => {
+                assert_eq!(variants[0].name, ast_variant.name);
+                assert_eq!(variants[0].name_span, ast_variant.name_span);
+                assert_eq!(variants[0].payload, ast_variant.payload);
+            }
+            other => panic!("expected HIR union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn variant_construction_lowers_to_variant_nodes() {
+        let src = "type Option[T] = union { None, Some(T), }; fun main() { val a = Option.Some(1u64); val n = Option.None; a; n; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[1] {
+            HirItem::Fn { body, .. } => {
+                match &body[0] {
+                    HirStmt::Let { value, .. } => match value {
+                        HirExpr::Variant {
+                            union,
+                            variant,
+                            args,
+                            ..
+                        } => {
+                            assert_eq!(union, "Option");
+                            assert_eq!(variant, "Some");
+                            assert_eq!(args.len(), 1);
+                        }
+                        other => panic!("expected variant, got {other:?}"),
+                    },
+                    other => panic!("expected let, got {other:?}"),
+                }
+                match &body[1] {
+                    HirStmt::Let { value, .. } => {
+                        assert!(
+                            matches!(
+                                value,
+                                HirExpr::Variant { args, .. } if args.is_empty()
+                            ),
+                            "expected nullary variant, got {value:?}"
+                        );
+                    }
+                    other => panic!("expected let, got {other:?}"),
+                }
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_lowers_with_arm_bindings() {
+        let src = "type U = union { A(u64), B, }; fun main() { val u = U.B; match (u) { U.A(v) { v; } else { 0u64; } } }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[1] {
+            HirItem::Fn { body, .. } => match &body[1] {
+                HirStmt::Match {
+                    arms, else_body, ..
+                } => {
+                    assert_eq!(arms.len(), 1);
+                    assert_eq!(arms[0].union, "U");
+                    assert_eq!(arms[0].variant, "A");
+                    assert_eq!(arms[0].bindings.len(), 1);
+                    assert_eq!(arms[0].bindings[0].binding, "v");
+                    assert!(arms[0].bindings[0].def.is_some());
+                    assert!(else_body.is_some());
+                }
+                other => panic!("expected match, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
     }
 
     #[test]

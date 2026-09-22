@@ -164,6 +164,35 @@ pub enum Instr {
         tys: Vec<Ty>,
         span: Span,
     },
+    /// Build a union value: heap tag + payload. `tag` is the variant's
+    /// declaration index; `tys` holds the erased payload types in order
+    /// (used by backends for lane/slot assignment — no global union table
+    /// needed, so generic instantiations work per site).
+    NewVariant {
+        dst: Reg,
+        union: String,
+        variant: String,
+        tag: u32,
+        args: Vec<Reg>,
+        tys: Vec<Ty>,
+        span: Span,
+    },
+    /// Read a union value's discriminant tag (a `u64` value).
+    TagOf {
+        dst: Reg,
+        scrut: Reg,
+        span: Span,
+    },
+    /// Read payload position `index` of the matched variant. `tys` is the
+    /// matched variant's erased payload types (slot mapping mirrors
+    /// [`Instr::NewVariant`]).
+    PayloadGet {
+        dst: Reg,
+        scrut: Reg,
+        index: usize,
+        tys: Vec<Ty>,
+        span: Span,
+    },
     /// Explicit integer conversion (`value as u8`). Backends lower it to a
     /// value copy reinterpreting the 64-bit payload per `target` (literals
     /// were range-checked by typechecking; variables are unchecked).
@@ -313,6 +342,7 @@ impl LirProgram {
             matches!(ty, Ty::Mutable(_) | Ty::Param(_) | Ty::Int | Ty::Error)
                 || match ty {
                     Ty::Array(elem) => bad(elem),
+                    Ty::Union(u) => u.args.iter().any(bad),
                     Ty::Tuple(fields) => fields.iter().any(|(_, t)| bad(t)),
                     _ => false,
                 }
@@ -377,11 +407,31 @@ impl LirProgram {
                         }
                     }
                 }
+                if let Some(tys) = instr_variant_tys(ins) {
+                    for ty in tys {
+                        if bad(ty) {
+                            return Some(format!(
+                                "function {} instruction has non-runtime type `{ty}`",
+                                f.name
+                            ));
+                        }
+                    }
+                }
             }
         }
         for g in &self.globals {
             for ins in &g.init {
                 if let Some(tys) = instr_tuple_tys(ins) {
+                    for ty in tys {
+                        if bad(ty) {
+                            return Some(format!(
+                                "global {} init has non-runtime type `{ty}`",
+                                g.name
+                            ));
+                        }
+                    }
+                }
+                if let Some(tys) = instr_variant_tys(ins) {
                     for ty in tys {
                         if bad(ty) {
                             return Some(format!(
@@ -413,8 +463,13 @@ fn instr_ty(ins: &Instr) -> Option<&Ty> {
         | Instr::ArraySet { elem, .. } => Some(elem),
         Instr::ObjectGet { ty, .. } | Instr::ObjectSet { ty, .. } => Some(ty),
         Instr::Cast { target, .. } => Some(target),
-        // Tuples carry a `Vec<Ty>`; validated element-wise in `validate_runtime`.
-        Instr::TupleLit { .. } | Instr::TupleGet { .. } | Instr::TupleSet { .. } => None,
+        // Tuples and variants carry a `Vec<Ty>`; validated element-wise in
+        // `validate_runtime`.
+        Instr::TupleLit { .. }
+        | Instr::TupleGet { .. }
+        | Instr::TupleSet { .. }
+        | Instr::NewVariant { .. }
+        | Instr::PayloadGet { .. } => None,
         _ => None,
     }
 }
@@ -425,6 +480,14 @@ fn instr_tuple_tys(ins: &Instr) -> Option<&Vec<Ty>> {
         Instr::TupleLit { tys, .. } | Instr::TupleGet { tys, .. } | Instr::TupleSet { tys, .. } => {
             Some(tys)
         }
+        _ => None,
+    }
+}
+
+/// Payload types carried by variant instructions, if any.
+fn instr_variant_tys(ins: &Instr) -> Option<&Vec<Ty>> {
+    match ins {
+        Instr::NewVariant { tys, .. } | Instr::PayloadGet { tys, .. } => Some(tys),
         _ => None,
     }
 }
@@ -555,6 +618,47 @@ fn fmt_instr(ins: &Instr) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("tuple_set %{}[{index}], %{} : #({tys})", tuple.0, value.0)
+        }
+        Instr::NewVariant {
+            dst,
+            union,
+            variant,
+            tag,
+            args,
+            tys,
+            ..
+        } => {
+            let args = args
+                .iter()
+                .map(|a| format!("%{}", a.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let tys = tys
+                .iter()
+                .map(|t| format!("{t}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "%{} = new_variant {union}.{variant}#{tag} [{args}] : ({tys})",
+                dst.0
+            )
+        }
+        Instr::TagOf { dst, scrut, .. } => {
+            format!("%{} = tag_of %{}", dst.0, scrut.0)
+        }
+        Instr::PayloadGet {
+            dst,
+            scrut,
+            index,
+            tys,
+            ..
+        } => {
+            let tys = tys
+                .iter()
+                .map(|t| format!("{t}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("%{} = payload_get %{}[{index}] : ({tys})", dst.0, scrut.0)
         }
         Instr::Cast {
             dst, src, target, ..
@@ -701,6 +805,11 @@ fn collect_import_expr(
                 collect_import_expr(e, typed, out)
             }
         }
+        HirExpr::Variant { args, .. } => {
+            for a in args {
+                collect_import_expr(a, typed, out)
+            }
+        }
         HirExpr::Index { base, index, .. } => {
             collect_import_expr(base, typed, out);
             collect_import_expr(index, typed, out);
@@ -753,6 +862,24 @@ fn collect_import_stmt(
             collect_import_expr(value, typed, out);
         }
         HirStmt::Destructure { value, .. } => collect_import_expr(value, typed, out),
+        HirStmt::Match {
+            scrutinee,
+            arms,
+            else_body,
+            ..
+        } => {
+            collect_import_expr(scrutinee, typed, out);
+            for arm in arms {
+                for s in &arm.body {
+                    collect_import_stmt(s, typed, out);
+                }
+            }
+            if let Some(body) = else_body {
+                for s in body {
+                    collect_import_stmt(s, typed, out);
+                }
+            }
+        }
         HirStmt::If {
             condition,
             then_body,
@@ -792,7 +919,7 @@ fn collect_imports(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> Vec
             }
             HirItem::Let { value, .. } => collect_import_expr(value, typed, &mut out),
             HirItem::Destructure { value, .. } => collect_import_expr(value, typed, &mut out),
-            HirItem::Object { .. } => {}
+            HirItem::Object { .. } | HirItem::Union { .. } => {}
         }
     }
     out
@@ -887,6 +1014,15 @@ fn lower_fn_stmt(
             span,
         } => {
             l.lower_if(condition, then_body, else_body.as_deref(), typed, *span);
+            *topped_return = false;
+        }
+        HirStmt::Match {
+            scrutinee,
+            arms,
+            else_body,
+            span,
+        } => {
+            l.lower_match(scrutinee, arms, else_body.as_deref(), typed, *span);
             *topped_return = false;
         }
         HirStmt::Assign {
@@ -1270,7 +1406,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
 
     for item in &prog.items {
         match item {
-            HirItem::Object { .. } => {}
+            HirItem::Object { .. } | HirItem::Union { .. } => {}
             HirItem::Let { .. } | HirItem::Destructure { .. } => {
                 // Already emitted as globals above; no `<global>` functions.
             }
@@ -1642,7 +1778,7 @@ pub fn lower_project(
 
     for item in &prog.items {
         match item {
-            HirItem::Object { .. } => {}
+            HirItem::Object { .. } | HirItem::Union { .. } => {}
             HirItem::Let { .. } | HirItem::Destructure { .. } => {}
             HirItem::Fn {
                 name,
@@ -2008,6 +2144,11 @@ fn collect_project_imports(
                     walk_expr(prog, typed, plan, outer, e, by_symbol);
                 }
             }
+            HirExpr::Variant { args, .. } => {
+                for a in args {
+                    walk_expr(prog, typed, plan, outer, a, by_symbol);
+                }
+            }
             HirExpr::TupleLiteral { elems, .. } => {
                 for (_, e) in elems {
                     walk_expr(prog, typed, plan, outer, e, by_symbol);
@@ -2078,6 +2219,24 @@ fn collect_project_imports(
                 walk_expr(prog, typed, plan, outer, condition, by_symbol);
                 for s in then_body {
                     walk_stmt(prog, typed, plan, outer, s, by_symbol);
+                }
+                if let Some(body) = else_body {
+                    for s in body {
+                        walk_stmt(prog, typed, plan, outer, s, by_symbol);
+                    }
+                }
+            }
+            HirStmt::Match {
+                scrutinee,
+                arms,
+                else_body,
+                ..
+            } => {
+                walk_expr(prog, typed, plan, outer, scrutinee, by_symbol);
+                for arm in arms {
+                    for s in &arm.body {
+                        walk_stmt(prog, typed, plan, outer, s, by_symbol);
+                    }
                 }
                 if let Some(body) = else_body {
                     for s in body {
@@ -2229,6 +2388,44 @@ impl Lowerer<'_> {
                         .zip(regs)
                         .map(|((field, _), reg)| (field.clone(), reg))
                         .collect(),
+                    span: *span,
+                });
+                Some(dst)
+            }
+            HirExpr::Variant {
+                id,
+                union,
+                variant,
+                args,
+                span,
+                ..
+            } => {
+                let mut regs = Vec::with_capacity(args.len());
+                for arg in args {
+                    regs.push(self.lower_expr(arg, typed)?);
+                }
+                // The node's recorded type carries the (instance-substituted)
+                // union arguments; capabilities are already erased here.
+                let union_ty = match self.resolved_ty(*id)? {
+                    Ty::Union(u) => (*u).clone(),
+                    Ty::Mutable(inner) => match *inner {
+                        Ty::Union(u) => (*u).clone(),
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                let (tag, tys) = self.variant_layout(union, variant, &union_ty.args)?;
+                if regs.len() != tys.len() {
+                    return None;
+                }
+                let dst = self.reg();
+                self.instrs.push(Instr::NewVariant {
+                    dst,
+                    union: union_ty.name,
+                    variant: variant.clone(),
+                    tag,
+                    args: regs,
+                    tys,
                     span: *span,
                 });
                 Some(dst)
@@ -2654,6 +2851,14 @@ impl Lowerer<'_> {
                 span,
             } => {
                 self.lower_if(condition, then_body, else_body.as_deref(), typed, *span);
+            }
+            HirStmt::Match {
+                scrutinee,
+                arms,
+                else_body,
+                span,
+            } => {
+                self.lower_match(scrutinee, arms, else_body.as_deref(), typed, *span);
             }
             HirStmt::Assign {
                 def, value, span, ..
@@ -3250,6 +3455,151 @@ impl Lowerer<'_> {
             span,
         });
     }
+
+    /// Declared tag + erased payload types for `union.variant` under concrete
+    /// union arguments. `None` when unknown (typechecking already reported;
+    /// lowering stands down).
+    fn variant_layout(&self, union: &str, variant: &str, args: &[Ty]) -> Option<(u32, Vec<Ty>)> {
+        let sig = self.typed.unions.get(union)?;
+        let (tag, payload) = sig
+            .variants
+            .iter()
+            .enumerate()
+            .find(|(_, v)| v.name == *variant)
+            .map(|(i, v)| (i as u32, &v.payload))?;
+        if args.len() != sig.type_params.len() {
+            return None;
+        }
+        let env: HashMap<String, Ty> = sig
+            .type_params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect();
+        Some((
+            tag,
+            payload.iter().map(|t| rt(&subst_ty(t, &env))).collect(),
+        ))
+    }
+
+    /// Lower `match`: read the discriminant once, then chain one tag
+    /// comparison per arm (typechecking validated coverage and payload
+    /// arity, so every arm binds exactly its variant's payloads).
+    fn lower_match(
+        &mut self,
+        scrutinee: &HirExpr,
+        arms: &[vl_hir::HirMatchArm],
+        else_body: Option<&[HirStmt]>,
+        typed: &vl_typecheck::TypedProgram,
+        span: Span,
+    ) {
+        let Some(scrut) = self.lower_expr(scrutinee, typed) else {
+            return;
+        };
+        // Resolve the union identity and every arm's layout before emitting:
+        // anything unknown was already reported upstream.
+        let union_ty = match self.resolved_ty(scrutinee.id()) {
+            Some(Ty::Union(u)) => (*u).clone(),
+            Some(Ty::Mutable(inner)) => match *inner {
+                Ty::Union(u) => (*u).clone(),
+                _ => return,
+            },
+            _ => return,
+        };
+        let mut layouts = Vec::with_capacity(arms.len());
+        for arm in arms {
+            let Some(layout) = self.variant_layout(&union_ty.name, &arm.variant, &union_ty.args)
+            else {
+                return;
+            };
+            layouts.push(layout);
+        }
+        let incoming = self.bindings.clone();
+        let end_label = self.label();
+        let tag_reg = self.reg();
+        self.instrs.push(Instr::TagOf {
+            dst: tag_reg,
+            scrut,
+            span,
+        });
+        let mut next_labels = Vec::with_capacity(arms.len());
+        for _ in arms {
+            next_labels.push(self.label());
+        }
+        for ((arm, (tag, tys)), next) in arms.iter().zip(layouts.iter()).zip(next_labels.iter()) {
+            // `tag == <arm tag>`, else fall to the next arm.
+            let tag_const = self.reg();
+            self.instrs.push(Instr::Const {
+                dst: tag_const,
+                value: Scalar::U64(u64::from(*tag)),
+                span,
+            });
+            let cond = self.reg();
+            self.instrs.push(Instr::BinOp {
+                dst: cond,
+                op: LirOp::Eq,
+                lhs: tag_reg,
+                rhs: tag_const,
+                span,
+            });
+            self.instrs.push(Instr::BranchIfFalse {
+                cond,
+                target: *next,
+                span,
+            });
+            // Bind this variant's payloads, then run the arm.
+            self.bindings = incoming.clone();
+            for (i, b) in arm.bindings.iter().enumerate() {
+                if i >= tys.len() {
+                    break;
+                }
+                let dst = self.reg();
+                self.instrs.push(Instr::PayloadGet {
+                    dst,
+                    scrut,
+                    index: i,
+                    tys: tys.clone(),
+                    span,
+                });
+                if let Some(def) = &b.def {
+                    if let Some(gid) = self.globals.get(&def.0).copied() {
+                        self.instrs.push(Instr::GlobalStore {
+                            global: gid,
+                            src: dst,
+                            span,
+                        });
+                    } else {
+                        let home = self.reg();
+                        self.instrs.push(Instr::Copy {
+                            dst: home,
+                            src: dst,
+                            span,
+                        });
+                        self.bindings.insert(def.0, home);
+                    }
+                }
+            }
+            for stmt in &arm.body {
+                self.lower_stmt(stmt, typed);
+            }
+            self.instrs.push(Instr::Jump {
+                target: end_label,
+                span,
+            });
+            self.instrs.push(Instr::Label { id: *next, span });
+        }
+        self.bindings = incoming.clone();
+        if let Some(body) = else_body {
+            for stmt in body {
+                self.lower_stmt(stmt, typed);
+            }
+        }
+        self.bindings = incoming;
+        self.instrs.push(Instr::Label {
+            id: end_label,
+            span,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -3287,6 +3637,57 @@ mod tests {
         assert!(dump.contains("new_object Counter"), "{dump}");
         assert!(dump.contains("object_get"), "{dump}");
         assert!(dump.contains("object_set"), "{dump}");
+    }
+
+    #[test]
+    fn union_declarations_emit_no_layouts_and_values_lower() {
+        let src = "type U = union { A, };";
+        let (toks, pdiags) = vl_lex::lex(src);
+        let (prog, sdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        assert!(sdiags.is_empty(), "{sdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.is_empty(), "{rdiags:?}");
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let lir = lower(&hir, &typed);
+        assert!(lir.objects.is_empty());
+        assert!(lir.functions.is_empty());
+        assert!(lir.dump().is_empty(), "{}", lir.dump());
+
+        // Object-literal construction of a union stays an error and lowers
+        // to no object allocation.
+        let src = "type U = union { A, }; fun main() { val u = U {}; u; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse(&toks, src);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert_eq!(
+            diags.iter().filter(|d| d.is_error()).count(),
+            1,
+            "{diags:?}"
+        );
+        let lir = lower(&hir, &typed);
+        assert!(!lir.dump().contains("new_object U"), "{}", lir.dump());
+    }
+
+    #[test]
+    fn variants_and_match_lower_to_dedicated_instrs() {
+        let src = "type U = union { A, B(u64), }; fun main() { val u = U.B(1u64); match (u) { U.B(v) { v; } U.A { 0u64; } else { 2u64; } } }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let dump = lower(&hir, &typed).dump();
+        assert!(dump.contains("new_variant U.B#1"), "{dump}");
+        assert!(dump.contains("tag_of"), "{dump}");
+        assert!(dump.contains("payload_get"), "{dump}");
     }
 
     #[test]

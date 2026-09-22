@@ -30,7 +30,7 @@ newline is then whitespace. An unterminated comment at EOF simply stops.
 ## Tokens
 
 ```text
-keyword    := "var" | "val" | "fun" | "type" | "object" | "if" | "else"
+keyword    := "var" | "val" | "fun" | "type" | "object" | "union" | "match" | "if" | "else"
             | "while" | "break" | "continue" | "return" | "as" | "extends"
 ident      := [a-zA-Z_] [a-zA-Z0-9_]*
 number     := digits ("." digits)? suffix?
@@ -60,7 +60,7 @@ bytes; no UTF-8 decoding is performed.
 
 | Spelling | `TokenKind` | Span |
 |---|---|---|
-| `var`, `val`, `fun`, `type`, `object`, `if`, `else`, `while`, `break`, `continue`, `return` | matching keyword | word span |
+| `var`, `val`, `fun`, `type`, `object`, `union`, `match`, `if`, `else`, `while`, `break`, `continue`, `return` | matching keyword | word span |
 | `as` | `As` | word span |
 | `extends` | `Extends` | word span |
 | `[a-zA-Z_][a-zA-Z0-9_]*` | `Ident(String)` | word span |

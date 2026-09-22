@@ -156,6 +156,7 @@ member namespace. VL has no inheritance or runtime type reflection for objects.
 Functions can declare type parameters (`fun first[T](a: Array[T]): T`);
 calls infer them (`first(a)`) or pass them explicitly (`first::[u64](a)`)
 (see `examples/generics.vl`).
+Sum types use `union` declarations with uppercase variants (`type Option[T] = union { None, Some(T), };`); variants build as `Option.Some(1u64)` / `Option.None` (optional turbofish `Option.Some::[u64](...)`) and are read with `match (o) { Option.Some(v) { ... } Option.None { ... } else { ... } }` (see `examples/unions.vl` and the [unions guide](website/src/pages/docs/unions.md)).
 Tuples are fixed-arity heterogeneous values with copy semantics
 (see `examples/tuples.vl`): `#(u64, String)` is unnamed (backtick indexing),
 `#(x: u64, y: String)` is named (`u.x` access), `#(1u64, "a")` /

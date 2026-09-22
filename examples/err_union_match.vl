@@ -1,0 +1,9 @@
+// Non-exhaustive match without an `else` arm: `B` is uncovered.
+type U = union { A, B(u64), };
+
+fun main() {
+  val u = U.B(1u64);
+  match (u) {
+    U.A { 0u64; }
+  }
+}

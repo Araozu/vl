@@ -22,6 +22,8 @@ pub enum TokenKind {
     Fun,
     Type,
     Object,
+    Union,
+    Match,
     If,
     Else,
     While,
@@ -383,6 +385,8 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                     "fun" => TokenKind::Fun,
                     "type" => TokenKind::Type,
                     "object" => TokenKind::Object,
+                    "union" => TokenKind::Union,
+                    "match" => TokenKind::Match,
                     "if" => TokenKind::If,
                     "else" => TokenKind::Else,
                     "while" => TokenKind::While,
@@ -462,6 +466,13 @@ mod tests {
     }
 
     #[test]
+    fn lexes_union_keyword() {
+        let (toks, diags) = lex("type Option = union { None, Some(u64), };");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Union)));
+    }
+
+    #[test]
     fn bad_char_is_a_diagnostic_not_a_panic() {
         let (toks, diags) = lex("var x = @;");
         assert_eq!(diags.len(), 1);
@@ -520,6 +531,13 @@ mod tests {
         let (_toks, diags) = lex("\"\\é\"");
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].labels[0].span, Span::new(1, 4));
+    }
+
+    #[test]
+    fn lexes_match_keyword() {
+        let (toks, diags) = lex("match (opt) { else { } }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(matches!(toks[0].kind, TokenKind::Match));
     }
 
     #[test]

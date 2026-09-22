@@ -603,6 +603,192 @@ fn objects_compile_with_reference_field_semantics() {
 }
 
 #[test]
+fn union_declaration_milestone_acceptance_probes() {
+    let cases = [
+        ("type C = object { a: u64 b: u64, };", "E100", None),
+        ("type String = union { Nope, };", "E200", None),
+        ("type U = union { A, A, };", "E200", None),
+        (
+            "type U = union { A(Nope) }; fun ok(): u64 { return 1u64; }",
+            "E105",
+            None,
+        ),
+        ("type U = union { A(no.such.Type), };", "E302", None),
+        (
+            "type U = union { A, }; fun main() { val u = U {}; u; }",
+            "E302",
+            Some("with an object literal"),
+        ),
+    ];
+    for (src, code, marker) in cases {
+        let err = frontend(src).expect_err("acceptance probe must fail");
+        let errors = err.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{src}: {err:?}");
+        assert_eq!(errors[0].code.as_deref(), Some(code), "{src}: {err:?}");
+        if let Some(marker) = marker {
+            assert!(errors[0].message.contains(marker), "{src}: {err:?}");
+        }
+    }
+}
+
+#[test]
+fn unions_example_constructs_and_matches() {
+    let src = std::fs::read_to_string("examples/unions.vl").unwrap();
+    let lir = frontend(&src).expect("unions.vl must compile");
+    assert!(lir.objects.is_empty());
+    let dump = lir.dump();
+    assert!(dump.contains("fn unwrap_or:"), "{dump}");
+    assert!(dump.contains("fn main:"), "{dump}");
+    assert!(dump.contains("new_variant Option.Some#1"), "{dump}");
+    assert!(dump.contains("new_variant Option.None#0"), "{dump}");
+    assert!(dump.contains("tag_of"), "{dump}");
+    assert!(dump.contains("payload_get"), "{dump}");
+}
+
+#[test]
+fn union_construction_and_match_compile_to_naravm() {
+    use vl_codegen::Target;
+    let src = std::fs::read_to_string("examples/unions.vl").unwrap();
+    let lir = frontend(&src).expect("unions.vl must compile");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+    // Variant containers lower to memory-container ops: `createi` (0x27)
+    // allocates, `getvati` (0x2c) reads the tag/payload, `setvati` (0x2d)
+    // writes them.
+    for op in [0x27u8, 0x2c, 0x2d] {
+        assert!(bytes.contains(&op), "expected opcode {op:#x}");
+    }
+}
+
+#[test]
+fn union_values_flow_through_signatures_and_generics() {
+    let src = r#"
+type Option[T] = union { None, Some(T), };
+type U = union { A, B(u64, String), };
+fun id[T](x: T): T { return x; }
+fun first(o: U): u64 {
+  match (o) {
+    U.A { return 0u64; }
+    U.B(n, s) { s; return n; }
+  }
+}
+fun main() {
+  val u: U = U.B(7u64, "seven");
+  val r = first(u);
+  r;
+  val m: *U = U.A;
+  m;
+  val w = id(U.A);
+  w;
+  val nested: Option[U] = Option.Some(U.A);
+  nested;
+  val arr: Array[U] = [U.A, U.B(1u64, "x")];
+  arr;
+}
+"#;
+    let lir = frontend(src).expect("union plumbing must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("new_variant U.B#1"), "{dump}");
+    assert!(dump.contains("payload_get"), "{dump}");
+}
+
+#[test]
+fn union_errors_are_single_root_causes() {
+    let cases = [
+        // Scrutinee is not a union.
+        (
+            "type U = union { A, B, }; fun main() { val x = 1u64; match (x) { U.A { x; } else { x; } } }",
+            "E302",
+        ),
+        // Construction arity mismatch.
+        (
+            "type U = union { A(u64), B, }; fun main() { val u = U.A(1u64, 2u64); u; }",
+            "E303",
+        ),
+        // Payload type mismatch (monomorphic: call-style E306).
+        (
+            "type U = union { A(u64), B, }; fun main() { val u = U.A(\"s\"); u; }",
+            "E306",
+        ),
+        // Payload type mismatch (generic).
+        (
+            "type Option[T] = union { None, Some(T), }; fun main() { val x: Option[String] = Option.Some(1u64); x; }",
+            "E306",
+        ),
+        // Non-exhaustive without `else`.
+        (
+            "type U = union { A, B, }; fun main() { val u = U.A; match (u) { U.A { 1u64; } } }",
+            "E309",
+        ),
+        // Arm matches a different union.
+        (
+            "type U = union { A, B, }; type V = union { X, }; fun main() { val u = U.A; match (u) { V.X { 1u64; } else { 2u64; } } }",
+            "E302",
+        ),
+        // Duplicate arm.
+        (
+            "type U = union { A, B, }; fun main() { val u = U.A; match (u) { U.A { 1u64; } U.A { 2u64; } else { 3u64; } } }",
+            "E200",
+        ),
+        // Bare generic union needs arguments.
+        (
+            "type Option[T] = union { None, Some(T), }; fun main() { val x: Option = Option.Some(1u64); x; }",
+            "E302",
+        ),
+        // Wrong number of type arguments.
+        (
+            "type Option[T] = union { None, Some(T), }; fun main() { val x: Option[u64, u64] = Option.Some(1u64); x; }",
+            "E302",
+        ),
+        // Nullary generic variant without annotation cannot infer.
+        (
+            "type Option[T] = union { None, Some(T), }; fun main() { val n = Option.None; n; }",
+            "E303",
+        ),
+        // Nullary use of a payload variant.
+        (
+            "type U = union { A(u64), }; fun main() { val u = U.A; match (u) { U.A { 1u64; } else { 2u64; } } }",
+            "E303",
+        ),
+        // Unknown variant.
+        (
+            "type U = union { A, }; fun main() { val x = U.B(1u64); x; }",
+            "E302",
+        ),
+    ];
+    for (src, code) in cases {
+        let err = frontend(src).expect_err("union probe must fail");
+        let errors = err.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{src}: {err:?}");
+        assert_eq!(errors[0].code.as_deref(), Some(code), "{src}: {err:?}");
+    }
+}
+
+#[test]
+fn union_match_accepts_full_coverage_without_else() {
+    let src = "type U = union { A, B(u64), }; fun f(o: U): u64 { match (o) { U.A { return 0u64; } U.B(v) { return v; } } } fun main() { val r = f(U.B(3u64)); r; }";
+    let lir = frontend(src).expect("fully covered match needs no else");
+    assert!(lir.dump().contains("tag_of"), "{}", lir.dump());
+}
+
+#[test]
+fn union_declarations_emit_no_layouts() {
+    let lir = frontend("type U = union { A, }; fun main() { }")
+        .expect("declaration-only union should compile");
+    assert!(lir.objects.is_empty());
+    assert_eq!(
+        lir.functions.len(),
+        1,
+        "the example's ordinary main remains"
+    );
+    let dump = lir.dump();
+    assert!(dump.contains("fn main:"), "{dump}");
+    assert!(!dump.contains("new_object"), "{dump}");
+}
+
+#[test]
 fn associated_functions_compile_with_sugar_and_run_on_naravm() {
     use vl_codegen::Target;
     let src = std::fs::read_to_string("examples/associated.vl").unwrap();
@@ -1315,6 +1501,26 @@ fn err_tuple_examples_fail() {
         ("examples/err_tuple_arity.vl", "E309"),
         ("examples/err_tuple_index.vl", "E302"),
         ("examples/err_tuple_readonly.vl", "E310"),
+    ] {
+        let src = std::fs::read_to_string(file).unwrap();
+        let err = frontend(&src).expect_err(&format!("{file} must fail"));
+        assert_eq!(
+            err.iter().filter(|d| d.is_error()).count(),
+            1,
+            "{file}: {err:?}"
+        );
+        assert!(
+            err.iter().any(|d| d.code.as_deref() == Some(code)),
+            "{file}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn err_union_examples_fail() {
+    for (file, code) in [
+        ("examples/err_union_match.vl", "E309"),
+        ("examples/err_union_arity.vl", "E303"),
     ] {
         let src = std::fs::read_to_string(file).unwrap();
         let err = frontend(&src).expect_err(&format!("{file} must fail"));

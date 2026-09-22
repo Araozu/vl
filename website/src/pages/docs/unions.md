@@ -122,6 +122,11 @@ VL usually figures out `T` from the carried value (`Option.Some(42u64)` is
 an `Option[u64]`). A bare `None` carries nothing to guess from, so annotate
 it: `val missing: Option[u64] = Option.None;`.
 
+Union values have reference semantics, like objects: assignment, parameters,
+and returns alias the same heap value. Payloads carried by value (numbers,
+tuples) are copied into the variant on construction, so later writes through
+the original binding never affect the constructed value.
+
 The same rules apply everywhere else: variant names are uppercase,
 payloads cannot be empty (`Some()` is rejected), and matching checks the
 number of bindings per arm.

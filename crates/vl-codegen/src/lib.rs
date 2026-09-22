@@ -197,6 +197,11 @@ enum NaraKind {
     /// maps to a value or reference slot by its own element kind; the
     /// vector holds the erased element kinds in source order.
     Tuple(Vec<NaraKind>),
+    /// Union value (a memory container): value slot 0 holds the `u64`
+    /// discriminant tag, remaining value slots hold value-kind payloads in
+    /// order, and reference slots hold reference-kind payloads in order.
+    /// The payload layout is per construction site (see `NewVariant`).
+    Union(String),
 }
 
 impl NaraKind {
@@ -216,6 +221,10 @@ impl NaraKind {
             vl_typecheck::Ty::String => Some(NaraKind::String),
             vl_typecheck::Ty::File => Some(NaraKind::File),
             vl_typecheck::Ty::Object(name) => Some(NaraKind::Object(name.clone())),
+            // Union values are heap tag+payload containers (reference lane).
+            // Type arguments are erased here: each construction site carries
+            // its concrete payload kinds on the instruction.
+            vl_typecheck::Ty::Union(u) => Some(NaraKind::Union(u.name.clone())),
             vl_typecheck::Ty::Array(elem) => Some(NaraKind::Array(Box::new(Self::of_ty(elem)?))),
             vl_typecheck::Ty::Tuple(fields) => {
                 let mut kinds = Vec::with_capacity(fields.len());
@@ -231,8 +240,9 @@ impl NaraKind {
     }
 
     /// Reference kinds live in `rf`, everything else in `rv`.
-    /// Tuples are heap containers (hence `rf`) with value copy semantics
-    /// at the language level (deep-copied on `Copy`/param entry).
+    /// Tuples and unions are heap containers (hence `rf`) with value copy
+    /// semantics at the language level for tuples (deep-copied on
+    /// `Copy`/param entry); unions copy as shared references like objects.
     fn is_ref(&self) -> bool {
         matches!(
             self,
@@ -241,6 +251,7 @@ impl NaraKind {
                 | NaraKind::Object(_)
                 | NaraKind::Array(_)
                 | NaraKind::Tuple(_)
+                | NaraKind::Union(_)
         )
     }
 
@@ -358,6 +369,41 @@ fn nara_tuple_kinds(
         }
     }
     Some(kinds)
+}
+
+/// Erased payload kinds for a variant instruction's `tys` list.
+fn nara_variant_kinds(
+    tys: &[vl_typecheck::Ty],
+    span: Span,
+    e: &mut NaraEmit,
+) -> Option<Vec<NaraKind>> {
+    let mut kinds = Vec::with_capacity(tys.len());
+    for ty in tys {
+        match NaraKind::of_ty(ty) {
+            Some(k) => kinds.push(k),
+            None => {
+                e.diags.push(
+                    Diagnostic::error("Naravm backend found a non-runtime variant payload type")
+                        .with_label(span, "variant emitted here")
+                        .with_code("E500"),
+                );
+                return None;
+            }
+        }
+    }
+    Some(kinds)
+}
+
+/// Payload position -> (uses-reference-lane, lane-local slot) for a variant
+/// container. Value slot 0 holds the discriminant tag, so value-kind
+/// payloads start at slot 1; reference-kind payloads start at slot 0.
+fn variant_payload_slot(kinds: &[NaraKind], index: usize) -> Option<(bool, usize)> {
+    let (is_ref, lane_slot) = tuple_slot(kinds, index)?;
+    Some(if is_ref {
+        (true, lane_slot)
+    } else {
+        (false, lane_slot + 1)
+    })
 }
 
 /// Deep-copy a tuple container (`src_rf`) into `dst_rf` (already allocated).
@@ -778,6 +824,17 @@ fn nara_last_use_fragment(
                     touch(*arg, idx);
                 }
             }
+            I::NewVariant { args, .. } => {
+                for arg in args {
+                    touch(*arg, idx);
+                }
+            }
+            I::TagOf { scrut, .. } => {
+                touch(*scrut, idx);
+            }
+            I::PayloadGet { scrut, .. } => {
+                touch(*scrut, idx);
+            }
             I::TupleLit { elems, .. } => {
                 for arg in elems {
                     touch(*arg, idx);
@@ -882,6 +939,9 @@ fn free_fragment_regs(e: &mut NaraEmit, instrs: &[Instr], result: &vl_lir::Reg) 
             | I::ArrayGet { dst, .. }
             | I::TupleLit { dst, .. }
             | I::TupleGet { dst, .. }
+            | I::NewVariant { dst, .. }
+            | I::TagOf { dst, .. }
+            | I::PayloadGet { dst, .. }
             | I::GlobalLoad { dst, .. }
             | I::Cast { dst, .. } => {
                 lir_regs.insert(*dst);
@@ -1495,6 +1555,13 @@ fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::R
                     touch(*value, idx);
                 }
             }
+            I::NewVariant { args, .. } => {
+                for arg in args {
+                    touch(*arg, idx);
+                }
+            }
+            I::TagOf { scrut, .. } => touch(*scrut, idx),
+            I::PayloadGet { scrut, .. } => touch(*scrut, idx),
             I::ObjectGet { object, .. } => touch(*object, idx),
             I::ObjectSet { object, value, .. } => {
                 touch(*object, idx);
@@ -1607,6 +1674,15 @@ fn nara_free_dead(e: &mut NaraEmit, ins: &Instr, idx: usize) {
         I::ObjectSet { object, value, .. } => {
             dead.push(*object);
             dead.push(*value);
+        }
+        I::NewVariant { args, .. } => {
+            dead.extend(args.iter().copied());
+        }
+        I::TagOf { scrut, .. } => {
+            dead.push(*scrut);
+        }
+        I::PayloadGet { scrut, .. } => {
+            dead.push(*scrut);
         }
         I::BranchIfFalse { cond, .. } => {
             dead.push(*cond);
@@ -2666,6 +2742,203 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 };
                 e.bytecode.extend_from_slice(&[0x2d, obj, slot, src]); // setvati
             }
+        }
+        Instr::NewVariant {
+            dst,
+            union,
+            tag,
+            args,
+            tys,
+            span,
+            ..
+        } => {
+            let Some(kinds) = nara_variant_kinds(tys, *span, e) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let union_kind = NaraKind::Union(union.clone());
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, union_kind);
+                return;
+            }
+            for arg in args {
+                if e.invalid.contains(arg) {
+                    e.invalid.insert(*dst);
+                    return;
+                }
+            }
+            let (values, refs) = tuple_lanes(&kinds);
+            // Value slot 0 is the discriminant tag; payloads follow it.
+            let values = values + 1;
+            if values > u8::MAX as usize || refs > u8::MAX as usize {
+                e.diags.push(
+                    Diagnostic::error(
+                        "Naravm variant has more than 255 payloads in one register lane",
+                    )
+                    .with_label(*span, "variant allocated here")
+                    .with_note("split the payload into smaller tuples")
+                    .with_code("E404"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            }
+            let Some(rf) = e.fresh_rf(*span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            e.bytecode
+                .extend_from_slice(&[0x27, rf, values as u8, refs as u8]); // createi
+            e.rf_map.insert(*dst, rf);
+            e.kinds.insert(*dst, union_kind);
+            // Tag first: intern the discriminant and store it in value slot 0.
+            let Some(tag_idx) = e.add_value(u64::from(*tag), *span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Ok(tag_idx) = u8::try_from(tag_idx) else {
+                e.diags.push(
+                    Diagnostic::error("Naravm value pool exhausted (compiler bug)")
+                        .with_label(*span, "variant allocated here")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(tag_rv) = e.fresh_rv(*span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            e.bytecode.extend_from_slice(&[0x02, tag_rv, tag_idx]); // lv
+            e.bytecode.extend_from_slice(&[0x2d, rf, 0, tag_rv]); // setvati
+            e.free_rv.push(tag_rv);
+            for (i, arg) in args.iter().enumerate() {
+                let Some((is_ref, slot)) = variant_payload_slot(&kinds, i) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                let Ok(slot) = u8::try_from(slot) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                if is_ref {
+                    let Some(v) = e.ref_reg(*arg, *span) else {
+                        e.invalid.insert(*dst);
+                        return;
+                    };
+                    // Nested tuple payloads are duplicated so the variant
+                    // owns its container; other references share.
+                    if let Some(NaraKind::Tuple(nested)) = kinds.get(i).cloned() {
+                        let Some(tmp) = e.fresh_rf(*span) else {
+                            e.invalid.insert(*dst);
+                            return;
+                        };
+                        if !nara_tuple_copy_into(e, tmp, v, &nested, *span) {
+                            e.free_rf.push(tmp);
+                            e.invalid.insert(*dst);
+                            return;
+                        }
+                        e.bytecode.extend_from_slice(&[0x2f, rf, slot, tmp]); // setrfati
+                        e.free_rf.push(tmp);
+                    } else {
+                        e.bytecode.extend_from_slice(&[0x2f, rf, slot, v]); // setrfati
+                    }
+                } else {
+                    let Some(v) = e.value_reg(*arg, *span) else {
+                        e.invalid.insert(*dst);
+                        return;
+                    };
+                    e.bytecode.extend_from_slice(&[0x2d, rf, slot, v]); // setvati
+                }
+            }
+        }
+        Instr::TagOf { dst, scrut, span } => {
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, NaraKind::U64);
+                return;
+            }
+            let Some(obj) = e.rf_map.get(scrut).copied() else {
+                if !e.invalid.contains(scrut) {
+                    e.diags.push(
+                        Diagnostic::error("Naravm backend expected a union reference")
+                            .with_label(*span, "tag read emitted here")
+                            .with_code("E500"),
+                    );
+                }
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(d) = e.fresh_rv(*span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            e.bytecode.extend_from_slice(&[0x2c, d, obj, 0]); // getvati (tag slot)
+            e.rv_map.insert(*dst, d);
+            e.kinds.insert(*dst, NaraKind::U64);
+        }
+        Instr::PayloadGet {
+            dst,
+            scrut,
+            index,
+            tys,
+            span,
+        } => {
+            let Some(kinds) = nara_variant_kinds(tys, *span, e) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some((is_ref, slot)) = variant_payload_slot(&kinds, *index) else {
+                e.diags.push(
+                    Diagnostic::error("Naravm variant payload index out of range (compiler bug)")
+                        .with_label(*span, "payload read emitted here")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(elem_kind) = kinds.get(*index).cloned() else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Ok(slot) = u8::try_from(slot) else {
+                e.diags.push(
+                    Diagnostic::error("Naravm variant payload slot is out of range (compiler bug)")
+                        .with_label(*span, "payload read emitted here")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            };
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, elem_kind);
+                return;
+            }
+            let Some(obj) = e.rf_map.get(scrut).copied() else {
+                if !e.invalid.contains(scrut) {
+                    e.diags.push(
+                        Diagnostic::error("Naravm backend expected a union reference")
+                            .with_label(*span, "payload read emitted here")
+                            .with_code("E500"),
+                    );
+                }
+                e.invalid.insert(*dst);
+                return;
+            };
+            if is_ref {
+                let Some(d) = e.fresh_rf(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x2e, d, obj, slot]); // getrfati
+                e.rf_map.insert(*dst, d);
+            } else {
+                let Some(d) = e.fresh_rv(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x2c, d, obj, slot]); // getvati
+                e.rv_map.insert(*dst, d);
+            }
+            e.kinds.insert(*dst, elem_kind);
         }
         Instr::Ret { src, span } => nara_ret(e, ctx, *src, *span),
         Instr::GlobalLoad { dst, global, span } => {

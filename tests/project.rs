@@ -206,6 +206,46 @@ fn project_imports_are_resolved_before_file_order_and_emitted_qualified() {
 }
 
 #[test]
+fn project_unions_construct_and_match_across_modules() {
+    let root = temp_project("unions-xmod");
+    fs::create_dir_all(root.join("src/lib")).expect("create source tree");
+    fs::write(root.join("vl.toml"), "module = \"demo\"\n").expect("write config");
+    fs::write(
+        root.join("src/lib/shapes.vl"),
+        "type Shape = union { Circle(f64), Rect(f64, f64), Dot, }; fun sides(s: Shape): u64 { match (s) { Shape.Circle(r) { r; return 1u64; } Shape.Rect(w, h) { w; h; return 4u64; } Shape.Dot { return 0u64; } } }",
+    )
+    .expect("write provider");
+    fs::write(
+        root.join("src/main.vl"),
+        "use demo.lib.shapes; fun main() { val a = shapes.Shape.Circle(1.0f64); val b = demo.lib.shapes.Shape.Dot; val n = shapes.sides(a); val m = shapes.sides(b); n; m; match (a) { shapes.Shape.Circle(r) { r; } else { 0.0f64; } } }",
+    )
+    .expect("write importer");
+
+    let output = run(&root, &["build", "--emit", "lir"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let main_lir = fs::read_to_string(root.join("out/demo__main.lir")).expect("main lir");
+    assert!(
+        main_lir.contains("new_variant demo.lib.shapes.Shape.Circle"),
+        "{main_lir}"
+    );
+    assert!(main_lir.contains("tag_of"), "{main_lir}");
+    assert!(main_lir.contains("payload_get"), "{main_lir}");
+    let output = run(&root, &["build"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = fs::read(root.join("out/demo__main.naravm")).expect("main artifact");
+    assert_eq!(&bytes[..4], b"nara");
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
+
+#[test]
 fn project_rejects_a_second_main_in_any_module() {
     let root = temp_project("library-main");
     fs::create_dir_all(root.join("src/lib")).expect("create source tree");

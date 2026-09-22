@@ -9,7 +9,7 @@ Parser recovers per-item (and per-stmt inside `fun`); one bad item hides no othe
 
 ```text
 program := item*
-item    := use_item | binding_item | function_item | object_item
+item    := use_item | binding_item | function_item | object_item | union_item
 use_item := "use" path ("." "{" ident ("," ident)* "}")? ";"
 binding_item := ("var" | "val") (ident | destructure) (":" type)? "=" expr ";"
 destructure := "#" "(" destructure_binding ("," destructure_binding)* ","? ")"
@@ -18,6 +18,9 @@ function_item := "fun" ident type_params? "(" params? ")" (":" type)? block
 type_params := "[" type_param ("," type_param)* "]"
 type_param := ident ("extends" ("Numeric" | "Comparable"))?
 object_item := "type" ident "=" "object" "{" object_member* "}" ";"
+union_item := "type" ident type_params? "=" "union" "{" union_variants? "}" ";"
+union_variants := union_variant ("," union_variant)* ","?
+union_variant := ident ("(" type ("," type)* ")")?
 object_member := object_field | assoc_fn
 object_field := ident ":" type ","?    ; the comma may be omitted before `fun` or `}`
 assoc_fn := "fun" ident type_params? "(" params? ")" (":" type)? block ","?
@@ -26,11 +29,12 @@ params   := param ("," param)*          ; no trailing comma
 param    := ident ":" type
 type     := mutable_type | type_atom
 mutable_type := "*" type_atom           ; one capability qualifier (`*Foo`, `*Array[T]`)
-type_atom := "u64" | "i64" | "f64" | "bool" | "u8" | "String" | "File" | ident | "Array" "[" type "]" | tuple_type | "void"
+type_atom := "u64" | "i64" | "f64" | "bool" | "u8" | "String" | "File" | ident | union_type | "Array" "[" type "]" | tuple_type | "void"
+union_type := ident ("[" type ("," type)* "]")?   ; bare `Option` or applied `Option[u64]` when `ident` names a union
 tuple_type := "#" "(" tuple_type_elem ("," tuple_type_elem)* ","? ")"
 tuple_type_elem := (ident ":")? type
 block    := "{" stmt* "}"
-stmt     := binding_stmt | assign_stmt | index_assign_stmt | field_assign_stmt | tuple_assign_stmt | destructure_stmt | if_stmt | while_stmt | break_stmt | continue_stmt | return_stmt | expr_stmt
+stmt     := binding_stmt | assign_stmt | index_assign_stmt | field_assign_stmt | tuple_assign_stmt | destructure_stmt | if_stmt | match_stmt | while_stmt | break_stmt | continue_stmt | return_stmt | expr_stmt
 binding_stmt := ("var" | "val") (ident | destructure) (":" type)? "=" expr ";"
 destructure_stmt := ("var" | "val") destructure (":" type)? "=" expr ";"
 assign_stmt := ident "=" expr ";"
@@ -40,6 +44,9 @@ tuple_assign_stmt := assignable backtick_index "=" expr ";"
 assignable := ident ("[" expr "]" | "." ident | backtick_index)*
 backtick_index := "." "`" int   ; unnamed tuples only, e.g. t.`0
 if_stmt  := "if" "(" expr ")" branch ("else" branch)?
+match_stmt := "match" "(" expr ")" "{" match_arm* ("else" branch)? "}"
+match_arm := path ("(" ident ("," ident)* ","? ")")? block
+           ; `path` is `Union.Variant` (2+ segments); bindings are implicit `val`s; `else` must be last
 while_stmt := "while" "(" expr ")" branch
 break_stmt := "break" ";"
 continue_stmt := "continue" ";"
@@ -67,7 +74,7 @@ literal  := int | i64 | u64 | f64 | u8 | bool
 path     := ident ("." ident)*
 ```
 
-Terminal names are `vl-lex` `TokenKind`s: `Var Val Fun Type Object If Else While Break
+Terminal names are `vl-lex` `TokenKind`s: `Var Val Fun Type Object Union Match If Else While Break
 Continue Return As Extends Eq EqEq Bang BangEq Lt LtEq Gt GtEq AmpAmp PipePipe
 Plus Minus Star Slash Semi LParen RParen LBrace RBrace LBracket RBracket Comma
 Dot Colon Hash Backtick ColonColon Ident Int I64 U64 F64 U8 Bool String Invalid Eof`.
@@ -99,6 +106,23 @@ Dot Colon Hash Backtick ColonColon Ident Int I64 U64 F64 U8 Bool String Invalid 
   `Array[*Foo]`); `*` in an expression stays multiplication (`a * b`).
   `mutable_type` goes through `type_atom` (not `type`), so `**Foo` is an
   immediate `E106`. Type spans include the leading `*`.
+* Union payload parentheses are non-empty and do not allow a trailing payload comma:
+  `Some(T)` is valid, while `Some()` and `Some(T,)` are rejected. Variant separators
+  and the optional final union comma are accepted. Variants must begin with an uppercase
+  letter and duplicate variant names produce one `E200`.
+* Union types spell instantiations with brackets: `Option` (monomorphic) or
+  `Option[u64]` (applied). Only names declared as `union` in the file parse
+  this way; other `Name[...]` spellings are a typecheck error. Annotations for
+  a generic union without arguments are rejected by typechecking (arity error).
+* Variant construction reuses call/field syntax: `Option.Some(1u64)` parses as
+  a call and `Option.None` as a field path; both resolve to variants in later
+  stages (an optional turbofish `Option.Some::[u64](...)` passes explicit args).
+* `match` arms name `Union.Variant` (2+ path segments; a bare `Some(v)` is one
+  `E100`), take an optional parenthesized binding list (implicit `val`s, one
+  optional trailing comma), and require brace blocks. `else` takes a branch
+  (like `if`) and must be the last arm (trailing arms after `else` are one
+  `E100`). Typechecking requires `else` in this milestone; omitting it with
+  uncovered variants is an exhaustiveness error.
 * Objects declare associated functions inside the body
   (`type Counter = object { value: u64, fun bump(self: *Counter): *Counter { ... } };`).
   Fields and `fun` members share one namespace: a duplicate member name is one
@@ -117,6 +141,8 @@ Item ::= Use { path, names, span }
        | Destructure { kind: Var | Val, bindings: Vec<DestructureBinding>, bindings_span, ty, ty_span, value: Expr, span }
        | Function { name, name_span, type_params: Vec<TypeParam>, params: Vec<Param>, ret: Option<VlType>, ret_span, body: Vec<Stmt>, span }
        | Object { name, name_span, fields: Vec<ObjectField>, methods: Vec<AssociatedFn>, span }
+       | Union { name, name_span, type_params: Vec<TypeParam>, variants: Vec<UnionVariant>, span }
+UnionVariant ::= { name, name_span, payload: Vec<(VlType, Span)> }
 AssociatedFn ::= { name, name_span, type_params: Vec<TypeParam>, params: Vec<Param>, ret: Option<VlType>, ret_span, body: Vec<Stmt>, span }
        ; same shape as Function; the owner lives on the enclosing Object
 TypeParam ::= { name, span, bound: Option<GenericBound> }
@@ -129,10 +155,12 @@ Stmt ::= Let { kind: Var | Val, name, name_span, ty, ty_span, value: Expr, span 
        | TupleAssign { base, index: usize, index_span, value, span }
        | Destructure { kind: Var | Val, bindings: Vec<DestructureBinding>, bindings_span, ty, ty_span, value: Expr, span }
        | If { condition, then_body, else_body, span }
+       | Match { scrutinee: Expr, arms: Vec<MatchArm>, else_body: Option<Vec<Stmt>>, span }
        | While { condition, body, span }
        | Break { span } | Continue { span }
        | Return { value: Option<Expr>, span }
        | Expr(Expr)
+MatchArm ::= { path: Vec<String>, path_span, bindings: Vec<(String, Span)>, body: Vec<Stmt>, span }
 Expr ::= Literal(Scalar, Span) | String(Vec<u8>, Span) | ArrayLiteral { elems, span }
          | TupleLiteral { elems: Vec<(Option<String>, Option<Span>, Expr)>, span }
          | TupleIndex { base, index: usize, index_span, span }

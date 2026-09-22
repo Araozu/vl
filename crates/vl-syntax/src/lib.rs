@@ -17,13 +17,20 @@
 //! param   := ident `:` type
 //! type    := mutable_type | type_atom
 //! mutable_type := `*` type_atom
-//! type_atom := `u64` | `i64` | `f64` | `bool` | `u8` | `String` | `File` | object-name | `Array` `[` type `]` | tuple-type | type-param | `void` (`void` only as return)
+//! type_atom := `u64` | `i64` | `f64` | `bool` | `u8` | `String` | `File` | object-name | union-type | `Array` `[` type `]` | tuple-type | type-param | `void` (`void` only as return)
+//! union-type := ident (`[` type (`,` type)* `]`)? ; `Option` or `Option[u64]` when `ident` names a union
+//! union-item := `type` ident type-params? `=` `union` `{` union-variants? `}` `;`
+//! union-variants := union-variant (`,` union-variant)* `,`?
+//! union-variant := ident (`(` type (`,` type)* `)`) ?
 //! tuple-type := `#` `(` [(ident `:`)? type] (`,` …)* `)` — 2+ elements, uniform named-ness, no `void`
 //! block   := `{` stmt* `}`
 //! stmt    := (`var` | `val`) (ident | destructure) (`:` type)? `=` expr `;` | ident `=` expr `;` | index `=` expr `;` | field `=` expr `;` | tuple-index `=` expr `;`
 //!          | `if` `(` expr `)` branch (`else` branch)?
+//!          | `match` `(` expr `)` `{` match-arm* (`else` block)? `}`
 //!          | `while` `(` expr `)` branch | `break` `;` | `continue` `;`
 //!          | `return` expr? `;` | expr `;`
+//! match-arm := path (`(` ident (`,` ident)* `,`? `)`)? block
+//!             ; `path` is `Union.Variant` (2+ segments); bindings are implicit `val`s
 //! branch  := block | stmt
 //! index   := ident (`[` expr `]`)+
 //! expr    := or
@@ -83,6 +90,13 @@
 //!
 //! Calls are callee-by-name (`ident(args)`). The callee is a plain variable use
 //! so forward references to `fun` items work.
+//!
+//! Union values are built through their variants (`Option.Some(1u64)` for
+//! payloads, `Option.None` for nullary variants, with an optional turbofish
+//! `Option.Some::[u64](...)`) and read through `match`:
+//! `match (opt) { Option.Some(v) { ... } Option.None { ... } else { ... } }`.
+//! Arm bindings are implicit `val`s; `else` is required in this milestone
+//! (full exhaustiveness checking without `else` is a follow-up).
 //! Semicolons are mandatory: every binding, every `return`, and every
 //! expression statement ends with `;` (no bare trailing value like Rust).
 //! There are no implicit returns: a function yields a value only through an
@@ -142,6 +156,16 @@ pub struct ObjectField {
     pub ty_span: Option<Span>,
 }
 
+/// One constructor of a `union` type. Variant names are intentionally
+/// ordinary identifiers in the AST; the parser enforces the public spelling
+/// convention that they begin with an uppercase letter.
+#[derive(Debug, Clone)]
+pub struct UnionVariant {
+    pub name: String,
+    pub name_span: Span,
+    pub payload: Vec<(VlType, Span)>,
+}
+
 /// One associated function declared inside an object body
 /// (`fun init(v: u64): Counter { ... }` in
 /// `type Counter = object { ..., fun init ... };`).
@@ -190,6 +214,19 @@ pub struct DestructureBinding {
     pub binding_span: Span,
 }
 
+/// One `match` arm: `Union.Variant(b0, b1) { ... }` (or `Union.Variant { ... }`
+/// for nullary variants). `path` holds every segment (`["Option", "Some"]`);
+/// the last names the variant, the rest the union. Bindings are implicit
+/// `val`s for the payload positions, in order.
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub path: Vec<String>,
+    pub path_span: Span,
+    pub bindings: Vec<(String, Span)>,
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub enum Item {
     Use {
@@ -204,6 +241,13 @@ pub enum Item {
         /// Associated functions declared inside the object body. Fields and
         /// methods share one member namespace (duplicates are E200).
         methods: Vec<AssociatedFn>,
+        span: Span,
+    },
+    Union {
+        name: String,
+        name_span: Span,
+        type_params: Vec<TypeParam>,
+        variants: Vec<UnionVariant>,
         span: Span,
     },
     Let {
@@ -302,6 +346,17 @@ pub enum Stmt {
     If {
         condition: Expr,
         then_body: Vec<Stmt>,
+        else_body: Option<Vec<Stmt>>,
+        span: Span,
+    },
+    /// Union match: `match (scrut) { Union.Variant(binds) { ... } else { ... } }`.
+    /// Each arm's path is `Union.Variant` (2+ segments; the last names the
+    /// variant, the rest the union). Bindings are implicit `val`s bound to the
+    /// variant payloads positionally. Arm bodies are brace blocks; `else` is
+    /// required in this milestone (full exhaustiveness is a follow-up).
+    Match {
+        scrutinee: Expr,
+        arms: Vec<MatchArm>,
         else_body: Option<Vec<Stmt>>,
         span: Span,
     },
@@ -447,7 +502,11 @@ struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
     diags: Vec<Diagnostic>,
-    known_objects: std::collections::HashSet<String>,
+    known_types: std::collections::HashSet<String>,
+    /// Bare names declared as `union` in this file (subset of `known_types`).
+    /// Union annotations (`Option`, `Option[u64]`) resolve through this set;
+    /// object names never do.
+    known_unions: std::collections::HashSet<String>,
 }
 
 pub fn parse(toks: &[Token], src: &str) -> (Program, Vec<Diagnostic>) {
@@ -455,27 +514,59 @@ pub fn parse(toks: &[Token], src: &str) -> (Program, Vec<Diagnostic>) {
 }
 
 pub fn parse_with_module(toks: &[Token], _src: &str, module: &str) -> (Program, Vec<Diagnostic>) {
-    let known_objects = toks
-        .windows(4)
-        .filter_map(|window| {
-            match (
-                &window[0].kind,
-                &window[1].kind,
-                &window[2].kind,
-                &window[3].kind,
-            ) {
-                (TokenKind::Type, TokenKind::Ident(name), TokenKind::Eq, TokenKind::Object) => {
-                    Some(name.clone())
+    let mut known_types = std::collections::HashSet::new();
+    let mut known_unions = std::collections::HashSet::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if !matches!(toks[i].kind, TokenKind::Type) {
+            i += 1;
+            continue;
+        }
+        let Some(Token {
+            kind: TokenKind::Ident(name),
+            ..
+        }) = toks.get(i + 1)
+        else {
+            i += 1;
+            continue;
+        };
+        let mut j = i + 2;
+        if matches!(toks.get(j).map(|t| &t.kind), Some(TokenKind::LBracket)) {
+            let mut depth = 0;
+            while let Some(token) = toks.get(j) {
+                match token.kind {
+                    TokenKind::LBracket => depth += 1,
+                    TokenKind::RBracket => {
+                        depth -= 1;
+                        if depth == 0 {
+                            j += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
                 }
-                _ => None,
+                j += 1;
             }
-        })
-        .collect();
+        }
+        if matches!(toks.get(j).map(|t| &t.kind), Some(TokenKind::Eq))
+            && matches!(
+                toks.get(j + 1).map(|t| &t.kind),
+                Some(TokenKind::Object | TokenKind::Union)
+            )
+        {
+            known_types.insert(name.clone());
+            if matches!(toks.get(j + 1).map(|t| &t.kind), Some(TokenKind::Union)) {
+                known_unions.insert(name.clone());
+            }
+        }
+        i += 1;
+    }
     let mut p = Parser {
         toks,
         pos: 0,
         diags: vec![],
-        known_objects,
+        known_types,
+        known_unions,
     };
     let mut items = Vec::new();
     while !p.at_eof() {
@@ -487,7 +578,17 @@ pub fn parse_with_module(toks: &[Token], _src: &str, module: &str) -> (Program, 
                 // A recovery boundary can itself be the token at which
                 // parsing failed (notably a nested `function`). Always make
                 // progress so malformed input cannot spin forever.
-                if p.pos == before && !p.at_eof() {
+                if p.pos == before
+                    && !p.at_eof()
+                    && !matches!(
+                        p.peek().kind,
+                        TokenKind::Var
+                            | TokenKind::Val
+                            | TokenKind::Fun
+                            | TokenKind::Type
+                            | TokenKind::Ident(_)
+                    )
+                {
                     p.bump();
                 }
             }
@@ -537,8 +638,15 @@ impl<'a> Parser<'a> {
     fn recover_to_item_boundary(&mut self) {
         while !self.at_eof() {
             match &self.peek().kind {
-                TokenKind::Semi | TokenKind::RBrace => {
+                TokenKind::Semi => {
                     self.bump();
+                    return;
+                }
+                TokenKind::RBrace => {
+                    self.bump();
+                    if matches!(self.peek().kind, TokenKind::Semi) {
+                        self.bump();
+                    }
                     return;
                 }
                 TokenKind::Var | TokenKind::Val | TokenKind::Fun | TokenKind::Type => return,
@@ -554,7 +662,7 @@ impl<'a> Parser<'a> {
             TokenKind::Var => self.parse_binding_item(BindingKind::Var),
             TokenKind::Val => self.parse_binding_item(BindingKind::Val),
             TokenKind::Fun => self.parse_function_item(),
-            TokenKind::Type => self.parse_object_item(),
+            TokenKind::Type => self.parse_type_item(),
             TokenKind::Ident(name) if name == "use" => self.parse_use_item(),
             TokenKind::Eof => None,
             TokenKind::Invalid => {
@@ -579,54 +687,186 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_use_item(&mut self) -> Option<Item> {
-        let start = self.bump().span;
-        let path = self.parse_path()?;
-        let names = if matches!(self.peek().kind, TokenKind::Dot) {
-            self.bump();
-            self.expect(&TokenKind::LBrace, "`{` after module path")?;
-            let mut names = Vec::new();
-            loop {
-                names.push(self.parse_ident()?.0);
-                if !matches!(self.peek().kind, TokenKind::Comma) {
-                    break;
-                }
-                self.bump();
-            }
-            self.expect(&TokenKind::RBrace, "`}` after imported names")?;
-            Some(names)
-        } else {
-            None
-        };
-        let semi = self.expect(&TokenKind::Semi, "`;`")?;
-        Some(Item::Use {
-            path,
-            names,
-            span: Span::new(start.start, semi.span.end),
-        })
-    }
-
-    fn parse_object_item(&mut self) -> Option<Item> {
+    fn parse_type_item(&mut self) -> Option<Item> {
         let type_tok = self.bump();
         let (name, name_span) = self.parse_ident()?;
-        let reserved_name = matches!(name.as_str(), "Array" | "U64Array" | "string" | "file")
-            || name.parse::<VlType>().is_ok();
-        if reserved_name {
+        let type_params = if matches!(self.peek().kind, TokenKind::LBracket) {
+            self.parse_type_params()?
+        } else {
+            Vec::new()
+        };
+        self.expect(&TokenKind::Eq, "`=` after type name")?;
+        self.check_reserved_type_name(&name, name_span);
+        if matches!(self.peek().kind, TokenKind::Union) {
+            return self.parse_union_item(type_tok.span, name, name_span, type_params);
+        }
+        if !type_params.is_empty() {
+            let t = self.peek().clone();
             self.diags.push(
-                Diagnostic::error(format!("object type name `{name}` is reserved"))
-                    .with_label(name_span, "choose a different object type name")
-                    .with_note("object names cannot shadow built-in or legacy type names")
+                Diagnostic::error("object types cannot have type parameters")
+                    .with_label(t.span, "generic parameters are only valid on `union`")
+                    .with_code("E104"),
+            );
+            return None;
+        }
+        self.parse_object_item_after_name(type_tok.span, name, name_span)
+    }
+
+    fn check_reserved_type_name(&mut self, name: &str, span: Span) {
+        if matches!(name, "Array" | "U64Array" | "string" | "file")
+            || name.parse::<VlType>().is_ok()
+        {
+            self.diags.push(
+                Diagnostic::error(format!("type name `{name}` is reserved"))
+                    .with_label(span, "choose a different type name")
+                    .with_note("type names cannot shadow built-in or legacy type names")
                     .with_code("E200"),
             );
         }
-        self.expect(&TokenKind::Eq, "`=` after object name")?;
+    }
+
+    fn parse_union_item(
+        &mut self,
+        start: Span,
+        name: String,
+        name_span: Span,
+        type_params: Vec<TypeParam>,
+    ) -> Option<Item> {
+        self.bump(); // union
+        self.expect(&TokenKind::LBrace, "`{` after `union`")?;
+        let allowed = type_params
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>();
+        let mut variants = Vec::new();
+        let mut variant_spans: std::collections::HashMap<String, Span> =
+            std::collections::HashMap::new();
+        while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
+            let (variant, variant_span) = self.parse_ident()?;
+            if let Some(previous) = variant_spans.insert(variant.clone(), variant_span) {
+                self.diags.push(
+                    Diagnostic::error(format!("duplicate union variant `{variant}`"))
+                        .with_label(variant_span, "redefined here")
+                        .with_bare_label(previous)
+                        .with_code("E200"),
+                );
+            }
+            if !variant.chars().next().is_some_and(char::is_uppercase) {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "union variant `{variant}` must start with an uppercase letter"
+                    ))
+                    .with_label(variant_span, "capitalize union variants, e.g. `Some`")
+                    .with_code("E200"),
+                );
+            }
+            let mut payload = Vec::new();
+            if matches!(self.peek().kind, TokenKind::LParen) {
+                self.bump();
+                if matches!(self.peek().kind, TokenKind::RParen) {
+                    let t = self.bump();
+                    self.diags.push(
+                        Diagnostic::error("a union payload cannot be empty")
+                            .with_label(t.span, "write `A` for a payload-free variant")
+                            .with_code("E104"),
+                    );
+                    self.recover_union_item();
+                    return None;
+                }
+                loop {
+                    let parsed = self.parse_type(&allowed, true);
+                    let Some((ty, span)) = parsed else {
+                        self.recover_union_item();
+                        return None;
+                    };
+                    if ty.is_void() {
+                        self.diags.push(
+                            Diagnostic::error("a union payload cannot be `void`")
+                                .with_label(span, "`void` is not a value type")
+                                .with_code("E104"),
+                        );
+                    }
+                    payload.push((ty, span));
+                    if !matches!(self.peek().kind, TokenKind::Comma) {
+                        break;
+                    }
+                    let comma = self.bump();
+                    if matches!(self.peek().kind, TokenKind::RParen) {
+                        self.bump();
+                        self.diags.push(
+                            Diagnostic::error("trailing commas are not allowed in union payloads")
+                                .with_label(comma.span, "remove this comma")
+                                .with_code("E100"),
+                        );
+                        self.recover_union_item();
+                        return None;
+                    }
+                }
+                if self
+                    .expect(&TokenKind::RParen, "`)` after union payload")
+                    .is_none()
+                {
+                    self.recover_union_item();
+                    return None;
+                }
+            }
+            variants.push(UnionVariant {
+                name: variant,
+                name_span: variant_span,
+                payload,
+            });
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.bump();
+            } else if !matches!(self.peek().kind, TokenKind::RBrace) {
+                let t = self.peek().clone();
+                self.diags.push(
+                    Diagnostic::error(format!("expected `,` or `}}`, found {}", describe(&t.kind)))
+                        .with_label(t.span, "separate union variants with commas")
+                        .with_code("E100"),
+                );
+                self.recover_union_item();
+                return None;
+            }
+        }
+        let close = self.expect(&TokenKind::RBrace, "`}` after union variants")?;
+        let semi = self.expect(&TokenKind::Semi, "`;` after union declaration")?;
+        Some(Item::Union {
+            name,
+            name_span,
+            type_params,
+            variants,
+            span: Span::new(start.start, semi.span.end.max(close.span.end)),
+        })
+    }
+
+    fn recover_union_item(&mut self) {
+        while !self.at_eof() {
+            match self.peek().kind {
+                TokenKind::RBrace => {
+                    self.bump();
+                    if matches!(self.peek().kind, TokenKind::Semi) {
+                        self.bump();
+                    }
+                    return;
+                }
+                TokenKind::Var | TokenKind::Val | TokenKind::Fun | TokenKind::Type => return,
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+    }
+
+    fn parse_object_item_after_name(
+        &mut self,
+        start: Span,
+        name: String,
+        name_span: Span,
+    ) -> Option<Item> {
         self.expect(&TokenKind::Object, "`object` after `=`")?;
         self.expect(&TokenKind::LBrace, "`{` after `object`")?;
         let mut fields = Vec::new();
         let mut methods = Vec::new();
-        // One member namespace: a field and an associated function may not
-        // share a name, so `c.name` (field) and `Type.name(...)` (call) never
-        // compete for the same member.
         let mut member_spans: Vec<(String, Span)> = Vec::new();
         let check_member = |name: &str,
                             span: Span,
@@ -643,7 +883,7 @@ impl<'a> Parser<'a> {
         };
         while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
             if matches!(self.peek().kind, TokenKind::Fun) {
-                let fun_tok = self.bump(); // `fun`
+                let fun_tok = self.bump();
                 let parsed = self.parse_fn_rest(fun_tok)?;
                 check_member(
                     &parsed.name,
@@ -663,8 +903,6 @@ impl<'a> Parser<'a> {
                     body: parsed.body,
                     span: parsed.span,
                 });
-                // A trailing comma after a `fun` member is allowed but never
-                // required: `fun f() {...},` and `fun f() {...}` both parse.
                 if matches!(self.peek().kind, TokenKind::Comma) {
                     self.bump();
                 }
@@ -693,8 +931,6 @@ impl<'a> Parser<'a> {
                     (None, Some(fallback.span))
                 }
             };
-            // Failed type already reported once; only keep the poisoned field
-            // when the follow (`,`, `fun`, or `}`) is present, else recover.
             if type_failed
                 && !matches!(
                     self.peek().kind,
@@ -715,8 +951,6 @@ impl<'a> Parser<'a> {
                 self.bump();
                 continue;
             }
-            // The comma may be omitted before a `fun` member or `}`:
-            // `type C = object { v: u64, fun f() {...} };` parses.
             if matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Fun) {
                 continue;
             }
@@ -735,7 +969,34 @@ impl<'a> Parser<'a> {
             name_span,
             fields,
             methods,
-            span: Span::new(type_tok.span.start, semi.span.end.max(close.span.end)),
+            span: Span::new(start.start, semi.span.end.max(close.span.end)),
+        })
+    }
+
+    fn parse_use_item(&mut self) -> Option<Item> {
+        let start = self.bump().span;
+        let path = self.parse_path()?;
+        let names = if matches!(self.peek().kind, TokenKind::Dot) {
+            self.bump();
+            self.expect(&TokenKind::LBrace, "`{` after module path")?;
+            let mut names = Vec::new();
+            loop {
+                names.push(self.parse_ident()?.0);
+                if !matches!(self.peek().kind, TokenKind::Comma) {
+                    break;
+                }
+                self.bump();
+            }
+            self.expect(&TokenKind::RBrace, "`}` after imported names")?;
+            Some(names)
+        } else {
+            None
+        };
+        let semi = self.expect(&TokenKind::Semi, "`;`")?;
+        Some(Item::Use {
+            path,
+            names,
+            span: Span::new(start.start, semi.span.end),
         })
     }
 
@@ -997,7 +1258,24 @@ impl<'a> Parser<'a> {
                     }
                 }
                 if full.contains('.') {
+                    // A qualified union instantiation (`m.Option[u64]`) parses
+                    // its argument list here; validation (known union, arity)
+                    // belongs to typechecking, which sees every module.
+                    if matches!(self.peek().kind, TokenKind::LBracket)
+                        && name.parse::<VlType>().is_err()
+                    {
+                        return self.parse_union_args(full, t.span, allowed, strict);
+                    }
                     return Some((VlType::Object(full), Span::new(t.span.start, end.end)));
+                }
+                // A bare union instantiation (`Option[u64]`). Primitives never
+                // take arguments; a type parameter literally named `Array`
+                // keeps the old path (its brackets stay a downstream error).
+                if matches!(self.peek().kind, TokenKind::LBracket)
+                    && name.parse::<VlType>().is_err()
+                    && !(name == "Array" && allowed.iter().any(|a| a == "Array"))
+                {
+                    return self.parse_union_args(full, t.span, allowed, strict);
                 }
                 if name == "Array" && !allowed.iter().any(|a| a == "Array") {
                     self.diags.push(
@@ -1041,7 +1319,14 @@ impl<'a> Parser<'a> {
                     Err(_) if allowed.iter().any(|a| a == &name) => {
                         Some((VlType::Param(name), t.span))
                     }
-                    Err(_) if self.known_objects.contains(&name) => {
+                    Err(_) if self.known_unions.contains(&name) => Some((
+                        VlType::Union {
+                            name,
+                            args: Vec::new(),
+                        },
+                        t.span,
+                    )),
+                    Err(_) if self.known_types.contains(&name) => {
                         Some((VlType::Object(name), t.span))
                     }
                     Err(_) if !strict => Some((VlType::Param(name), t.span)),
@@ -1060,7 +1345,7 @@ impl<'a> Parser<'a> {
                     Diagnostic::error(format!("expected a type, found {}", describe(&t.kind)))
                         .with_label(
                             t.span,
-                            "expected a built-in type, an object type, Array[T], `*T`, or void",
+                            "expected a built-in type, an object or union type, Array[T], `*T`, or void",
                         )
                         .with_code("E104"),
                 );
@@ -1093,6 +1378,54 @@ impl<'a> Parser<'a> {
             VlType::Array(Box::new(elem)),
             Span::new(head.span.start, close.span.end),
         ))
+    }
+
+    /// Parse the `[T, ...]` tail of a union instantiation (`Option[u64]`).
+    /// `head` is the union name spelling (bare or qualified) and `head_span`
+    /// its first segment's span. Arity and union-ness are validated by
+    /// typechecking; an empty `[]` or a `void` argument is one error here.
+    fn parse_union_args(
+        &mut self,
+        head: String,
+        head_span: Span,
+        allowed: &[String],
+        strict: bool,
+    ) -> Option<(VlType, Span)> {
+        self.bump(); // `[` (established by lookahead)
+        let mut args = Vec::new();
+        if matches!(self.peek().kind, TokenKind::RBracket) {
+            let close = self.bump();
+            self.diags.push(
+                Diagnostic::error(format!("union `{head}` needs type arguments in `[...]`"))
+                    .with_label(
+                        Span::new(head_span.start, close.span.end),
+                        "write e.g. `Option[u64]`, or bare `Option` for a monomorphic union",
+                    )
+                    .with_code("E104"),
+            );
+            return None;
+        }
+        loop {
+            let (ty, _) = self.parse_type(allowed, strict)?;
+            args.push(ty);
+            if !matches!(self.peek().kind, TokenKind::Comma) {
+                break;
+            }
+            self.bump();
+        }
+        let close = self.expect(&TokenKind::RBracket, "`]` after union type arguments")?;
+        let span = Span::new(head_span.start, close.span.end);
+        if args.iter().any(|a| a.is_void()) {
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "union `{head}` cannot take `void` as a type argument"
+                ))
+                .with_label(span, "`void` is not a value type")
+                .with_code("E104"),
+            );
+            return None;
+        }
+        Some((VlType::Union { name: head, args }, span))
     }
 
     /// Skip to the closing `)` of a broken `#(...)` shape (depth-aware
@@ -1711,6 +2044,9 @@ impl<'a> Parser<'a> {
         if matches!(self.peek().kind, TokenKind::If) {
             return self.parse_if_stmt(allowed);
         }
+        if matches!(self.peek().kind, TokenKind::Match) {
+            return self.parse_match_stmt(allowed);
+        }
         if matches!(self.peek().kind, TokenKind::While) {
             return self.parse_while_stmt(allowed);
         }
@@ -1865,6 +2201,105 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse `match (scrut) { Union.Variant(binds) { ... } ... else { ... } }`.
+    /// Arm heads are `Union.Variant` paths (2+ segments) with an optional
+    /// parenthesized binding list; arm bodies are brace blocks. `else` (with a
+    /// branch body, like `if`) must come last when present.
+    fn parse_match_stmt(&mut self, allowed: &[String]) -> Option<Stmt> {
+        let start = self.bump().span.start; // `match`
+        self.expect(&TokenKind::LParen, "`(` after `match`")?;
+        let scrutinee = self.parse_expr()?;
+        self.expect(&TokenKind::RParen, "`)` after match scrutinee")?;
+        self.expect(&TokenKind::LBrace, "`{` after match scrutinee")?;
+        let mut arms = Vec::new();
+        let mut else_body = None;
+        while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
+            if matches!(self.peek().kind, TokenKind::Else) {
+                self.bump(); // `else`
+                let body = self.parse_branch(allowed)?;
+                else_body = Some(body);
+                // `else` must be the last arm: anything but `}` after it is
+                // a shape error, reported once without cascading.
+                if !matches!(self.peek().kind, TokenKind::RBrace) {
+                    let t = self.peek().clone();
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "expected `}}` after `else` arm, found {}",
+                            describe(&t.kind)
+                        ))
+                        .with_label(t.span, "`else` must be the last arm in `match`")
+                        .with_code("E100"),
+                    );
+                    return None;
+                }
+                break;
+            }
+            let arm_start = self.peek().span.start;
+            let path = self.parse_path()?;
+            if path.len() < 2 {
+                self.diags.push(
+                    Diagnostic::error("match arm must name a variant (`Union.Variant`)")
+                        .with_label(
+                            Span::new(arm_start, self.toks[self.pos.saturating_sub(1)].span.end),
+                            "write `Union.Variant` here, e.g. `Option.Some(v)`",
+                        )
+                        .with_code("E100"),
+                );
+                return None;
+            }
+            let path_end = self.toks[self.pos.saturating_sub(1)].span.end;
+            // Optional binding list (`(a, b)`); absent means nullary. An
+            // empty `()` is accepted and means the same.
+            let mut bindings = Vec::new();
+            if matches!(self.peek().kind, TokenKind::LParen) {
+                self.bump(); // `(`
+                if !matches!(self.peek().kind, TokenKind::RParen) {
+                    loop {
+                        let (name, name_span) = self.parse_ident()?;
+                        bindings.push((name, name_span));
+                        if !matches!(self.peek().kind, TokenKind::Comma) {
+                            break;
+                        }
+                        self.bump();
+                        // Allow one trailing comma: `(a, b,)`.
+                        if matches!(self.peek().kind, TokenKind::RParen) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&TokenKind::RParen, "`)` after match bindings")?;
+            }
+            if !matches!(self.peek().kind, TokenKind::LBrace) {
+                let t = self.peek().clone();
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "expected `{{` for match arm body, found {}",
+                        describe(&t.kind)
+                    ))
+                    .with_label(t.span, "arm bodies are brace blocks")
+                    .with_code("E100"),
+                );
+                return None;
+            }
+            let body = self.parse_block(allowed)?;
+            let end = self.toks[self.pos.saturating_sub(1)].span.end;
+            arms.push(MatchArm {
+                path,
+                path_span: Span::new(arm_start, path_end),
+                bindings,
+                body,
+                span: Span::new(arm_start, end),
+            });
+        }
+        let close = self.expect(&TokenKind::RBrace, "`}` after match arms")?;
+        Some(Stmt::Match {
+            scrutinee,
+            arms,
+            else_body,
+            span: Span::new(start, close.span.end),
+        })
+    }
+
     fn parse_while_stmt(&mut self, allowed: &[String]) -> Option<Stmt> {
         let start = self.bump().span.start; // `while`
         self.expect(&TokenKind::LParen, "`(` after `while`")?;
@@ -1921,6 +2356,7 @@ impl<'a> Parser<'a> {
                 | TokenKind::Val
                 | TokenKind::Fun
                 | TokenKind::If
+                | TokenKind::Match
                 | TokenKind::While
                 | TokenKind::Break
                 | TokenKind::Continue
@@ -2467,6 +2903,8 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::Fun => "`fun`".into(),
         TokenKind::Type => "`type`".into(),
         TokenKind::Object => "`object`".into(),
+        TokenKind::Union => "`union`".into(),
+        TokenKind::Match => "`match`".into(),
         TokenKind::If => "`if`".into(),
         TokenKind::Else => "`else`".into(),
         TokenKind::While => "`while`".into(),
@@ -2588,6 +3026,105 @@ mod tests {
             }
             other => panic!("expected function, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_union_with_uppercase_variants_and_payloads() {
+        let (prog, diags) = parse_src("type Option[T] = union { None, Some(T), Pair(T, T), };");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Union {
+                name,
+                type_params,
+                variants,
+                ..
+            } => {
+                assert_eq!(name, "Option");
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(variants.len(), 3);
+                assert_eq!(variants[0].name, "None");
+                assert_eq!(
+                    variants[1].payload,
+                    vec![(VlType::Param("T".into()), variants[1].payload[0].1)]
+                );
+                assert_eq!(variants[2].payload.len(), 2);
+            }
+            other => panic!("expected union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn union_variants_must_be_uppercase() {
+        let (_prog, diags) = parse_src("type Bad = union { none, };");
+        assert!(mentions(&diags, "uppercase"));
+    }
+
+    #[test]
+    fn union_declaration_validation_and_recovery_are_single_root_errors() {
+        for (src, code, message) in [
+            ("type String = union { Nope, };", "E200", "reserved"),
+            (
+                "type U = union { A, A, };",
+                "E200",
+                "duplicate union variant",
+            ),
+            ("type U = union { A(), };", "E104", "empty"),
+            ("type U = union { A(u64,), };", "E100", "trailing commas"),
+            ("type U = union { A B, };", "E100", "expected `,`"),
+        ] {
+            let (prog, diags) = parse_src(src);
+            let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{src}: {diags:?}");
+            assert_eq!(errors[0].code.as_deref(), Some(code), "{src}: {diags:?}");
+            assert!(errors[0].message.contains(message), "{src}: {diags:?}");
+            if src.contains("u64,") {
+                let comma = src.find("u64,").unwrap() + 3;
+                assert!(errors[0]
+                    .labels
+                    .iter()
+                    .any(|label| label.span.start == comma && label.span.end == comma + 1));
+            }
+            if src.contains("A()") || src.contains("u64,") || src.contains("A B") {
+                assert!(prog.items.is_empty(), "{src}: {prog:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_union_preserves_later_items() {
+        let (prog, diags) = parse_src("type U = union { A(Nope) }; fun ok(): u64 { return 1u64; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E105"));
+        assert!(matches!(&prog.items[..], [Item::Function { name, .. }] if name == "ok"));
+    }
+
+    #[test]
+    fn object_missing_field_separator_is_one_error_and_consumes_declaration() {
+        let (prog, diags) =
+            parse_src("type C = object { a: u64 b: u64, }; fun ok(): u64 { return 1u64; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E100"));
+        assert!(matches!(&prog.items[..], [Item::Function { name, .. }] if name == "ok"));
+    }
+
+    #[test]
+    fn generic_unions_are_known_for_forward_and_self_payloads() {
+        let (prog, diags) = parse_src(
+            "type U[T] = union { Self(U), Forward(F), }; type F = object { value: u64, };",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(matches!(prog.items[0], Item::Union { .. }));
+        assert!(matches!(prog.items[1], Item::Object { .. }));
+    }
+
+    #[test]
+    fn generic_objects_remain_rejected() {
+        let (_prog, diags) = parse_src("type C[T] = object { value: u64, };");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E104"));
     }
 
     #[test]
@@ -2816,6 +3353,94 @@ mod tests {
             Item::Function { body, .. } => assert!(matches!(body[0], Stmt::If { .. })),
             other => panic!("expected function, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_match_with_variant_arms_and_else() {
+        let (prog, diags) = parse_src(
+            "type Option[T] = union { None, Some(T), }; fun main() { match (o) { Option.Some(v) { v; } Option.None { 0u64; } else { 1u64; } } }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[1] {
+            Item::Function { body, .. } => match &body[0] {
+                Stmt::Match {
+                    arms, else_body, ..
+                } => {
+                    assert_eq!(arms.len(), 2);
+                    assert_eq!(arms[0].path, vec!["Option", "Some"]);
+                    assert_eq!(arms[0].bindings.len(), 1);
+                    assert_eq!(arms[1].path, vec!["Option", "None"]);
+                    assert!(arms[1].bindings.is_empty());
+                    assert!(else_body.is_some());
+                }
+                other => panic!("expected match, got {other:?}"),
+            },
+            other => panic!("expected function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_union_type_arguments() {
+        let (prog, diags) = parse_src(
+            "type Option[T] = union { None, Some(T), }; fun f(o: Option[u64]): Option[u64] { return o; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[1] {
+            Item::Function { params, ret, .. } => {
+                assert_eq!(
+                    params[0].ty.clone(),
+                    Some(VlType::Union {
+                        name: "Option".into(),
+                        args: vec![VlType::U64],
+                    })
+                );
+                assert_eq!(
+                    ret.clone(),
+                    Some(VlType::Union {
+                        name: "Option".into(),
+                        args: vec![VlType::U64],
+                    })
+                );
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_union_name_parses_as_union_type() {
+        let (prog, diags) = parse_src("type U = union { A, }; fun f(x: U): U { return x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[1] {
+            Item::Function { params, .. } => {
+                assert_eq!(
+                    params[0].ty.clone(),
+                    Some(VlType::Union {
+                        name: "U".into(),
+                        args: Vec::new(),
+                    })
+                );
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_arm_requires_qualified_variant() {
+        let (_, diags) = parse_src("fun main() { match (o) { Some(v) { v; } } }");
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E100")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn match_else_must_be_last() {
+        let (_, diags) =
+            parse_src("fun main() { match (o) { else { 1u64; } Option.None { 2u64; } } }");
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E100")),
+            "{diags:?}"
+        );
     }
 
     #[test]

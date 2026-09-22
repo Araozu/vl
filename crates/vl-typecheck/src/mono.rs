@@ -362,6 +362,11 @@ fn calls_in_item(
                     walk_expr(typed, value, out);
                 }
             }
+            HirExpr::Variant { args, .. } => {
+                for arg in args {
+                    walk_expr(typed, arg, out);
+                }
+            }
             HirExpr::Index { base, index, .. } => {
                 walk_expr(typed, base, out);
                 walk_expr(typed, index, out);
@@ -425,6 +430,24 @@ fn calls_in_item(
                 walk_expr(typed, condition, out);
                 for s in then_body {
                     walk_stmt(typed, s, out);
+                }
+                if let Some(body) = else_body {
+                    for s in body {
+                        walk_stmt(typed, s, out);
+                    }
+                }
+            }
+            HirStmt::Match {
+                scrutinee,
+                arms,
+                else_body,
+                ..
+            } => {
+                walk_expr(typed, scrutinee, out);
+                for arm in arms {
+                    for s in &arm.body {
+                        walk_stmt(typed, s, out);
+                    }
                 }
                 if let Some(body) = else_body {
                     for s in body {

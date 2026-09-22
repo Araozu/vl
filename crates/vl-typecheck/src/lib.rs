@@ -41,6 +41,11 @@ pub enum Ty {
     File,
     /// User-defined nominal object (reference semantics).
     Object(String),
+    /// Nominal union instantiation (`Option`, `Option[u64]`). Reference
+    /// semantics (heap tag + payload); constructed via variants, read via
+    /// `match`. Boxed to keep [`Ty`] small on the stack: generic-instance
+    /// checking nests types dozens deep.
+    Union(Box<UnionTy>),
     /// Fixed-length heap array of `T` (reference type, like `String`).
     Array(Box<Ty>),
     /// Fixed-arity heterogeneous tuple (`#(u64, String)`). Value semantics
@@ -58,6 +63,14 @@ pub enum Ty {
     Mutable(Box<Ty>),
 }
 
+/// Nominal union instantiation: `name` plus one argument per declared type
+/// parameter (`args` aligns positionally). Boxed inside [`Ty::Union`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnionTy {
+    pub name: String,
+    pub args: Vec<Ty>,
+}
+
 impl std::fmt::Display for Ty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -70,6 +83,20 @@ impl std::fmt::Display for Ty {
             Ty::String => write!(f, "String"),
             Ty::File => write!(f, "File"),
             Ty::Object(name) => write!(f, "{name}"),
+            Ty::Union(u) => {
+                write!(f, "{}", u.name)?;
+                if !u.args.is_empty() {
+                    write!(f, "[")?;
+                    for (i, arg) in u.args.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{arg}")?;
+                    }
+                    write!(f, "]")?;
+                }
+                Ok(())
+            }
             Ty::Array(elem) => write!(f, "Array[{elem}]"),
             Ty::Tuple(fields) => {
                 write!(f, "#(")?;
@@ -110,6 +137,10 @@ impl Ty {
             VlType::String => Ty::String,
             VlType::File => Ty::File,
             VlType::Object(name) => Ty::Object(name.clone()),
+            VlType::Union { name, args } => Ty::Union(Box::new(UnionTy {
+                name: name.clone(),
+                args: args.iter().map(|a| Self::from_vl_in(a, env)).collect(),
+            })),
             VlType::Array(elem) => Ty::Array(Box::new(Self::from_vl_in(elem, env))),
             VlType::Tuple(fields) => Ty::Tuple(
                 fields
@@ -132,6 +163,7 @@ impl Ty {
         match self {
             Ty::Array(elem) => elem.is_concrete(),
             Ty::Tuple(fields) => fields.iter().all(|(_, ty)| ty.is_concrete()),
+            Ty::Union(u) => u.args.iter().all(|a| a.is_concrete()),
             Ty::Mutable(inner) => inner.is_concrete(),
             Ty::Param(_) | Ty::Error | Ty::Int => false,
             _ => true,
@@ -184,6 +216,10 @@ impl Ty {
         match self {
             Ty::Mutable(inner) => inner.erase_capability(),
             Ty::Array(elem) => Ty::Array(Box::new(elem.erase_capability())),
+            Ty::Union(u) => Ty::Union(Box::new(UnionTy {
+                name: u.name.clone(),
+                args: u.args.iter().map(|a| a.erase_capability()).collect(),
+            })),
             Ty::Tuple(fields) => Ty::Tuple(
                 fields
                     .iter()
@@ -206,6 +242,7 @@ impl Ty {
         match self {
             Ty::String | Ty::File => true,
             Ty::Object(_) => true,
+            Ty::Union { .. } => true,
             Ty::Array(_) => true,
             Ty::Tuple(_) => true,
             Ty::Mutable(inner) => inner.is_reference_type(),
@@ -221,6 +258,7 @@ impl Ty {
             Ty::Void => true,
             Ty::Mutable(inner) => inner.is_void(),
             Ty::Array(elem) => elem.is_void(),
+            Ty::Union(u) => u.args.iter().any(|a| a.is_void()),
             Ty::Tuple(fields) => fields.iter().any(|(_, ty)| ty.is_void()),
             _ => false,
         }
@@ -233,6 +271,10 @@ impl Ty {
 pub fn subst_ty(ty: &Ty, env: &HashMap<String, Ty>) -> Ty {
     match ty {
         Ty::Array(elem) => Ty::Array(Box::new(subst_ty(elem, env))),
+        Ty::Union(u) => Ty::Union(Box::new(UnionTy {
+            name: u.name.clone(),
+            args: u.args.iter().map(|a| subst_ty(a, env)).collect(),
+        })),
         Ty::Tuple(fields) => Ty::Tuple(
             fields
                 .iter()
@@ -282,6 +324,17 @@ fn mangle_ty(ty: &Ty) -> String {
         Ty::String => "String".into(),
         Ty::File => "File".into(),
         Ty::Object(name) => format!("Object_{}", sanitize_object_name(name)),
+        Ty::Union(u) => {
+            // `Option[u64]` -> `Union_Option_u64`; bare `Option` ->
+            // `Union_Option`. `$` never appears inside an encoded argument,
+            // so multi-argument joins stay collision-free.
+            let mut out = format!("Union_{}", sanitize_object_name(&u.name));
+            for arg in &u.args {
+                out.push('_');
+                out.push_str(&mangle_ty(arg));
+            }
+            out
+        }
         Ty::Array(elem) => format!("Array_{}", mangle_ty(elem)),
         Ty::Tuple(fields) => {
             let parts: Vec<String> = fields
@@ -304,6 +357,21 @@ fn mangle_ty(ty: &Ty) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectSigTy {
     pub fields: Vec<(String, Ty)>,
+}
+
+/// Declaration-only metadata for one nominal union. It is intentionally
+/// separate from [`ObjectSigTy`]: unions have no fields, methods, or runtime
+/// layout in this milestone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnionSigTy {
+    pub type_params: Vec<String>,
+    pub variants: Vec<UnionVariantSigTy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnionVariantSigTy {
+    pub name: String,
+    pub payload: Vec<Ty>,
 }
 
 /// Compiler-owned signature of one user function.
@@ -464,6 +532,8 @@ pub struct TypedProgram {
     pub types: HashMap<u32, Ty>,
     /// User-defined object declarations and their field types.
     pub objects: HashMap<String, ObjectSigTy>,
+    /// Nominal union declarations, kept out of object layouts and methods.
+    pub unions: HashMap<String, UnionSigTy>,
     /// Top-level value names in order (for LIR/codegen).
     pub globals: Vec<String>,
     /// Function `DefId.0` -> parameter count (for arity checks + LIR).
@@ -636,6 +706,11 @@ fn template_expr_ids(e: &HirExpr, out: &mut HashSet<u32>) {
                 template_expr_ids(value, out);
             }
         }
+        HirExpr::Variant { args, .. } => {
+            for a in args {
+                template_expr_ids(a, out);
+            }
+        }
         HirExpr::Index { base, index, .. } => {
             template_expr_ids(base, out);
             template_expr_ids(index, out);
@@ -726,6 +801,24 @@ fn template_stmt_ids(s: &HirStmt, out: &mut HashSet<u32>) {
                 }
             }
         }
+        HirStmt::Match {
+            scrutinee,
+            arms,
+            else_body,
+            ..
+        } => {
+            template_expr_ids(scrutinee, out);
+            for arm in arms {
+                for st in &arm.body {
+                    template_stmt_ids(st, out);
+                }
+            }
+            if let Some(body) = else_body {
+                for st in body {
+                    template_stmt_ids(st, out);
+                }
+            }
+        }
         HirStmt::While {
             condition, body, ..
         } => {
@@ -791,15 +884,172 @@ fn generic_template_ids(prog: &HirProgram) -> HashSet<u32> {
 /// True when a converted type names a qualified object (`a.b.C`) with no
 /// layout in scope. Callers poison quietly: [`validate_qualified_types`]
 /// already reported the E302, so any follow-on mismatch would cascade.
-fn ty_has_unknown_qualified(ty: &Ty, objects: &HashMap<String, ObjectSigTy>) -> bool {
+fn ty_has_unknown_qualified(
+    ty: &Ty,
+    objects: &HashMap<String, ObjectSigTy>,
+    unions: &HashMap<String, UnionSigTy>,
+) -> bool {
     match ty {
-        Ty::Object(name) => name.contains('.') && !objects.contains_key(name),
-        Ty::Array(elem) => ty_has_unknown_qualified(elem, objects),
+        Ty::Object(name) => {
+            name.contains('.') && !objects.contains_key(name) && !unions.contains_key(name)
+        }
+        Ty::Array(elem) => ty_has_unknown_qualified(elem, objects, unions),
+        Ty::Union(u) => u
+            .args
+            .iter()
+            .any(|a| ty_has_unknown_qualified(a, objects, unions)),
         Ty::Tuple(fields) => fields
             .iter()
-            .any(|(_, ty)| ty_has_unknown_qualified(ty, objects)),
-        Ty::Mutable(inner) => ty_has_unknown_qualified(inner, objects),
+            .any(|(_, ty)| ty_has_unknown_qualified(ty, objects, unions)),
+        Ty::Mutable(inner) => ty_has_unknown_qualified(inner, objects, unions),
         _ => false,
+    }
+}
+
+/// Resolve union spellings in a converted annotation (see
+/// [`Checker::vl_to_ty`](Checker::vl_to_ty)). Free function so the module
+/// pre-pass (which owns no `Checker` yet) shares the exact rules.
+fn normalize_union_ty(
+    diags: &mut Vec<Diagnostic>,
+    unions: &HashMap<String, UnionSigTy>,
+    objects: &HashMap<String, ObjectSigTy>,
+    ty: Ty,
+    span: Span,
+) -> Ty {
+    match ty {
+        Ty::Union(u) => {
+            let name = u.name.clone();
+            let args = u
+                .args
+                .into_iter()
+                .map(|a| normalize_union_ty(diags, unions, objects, a, span))
+                .collect::<Vec<_>>();
+            if args.iter().any(ty_has_error) {
+                return Ty::Error;
+            }
+            let Some(sig) = unions.get(&name) else {
+                if objects.contains_key(&name) {
+                    diags.push(
+                        Diagnostic::error(format!("unknown type `{name}` with type arguments"))
+                            .with_label(
+                                span,
+                                format!("`{name}` is an object and takes no `[...]` arguments"),
+                            )
+                            .with_note("only `union` types take `[...]` type arguments")
+                            .with_code("E105"),
+                    );
+                } else {
+                    let mut diag = Diagnostic::error(format!(
+                        "unknown type `{name}`{}",
+                        if args.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "[{}]",
+                                args.iter()
+                                    .map(|a| a.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        }
+                    ))
+                    .with_label(span, "no union with this name is in scope")
+                    .with_code("E105");
+                    // Foreign unions need their qualified spelling
+                    // (`m.Option[u64]`); suggest it when unambiguous.
+                    if !name.contains('.') {
+                        let mut qualified: Vec<&String> = unions
+                            .keys()
+                            .filter(|k| k.rsplit('.').next().is_some_and(|short| short == name))
+                            .collect();
+                        qualified.sort();
+                        qualified.dedup();
+                        if qualified.len() == 1 {
+                            diag = diag.with_note(format!(
+                                "did you mean `{}`? (unions from other modules need their qualified spelling)",
+                                qualified[0]
+                            ));
+                        }
+                    }
+                    diags.push(diag);
+                }
+                return Ty::Error;
+            };
+            if args.len() != sig.type_params.len() {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "union `{name}` expects {} type argument(s), got {}",
+                        sig.type_params.len(),
+                        args.len()
+                    ))
+                    .with_label(
+                        span,
+                        format!(
+                            "write `{name}[...]` with {} argument(s)",
+                            sig.type_params.len()
+                        ),
+                    )
+                    .with_code("E302"),
+                );
+                return Ty::Error;
+            }
+            Ty::Union(Box::new(UnionTy { name, args }))
+        }
+        Ty::Object(name) => {
+            // A bare object spelling naming a union: the parser resolves
+            // file-local bare unions itself, so only qualified spellings
+            // (`m.Option`) and odd orders land here.
+            if let Some(sig) = unions.get(&name) {
+                if sig.type_params.is_empty() {
+                    return Ty::Union(Box::new(UnionTy {
+                        name,
+                        args: Vec::new(),
+                    }));
+                }
+                diags.push(
+                    Diagnostic::error(format!(
+                        "union `{name}` expects {} type argument(s), got 0",
+                        sig.type_params.len()
+                    ))
+                    .with_label(
+                        span,
+                        format!(
+                            "write `{name}[...]` with {} argument(s)",
+                            sig.type_params.len()
+                        ),
+                    )
+                    .with_code("E302"),
+                );
+                return Ty::Error;
+            }
+            Ty::Object(name)
+        }
+        Ty::Array(elem) => {
+            let elem = normalize_union_ty(diags, unions, objects, *elem, span);
+            if ty_has_error(&elem) {
+                return Ty::Error;
+            }
+            Ty::Array(Box::new(elem))
+        }
+        Ty::Tuple(fields) => {
+            let mut out = Vec::with_capacity(fields.len());
+            for (fname, fty) in fields {
+                let fty = normalize_union_ty(diags, unions, objects, fty, span);
+                if ty_has_error(&fty) {
+                    return Ty::Error;
+                }
+                out.push((fname, fty));
+            }
+            Ty::Tuple(out)
+        }
+        Ty::Mutable(inner) => {
+            let inner = normalize_union_ty(diags, unions, objects, *inner, span);
+            if ty_has_error(&inner) {
+                return Ty::Error;
+            }
+            Ty::Mutable(Box::new(inner))
+        }
+        _ => ty,
     }
 }
 
@@ -812,40 +1062,56 @@ fn ty_has_unknown_qualified(ty: &Ty, objects: &HashMap<String, ObjectSigTy>) -> 
 fn validate_qualified_types(
     prog: &HirProgram,
     objects: &HashMap<String, ObjectSigTy>,
+    unions: &HashMap<String, UnionSigTy>,
 ) -> Vec<Diagnostic> {
     fn check_ty(
         ty: &VlType,
         span: Span,
         objects: &HashMap<String, ObjectSigTy>,
+        unions: &HashMap<String, UnionSigTy>,
         diags: &mut Vec<Diagnostic>,
     ) {
         match ty {
-            VlType::Object(name) if name.contains('.') && !objects.contains_key(name) => {
+            VlType::Object(name)
+                if name.contains('.')
+                    && !objects.contains_key(name)
+                    && !unions.contains_key(name) =>
+            {
                 diags.push(
                     Diagnostic::error(format!("cannot find object type `{name}`"))
                         .with_label(span, "unknown object type")
                         .with_code("E302"),
                 );
             }
-            VlType::Array(elem) => check_ty(elem, span, objects, diags),
-            VlType::Tuple(fields) => {
-                for f in fields {
-                    check_ty(&f.ty, span, objects, diags);
+            VlType::Array(elem) => check_ty(elem, span, objects, unions, diags),
+            VlType::Union { args, .. } => {
+                // Union heads are validated during conversion
+                // (`normalize_union_ty` owns E105/E302); only dotted names
+                // nested in the arguments still need the walk. Bare argument
+                // names were parser-validated.
+                for arg in args {
+                    check_ty(arg, span, objects, unions, diags);
                 }
             }
-            VlType::Mutable(inner) => check_ty(inner, span, objects, diags),
+            VlType::Tuple(fields) => {
+                for f in fields {
+                    check_ty(&f.ty, span, objects, unions, diags);
+                }
+            }
+            VlType::Mutable(inner) => check_ty(inner, span, objects, unions, diags),
             _ => {}
         }
     }
     fn check_expr(
         expr: &HirExpr,
         objects: &HashMap<String, ObjectSigTy>,
+        unions: &HashMap<String, UnionSigTy>,
         diags: &mut Vec<Diagnostic>,
     ) {
         match expr {
             HirExpr::Cast { inner, .. } => {
                 // Target owned by `check_cast`; it reports once itself.
-                check_expr(inner, objects, diags);
+                check_expr(inner, objects, unions, diags);
             }
             HirExpr::Call {
                 type_args,
@@ -854,10 +1120,10 @@ fn validate_qualified_types(
                 ..
             } => {
                 for arg in type_args {
-                    check_ty(arg, *span, objects, diags);
+                    check_ty(arg, *span, objects, unions, diags);
                 }
                 for arg in args {
-                    check_expr(arg, objects, diags);
+                    check_expr(arg, objects, unions, diags);
                 }
             }
             HirExpr::MethodCall {
@@ -868,45 +1134,59 @@ fn validate_qualified_types(
                 ..
             } => {
                 for arg in type_args {
-                    check_ty(arg, *span, objects, diags);
+                    check_ty(arg, *span, objects, unions, diags);
                 }
-                check_expr(receiver, objects, diags);
+                check_expr(receiver, objects, unions, diags);
                 for arg in args {
-                    check_expr(arg, objects, diags);
+                    check_expr(arg, objects, unions, diags);
                 }
             }
             HirExpr::ArrayLiteral { elems, .. } => {
                 for elem in elems {
-                    check_expr(elem, objects, diags);
+                    check_expr(elem, objects, unions, diags);
                 }
             }
             HirExpr::ObjectLiteral { fields, .. } => {
                 for (_, value) in fields {
-                    check_expr(value, objects, diags);
+                    check_expr(value, objects, unions, diags);
+                }
+            }
+            HirExpr::Variant {
+                type_args,
+                args,
+                span,
+                ..
+            } => {
+                for arg in type_args {
+                    check_ty(arg, *span, objects, unions, diags);
+                }
+                for arg in args {
+                    check_expr(arg, objects, unions, diags);
                 }
             }
             HirExpr::Index { base, index, .. } => {
-                check_expr(base, objects, diags);
-                check_expr(index, objects, diags);
+                check_expr(base, objects, unions, diags);
+                check_expr(index, objects, unions, diags);
             }
             HirExpr::TupleLiteral { elems, .. } => {
                 for (_, value) in elems {
-                    check_expr(value, objects, diags);
+                    check_expr(value, objects, unions, diags);
                 }
             }
-            HirExpr::TupleIndex { base, .. } => check_expr(base, objects, diags),
-            HirExpr::Field { base, .. } => check_expr(base, objects, diags),
+            HirExpr::TupleIndex { base, .. } => check_expr(base, objects, unions, diags),
+            HirExpr::Field { base, .. } => check_expr(base, objects, unions, diags),
             HirExpr::Binary { lhs, rhs, .. } => {
-                check_expr(lhs, objects, diags);
-                check_expr(rhs, objects, diags);
+                check_expr(lhs, objects, unions, diags);
+                check_expr(rhs, objects, unions, diags);
             }
-            HirExpr::Unary { inner, .. } => check_expr(inner, objects, diags),
+            HirExpr::Unary { inner, .. } => check_expr(inner, objects, unions, diags),
             HirExpr::Literal { .. } | HirExpr::String { .. } | HirExpr::Var { .. } => {}
         }
     }
     fn check_stmts(
         stmts: &[HirStmt],
         objects: &HashMap<String, ObjectSigTy>,
+        unions: &HashMap<String, UnionSigTy>,
         diags: &mut Vec<Diagnostic>,
     ) {
         for stmt in stmts {
@@ -915,37 +1195,37 @@ fn validate_qualified_types(
                     ty, ty_span, value, ..
                 } => {
                     if let (Some(ty), Some(span)) = (ty, ty_span) {
-                        check_ty(ty, *span, objects, diags);
+                        check_ty(ty, *span, objects, unions, diags);
                     }
-                    check_expr(value, objects, diags);
+                    check_expr(value, objects, unions, diags);
                 }
-                HirStmt::Assign { value, .. } => check_expr(value, objects, diags),
-                HirStmt::Expr(value) => check_expr(value, objects, diags),
+                HirStmt::Assign { value, .. } => check_expr(value, objects, unions, diags),
+                HirStmt::Expr(value) => check_expr(value, objects, unions, diags),
                 HirStmt::IndexAssign {
                     array,
                     index,
                     value,
                     ..
                 } => {
-                    check_expr(array, objects, diags);
-                    check_expr(index, objects, diags);
-                    check_expr(value, objects, diags);
+                    check_expr(array, objects, unions, diags);
+                    check_expr(index, objects, unions, diags);
+                    check_expr(value, objects, unions, diags);
                 }
                 HirStmt::FieldAssign { base, value, .. } => {
-                    check_expr(base, objects, diags);
-                    check_expr(value, objects, diags);
+                    check_expr(base, objects, unions, diags);
+                    check_expr(value, objects, unions, diags);
                 }
                 HirStmt::TupleAssign { base, value, .. } => {
-                    check_expr(base, objects, diags);
-                    check_expr(value, objects, diags);
+                    check_expr(base, objects, unions, diags);
+                    check_expr(value, objects, unions, diags);
                 }
                 HirStmt::Destructure {
                     ty, ty_span, value, ..
                 } => {
                     if let (Some(ty), Some(span)) = (ty, ty_span) {
-                        check_ty(ty, *span, objects, diags);
+                        check_ty(ty, *span, objects, unions, diags);
                     }
-                    check_expr(value, objects, diags);
+                    check_expr(value, objects, unions, diags);
                 }
                 HirStmt::If {
                     condition,
@@ -953,21 +1233,35 @@ fn validate_qualified_types(
                     else_body,
                     ..
                 } => {
-                    check_expr(condition, objects, diags);
-                    check_stmts(then_body, objects, diags);
+                    check_expr(condition, objects, unions, diags);
+                    check_stmts(then_body, objects, unions, diags);
                     if let Some(else_body) = else_body {
-                        check_stmts(else_body, objects, diags);
+                        check_stmts(else_body, objects, unions, diags);
+                    }
+                }
+                HirStmt::Match {
+                    scrutinee,
+                    arms,
+                    else_body,
+                    ..
+                } => {
+                    check_expr(scrutinee, objects, unions, diags);
+                    for arm in arms {
+                        check_stmts(&arm.body, objects, unions, diags);
+                    }
+                    if let Some(else_body) = else_body {
+                        check_stmts(else_body, objects, unions, diags);
                     }
                 }
                 HirStmt::While {
                     condition, body, ..
                 } => {
-                    check_expr(condition, objects, diags);
-                    check_stmts(body, objects, diags);
+                    check_expr(condition, objects, unions, diags);
+                    check_stmts(body, objects, unions, diags);
                 }
                 HirStmt::Return { value, .. } => {
                     if let Some(value) = value {
-                        check_expr(value, objects, diags);
+                        check_expr(value, objects, unions, diags);
                     }
                 }
                 HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
@@ -980,7 +1274,14 @@ fn validate_qualified_types(
             HirItem::Object { fields, .. } => {
                 for (_, ty, span) in fields {
                     if let Some(ty) = ty {
-                        check_ty(ty, *span, objects, &mut diags);
+                        check_ty(ty, *span, objects, unions, &mut diags);
+                    }
+                }
+            }
+            HirItem::Union { variants, .. } => {
+                for variant in variants {
+                    for (ty, span) in &variant.payload {
+                        check_ty(ty, *span, objects, unions, &mut diags);
                     }
                 }
             }
@@ -988,17 +1289,17 @@ fn validate_qualified_types(
                 ty, ty_span, value, ..
             } => {
                 if let (Some(ty), Some(span)) = (ty, ty_span) {
-                    check_ty(ty, *span, objects, &mut diags);
+                    check_ty(ty, *span, objects, unions, &mut diags);
                 }
-                check_expr(value, objects, &mut diags);
+                check_expr(value, objects, unions, &mut diags);
             }
             HirItem::Destructure {
                 ty, ty_span, value, ..
             } => {
                 if let (Some(ty), Some(span)) = (ty, ty_span) {
-                    check_ty(ty, *span, objects, &mut diags);
+                    check_ty(ty, *span, objects, unions, &mut diags);
                 }
-                check_expr(value, objects, &mut diags);
+                check_expr(value, objects, unions, &mut diags);
             }
             HirItem::Fn {
                 params,
@@ -1009,13 +1310,13 @@ fn validate_qualified_types(
             } => {
                 for (_, _, ty, span) in params {
                     if let Some(ty) = ty {
-                        check_ty(ty, *span, objects, &mut diags);
+                        check_ty(ty, *span, objects, unions, &mut diags);
                     }
                 }
                 if let (Some(ret), Some(span)) = (ret, ret_span) {
-                    check_ty(ret, *span, objects, &mut diags);
+                    check_ty(ret, *span, objects, unions, &mut diags);
                 }
-                check_stmts(body, objects, &mut diags);
+                check_stmts(body, objects, unions, &mut diags);
             }
         }
     }
@@ -1104,8 +1405,123 @@ pub fn check_with_modules(
                 }
             }
         }
+        for export in &spec.unions {
+            if cx.typed.unions.contains_key(&export.qualified) {
+                continue;
+            }
+            let env: HashMap<String, Ty> = export
+                .type_params
+                .iter()
+                .map(|p| (p.name.clone(), Ty::Param(p.name.clone())))
+                .collect();
+            cx.typed.unions.insert(
+                export.qualified.clone(),
+                UnionSigTy {
+                    type_params: export.type_params.iter().map(|p| p.name.clone()).collect(),
+                    variants: export
+                        .variants
+                        .iter()
+                        .map(|variant| UnionVariantSigTy {
+                            name: variant.name.clone(),
+                            payload: variant
+                                .payload
+                                .iter()
+                                .map(|ty| Ty::from_vl_in(ty, &env))
+                                .collect(),
+                        })
+                        .collect(),
+                },
+            );
+        }
     }
-    // Pass 0: collect object layouts so field types and object literals can
+    // Predeclare every local nominal name before validating any declaration so
+    // qualified forward/self references are known without manufacturing union
+    // object layouts.
+    for item in &prog.items {
+        match item {
+            HirItem::Union {
+                name, type_params, ..
+            } => {
+                let sig = UnionSigTy {
+                    type_params: type_params.iter().map(|p| p.name.clone()).collect(),
+                    variants: Vec::new(),
+                };
+                cx.typed.unions.entry(name.clone()).or_insert(sig.clone());
+                cx.typed
+                    .unions
+                    .entry(format!("{}.{}", prog.module, name))
+                    .or_insert(sig);
+            }
+            HirItem::Object { name, .. } => {
+                cx.typed
+                    .objects
+                    .entry(name.clone())
+                    .or_insert_with(|| ObjectSigTy { fields: Vec::new() });
+                cx.typed
+                    .objects
+                    .entry(format!("{}.{}", prog.module, name))
+                    .or_insert_with(|| ObjectSigTy { fields: Vec::new() });
+            }
+            _ => {}
+        }
+    }
+    // Pass 0: collect nominal union metadata separately from object layouts.
+    for item in &prog.items {
+        let HirItem::Union {
+            name,
+            type_params,
+            variants,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        let env: HashMap<String, Ty> = type_params
+            .iter()
+            .map(|p| (p.name.clone(), Ty::Param(p.name.clone())))
+            .collect();
+        let out_variants = variants
+            .iter()
+            .map(|variant| UnionVariantSigTy {
+                name: variant.name.clone(),
+                payload: variant
+                    .payload
+                    .iter()
+                    .map(|(ty, span)| {
+                        let mut payload_ty = Checker::vl_to_ty_in(
+                            &mut cx.diags,
+                            &cx.typed.unions,
+                            &cx.typed.objects,
+                            ty,
+                            &env,
+                            *span,
+                        );
+                        if ty_has_error(&payload_ty)
+                            || payload_ty.is_void()
+                            || ty_has_unknown_qualified(
+                                &payload_ty,
+                                &cx.typed.objects,
+                                &cx.typed.unions,
+                            )
+                            || !validate_capability(&payload_ty, *span, &mut cx.diags)
+                        {
+                            payload_ty = Ty::Error;
+                        }
+                        payload_ty
+                    })
+                    .collect(),
+            })
+            .collect();
+        let sig = UnionSigTy {
+            type_params: type_params.iter().map(|p| p.name.clone()).collect(),
+            variants: out_variants,
+        };
+        cx.typed.unions.insert(name.clone(), sig.clone());
+        cx.typed
+            .unions
+            .insert(format!("{}.{}", prog.module, name), sig);
+    }
+    // Pass 1: collect object layouts so field types and object literals can
     // refer to declarations in either order.
     for item in &prog.items {
         if let HirItem::Object { name, fields, .. } = item {
@@ -1113,11 +1529,20 @@ pub fn check_with_modules(
             for (field, ty, span) in fields {
                 let mut field_ty = ty
                     .as_ref()
-                    .map(|v| Ty::from_vl_in(v, &HashMap::new()))
+                    .map(|v| {
+                        Checker::vl_to_ty_in(
+                            &mut cx.diags,
+                            &cx.typed.unions,
+                            &cx.typed.objects,
+                            v,
+                            &HashMap::new(),
+                            *span,
+                        )
+                    })
                     .unwrap_or(Ty::Error);
                 if ty_has_error(&field_ty) {
                     // Parser already reported (unknown type); stay quiet.
-                } else if ty_has_unknown_qualified(&field_ty, &cx.typed.objects) {
+                } else if ty_has_unknown_qualified(&field_ty, &cx.typed.objects, &cx.typed.unions) {
                     // Qualified reference with no layout in scope: the
                     // validation walk below owns the E302, so poison quietly.
                     field_ty = Ty::Error;
@@ -1142,8 +1567,11 @@ pub fn check_with_modules(
                 .insert(format!("{}.{}", prog.module, name), sig);
         }
     }
-    cx.diags
-        .append(&mut validate_qualified_types(prog, &cx.typed.objects));
+    cx.diags.append(&mut validate_qualified_types(
+        prog,
+        &cx.typed.objects,
+        &cx.typed.unions,
+    ));
     // Pass 1: collect function signatures so calls resolve arity + types
     // regardless of definition order (matches the resolver pre-pass).
     for item in &prog.items {
@@ -1171,9 +1599,20 @@ pub fn check_with_modules(
             for (pname, _, t, pspan) in params {
                 let mut pt = t
                     .as_ref()
-                    .map(|v| Ty::from_vl_in(v, &env))
+                    .map(|v| {
+                        Checker::vl_to_ty_in(
+                            &mut cx.diags,
+                            &cx.typed.unions,
+                            &cx.typed.objects,
+                            v,
+                            &env,
+                            *pspan,
+                        )
+                    })
                     .unwrap_or(Ty::Error);
-                if !ty_has_error(&pt) && ty_has_unknown_qualified(&pt, &cx.typed.objects) {
+                if !ty_has_error(&pt)
+                    && ty_has_unknown_qualified(&pt, &cx.typed.objects, &cx.typed.unions)
+                {
                     // Qualified reference with no layout: the validation walk
                     // owns the E302, so poison quietly instead of cascading
                     // arity-independent E303s at every call site.
@@ -1195,9 +1634,20 @@ pub fn check_with_modules(
             }
             let mut ret_ty = ret
                 .as_ref()
-                .map(|v| Ty::from_vl_in(v, &env))
+                .map(|v| {
+                    Checker::vl_to_ty_in(
+                        &mut cx.diags,
+                        &cx.typed.unions,
+                        &cx.typed.objects,
+                        v,
+                        &env,
+                        ret_span.unwrap_or(*span),
+                    )
+                })
                 .unwrap_or(Ty::Error);
-            if !ty_has_error(&ret_ty) && ty_has_unknown_qualified(&ret_ty, &cx.typed.objects) {
+            if !ty_has_error(&ret_ty)
+                && ty_has_unknown_qualified(&ret_ty, &cx.typed.objects, &cx.typed.unions)
+            {
                 ret_ty = Ty::Error;
             }
             if !ty_has_error(&ret_ty) {
@@ -1305,15 +1755,82 @@ pub(crate) fn canonicalize_for_key(
     }
 }
 
+/// Union arguments carried by an expected type (`Union` or `*Union`) when it
+/// names `union` with `arity` parameters. `None` means "no usable context"
+/// (a different type, poisoned, or an arity mismatch — inference proceeds and
+/// the boundary reports any real mismatch).
+fn expected_union_args(expected: Option<&Ty>, union: &str, arity: usize) -> Option<Vec<Ty>> {
+    let want = expected?;
+    let inner = match want {
+        Ty::Union(u) if u.name == union => &u.args,
+        Ty::Mutable(inner) => match &**inner {
+            Ty::Union(u) if u.name == union => &u.args,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if inner.len() != arity || inner.iter().any(ty_has_error) {
+        return None;
+    }
+    Some(inner.clone())
+}
+
 impl Checker {
     fn record(&mut self, id: vl_hir::HirId, ty: Ty) -> Ty {
         self.typed.types.insert(id.0, ty.clone());
         ty
     }
 
+    /// Convert a user annotation to [`Ty`], resolving union spellings against
+    /// the declared (local + imported) unions.
+    ///
+    /// - `VlType::Union` validates the union exists and the arity matches.
+    /// - Bare `VlType::Object` naming a monomorphic union becomes
+    ///   `Union{name, []}` (covers qualified `m.U`, which the parser cannot
+    ///   resolve); naming a generic union is one E302 (write `U[...]`).
+    ///
+    /// Recurses through `Array`/`Tuple`/`Union` arguments/`*` so
+    /// `Array[Option[u64]]` works. Reports once per call; callers poison via
+    /// the returned [`Ty::Error`].
+    fn vl_to_ty(&mut self, v: &VlType, span: Span) -> Ty {
+        let ty = Ty::from_vl_in(v, &self.type_env);
+        self.normalize_union_ty(ty, span)
+    }
+
+    /// Same as [`vl_to_ty`](Self::vl_to_ty) with an explicit type-parameter
+    /// environment (union declarations and the module pre-pass, which build
+    /// their own `env` instead of using the current function scope).
+    fn vl_to_ty_in(
+        diags: &mut Vec<Diagnostic>,
+        unions: &HashMap<String, UnionSigTy>,
+        objects: &HashMap<String, ObjectSigTy>,
+        v: &VlType,
+        env: &HashMap<String, Ty>,
+        span: Span,
+    ) -> Ty {
+        let ty = Ty::from_vl_in(v, env);
+        normalize_union_ty(diags, unions, objects, ty, span)
+    }
+
+    fn normalize_union_ty(&mut self, ty: Ty, span: Span) -> Ty {
+        normalize_union_ty(
+            &mut self.diags,
+            &self.typed.unions,
+            &self.typed.objects,
+            ty,
+            span,
+        )
+    }
+
+    /// Look up a union by spelling (bare `Option` or qualified `m.Option`).
+    fn union_sig(&self, name: &str) -> Option<UnionSigTy> {
+        self.typed.unions.get(name).cloned()
+    }
+
     fn check_item(&mut self, item: &HirItem) {
         match item {
             HirItem::Object { .. } => {}
+            HirItem::Union { .. } => {}
             HirItem::Let {
                 id,
                 def,
@@ -1391,29 +1908,32 @@ impl Checker {
                     .iter()
                     .filter_map(|p| p.bound.map(|b| (p.name.clone(), b)))
                     .collect();
-                let mut ret_ty = ret
-                    .as_ref()
-                    .map(|v| Ty::from_vl_in(v, &self.type_env))
-                    .unwrap_or(Ty::Error);
+                // Signatures were validated once in the pre-pass (annotations
+                // converted, union spellings normalized, E104/E106/E302 owned
+                // there); reuse them so no second error cascades here.
+                let (mut ret_ty, sig_params) = match def {
+                    Some(d) => match self.typed.func_sigs.get(&d.0) {
+                        Some(sig) => (sig.ret.clone(), sig.param_tys.clone()),
+                        None => (Ty::Error, vec![Ty::Error; params.len()]),
+                    },
+                    None => (Ty::Error, vec![Ty::Error; params.len()]),
+                };
                 self.record(*id, ret_ty.clone());
                 // Bad annotations were already reported by the parser
-                // (E104/E105) or by Pass 1 (E106); poison the scope quietly
-                // so no second error cascades. (An omitted return parses as
-                // `void`, never `None`.) Capability-invalid shapes (`*T`,
-                // `*u64` surviving as `Error` excluded) poison quietly here
-                // without re-reporting: Pass 1 already owns E106.
+                // (E104/E105) or by Pass 1 (E106/E302); poison the scope
+                // quietly so no second error cascades. (An omitted return
+                // parses as `void`, never `None`.) Capability-invalid shapes
+                // (`*T`, `*u64` surviving as `Error` excluded) poison quietly
+                // here without re-reporting: Pass 1 already owns E106.
                 let mut poisoned_sig =
                     ty_has_error(&ret_ty) || params.iter().any(|(_, _, t, _)| t.is_none());
                 if !ty_has_error(&ret_ty) && !is_capability_valid(&ret_ty) {
                     ret_ty = Ty::Error;
                     poisoned_sig = true;
                 }
-                for (_, def, ty, _) in params {
+                for ((_, def, _, _), t) in params.iter().zip(sig_params.iter()) {
                     if let Some(def) = def {
-                        let mut t = ty
-                            .as_ref()
-                            .map(|v| Ty::from_vl_in(v, &self.type_env))
-                            .unwrap_or(Ty::Error);
+                        let mut t = t.clone();
                         if !ty_has_error(&t) && !is_capability_valid(&t) {
                             t = Ty::Error;
                             poisoned_sig = true;
@@ -1464,6 +1984,7 @@ impl Checker {
                     );
                 }
                 let _ = def;
+                let _ = ret;
             }
         }
     }
@@ -1521,14 +2042,17 @@ impl Checker {
             poison(self);
             return Ty::Error;
         }
-        let ann = ty.as_ref().map(|v| Ty::from_vl_in(v, &self.type_env));
+        let ann = ty.as_ref().map(|v| {
+            let asp = ty_span.unwrap_or(value.span());
+            self.vl_to_ty(v, asp)
+        });
         if let Some(a) = &ann {
             if ty_has_error(a) {
                 let _ = self.infer_expr(value);
                 poison(self);
                 return Ty::Error;
             }
-            if ty_has_unknown_qualified(a, &self.typed.objects) {
+            if ty_has_unknown_qualified(a, &self.typed.objects, &self.typed.unions) {
                 let _ = self.infer_expr(value);
                 poison(self);
                 return Ty::Error;
@@ -1710,13 +2234,16 @@ impl Checker {
             let _ = self.infer_expr(value);
             return Ty::Error;
         }
-        let ann = ty.as_ref().map(|v| Ty::from_vl_in(v, &self.type_env));
+        let ann = ty.as_ref().map(|v| {
+            let asp = ty_span.unwrap_or(value.span());
+            self.vl_to_ty(v, asp)
+        });
         if let Some(a) = &ann {
             if ty_has_error(a) {
                 let _ = self.infer_expr(value);
                 return Ty::Error;
             }
-            if ty_has_unknown_qualified(a, &self.typed.objects) {
+            if ty_has_unknown_qualified(a, &self.typed.objects, &self.typed.unions) {
                 // Qualified annotation with no layout: the validation walk
                 // owns the E302, so poison quietly instead of cascading E309.
                 let _ = self.infer_expr(value);
@@ -2485,6 +3012,218 @@ impl Checker {
                     }
                 }
             }
+            HirStmt::Match {
+                scrutinee,
+                arms,
+                else_body,
+                span,
+            } => {
+                self.check_match(scrutinee, arms, else_body.as_deref(), *span);
+            }
+        }
+    }
+
+    /// Check `match (scrut) { Union.Variant(binds) { ... } ... else { ... } }`.
+    /// The scrutinee must be a `Union` (or `*Union`); each arm must name a
+    /// variant of that union with exactly the payload arity, binding each
+    /// payload position to a fresh `val` (capability-projected like field
+    /// reads). Duplicate arms are one E200; a missing `else` with uncovered
+    /// variants is one E309. Bodies always check (poisoned bindings stay
+    /// quiet) so one root cause never hides inner errors.
+    fn check_match(
+        &mut self,
+        scrutinee: &HirExpr,
+        arms: &[vl_hir::HirMatchArm],
+        else_body: Option<&[HirStmt]>,
+        span: Span,
+    ) {
+        let scrut_ty = self.infer_expr(scrutinee);
+        // Poison every arm binding quietly (the one root cause is reported
+        // by the caller path below).
+        let poison_arm = |checker: &mut Self, arm: &vl_hir::HirMatchArm| {
+            for b in &arm.bindings {
+                if let Some(def) = &b.def {
+                    checker.bindings.insert(def.0, Ty::Error);
+                    checker.fixed_defs.insert(def.0);
+                }
+            }
+        };
+        if ty_has_error(&scrut_ty) {
+            for arm in arms {
+                poison_arm(self, arm);
+                for stmt in &arm.body {
+                    self.check_stmt(stmt);
+                }
+            }
+            if let Some(body) = else_body {
+                for stmt in body {
+                    self.check_stmt(stmt);
+                }
+            }
+            return;
+        }
+        let scrut_core: Option<(&String, &Vec<Ty>)> = match &scrut_ty {
+            Ty::Union(u) => Some((&u.name, &u.args)),
+            Ty::Mutable(inner) => match &**inner {
+                Ty::Union(u) => Some((&u.name, &u.args)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((scrut_name, scrut_args)) = scrut_core else {
+            self.diags.push(
+                Diagnostic::error(format!("match scrutinee must be a union, got `{scrut_ty}`"))
+                    .with_label(scrutinee.span(), "expected a union value here")
+                    .with_code("E302"),
+            );
+            for arm in arms {
+                poison_arm(self, arm);
+                for stmt in &arm.body {
+                    self.check_stmt(stmt);
+                }
+            }
+            if let Some(body) = else_body {
+                for stmt in body {
+                    self.check_stmt(stmt);
+                }
+            }
+            return;
+        };
+        let scrut_name = scrut_name.clone();
+        let scrut_args = scrut_args.clone();
+        let Some(sig) = self.union_sig(&scrut_name) else {
+            self.diags.push(
+                Diagnostic::error(format!("cannot find union type `{scrut_name}`"))
+                    .with_label(span, "unknown union type")
+                    .with_code("E302"),
+            );
+            for arm in arms {
+                poison_arm(self, arm);
+                for stmt in &arm.body {
+                    self.check_stmt(stmt);
+                }
+            }
+            if let Some(body) = else_body {
+                for stmt in body {
+                    self.check_stmt(stmt);
+                }
+            }
+            return;
+        };
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for arm in arms {
+            if arm.union != scrut_name {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "pattern `{}.{}` does not match scrutinee type `{scrut_name}`",
+                        arm.union, arm.variant
+                    ))
+                    .with_label(arm.span, "this arm matches a different union")
+                    .with_code("E302"),
+                );
+                poison_arm(self, arm);
+                for stmt in &arm.body {
+                    self.check_stmt(stmt);
+                }
+                continue;
+            }
+            let Some(tag) = sig.variants.iter().position(|v| v.name == arm.variant) else {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "union `{scrut_name}` has no variant `{}`",
+                        arm.variant
+                    ))
+                    .with_label(arm.span, "unknown union variant")
+                    .with_code("E302"),
+                );
+                poison_arm(self, arm);
+                for stmt in &arm.body {
+                    self.check_stmt(stmt);
+                }
+                continue;
+            };
+            if !seen.insert(arm.variant.clone()) {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "duplicate arm for variant `{scrut_name}.{}`",
+                        arm.variant
+                    ))
+                    .with_label(arm.span, "this variant is already matched above")
+                    .with_code("E200"),
+                );
+                poison_arm(self, arm);
+                for stmt in &arm.body {
+                    self.check_stmt(stmt);
+                }
+                continue;
+            }
+            covered.insert(arm.variant.clone());
+            let payload = &sig.variants[tag].payload;
+            if arm.bindings.len() != payload.len() {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "variant `{scrut_name}.{}` has {} payload(s), pattern binds {}",
+                        arm.variant,
+                        payload.len(),
+                        arm.bindings.len()
+                    ))
+                    .with_label(arm.span, "arity mismatch in match pattern")
+                    .with_code("E303"),
+                );
+                poison_arm(self, arm);
+                for stmt in &arm.body {
+                    self.check_stmt(stmt);
+                }
+                continue;
+            }
+            let env: HashMap<String, Ty> = sig
+                .type_params
+                .iter()
+                .cloned()
+                .zip(scrut_args.iter().cloned())
+                .collect();
+            for (binding, formal) in arm.bindings.iter().zip(payload.iter()) {
+                let bound = project_capability(&scrut_ty, &subst_ty(formal, &env));
+                if let Some(def) = &binding.def {
+                    if ty_has_error(&bound) {
+                        self.bindings.insert(def.0, Ty::Error);
+                    } else {
+                        self.bindings.insert(def.0, bound);
+                    }
+                    self.fixed_defs.insert(def.0);
+                }
+            }
+            for stmt in &arm.body {
+                self.check_stmt(stmt);
+            }
+        }
+        if let Some(body) = else_body {
+            for stmt in body {
+                self.check_stmt(stmt);
+            }
+        } else {
+            let mut missing: Vec<&str> = sig
+                .variants
+                .iter()
+                .filter(|v| !covered.contains(&v.name))
+                .map(|v| v.name.as_str())
+                .collect();
+            missing.sort();
+            if !missing.is_empty() {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "match is not exhaustive: missing variant(s) {}",
+                        missing
+                            .iter()
+                            .map(|v| format!("`{scrut_name}.{v}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                    .with_label(span, "add an `else` arm for the remaining variants")
+                    .with_code("E309"),
+                );
+            }
         }
     }
 
@@ -2984,14 +3723,16 @@ impl Checker {
 
     /// Convert one explicit type argument with unbound-name reporting.
     /// (Declaration positions are parser-validated; turbofish arguments in
-    /// expression position parse permissively and land here.)
+    /// expression position parse permissively and land here.) Union spellings
+    /// normalize like annotations (`Option[u64]`, qualified `m.Option`).
     fn vl_to_ty_reported(&mut self, v: &VlType, span: Span) -> Ty {
-        let ty = Ty::from_vl_in(v, &self.type_env);
+        let ty = self.vl_to_ty(v, span);
         if ty_has_error(&ty) {
-            // from_vl_in only fails on unbound `Param` (void-in-Array is a
-            // parser error; everything else converts). Recurse through
-            // `Array` and `*` so `Array[Missing]` and `*Missing` report E105
-            // here instead of leaking to an E500 downstream.
+            // Conversion only fails on unknown names/`void`/arity (parser
+            // errors surface as `None` annotations elsewhere); unbound
+            // `Param`s report E105 here instead of leaking to an E500.
+            // Recurse through containers so `Array[Missing]` reports E105
+            // here instead of leaking downstream.
             if Self::vl_has_unbound_param(v) {
                 self.diags.push(
                     Diagnostic::error(format!("unknown type `{v}`"))
@@ -3005,12 +3746,13 @@ impl Checker {
     }
 
     /// True when a type argument mentions an unbound `Param` at any depth
-    /// (including through `Array[T]` and `*T`).
+    /// (including through `Array[T]`, union arguments, and `*T`).
     fn vl_has_unbound_param(v: &VlType) -> bool {
         match v {
             VlType::Param(_) => true,
             VlType::Array(elem) => Self::vl_has_unbound_param(elem),
             VlType::Tuple(fields) => fields.iter().any(|f| Self::vl_has_unbound_param(&f.ty)),
+            VlType::Union { args, .. } => args.iter().any(Self::vl_has_unbound_param),
             VlType::Mutable(inner) => Self::vl_has_unbound_param(inner),
             _ => false,
         }
@@ -3153,6 +3895,243 @@ impl Checker {
         Some(out)
     }
 
+    /// Declared payload of one union variant: index (tag order) plus arity.
+    fn lookup_variant(&self, union: &str, variant: &str) -> Option<(UnionSigTy, usize)> {
+        let sig = self.union_sig(union)?;
+        let tag = sig.variants.iter().position(|v| v.name == variant)?;
+        Some((sig, tag))
+    }
+
+    /// Instantiate a variant's payload formals under concrete union arguments
+    /// (declaration parameters substituted). `None` when unknown (reported by
+    /// the caller).
+    fn variant_payload_tys(&self, sig: &UnionSigTy, tag: usize, args: &[Ty]) -> Option<Vec<Ty>> {
+        let payload = &sig.variants.get(tag)?.payload;
+        let env: HashMap<String, Ty> = sig
+            .type_params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect();
+        Some(payload.iter().map(|t| subst_ty(t, &env)).collect())
+    }
+
+    /// Check `Union.Variant(args)` construction. `expected` (a `Union` or
+    /// `*Union` from an annotation, parameter, or return position) supplies
+    /// the union arguments when present and name-matching; an explicit
+    /// turbofish wins over it; otherwise arguments infer from the payloads
+    /// (missing constraints are one E303, like generic calls).
+    #[allow(clippy::too_many_arguments)]
+    fn check_variant(
+        &mut self,
+        id: vl_hir::HirId,
+        union: &str,
+        variant: &str,
+        type_args: &[VlType],
+        args: &[HirExpr],
+        span: Span,
+        expected: Option<&Ty>,
+    ) -> Ty {
+        let display = format!("{union}.{variant}");
+        let Some((sig, tag)) = self.lookup_variant(union, variant) else {
+            // Unreachable through the driver (semantic owns unknown unions
+            // and variants with E201/E302 and records no site), but poison
+            // loudly rather than silently for hand-built HIR.
+            self.diags.push(
+                Diagnostic::error(format!("cannot find union variant `{display}`"))
+                    .with_label(span, "unknown union variant")
+                    .with_code("E302"),
+            );
+            for arg in args {
+                let _ = self.infer_expr(arg);
+            }
+            return self.record(id, Ty::Error);
+        };
+        // Infer payload argument types first (inner errors surface here, like
+        // calls). Bare `Array.new(n)` and empty `[]` defer to the formal,
+        // exactly like call arguments.
+        let mut arg_tys = Vec::with_capacity(args.len());
+        let mut poisoned = false;
+        for arg in args {
+            if let HirExpr::Call {
+                name: inner,
+                type_args: inner_args,
+                args: inner_call_args,
+                ..
+            } = arg
+            {
+                if inner == "Array.new" && inner_args.is_empty() {
+                    for a in inner_call_args {
+                        let _ = self.infer_expr(a);
+                    }
+                    arg_tys.push(Ty::Error);
+                    continue;
+                }
+            }
+            if let HirExpr::ArrayLiteral { elems, .. } = arg {
+                if elems.is_empty() {
+                    arg_tys.push(Ty::Error);
+                    continue;
+                }
+            }
+            let t = self.infer_expr(arg);
+            if ty_has_error(&t) {
+                poisoned = true;
+            }
+            arg_tys.push(t);
+        }
+        let formals = sig.variants[tag].payload.clone();
+        if args.len() != formals.len() {
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "variant `{display}` expects {} argument(s), got {}",
+                    formals.len(),
+                    args.len()
+                ))
+                .with_label(span, "wrong number of variant arguments")
+                .with_code("E303"),
+            );
+            return self.record(id, Ty::Error);
+        }
+        if poisoned {
+            return self.record(id, Ty::Error);
+        }
+        // Resolve the union arguments: explicit turbofish, then the expected
+        // union (same name, arity-checked), then payload inference.
+        let resolved: Option<Vec<Ty>> = if !type_args.is_empty() {
+            if type_args.len() != sig.type_params.len() {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "`{display}` expects {} type argument(s), got {}",
+                        sig.type_params.len(),
+                        type_args.len()
+                    ))
+                    .with_label(span, "wrong number of type arguments")
+                    .with_code("E303"),
+                );
+                return self.record(id, Ty::Error);
+            }
+            let mut out = Vec::with_capacity(type_args.len());
+            for v in type_args {
+                let t = self.vl_to_ty_reported(v, span);
+                if ty_has_error(&t) {
+                    return self.record(id, Ty::Error);
+                }
+                if !is_capability_valid(&t) {
+                    validate_capability(&t, span, &mut self.diags);
+                    return self.record(id, Ty::Error);
+                }
+                if t == Ty::Void || t.is_void() {
+                    self.diags.push(
+                        Diagnostic::error("type argument cannot be `void`")
+                            .with_label(span, "`void` is not a value type")
+                            .with_code("E308"),
+                    );
+                    return self.record(id, Ty::Error);
+                }
+                out.push(t);
+            }
+            Some(out)
+        } else if let Some(want) = expected_union_args(expected, union, sig.type_params.len()) {
+            Some(want)
+        } else if args.is_empty() && type_args.is_empty() && !sig.type_params.is_empty() {
+            // A nullary variant of a generic union (`Option.None`) carries
+            // no constraints and takes no turbofish: the only source is an
+            // annotation. Point there instead of the generic `::[...]` hint.
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "cannot infer type argument(s) `{}` for `{display}`",
+                    sig.type_params.join(", ")
+                ))
+                .with_label(span, "annotate the binding with concrete arguments")
+                .with_note(format!("write e.g. `val x: {union}[u64] = {display};`"))
+                .with_code("E303"),
+            );
+            return self.record(id, Ty::Error);
+        } else {
+            // Inference: one synthetic signature over the declaration
+            // parameters, solved exactly like a generic call.
+            let decl_env: HashMap<String, Ty> = sig
+                .type_params
+                .iter()
+                .map(|p| (p.clone(), Ty::Param(p.clone())))
+                .collect();
+            let formal_tys: Vec<Ty> = formals.iter().map(|t| subst_ty(t, &decl_env)).collect();
+            let synthetic = FuncSigTy {
+                param_names: (0..formal_tys.len())
+                    .map(|i| format!("payload{i}"))
+                    .collect(),
+                param_tys: formal_tys,
+                ret: Ty::Void,
+                type_params: sig.type_params.clone(),
+                bounds: HashMap::new(),
+            };
+            self.infer_type_args(&display, span, &synthetic, &arg_tys)
+        };
+        let Some(resolved) = resolved else {
+            return self.record(id, Ty::Error);
+        };
+        let Some(wants) = self.variant_payload_tys(&sig, tag, &resolved) else {
+            return self.record(id, Ty::Error);
+        };
+        for (i, (arg, original_got)) in args.iter().zip(arg_tys.iter()).enumerate() {
+            let is_bare_new = matches!(arg, HirExpr::Call { name, type_args, .. } if name == "Array.new" && type_args.is_empty());
+            let is_empty_array =
+                matches!(arg, HirExpr::ArrayLiteral { elems, .. } if elems.is_empty());
+            if ty_has_error(original_got) && !(is_bare_new || is_empty_array) {
+                continue;
+            }
+            let want = &wants[i];
+            if ty_has_error(want) {
+                continue;
+            }
+            let got = self.infer_expr_expected(arg, want);
+            if ty_has_error(&got) {
+                continue;
+            }
+            if got == Ty::Void || *want == Ty::Void {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "variant `{display}` payload `{i}` cannot be `void`"
+                    ))
+                    .with_label(arg.span(), "unexpected `void` here")
+                    .with_code("E308"),
+                );
+                return self.record(id, Ty::Error);
+            }
+            if !can_coerce(&got, want) {
+                if got.readonly_view() == want.readonly_view()
+                    && got.is_mutable_view() != want.is_mutable_view()
+                {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "cannot pass read-only `{got}` to mutable variant payload `{i}: {want}`"
+                        ))
+                        .with_label(arg.span(), "mutation authority is required here")
+                        .with_note(format!("a read-only view cannot be upgraded to `{want}`"))
+                        .with_code("E306"),
+                    );
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "variant `{display}` payload `{i}` expects `{want}`, got `{got}`"
+                        ))
+                        .with_label(arg.span(), format!("expected `{want}` here"))
+                        .with_code("E306"),
+                    );
+                }
+                return self.record(id, Ty::Error);
+            }
+        }
+        self.record(
+            id,
+            Ty::Union(Box::new(UnionTy {
+                name: union.to_string(),
+                args: resolved,
+            })),
+        )
+    }
+
     /// `Array.new::[T](count)`: one `u64` argument, returns `Array[T]`.
     /// A bare `Array.new(count)` only typechecks under an annotated binding
     /// (handled in [`Checker::binding_type`](Self::binding_type)); everywhere else
@@ -3243,6 +4222,35 @@ impl Checker {
     }
 
     fn infer_expr_expected(&mut self, expr: &HirExpr, expected: &Ty) -> Ty {
+        // Contextual variant construction: an expected `Union` (or `*Union`)
+        // supplies the union arguments — a nullary `Option.None` under
+        // `val x: Option[u64]`, or payload `int` literals.
+        if let HirExpr::Variant {
+            id,
+            union,
+            variant,
+            type_args,
+            args,
+            span,
+        } = expr
+        {
+            let union_expected = matches!(expected, Ty::Union { .. })
+                || matches!(
+                    expected,
+                    Ty::Mutable(inner) if matches!(&**inner, Ty::Union { .. })
+                );
+            if union_expected && !ty_has_error(expected) {
+                let got =
+                    self.check_variant(*id, union, variant, type_args, args, *span, Some(expected));
+                if !ty_has_error(&got)
+                    && expected.is_mutable_view()
+                    && same_type(&got, &expected.readonly_view())
+                {
+                    return self.record(*id, expected.clone());
+                }
+                return got;
+            }
+        }
         // Contextual bare `Array.new(n)`: `Array[T]` or `*Array[T]` expected
         // supplies the element type (returns/args as well as bindings).
         if let HirExpr::Call {
@@ -3532,6 +4540,39 @@ impl Checker {
                     }
                 }
             }
+            HirExpr::Variant {
+                id,
+                union,
+                variant,
+                args,
+                ..
+            } => {
+                // Coerce payload literals under an expected union of the same
+                // name: instantiate the formals and recurse per argument,
+                // then record the expected shape (re-inference rebuilds it).
+                let want_union: Option<(&String, &Vec<Ty>)> = match expected {
+                    Ty::Union(u) => Some((&u.name, &u.args)),
+                    Ty::Mutable(inner) => match &**inner {
+                        Ty::Union(u) => Some((&u.name, &u.args)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some((want_name, want_args)) = want_union {
+                    if want_name == union {
+                        if let Some((sig, tag)) = self.lookup_variant(union, variant) {
+                            if let Some(wants) = self.variant_payload_tys(&sig, tag, want_args) {
+                                if wants.len() == args.len() {
+                                    for (arg, want) in args.iter().zip(wants.iter()) {
+                                        self.coerce_expr_literals(arg, want);
+                                    }
+                                    self.record(*id, expected.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             HirExpr::Binary { lhs, rhs, .. } if is_integer(expected) => {
                 self.coerce_expr_literals(lhs, expected);
                 self.coerce_expr_literals(rhs, expected);
@@ -3659,6 +4700,22 @@ impl Checker {
                 fields,
                 span,
             } => {
+                if self.typed.unions.contains_key(name) {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "cannot construct union `{name}` with an object literal"
+                        ))
+                        .with_label(*span, "unions construct through variants")
+                        .with_note(format!(
+                            "write `{name}.Variant(...)` for a payload variant or `{name}.Variant` for a nullary one"
+                        ))
+                        .with_code("E302"),
+                    );
+                    for (_, value) in fields {
+                        self.infer_expr(value);
+                    }
+                    return self.record(*id, Ty::Error);
+                }
                 let Some(sig) = self.typed.objects.get(name).cloned() else {
                     self.diags.push(
                         Diagnostic::error(format!("cannot find object type `{name}`"))
@@ -3753,6 +4810,14 @@ impl Checker {
                     self.record(*id, Ty::Object(name.clone()))
                 }
             }
+            HirExpr::Variant {
+                id,
+                union,
+                variant,
+                type_args,
+                args,
+                span,
+            } => self.check_variant(*id, union, variant, type_args, args, *span, None),
             HirExpr::TupleLiteral { id, elems, span } => {
                 if elems.len() < 2 {
                     self.diags.push(
@@ -4667,6 +5732,7 @@ pub(crate) fn ty_has_error(ty: &Ty) -> bool {
     match ty {
         Ty::Error => true,
         Ty::Array(elem) => ty_has_error(elem),
+        Ty::Union(u) => u.args.iter().any(ty_has_error),
         Ty::Tuple(fields) => fields.iter().any(|(_, ty)| ty_has_error(ty)),
         Ty::Mutable(inner) => ty_has_error(inner),
         _ => false,
@@ -4674,11 +5740,12 @@ pub(crate) fn ty_has_error(ty: &Ty) -> bool {
 }
 
 /// Does a type still hold an unresolved `int` literal (top level or nested
-/// in `Array`/`Tuple`)? Such types must be defaulted (`u64` lane) before lowering.
+/// in `Array`/`Tuple`/`Union`)? Such types must be defaulted (`u64` lane) before lowering.
 fn ty_contains_int(ty: &Ty) -> bool {
     match ty {
         Ty::Int => true,
         Ty::Array(elem) => ty_contains_int(elem),
+        Ty::Union(u) => u.args.iter().any(ty_contains_int),
         Ty::Tuple(fields) => fields.iter().any(|(_, ty)| ty_contains_int(ty)),
         Ty::Mutable(inner) => ty_contains_int(inner),
         _ => false,
@@ -4747,6 +5814,10 @@ pub(crate) fn default_inferred_ty(ty: Ty) -> Ty {
     match ty {
         Ty::Int => Ty::U64,
         Ty::Array(elem) => Ty::Array(Box::new(default_inferred_ty(*elem))),
+        Ty::Union(u) => Ty::Union(Box::new(UnionTy {
+            name: u.name.clone(),
+            args: u.args.into_iter().map(default_inferred_ty).collect(),
+        })),
         Ty::Tuple(fields) => Ty::Tuple(
             fields
                 .into_iter()
@@ -4790,6 +5861,18 @@ impl ConstraintSet {
                 true
             }
             (Ty::Array(f), Ty::Array(a)) => self.collect(f, a, name, span, diags),
+            (Ty::Union(fu), Ty::Union(au))
+                if fu.name == au.name && fu.args.len() == au.args.len() =>
+            {
+                let mut ok = true;
+                for (f, a) in fu.args.iter().zip(au.args.iter()) {
+                    if !self.collect(f, a, name, span, diags) {
+                        ok = false;
+                        break;
+                    }
+                }
+                ok
+            }
             (Ty::Tuple(fs), Ty::Tuple(as_)) => {
                 if fs.len() != as_.len() {
                     diags.push(
@@ -4961,6 +6044,33 @@ pub fn stmt_flow(stmt: &HirStmt) -> Flow {
             // the construct as diverging.
             Flow::Breaks
         }
+        HirStmt::Match {
+            arms, else_body, ..
+        } => {
+            // Like `if`, but arms stand in for branches: every arm plus
+            // `else` (when present) must agree. A missing `else` with full
+            // coverage behaves the same way (exhaustiveness is enforced by
+            // checking; when it fails, that E309 is the single root cause
+            // and this must not add a spurious missing-return error).
+            let mut flows: Vec<Flow> = Vec::with_capacity(arms.len() + 1);
+            for arm in arms {
+                flows.push(block_flow(&arm.body));
+            }
+            if let Some(else_body) = else_body {
+                flows.push(block_flow(else_body));
+            }
+            if flows.is_empty() {
+                return Flow::FallsThrough;
+            }
+            let first = flows[0];
+            if flows.iter().all(|f| *f == first) {
+                return first;
+            }
+            if flows.contains(&Flow::FallsThrough) {
+                return Flow::FallsThrough;
+            }
+            Flow::Breaks
+        }
     }
 }
 
@@ -5000,6 +6110,16 @@ fn check_unreachable(stmts: &[HirStmt], diags: &mut Vec<Diagnostic>) {
                     check_unreachable(body, diags);
                 }
             }
+            HirStmt::Match {
+                arms, else_body, ..
+            } => {
+                for arm in arms {
+                    check_unreachable(&arm.body, diags);
+                }
+                if let Some(body) = else_body {
+                    check_unreachable(body, diags);
+                }
+            }
             HirStmt::While { body, .. } => check_unreachable(body, diags),
             _ => {}
         }
@@ -5019,6 +6139,7 @@ fn stmt_span(stmt: &HirStmt) -> Span {
         | HirStmt::TupleAssign { span, .. }
         | HirStmt::Destructure { span, .. }
         | HirStmt::If { span, .. }
+        | HirStmt::Match { span, .. }
         | HirStmt::While { span, .. }
         | HirStmt::Break { span }
         | HirStmt::Continue { span }
@@ -5045,6 +6166,31 @@ fn fallthrough_span(body: &[HirStmt]) -> Option<Span> {
                 .map(|body| block_flow(body) == Flow::Returns)
                 .unwrap_or(false);
             if then_returns != else_returns {
+                return Some(*span);
+            }
+        }
+        if let HirStmt::Match {
+            arms,
+            else_body,
+            span,
+            ..
+        } = stmt
+        {
+            // Any arm/else disagreeing on `return` vs fallthrough lets
+            // execution fall through on some path: anchor there.
+            let mut returns = else_body
+                .as_ref()
+                .map(|body| block_flow(body) == Flow::Returns)
+                .unwrap_or(false);
+            let mut falls = else_body.is_none();
+            for arm in arms {
+                if block_flow(&arm.body) == Flow::Returns {
+                    returns = true;
+                } else {
+                    falls = true;
+                }
+            }
+            if returns && falls {
                 return Some(*span);
             }
         }
@@ -5134,6 +6280,18 @@ fn common_type(a: &Ty, b: &Ty) -> Option<Ty> {
         // `Array[*Foo]` vs `Array[Foo]` therefore has no common type.
         (Ty::Array(x), Ty::Array(y)) => invariant_common(x, y).map(|e| Ty::Array(Box::new(e))),
         (Ty::Mutable(x), Ty::Mutable(y)) => common_type(x, y).map(|e| Ty::Mutable(Box::new(e))),
+        // Same-named unions merge argument-wise (arity already enforced by
+        // checking; a length mismatch here is a genuine conflict).
+        (Ty::Union(au), Ty::Union(bu)) if au.name == bu.name && au.args.len() == bu.args.len() => {
+            let mut out = Vec::with_capacity(au.args.len());
+            for (x, y) in au.args.iter().zip(bu.args.iter()) {
+                out.push(common_type(x, y)?);
+            }
+            Some(Ty::Union(Box::new(UnionTy {
+                name: au.name.clone(),
+                args: out,
+            })))
+        }
         (Ty::Tuple(x), Ty::Tuple(y)) if x.len() == y.len() => {
             let mut out = Vec::with_capacity(x.len());
             for ((nx, tx), (ny, ty)) in x.iter().zip(y.iter()) {
@@ -5162,6 +6320,16 @@ fn invariant_common(a: &Ty, b: &Ty) -> Option<Ty> {
     }
     match (a, b) {
         (Ty::Array(x), Ty::Array(y)) => invariant_common(x, y).map(|e| Ty::Array(Box::new(e))),
+        (Ty::Union(au), Ty::Union(bu)) if au.name == bu.name && au.args.len() == bu.args.len() => {
+            let mut out = Vec::with_capacity(au.args.len());
+            for (x, y) in au.args.iter().zip(bu.args.iter()) {
+                out.push(invariant_common(x, y)?);
+            }
+            Some(Ty::Union(Box::new(UnionTy {
+                name: au.name.clone(),
+                args: out,
+            })))
+        }
         (Ty::Tuple(x), Ty::Tuple(y)) if x.len() == y.len() => {
             let mut out = Vec::with_capacity(x.len());
             for ((nx, tx), (ny, ty)) in x.iter().zip(y.iter()) {
@@ -5218,11 +6386,13 @@ fn same_object_name(a: &str, b: &str, current_module: &str) -> bool {
 
 /// Compiler-known fresh allocations whose initial capability may be selected
 /// by an expected type: object literals, array literals (including `[]`),
-/// `Array.new` constructions, and string literals. Variables, fields, index
-/// results, and calls never upgrade from a read-only view.
+/// `Array.new` constructions, variant constructions, and string literals.
+/// Variables, fields, index results, and calls never upgrade from a
+/// read-only view.
 fn is_fresh_allocation(expr: &vl_hir::HirExpr) -> bool {
     match expr {
         vl_hir::HirExpr::ObjectLiteral { .. } => true,
+        vl_hir::HirExpr::Variant { .. } => true,
         vl_hir::HirExpr::TupleLiteral { .. } => true,
         vl_hir::HirExpr::ArrayLiteral { .. } => true,
         vl_hir::HirExpr::Call { name, .. } if name == "Array.new" => true,
@@ -5274,7 +6444,13 @@ fn validate_capability(ty: &Ty, span: Span, diags: &mut Vec<Diagnostic>) -> bool
                     );
                     return false;
                 }
-                Ty::String | Ty::File | Ty::Object(_) | Ty::Array(_) | Ty::Tuple(_) | Ty::Error => {
+                Ty::String
+                | Ty::File
+                | Ty::Object(_)
+                | Ty::Union { .. }
+                | Ty::Array(_)
+                | Ty::Tuple(_)
+                | Ty::Error => {
                     // Payload may still be malformed (`*Array[*u64]`).
                     return validate_capability(inner, span, diags);
                 }
@@ -5289,6 +6465,14 @@ fn validate_capability(ty: &Ty, span: Span, diags: &mut Vec<Diagnostic>) -> bool
             }
         }
         Ty::Array(elem) => return validate_capability(elem, span, diags),
+        Ty::Union(u) => {
+            for arg in &u.args {
+                if !validate_capability(arg, span, diags) {
+                    return false;
+                }
+            }
+            return true;
+        }
         Ty::Tuple(fields) => {
             for (_, ty) in fields {
                 if !validate_capability(ty, span, diags) {
@@ -5324,13 +6508,14 @@ pub(crate) fn is_capability_valid(ty: &Ty) -> bool {
                 Ty::String | Ty::File | Ty::Object(_) | Ty::Error => {
                     return is_capability_valid(inner);
                 }
-                Ty::Array(_) | Ty::Tuple(_) => {
+                Ty::Array(_) | Ty::Tuple(_) | Ty::Union { .. } => {
                     return is_capability_valid(inner);
                 }
             }
         }
         Ty::Array(elem) => return is_capability_valid(elem),
         Ty::Tuple(fields) => return fields.iter().all(|(_, ty)| is_capability_valid(ty)),
+        Ty::Union(u) => return u.args.iter().all(is_capability_valid),
         _ => {}
     }
     true
@@ -5402,6 +6587,112 @@ mod tests {
         let (res, _) = vl_semantic::resolve(&prog);
         let hir = vl_hir::lower(&prog, &res);
         check(&hir)
+    }
+
+    fn check_src_module(src: &str, module: &str) -> (TypedProgram, Vec<Diagnostic>) {
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, _) = vl_syntax::parse_with_module(&toks, src, module);
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        check(&hir)
+    }
+
+    #[test]
+    fn union_payload_qualified_names_and_capabilities_are_checked_once() {
+        let (_, unknown) = check_src("type U = union { A(no.such.Type), };");
+        assert_eq!(
+            unknown.iter().filter(|d| d.is_error()).count(),
+            1,
+            "{unknown:?}"
+        );
+        assert_eq!(unknown[0].code.as_deref(), Some("E302"), "{unknown:?}");
+
+        let (_, valid_forward) = check_src_module(
+            "type U = union { A(demo.V), }; type V = object { value: u64, };",
+            "demo",
+        );
+        assert!(valid_forward.is_empty(), "{valid_forward:?}");
+
+        let (_, valid_self) = check_src_module("type U = union { A(demo.U), };", "demo");
+        assert!(valid_self.is_empty(), "{valid_self:?}");
+
+        let (toks, _) = vl_lex::lex("type U = union { A(demo.lib.ForeignU), };");
+        let (prog, _) = vl_syntax::parse_with_module(&toks, "", "demo.main");
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let mut foreign = vl_common::ModuleSpec::new(&["demo", "lib"], &[]);
+        foreign.unions.push(vl_common::UnionExport {
+            name: "ForeignU".into(),
+            qualified: "demo.lib.ForeignU".into(),
+            type_params: Vec::new(),
+            variants: vec![vl_common::UnionVariantSig {
+                name: "A".into(),
+                payload: Vec::new(),
+            }],
+        });
+        let (_, valid_foreign) = check_with_modules(&hir, &[foreign]);
+        assert!(valid_foreign.is_empty(), "{valid_foreign:?}");
+
+        let (_, invalid_mutable) = check_src("type U[T] = union { A(*T), };");
+        assert_eq!(invalid_mutable.iter().filter(|d| d.is_error()).count(), 1);
+        assert_eq!(invalid_mutable[0].code.as_deref(), Some("E106"));
+    }
+
+    #[test]
+    fn union_values_check_clean_through_signatures() {
+        // Object-literal construction of a union stays an error pointing at
+        // variant syntax.
+        let (_, construction) = check_src("type U = union { A, }; fun main() { val u = U {}; u; }");
+        assert_eq!(
+            construction.iter().filter(|d| d.is_error()).count(),
+            1,
+            "{construction:?}"
+        );
+        assert!(construction[0].message.contains("object literal"));
+
+        // Union values now flow through signatures, bindings, and returns.
+        let (typed, diags) =
+            check_src("type U = union { A, B(u64), }; fun passthrough(x: U): U { return x; } fun main() { val u = passthrough(U.B(1u64)); u; }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let ret = typed.func_sigs.values().find(|s| {
+            s.ret
+                == Ty::Union(Box::new(UnionTy {
+                    name: "U".into(),
+                    args: Vec::new(),
+                }))
+        });
+        assert!(ret.is_some(), "{typed:?}");
+    }
+
+    #[test]
+    fn union_generic_construction_infers_and_checks() {
+        let (typed, diags) = check_src(
+            "type Option[T] = union { None, Some(T), }; fun main() { val a = Option.Some(1u64); val n: Option[u64] = Option.None; a; n; }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let tys: Vec<&Ty> = typed.types.values().collect();
+        assert!(
+            tys.iter().any(|t| **t
+                == Ty::Union(Box::new(UnionTy {
+                    name: "Option".into(),
+                    args: vec![Ty::U64],
+                }))),
+            "{tys:?}"
+        );
+    }
+
+    #[test]
+    fn union_match_binds_payloads_and_needs_coverage() {
+        let (_, diags) = check_src(
+            "type U = union { A, B(u64), }; fun f(o: U): u64 { match (o) { U.A { return 0u64; } U.B(v) { return v; } } } fun main() { f(U.A); }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+
+        let (_, missing) = check_src(
+            "type U = union { A, B, }; fun main() { val u = U.A; match (u) { U.A { 1u64; } } }",
+        );
+        assert_eq!(missing.iter().filter(|d| d.is_error()).count(), 1);
+        assert_eq!(missing[0].code.as_deref(), Some("E309"));
     }
 
     #[test]

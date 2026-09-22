@@ -1,0 +1,21 @@
+// Sum types: `union` declares variants, `Type.Variant(...)` constructs
+// them (`Type.Variant` for nullary ones), and `match` reads them back.
+type Option[T] = union { None, Some(T), };
+
+fun unwrap_or(o: Option[u64], fallback: u64): u64 {
+  match (o) {
+    Option.Some(v) { return v; }
+    Option.None { return fallback; }
+    else { return fallback; }
+  }
+}
+
+fun main() {
+  val some = Option.Some(1u64);
+  val none: Option[u64] = Option.None;
+  none;
+  val a = unwrap_or(some, 0u64);
+  val b = unwrap_or(Option.Some::[u64](41u64), 0u64);
+  a;
+  b;
+}

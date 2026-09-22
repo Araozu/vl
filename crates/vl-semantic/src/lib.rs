@@ -44,6 +44,17 @@ pub enum DefKind {
     ModuleAlias,
 }
 
+/// A union-variant use site: `Option.Some(args)` (call) or `Option.None`
+/// (nullary field path). The resolver records these so later stages can tell
+/// variant construction apart from function calls and field reads, which
+/// share the surface syntax. `union` is the canonical name (bare for local
+/// unions, module-qualified for imported ones, matching `typed.unions` keys).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariantUse {
+    pub union: String,
+    pub variant: String,
+}
+
 /// Resolution result: every variable *use* span maps to its [`Def`].
 #[derive(Debug, Default)]
 pub struct Resolution {
@@ -55,6 +66,16 @@ pub struct Resolution {
     /// `vl-hir` lowers these to method calls; `vl-typecheck` validates the
     /// self-type gate. No E201 is reported for these sites here.
     pub sugar_receivers: HashMap<(usize, usize), DefId>,
+    /// Union-variant construction sites: call callee spans (`Option.Some`)
+    /// and nullary field-path spans (`Option.None`) map to the referenced
+    /// variant. `vl-hir` lowers these to variant nodes; `vl-typecheck`
+    /// validates arity and payload types. No E201 is reported here.
+    pub variants: HashMap<(usize, usize), VariantUse>,
+    /// Canonical union names for `match` arm paths, keyed by the arm's path
+    /// span. Import-alias heads (`alias.Union.Variant`) rewrite to the
+    /// module-qualified spelling so later stages compare one identity;
+    /// bare and fully qualified heads keep their spelling.
+    pub match_patterns: HashMap<(usize, usize), String>,
     /// Import names poisoned by an upstream provider diagnostic. Downstream
     /// stages use this to keep the poison quiet without inventing E500s.
     pub poisoned_imports: bool,
@@ -126,6 +147,10 @@ struct Resolver {
     /// Associated functions declared in this module: `(Type, method)` maps to
     /// the method's [`DefId`] (first declaration wins).
     assoc: HashMap<(String, String), DefId>,
+    /// Bare union names declared in this module mapped to their variant names
+    /// in declaration order. Variant construction (`Union.Variant(...)`,
+    /// `Union.Variant`) resolves through this table without an import.
+    local_unions: HashMap<String, Vec<String>>,
 }
 
 pub fn resolve(prog: &Program) -> (Resolution, Vec<Diagnostic>) {
@@ -151,6 +176,7 @@ fn collect_interface_impl(
 ) -> (ModuleInterface, Vec<Diagnostic>) {
     let mut functions: Vec<vl_common::Export> = Vec::new();
     let mut objects: Vec<vl_common::ObjectExport> = Vec::new();
+    let mut unions: Vec<vl_common::UnionExport> = Vec::new();
     let mut diags = Vec::new();
     let mut poisoned_exports = Vec::new();
     let mut global_dependent_exports = Vec::new();
@@ -163,6 +189,14 @@ fn collect_interface_impl(
         .iter()
         .filter_map(|item| match item {
             Item::Object { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let local_types = prog
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Object { name, .. } | Item::Union { name, .. } => Some(name.clone()),
             _ => None,
         })
         .collect::<std::collections::HashSet<_>>();
@@ -183,6 +217,44 @@ fn collect_interface_impl(
     // `(key, params, body)` borrows keep free and associated units uniform.
     let mut fn_units: Vec<(String, &[vl_syntax::Param], &[Stmt])> = Vec::new();
     let mut direct_dependencies = HashMap::<String, Vec<String>>::new();
+    // Union declarations export nominal identity and payload metadata, but
+    // never acquire an object layout or associated-method namespace.
+    for item in &prog.items {
+        let Item::Union {
+            name,
+            type_params,
+            variants,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        if unions.iter().any(|export| export.name == *name) {
+            continue;
+        }
+        unions.push(vl_common::UnionExport {
+            name: name.clone(),
+            qualified: format!("{}.{}", prog.module, name),
+            type_params: type_params
+                .iter()
+                .map(|p| vl_common::TypeParamSig {
+                    name: p.name.clone(),
+                    bound: p.bound,
+                })
+                .collect(),
+            variants: variants
+                .iter()
+                .map(|variant| vl_common::UnionVariantSig {
+                    name: variant.name.clone(),
+                    payload: variant
+                        .payload
+                        .iter()
+                        .map(|(ty, _)| qualify_export_ty(ty, &prog.module, &local_types))
+                        .collect(),
+                })
+                .collect(),
+        });
+    }
     for item in &prog.items {
         if let Item::Function {
             name, params, body, ..
@@ -255,7 +327,7 @@ fn collect_interface_impl(
             let ty = field
                 .ty
                 .clone()
-                .map(|ty| qualify_export_ty(&ty, &prog.module, &local_objects));
+                .map(|ty| qualify_export_ty(&ty, &prog.module, &local_types));
             out_fields.push(vl_common::ObjectFieldSig {
                 name: field.name.clone(),
                 // A missing field type was already reported by the parser;
@@ -302,13 +374,13 @@ fn collect_interface_impl(
                     .filter_map(|p| {
                         p.ty.clone().map(|ty| vl_common::ParamSig {
                             name: p.name.clone(),
-                            ty: qualify_export_ty(&ty, &prog.module, &local_objects),
+                            ty: qualify_export_ty(&ty, &prog.module, &local_types),
                         })
                     })
                     .collect(),
                 m.ret
                     .clone()
-                    .map(|ty| qualify_export_ty(&ty, &prog.module, &local_objects))
+                    .map(|ty| qualify_export_ty(&ty, &prog.module, &local_types))
                     .unwrap_or(vl_common::VlType::Void),
             );
             if sig.params.len() != m.params.len() {
@@ -390,12 +462,12 @@ fn collect_interface_impl(
                 .filter_map(|p| {
                     p.ty.clone().map(|ty| vl_common::ParamSig {
                         name: p.name.clone(),
-                        ty: qualify_export_ty(&ty, &prog.module, &local_objects),
+                        ty: qualify_export_ty(&ty, &prog.module, &local_types),
                     })
                 })
                 .collect(),
             ret.clone()
-                .map(|ty| qualify_export_ty(&ty, &prog.module, &local_objects))
+                .map(|ty| qualify_export_ty(&ty, &prog.module, &local_types))
                 .unwrap_or(vl_common::VlType::Void),
         );
         if sig.params.len() != params.len() {
@@ -410,6 +482,7 @@ fn collect_interface_impl(
             origin: ModuleOrigin::Source,
             functions,
             objects,
+            unions,
             parse_poisoned: false,
             poisoned_exports,
             global_dependent_exports,
@@ -450,6 +523,20 @@ fn qualify_export_ty(
         ),
         vl_common::VlType::Mutable(inner) => {
             vl_common::VlType::Mutable(Box::new(qualify_export_ty(inner, module, local_objects)))
+        }
+        vl_common::VlType::Union { name, args } if !name.contains('.') => {
+            let name = if local_objects.contains(name) {
+                format!("{module}.{name}")
+            } else {
+                name.clone()
+            };
+            vl_common::VlType::Union {
+                name,
+                args: args
+                    .iter()
+                    .map(|a| qualify_export_ty(a, module, local_objects))
+                    .collect(),
+            }
         }
         _ => ty.clone(),
     }
@@ -518,6 +605,21 @@ fn collect_local_calls(stmts: &[Stmt], calls: &mut Vec<String>) {
                 visit_expr(value, calls);
             }
             Stmt::Destructure { value, .. } => visit_expr(value, calls),
+            Stmt::Match {
+                scrutinee,
+                arms,
+                else_body,
+                ..
+            } => {
+                // Arm paths (`Option.Some`) are patterns, not calls.
+                visit_expr(scrutinee, calls);
+                for arm in arms {
+                    collect_local_calls(&arm.body, calls);
+                }
+                if let Some(body) = else_body {
+                    collect_local_calls(body, calls);
+                }
+            }
             Stmt::If {
                 condition,
                 then_body,
@@ -663,6 +765,24 @@ fn function_depends_on_global(
                             stmts_depend(body, &mut locals.clone(), globals, types)
                         })
                 }
+                Stmt::Match {
+                    scrutinee,
+                    arms,
+                    else_body,
+                    ..
+                } => {
+                    expr_depends(scrutinee, locals, globals, types)
+                        || arms.iter().any(|arm| {
+                            let mut arm_locals = locals.clone();
+                            for (name, _) in &arm.bindings {
+                                arm_locals.insert(name.clone());
+                            }
+                            stmts_depend(&arm.body, &mut arm_locals, globals, types)
+                        })
+                        || else_body.as_ref().is_some_and(|body| {
+                            stmts_depend(body, &mut locals.clone(), globals, types)
+                        })
+                }
                 Stmt::While {
                     condition, body, ..
                 } => {
@@ -704,6 +824,7 @@ pub fn resolve_with_modules(
         local_objects: std::collections::HashSet::new(),
         local_fields: HashMap::new(),
         assoc: HashMap::new(),
+        local_unions: HashMap::new(),
     };
 
     for item in &prog.items {
@@ -715,13 +836,19 @@ pub fn resolve_with_modules(
     // Pass 1: declare top-level names so forward references work.
     let mut object_spans: HashMap<String, Span> = HashMap::new();
     for item in &prog.items {
-        if let Item::Object {
-            name, name_span, ..
-        } = item
+        let (name, name_span) = match item {
+            Item::Object {
+                name, name_span, ..
+            }
+            | Item::Union {
+                name, name_span, ..
+            } => (name, name_span),
+            _ => continue,
+        };
         {
             if let Some(previous) = object_spans.insert(name.clone(), *name_span) {
                 r.diags.push(
-                    Diagnostic::error(format!("duplicate object type `{name}`"))
+                    Diagnostic::error(format!("duplicate type `{name}`"))
                         .with_label(*name_span, "redefined here")
                         .with_bare_label(previous)
                         .with_code("E200"),
@@ -755,11 +882,19 @@ pub fn resolve_with_modules(
                 r.assoc.entry((owner.clone(), m.name.clone())).or_insert(id);
             }
         }
+        // Union variant namespaces: first declaration wins, like associated
+        // functions, so later duplicates keep quiet here (the E200 above is
+        // the single root cause).
+        if let Item::Union { name, variants, .. } = item {
+            r.local_unions
+                .entry(name.clone())
+                .or_insert_with(|| variants.iter().map(|v| v.name.clone()).collect());
+        }
     }
     for item in &prog.items {
         match item {
             Item::Use { .. } => {}
-            Item::Object { .. } => {}
+            Item::Object { .. } | Item::Union { .. } => {}
             Item::Let {
                 name,
                 name_span,
@@ -790,6 +925,7 @@ pub fn resolve_with_modules(
                     r.resolve_fn_body(&m.params, &m.body);
                 }
             }
+            Item::Union { .. } => {}
             Item::Let { value, .. } => {
                 r.resolve_expr(value);
             }
@@ -1095,6 +1231,60 @@ impl Resolver {
                     self.scopes.pop();
                 }
             }
+            Stmt::Match {
+                scrutinee,
+                arms,
+                else_body,
+                ..
+            } => {
+                // The scrutinee lives in the enclosing scope; each arm binds
+                // its payload names as implicit `val`s scoped to that arm.
+                // Union/variant existence is validated by typechecking (which
+                // sees qualified and imported unions); scoping here must
+                // still declare the bindings so bodies resolve. Import-alias
+                // heads (`alias.Union.Variant`) canonicalize to the
+                // module-qualified spelling for later stages.
+                self.resolve_expr(scrutinee);
+                for arm in arms {
+                    if arm.path.len() >= 2 {
+                        let (head, _) = arm.path.split_at(arm.path.len() - 1);
+                        if let Some((canonical, _)) = self.canonical_union_head(head) {
+                            let head_joined = head.join(".");
+                            if canonical != head_joined {
+                                self.out
+                                    .match_patterns
+                                    .insert((arm.path_span.start, arm.path_span.end), canonical);
+                            }
+                        }
+                    }
+                    self.scopes.push(HashMap::new());
+                    let mut seen = std::collections::HashSet::new();
+                    for (name, span) in &arm.bindings {
+                        if !seen.insert(name.clone()) {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "duplicate binding `{name}` in match arm"
+                                ))
+                                .with_label(*span, "redefined here")
+                                .with_code("E200"),
+                            );
+                            continue;
+                        }
+                        self.declare_local(name.clone(), *span, BindingKind::Val);
+                    }
+                    for stmt in &arm.body {
+                        self.resolve_stmt(stmt);
+                    }
+                    self.scopes.pop();
+                }
+                if let Some(body) = else_body {
+                    self.scopes.push(HashMap::new());
+                    for stmt in body {
+                        self.resolve_stmt(stmt);
+                    }
+                    self.scopes.pop();
+                }
+            }
         }
     }
 
@@ -1121,7 +1311,30 @@ impl Resolver {
                 self.resolve_expr(base);
                 self.resolve_expr(index);
             }
-            Expr::Field { base, .. } => self.resolve_expr(base),
+            Expr::Field { base, name, span } => {
+                // A nullary variant use (`Option.None`, `alias.Option.None`,
+                // `mod.Option.None`): the spine heads a union, not a value.
+                // Record the site for HIR lowering and stay quiet here;
+                // typechecking validates arity (a payload-carrying variant
+                // without `(...)` is an error there).
+                if let Some(spine) = Self::field_spine(base, name) {
+                    if spine.len() >= 2 {
+                        let (head, variant) = spine.split_at(spine.len() - 1);
+                        if let Some((canonical, variants)) = self.canonical_union_head(head) {
+                            let display = head.join(".");
+                            self.record_variant_use(
+                                *span,
+                                canonical,
+                                &variants,
+                                &variant[0],
+                                &display,
+                            );
+                            return;
+                        }
+                    }
+                }
+                self.resolve_expr(base)
+            }
             Expr::Var { path, span } => match self.lookup_path(path, *span) {
                 Some(id) => {
                     self.out.uses.insert((span.start, span.end), id);
@@ -1316,6 +1529,7 @@ impl Resolver {
                                 path: vl_common::ModulePath::new(vec![parent_key, leaf]),
                                 exports: vec![],
                                 objects: vec![],
+                                unions: vec![],
                                 parse_poisoned: parent.parse_poisoned,
                                 poisoned_exports: vec![],
                                 global_dependent_exports: vec![],
@@ -1600,6 +1814,103 @@ impl Resolver {
         ))
     }
 
+    /// Canonical union name for a `Union.Variant` head (`parts` = every
+    /// segment but the last). Returns the canonical spelling plus the
+    /// variant list: bare for local unions, module-qualified for imported
+    /// ones (matching `typed.unions` keys downstream). Own-module qualified
+    /// spellings (`m.Union` inside `m`) fold to bare so one spelling
+    /// identifies local values.
+    fn canonical_union_head(&self, parts: &[String]) -> Option<(String, Vec<String>)> {
+        if parts.len() == 1 {
+            return self
+                .local_unions
+                .get(&parts[0])
+                .map(|v| (parts[0].clone(), v.clone()));
+        }
+        // Alias-qualified `alias.Union` (exactly two segments).
+        if parts.len() == 2 && self.imports.contains_key(&parts[0]) {
+            let spec = self.imports.get(&parts[0]).cloned()?;
+            let found = spec.unions.iter().find(|u| u.name == parts[1])?;
+            return Some((
+                found.qualified.clone(),
+                found.variants.iter().map(|v| v.name.clone()).collect(),
+            ));
+        }
+        let joined = parts.join(".");
+        // Own-module qualified: fold to the bare local spelling.
+        if let Some(rest) = joined.strip_prefix(&format!("{}.", self.module)) {
+            if let Some(variants) = self.local_unions.get(rest) {
+                return Some((rest.to_string(), variants.clone()));
+            }
+        }
+        // Fully qualified without an import.
+        for spec in &self.modules {
+            if let Some(found) = spec.unions.iter().find(|u| u.qualified == joined) {
+                return Some((
+                    joined.clone(),
+                    found.variants.iter().map(|v| v.name.clone()).collect(),
+                ));
+            }
+        }
+        None
+    }
+
+    /// Flatten a field spine (`a.b.C`) into segments in order when the whole
+    /// spine is plain names (no calls or indices); `None` otherwise.
+    fn field_spine(base: &Expr, outer: &str) -> Option<Vec<String>> {
+        let mut rev = vec![outer.to_string()];
+        let mut head = base;
+        loop {
+            match head {
+                Expr::Field {
+                    base: inner, name, ..
+                } => {
+                    rev.push(name.clone());
+                    head = inner;
+                }
+                Expr::Var { path, .. } => {
+                    for seg in path.iter().rev() {
+                        rev.push(seg.clone());
+                    }
+                    rev.reverse();
+                    return Some(rev);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Record one variant construction site (`at` = call callee span or field
+    /// span) after checking the variant exists. Always returns true (the
+    /// site is fully handled: one E302 at most, then quiet).
+    fn record_variant_use(
+        &mut self,
+        at: Span,
+        canonical: String,
+        variants: &[String],
+        variant: &str,
+        union_display: &str,
+    ) -> bool {
+        if !variants.iter().any(|v| v == variant) {
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "union `{union_display}` has no variant `{variant}`"
+                ))
+                .with_label(at, "unknown union variant")
+                .with_code("E302"),
+            );
+        } else {
+            self.out.variants.insert(
+                (at.start, at.end),
+                VariantUse {
+                    union: canonical,
+                    variant: variant.to_string(),
+                },
+            );
+        }
+        true
+    }
+
     /// Resolve `Type.method(args)` and `value.method(args)` call sites.
     /// Returns true when the site was fully handled here: an associated
     /// callee recorded, a sugar receiver recorded, or one root-cause
@@ -1622,6 +1933,43 @@ impl Resolver {
             return false;
         }
         let full = callee.join(".");
+        // Union variant construction (`Option.Some(args)`,
+        // `alias.Option.Some(args)`, `mod.Option.Some(args)`): the head
+        // names a union, not a value or an object with methods. Like object
+        // type names, the union head wins over same-named values. Unknown
+        // variants are one E302 here; arity and payload types are validated
+        // by typechecking from the recorded site.
+        if callee.len() == 2 && self.local_unions.contains_key(&callee[0]) {
+            let union = callee[0].clone();
+            let variants = self.local_unions[&union].clone();
+            for arg in args {
+                self.resolve_expr(arg);
+            }
+            return self.record_variant_use(
+                callee_span,
+                union.clone(),
+                &variants,
+                &callee[1],
+                &union,
+            );
+        }
+        if callee.len() >= 3 {
+            let head = &callee[..callee.len() - 1];
+            let variant = callee[callee.len() - 1].clone();
+            if let Some((canonical, variants)) = self.canonical_union_head(head) {
+                let display = head.join(".");
+                for arg in args {
+                    self.resolve_expr(arg);
+                }
+                return self.record_variant_use(
+                    callee_span,
+                    canonical,
+                    &variants,
+                    &variant,
+                    &display,
+                );
+            }
+        }
         if self.poisoned_imports.contains(&full) || self.poisoned_imports.contains(&callee[0]) {
             let id = self.external_def(full, callee_span, None, DefKind::ImportedFunction, None);
             self.out
@@ -2257,6 +2605,92 @@ mod tests {
             print.sig.params[0].ty,
             vl_common::VlType::Object("vl.person.Person".into())
         );
+    }
+
+    #[test]
+    fn union_interface_metadata_is_separate_from_object_namespaces() {
+        let (toks, _) = vl_lex::lex(
+            "type Option[T] = union { None, Some(T), }; type Box = object { value: u64, };",
+        );
+        let (provider, _) = vl_syntax::parse_with_module(&toks, "", "demo.types");
+        let (interface, diags) = collect_interface(&provider);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(interface.objects.len(), 1);
+        assert_eq!(interface.unions.len(), 1);
+        let option = &interface.unions[0];
+        assert_eq!(option.qualified, "demo.types.Option");
+        assert_eq!(option.type_params.len(), 1);
+        assert_eq!(
+            option.variants[1].payload,
+            vec![vl_common::VlType::Param("T".into())]
+        );
+        assert!(interface
+            .objects
+            .iter()
+            .all(|object| object.name != "Option"));
+
+        let (_, resolve_diags) = resolve_src("type U = union { A, }; fun main() { U.f(); }");
+        assert_eq!(resolve_diags.iter().filter(|d| d.is_error()).count(), 1);
+        assert_eq!(resolve_diags[0].code.as_deref(), Some("E302"));
+    }
+
+    #[test]
+    fn union_variant_construction_resolves_without_e201() {
+        let (resolution, diags) = resolve_src(
+            "type Option[T] = union { None, Some(T), }; fun main() { val a = Option.Some(1u64); val n = Option.None; a; n; }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let mut uses: Vec<(String, String)> = resolution
+            .variants
+            .values()
+            .map(|u| (u.union.clone(), u.variant.clone()))
+            .collect();
+        uses.sort();
+        assert_eq!(
+            uses,
+            vec![
+                ("Option".to_string(), "None".to_string()),
+                ("Option".to_string(), "Some".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_union_variant_is_one_e302() {
+        let (_, diags) = resolve_src("type U = union { A, }; fun main() { val x = U.B(1u64); x; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E302"));
+    }
+
+    #[test]
+    fn match_arm_bindings_are_scoped_to_their_arm() {
+        let (resolution, diags) = resolve_src(
+            "type U = union { A(u64), B, }; fun main() { val u = U.B; match (u) { U.A(v) { v; } else { 0u64; } } }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        // The arm binding `v` is declared exactly once as a `val`.
+        let v_defs: Vec<_> = resolution.defs.iter().filter(|d| d.name == "v").collect();
+        assert_eq!(v_defs.len(), 1);
+        assert_eq!(v_defs[0].binding, Some(BindingKind::Val));
+    }
+
+    #[test]
+    fn duplicate_match_arm_binding_is_one_e200() {
+        let (_, diags) = resolve_src(
+            "type U = union { A(u64, u64), }; fun main() { val u = U.A(1u64, 2u64); match (u) { U.A(v, v) { v; } else { 0u64; } } }",
+        );
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E200"));
+    }
+
+    #[test]
+    fn duplicate_object_and_union_type_is_one_error() {
+        let (_, diags) = resolve_src("type U = object { value: u64, }; type U = union { A, };");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E200"));
     }
 
     #[test]

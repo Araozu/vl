@@ -193,12 +193,33 @@ pub struct ObjectFieldSig {
     pub ty: VlType,
 }
 
+/// One declaration-only union variant exported through a module interface.
+/// Payloads retain their source-level nominal type spellings so importers can
+/// validate qualified references without inventing a runtime representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnionVariantSig {
+    pub name: String,
+    pub payload: Vec<VlType>,
+}
+
+/// Exported nominal union metadata. Unlike [`ObjectExport`], this carries no
+/// layout or associated-method namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnionExport {
+    pub name: String,
+    pub qualified: String,
+    pub type_params: Vec<TypeParamSig>,
+    pub variants: Vec<UnionVariantSig>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleSpec {
     pub path: ModulePath,
     pub exports: Vec<Export>,
     /// Exported object layouts, keyed by disambiguation through `qualified`.
     pub objects: Vec<ObjectExport>,
+    /// Exported nominal unions. Unions have no object layout or methods.
+    pub unions: Vec<UnionExport>,
     /// The provider had lexer/parser errors, so recovered AST omissions are
     /// not reliable evidence that an export does not exist.
     pub parse_poisoned: bool,
@@ -216,6 +237,7 @@ pub struct ModuleInterface {
     pub origin: ModuleOrigin,
     pub functions: Vec<Export>,
     pub objects: Vec<ObjectExport>,
+    pub unions: Vec<UnionExport>,
     pub parse_poisoned: bool,
     pub poisoned_exports: Vec<String>,
     pub global_dependent_exports: Vec<String>,
@@ -227,6 +249,7 @@ impl ModuleInterface {
             path: self.path.clone(),
             exports: self.functions.clone(),
             objects: self.objects.clone(),
+            unions: self.unions.clone(),
             parse_poisoned: self.parse_poisoned,
             poisoned_exports: self.poisoned_exports.clone(),
             global_dependent_exports: self.global_dependent_exports.clone(),
@@ -248,6 +271,7 @@ impl ModuleSpec {
                 })
                 .collect(),
             objects: Vec::new(),
+            unions: Vec::new(),
             parse_poisoned: false,
             poisoned_exports: Vec::new(),
             global_dependent_exports: Vec::new(),
@@ -259,6 +283,7 @@ impl ModuleSpec {
             path: ModulePath::new(path.iter().map(|s| (*s).into()).collect()),
             exports,
             objects: Vec::new(),
+            unions: Vec::new(),
             parse_poisoned: false,
             poisoned_exports: Vec::new(),
             global_dependent_exports: Vec::new(),
@@ -325,5 +350,32 @@ mod tests {
         let generic = catalog[0].lookup("max").expect("helper");
         assert_eq!(native.kind, ExportKind::Target);
         assert_eq!(generic.kind, ExportKind::Source);
+    }
+
+    #[test]
+    fn interface_spec_round_trip_preserves_union_metadata() {
+        let interface = ModuleInterface {
+            path: ModulePath::from_dotted("demo.types"),
+            origin: ModuleOrigin::Source,
+            functions: Vec::new(),
+            objects: Vec::new(),
+            unions: vec![UnionExport {
+                name: "Option".into(),
+                qualified: "demo.types.Option".into(),
+                type_params: vec![TypeParamSig {
+                    name: "T".into(),
+                    bound: None,
+                }],
+                variants: vec![UnionVariantSig {
+                    name: "Some".into(),
+                    payload: vec![VlType::Param("T".into())],
+                }],
+            }],
+            parse_poisoned: false,
+            poisoned_exports: Vec::new(),
+            global_dependent_exports: Vec::new(),
+        };
+        let spec = interface.as_spec();
+        assert_eq!(spec.unions, interface.unions);
     }
 }

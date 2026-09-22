@@ -228,6 +228,11 @@ fn calls_in_template(prog: &HirProgram, typed: &TypedProgram, def: u32) -> Vec<N
                     walk_expr(prog, typed, value, out);
                 }
             }
+            HirExpr::Variant { args, .. } => {
+                for arg in args {
+                    walk_expr(prog, typed, arg, out);
+                }
+            }
             HirExpr::TupleLiteral { elems, .. } => {
                 for (_, value) in elems {
                     walk_expr(prog, typed, value, out);
@@ -287,6 +292,24 @@ fn calls_in_template(prog: &HirProgram, typed: &TypedProgram, def: u32) -> Vec<N
                 walk_expr(prog, typed, condition, out);
                 for s in then_body {
                     walk_stmt(prog, typed, s, out);
+                }
+                if let Some(body) = else_body {
+                    for s in body {
+                        walk_stmt(prog, typed, s, out);
+                    }
+                }
+            }
+            HirStmt::Match {
+                scrutinee,
+                arms,
+                else_body,
+                ..
+            } => {
+                walk_expr(prog, typed, scrutinee, out);
+                for arm in arms {
+                    for s in &arm.body {
+                        walk_stmt(prog, typed, s, out);
+                    }
                 }
                 if let Some(body) = else_body {
                     for s in body {
@@ -618,6 +641,11 @@ pub fn validate_plan(
                         expr_ids(v, out);
                     }
                 }
+                HirExpr::Variant { args, .. } => {
+                    for a in args {
+                        expr_ids(a, out);
+                    }
+                }
                 HirExpr::TupleLiteral { elems, .. } => {
                     for (_, v) in elems {
                         expr_ids(v, out);
@@ -700,6 +728,24 @@ pub fn validate_plan(
                     expr_ids(condition, out);
                     for st in then_body {
                         stmt_ids(st, out);
+                    }
+                    if let Some(body) = else_body {
+                        for st in body {
+                            stmt_ids(st, out);
+                        }
+                    }
+                }
+                HirStmt::Match {
+                    scrutinee,
+                    arms,
+                    else_body,
+                    ..
+                } => {
+                    expr_ids(scrutinee, out);
+                    for arm in arms {
+                        for st in &arm.body {
+                            stmt_ids(st, out);
+                        }
                     }
                     if let Some(body) = else_body {
                         for st in body {

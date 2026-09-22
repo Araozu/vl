@@ -38,6 +38,13 @@ pub enum VlType {
     File,
     /// A user-defined nominal object type. Objects have reference semantics.
     Object(String),
+    /// A nominal union instantiation (`Option`, `Option[u64]`). Reference
+    /// semantics (heap-allocated tag + payload); always constructed through a
+    /// variant (`Option.Some(...)`) and read through `match`.
+    Union {
+        name: String,
+        args: Vec<VlType>,
+    },
     Array(Box<VlType>),
     /// Fixed-arity heterogeneous tuple (`#(u64, String)` / `#(x: u64)`).
     /// Value semantics (copy on bind/assign); heap container on the target.
@@ -60,6 +67,20 @@ impl fmt::Display for VlType {
             VlType::String => write!(f, "String"),
             VlType::File => write!(f, "File"),
             VlType::Object(name) => write!(f, "{name}"),
+            VlType::Union { name, args } => {
+                write!(f, "{name}")?;
+                if !args.is_empty() {
+                    write!(f, "[")?;
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{arg}")?;
+                    }
+                    write!(f, "]")?;
+                }
+                Ok(())
+            }
             VlType::Array(elem) => write!(f, "Array[{elem}]"),
             VlType::Tuple(fields) => {
                 write!(f, "#(")?;
@@ -130,6 +151,7 @@ impl VlType {
             VlType::Mutable(inner) => inner.is_void(),
             VlType::Array(elem) => elem.is_void(),
             VlType::Tuple(fields) => fields.iter().any(|f| f.ty.is_void()),
+            VlType::Union { args, .. } => args.iter().any(|a| a.is_void()),
             _ => false,
         }
     }
@@ -162,6 +184,7 @@ impl VlType {
         match self {
             VlType::String | VlType::File => true,
             VlType::Object(_) => true,
+            VlType::Union { .. } => true,
             VlType::Array(_) => true,
             VlType::Tuple(_) => true,
             VlType::Mutable(inner) => inner.is_reference_type(),
@@ -189,6 +212,10 @@ impl VlType {
         match self {
             VlType::Mutable(inner) => inner.erase_capability(),
             VlType::Array(elem) => VlType::Array(Box::new(elem.erase_capability())),
+            VlType::Union { name, args } => VlType::Union {
+                name: name.clone(),
+                args: args.iter().map(|a| a.erase_capability()).collect(),
+            },
             VlType::Tuple(fields) => VlType::Tuple(
                 fields
                     .iter()
@@ -233,7 +260,7 @@ impl VlType {
                     | VlType::F64
                     | VlType::Bool
                     | VlType::U8 => Some(format!("`*{inner}` is not a reference type")),
-                    VlType::String | VlType::File | VlType::Object(_) | VlType::Array(_) | VlType::Tuple(_) => {
+                    VlType::String | VlType::File | VlType::Object(_) | VlType::Union { .. } | VlType::Array(_) | VlType::Tuple(_) => {
                         // The payload itself may still be malformed
                         // (e.g. `*Array[*u64]`).
                         inner.mutable_wellformed_error()
@@ -242,6 +269,7 @@ impl VlType {
             }
             VlType::Array(elem) => elem.mutable_wellformed_error(),
             VlType::Tuple(fields) => fields.iter().find_map(|f| f.ty.mutable_wellformed_error()),
+            VlType::Union { args, .. } => args.iter().find_map(|a| a.mutable_wellformed_error()),
             _ => None,
         }
     }

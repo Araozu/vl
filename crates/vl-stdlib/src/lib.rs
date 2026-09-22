@@ -120,6 +120,9 @@ fn hir_expr_has_generic_call(expr: &vl_hir::HirExpr, typed: &vl_typecheck::Typed
         vl_hir::HirExpr::ObjectLiteral { fields, .. } => fields
             .iter()
             .any(|(_, v)| hir_expr_has_generic_call(v, typed)),
+        vl_hir::HirExpr::Variant { args, .. } => {
+            args.iter().any(|a| hir_expr_has_generic_call(a, typed))
+        }
         vl_hir::HirExpr::TupleLiteral { elems, .. } => elems
             .iter()
             .any(|(_, v)| hir_expr_has_generic_call(v, typed)),
@@ -179,6 +182,20 @@ fn hir_stmt_has_generic_call(stmt: &vl_hir::HirStmt, typed: &vl_typecheck::Typed
             hir_expr_has_generic_call(base, typed) || hir_expr_has_generic_call(value, typed)
         }
         vl_hir::HirStmt::Destructure { value, .. } => hir_expr_has_generic_call(value, typed),
+        vl_hir::HirStmt::Match {
+            scrutinee,
+            arms,
+            else_body,
+            ..
+        } => {
+            hir_expr_has_generic_call(scrutinee, typed)
+                || arms
+                    .iter()
+                    .any(|arm| arm.body.iter().any(|s| hir_stmt_has_generic_call(s, typed)))
+                || else_body
+                    .as_ref()
+                    .is_some_and(|b| b.iter().any(|s| hir_stmt_has_generic_call(s, typed)))
+        }
         vl_hir::HirStmt::If {
             condition,
             then_body,
@@ -262,6 +279,15 @@ pub fn load() -> Stdlib {
                         .any(|o| o.qualified == obj.qualified)
                     {
                         existing.objects.push(obj.clone());
+                    }
+                }
+                for union in &spec.unions {
+                    if !existing
+                        .unions
+                        .iter()
+                        .any(|u| u.qualified == union.qualified)
+                    {
+                        existing.unions.push(union.clone());
                     }
                 }
             }
@@ -361,6 +387,15 @@ impl Stdlib {
                             spec.path.as_string(),
                         );
                         existing.exports.push(export.clone());
+                    }
+                    for union in &spec.unions {
+                        if !existing
+                            .unions
+                            .iter()
+                            .any(|candidate| candidate.qualified == union.qualified)
+                        {
+                            existing.unions.push(union.clone());
+                        }
                     }
                 }
                 None => catalog.push(spec.clone()),
@@ -911,6 +946,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn extend_catalog_preserves_union_metadata() {
+        let mut helper = ModuleSpec::new(&["demo"], &[]);
+        helper.unions.push(vl_common::UnionExport {
+            name: "U".into(),
+            qualified: "demo.U".into(),
+            type_params: Vec::new(),
+            variants: vec![vl_common::UnionVariantSig {
+                name: "A".into(),
+                payload: Vec::new(),
+            }],
+        });
+        let stdlib = Stdlib {
+            bodies: HashMap::new(),
+            module_imports: HashMap::new(),
+            specs: vec![helper],
+            checked: Vec::new(),
+        };
+        let mut catalog = vec![ModuleSpec::new(&["demo"], &[])];
+        stdlib.extend_catalog(&mut catalog);
+        assert_eq!(catalog[0].unions.len(), 1);
+        assert_eq!(catalog[0].unions[0].qualified, "demo.U");
     }
 
     #[test]
