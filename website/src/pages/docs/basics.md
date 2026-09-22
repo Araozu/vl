@@ -59,12 +59,14 @@ operations make sense for it.
 | `u8` | `255u8` | A small non-negative number |
 | `f64` | `3.14f64` | A decimal number |
 | `bool` | `true` | A yes/no value |
-| `String` | `"hello"` | A byte string (read-only view) |
-| `object` type | `Counter { value = 1 }` | Named GC data; `Foo` reads, `*Foo` mutates |
+| `String` | `"hello"` | Text |
+| `object` type | `Counter { value = 1 }` | Your own named data (see [Objects](/docs/objects)) |
 
-`String` and `File` are reference types too, so `*String` and `*File` carry
-the mutable capability when their APIs expose mutable operations. A plain
-`String` or `File` is the read-only view.
+You will also see a `*` in front of some types, as in `*Counter` or
+`*Array[u64]`. The `*` means "allowed to change the contents". A plain
+`Counter` can be read; a `*Counter` can also be written. The
+[Objects](/docs/objects) and [Arrays](/docs/arrays) chapters explain when to
+use each form.
 
 Integer literals are chosen from their context. For example, the parameter
 type tells VL what type the `1` and `2` should have here:
@@ -79,13 +81,12 @@ fun main() {
 }
 ```
 
-Decimal literals need an explicit suffix such as `f64`. Values do not silently
-change from one numeric type to another; when a type matters, write it down.
-Integer literals adapt to their context (`val x: u8 = 3;` checks the range),
-but variables never convert implicitly: a `u64` variable does not flow into a
-`u8` parameter.
+Decimal literals need an explicit suffix such as `f64`. VL does not silently
+mix numeric types: a `u64` variable cannot be used where a `u8` is expected.
+Plain integer literals like `1` adapt to whatever the context needs
+(`val x: u8 = 3;` checks that `3` fits).
 
-Explicit conversions use `as` (integers only in v0):
+Explicit conversions use `as` (integers only):
 
 ```vl
 val v = 200u64;
@@ -93,22 +94,11 @@ val w = v as u8;
 val lit = 10 as u8;
 ```
 
-Literals are range-checked at compile time (`300 as u8` fails); variable
-conversions are unchecked reinterpretations with no runtime cost (no trap, no
-wrap instruction).
+Out-of-range literals such as `300 as u8` are rejected when compiling.
 
 ## Bindings with `var` and `val`
 
-`var` creates a rebindable binding. `val` creates a fixed binding. Both can
-hold primitives or references, and the binding keyword is independent from the
-reference capability: `Foo` is a read-only view of a GC-managed `Foo`, while
-`*Foo` is a mutable view of the same allocation. Passing or assigning either
-spelling copies the GC reference.
-
-For a reference created directly in an unannotated `var`, VL infers the
-mutable capability. An unannotated `val` keeps the read-only view. An explicit
-annotation always wins, so `var view: Foo = ...` is rebindable but read-only,
-and `val editable: *Foo = ...` is fixed but can mutate its referent.
+`var` creates a name you can reassign. `val` creates a name that stays fixed.
 
 ```vl
 val name = "Ada";
@@ -116,42 +106,37 @@ var visits = 1;
 val welcome = visits == 1;
 ```
 
-A type can also be written down explicitly with an annotation. The value must
-have that type (integer literals adapt, so `3` works where `u64` is written).
-An annotation is required to give `Array.new` its element type without a
-turbofish. Fresh reference data adopts an expected `*` capability:
+A type can also be written down explicitly. The value must have that type
+(plain integer literals adapt, so `3` works where `u64` is written):
 
 ```vl
-type Foo = object { value: u64, };
-
 val retries: u64 = 3;
 var scores: *Array[u64] = Array.new(3);
-val view = Foo { value = 0 };
-var editable = Foo { value = 0 }; // inferred *Foo
-val fixed_editable: *Foo = Foo { value = 0 }; // fixed binding, mutable view
 ```
 
+The `*` in `*Array[u64]` means the array contents may be changed. As a rule
+of thumb: use `var` when a fresh object or array should be changeable, and
+`val` when it should stay as created. Writing the type explicitly always
+wins over the default. The [Objects](/docs/objects) and
+[Arrays](/docs/arrays) chapters show this in detail.
+
 Named object types use `type Name = object { ... };` declarations. Their fields
-are comma-separated, and an object literal initializes every field:
+are comma-separated, and a literal fills in every field:
 
 ```vl
 type Point = object { x: u64, y: u64, };
 
 fun main() {
-    var point = Point { x = 10, y = 20 }; // inferred *Point
+    var point = Point { x = 10, y = 20 };
     point.x = 11;
 }
 ```
 
-Objects have reference semantics: assignment and function calls share the same
-heap object, so a field write through a `*Point` is visible through every
-alias, including read-only ones. See the
-[Objects](/docs/objects) chapter for details.
+Objects share rather than copy: passing an object to a function hands over
+the same object, so a change made through one name is visible through the
+others. See the [Objects](/docs/objects) chapter for details.
 
-The name can be assigned a new value later, but the replacement must be
-coercible to the declared type: a `*Foo` value downgrades into a `Foo`
-binding, while a `Foo` value never upgrades into a `*Foo` binding (a
-`*Foo` binding accepts a fresh `Foo {}` via contextual capability):
+A `var` name can be assigned a new value later:
 
 ```vl
 type Counter = object { value: u64, };
@@ -159,7 +144,7 @@ type Counter = object { value: u64, };
 fun main() {
     var count = 0;
     count = count + 1;
-    var current = Counter { value = 0 }; // inferred *Counter
+    var current = Counter { value = 0 };
     current = Counter { value = 10 };
 }
 ```

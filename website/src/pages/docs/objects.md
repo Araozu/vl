@@ -21,8 +21,7 @@ type Counter = object {
 
 Create an object with a named literal. Every declared field must appear exactly
 once, and fields may be written in any order. Declarations use `name: type`,
-while literals assign with `name = value`. A fresh literal adopts an expected
-`*` capability and otherwise defaults to a read-only view:
+while literals assign with `name = value`:
 
 ```vl
 type Counter = object { value: u64, label: String, };
@@ -33,13 +32,15 @@ fun main() {
 }
 ```
 
-## Read-only views, mutable views, and aliasing
+Use `var` when the new object should be changeable and `val` when it should
+stay as created. Writing the type explicitly (`val c: Counter = ...` or
+`val c: *Counter = ...`) always wins over the default.
 
-`Foo` is a read-only view of a GC-managed `Foo`; `*Foo` is a mutable view of
-the same kind of allocation. Mutation authority belongs to each view, not to
-the heap object: there is no freezing, no borrow checker, and no exclusive
-mutable alias. Multiple `*Foo` aliases may coexist with read-only ones, and a
-read-only alias observes writes made through a mutable one.
+## Read-only views and writable views
+
+`Counter` lets you read an object; `*Counter` (with a star) additionally
+lets you change its fields. Several names may point at the same object, and
+a change made through a writable name is visible through the others:
 
 ```vl
 type Counter = object { value: u64, label: String, };
@@ -60,11 +61,11 @@ fun main() {
 }
 ```
 
-## Reference semantics
+## Sharing objects
 
-Objects are reference values. Assigning an object, passing it to a function,
-or returning it passes the same object; it does not copy the fields. A field
-write through a mutable view is therefore visible through every alias:
+Objects share rather than copy. Assigning an object, passing it to a function,
+or returning it hands over the same object. A field write through a writable
+view is therefore visible through every other name for it:
 
 ```vl
 type Counter = object { value: u64, label: String, };
@@ -82,9 +83,7 @@ fun main() {
 }
 ```
 
-Field declarations carry the maximum stored capability. Reading through a
-read-only receiver downgrades mutable fields transitively; a mutable receiver
-preserves them. Field assignment itself requires a `*Object` receiver:
+Field assignment needs a writable (`*Object`) name:
 
 ```vl
 type Child = object { value: u64, };
@@ -94,7 +93,7 @@ type Parent = object {
 };
 
 fun inspect(parent: Parent) {
-    // parent.child.value = 1; // error: read-only view
+    // parent.child.value = 1; // error: needs a writable view
 }
 
 fun edit(parent: *Parent) {
@@ -103,22 +102,19 @@ fun edit(parent: *Parent) {
 ```
 
 Object fields use the normal VL types, including `String`, `Array[T]`,
-`*Array[T]`, and other object types (including `*Child`). A field whose type
-is itself a reference value keeps that reference when the containing object
-is assigned. Array elements are read through either capability but written
-only through a mutable `*Array[T]` access path (projected transitively, as
-above).
+`*Array[T]`, and other object types. An array element can be read through
+either form but written only through a writable `*Array[T]` path.
 
-Objects are nominal data types. Besides fields and reference semantics, VL
-gives objects Zig-style associated functions declared inside the body. There
-is no inheritance, no implicit constructor, and no runtime type reflection.
+Each object type is distinct by name: two types with the same fields but
+different names are different types. Objects can also own functions declared
+inside the body (see below). There is no inheritance and no automatic
+constructor.
 
 ## Associated functions
 
-Declare a `fun` member inside the `object` body. Fields and functions share
-one member namespace, so a duplicate member name is an error. The comma after
-a field may be omitted before a `fun` member; a trailing comma after a `fun`
-member is allowed but never required.
+Declare a `fun` member inside the `object` body. A field and a function may
+not share a name. The comma after a field may be omitted before a `fun`
+member.
 
 ```vl
 type Counter = object {
@@ -139,7 +135,7 @@ type Counter = object {
 };
 ```
 
-Calls spell the owner explicitly, exactly like the `Array.new` builtin:
+Call it through the type, just like the `Array.new` builtin:
 
 ```vl
 fun main() {
@@ -148,21 +144,15 @@ fun main() {
 }
 ```
 
-Nominal identity is spelling-sensitive, as for every other call: a value
-annotated `Counter` and a value annotated `my.mod.Counter` do not coerce into
-each other even inside the defining module, so spell the type the same way on
-both sides of a call.
-
-There is no implicit `self`: the receiver is an ordinary first parameter.
-Readers take `self: Counter`; writers take `self: *Counter`, and the usual
-capability rules apply (a read-only view never upgrades to `*Counter`).
+There is no hidden `self`: the receiver is an ordinary first parameter.
+Readers take `self: Counter`; writers take `self: *Counter`.
 
 ## Instance sugar
 
-When — and only when — the first parameter takes the receiver's object type,
-the call may spell the receiver first: `counter.bump()` is sugar for
-`Counter.bump(counter)`. A method whose first parameter is some other type
-(or takes no parameters at all) can only be called through the type.
+When the first parameter takes the receiver's own object type, the call may
+put the receiver first: `counter.bump()` means `Counter.bump(counter)`. A
+function whose first parameter is some other type can only be called through
+the type itself.
 
 ```vl
 fun main() {
@@ -172,13 +162,9 @@ fun main() {
 }
 ```
 
-Associated functions may declare their own type parameters and are
-monomorphized per call like free generic functions
-(`box.wrap(7)` infers `Box.wrap$u64`). Across modules they live in the type
-namespace: with `use vl.person;` in scope, call `person.Person.birthday(rose)`
-or the fully qualified `vl.person.Person.birthday(rose)`; sugar on a foreign
-value (`rose.birthday()`) resolves through the receiver's type and needs no
-import. Cross-module calls meet the same module-global boundary as free
-functions.
+Functions on objects may use their own type parameters, just like free
+generic functions. Across files, call them through the type
+(`person.Person.birthday(rose)`); the short receiver form (`rose.birthday()`)
+works from the value alone and needs no import.
 
-Continue with [modules and strings](/docs/modules).
+Continue with [unions](/docs/unions).

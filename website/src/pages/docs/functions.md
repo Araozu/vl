@@ -34,29 +34,25 @@ The parts of the definition are:
 5. `return a + b;` sends the result back to the caller.
 
 The caller supplies arguments in the same order as the parameters. The number
-and types of the arguments must match the definition. A `*Foo` argument
-downgrades to a `Foo` parameter; a `Foo` argument never upgrades to `*Foo`.
-
-At the call site, use `var` when a fresh reference should be mutable and
-rebindable, or `val` when the binding should be fixed. An explicit `Foo` or
-`*Foo` annotation controls the capability regardless of the binding keyword.
+and types of the arguments must match the definition. A writable object can
+be passed where a read-only one is expected, but not the other way around.
 
 ## Fixed parameters
 
-Function parameters are always fixed bindings, for primitives and references
-alike. A function may mutate through a `*Foo` parameter, but it may never
-rebind the parameter itself:
+Function parameters cannot be reassigned, whether they hold numbers or
+objects. A function may change an object's fields through a writable `*Foo`
+parameter, but it may never point the parameter at a different object:
 
 ```vl
 type Foo = object { value: u64, };
 
 fun inspect(item: Foo) {
-    // item = other; // error: parameters cannot be rebound
+    // item = other; // error: parameters cannot be reassigned
 }
 
 fun update(item: *Foo) {
-    item.value = 1; // allowed: mutates the referent
-    // item = other; // error: the binding is still fixed
+    item.value = 1; // allowed: changes the object itself
+    // item = other; // error: the name itself is still fixed
 }
 ```
 
@@ -95,8 +91,9 @@ fun larger(a: i64, b: i64): i64 {
 ```
 
 `return;` is only for `void` functions. A returned value must have the type
-declared after the parameter list. A `*Foo` result may initialize either a
-mutable or read-only binding; a `Foo` result can never initialize `*Foo`:
+declared after the parameter list. A writable `*Foo` result can initialize
+either kind of name; a read-only `Foo` result can never initialize a
+writable `*Foo` name:
 
 ```vl
 type Foo = object { value: u64, };
@@ -132,10 +129,10 @@ fun main() {
 Arguments are evaluated from left to right. User functions may be called from
 any other function, including a function defined earlier or later in the file.
 
-Object types can also own functions: an associated function declared inside an
-`object` body is called through the type (`Counter.bump(counter)`), or as
-instance sugar (`counter.bump()`) when its first parameter takes the object
-itself. See [associated functions](/docs/objects#associated-functions).
+Object types can also own functions: a function declared inside an `object`
+body is called through the type (`Counter.bump(counter)`), or in the short
+form (`counter.bump()`) when its first parameter takes the object itself.
+See [associated functions](/docs/objects#associated-functions).
 
 ## Recursion
 

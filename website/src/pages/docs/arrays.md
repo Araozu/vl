@@ -8,28 +8,23 @@ availability: VL 0.1+
 
 # Arrays and generics
 
-An array stores several values of one type. VL arrays have a fixed length: the
-length is chosen when the array is created and there is currently no operation
-to grow it or ask for its length.
+An array stores several values of one type. VL arrays have a fixed length:
+the length is chosen when the array is created and cannot grow afterwards.
 
 ## Creating an array
 
 An array literal uses square brackets. All its elements must have the same
-type.
-
-An unannotated `var` array gets a `*Array[T]` view; an unannotated `val` array
-gets `Array[T]`. Add an explicit annotation when the intended capability
-should be independent of the binding keyword.
+type. Use `var` when the new array should be changeable and `val` when it
+should stay as created:
 
 ```vl
 val scores = [10, 20, 30];
 val words = ["one", "two"];
 ```
 
-For an array whose size is known but whose values will be filled in later, use
-the builtin `Array.new` constructor. The preferred form annotates the `var`
-so the element type comes from the annotation. Element writes require a
-`*Array[T]` view; reads work through either capability:
+For an array whose size is known but whose values will be filled in later,
+use the builtin `Array.new` constructor. Reading works through either form;
+writing needs a writable `*Array[T]` name:
 
 ```vl
 fun main() {
@@ -40,7 +35,7 @@ fun main() {
 }
 ```
 
-The explicit turbofish form says the element type at the call instead:
+You can also write the element type at the call with `::[...]`:
 
 ```vl
 val scores = Array.new::[u64](3);
@@ -63,11 +58,10 @@ fun main() {
 }
 ```
 
-Indexes are `u64` values. Reading or writing outside the array bounds traps at
-runtime, so keep the length alongside the array when a loop needs it.
-`Array[T]` reads while `*Array[T]` writes; a `*Array[T]` argument downgrades
-to `Array[T]`, never the reverse. Indexing projects element capabilities
-(`Array[*Foo][i]` reads as `Foo`):
+Indexes are `u64` values. Reading or writing outside the array bounds stops
+the program, so keep the length alongside the array when a loop needs it. A
+writable `*Array[T]` can be used where a read-only `Array[T]` is expected,
+never the other way around.
 
 ```vl
 fun sum(values: Array[u64], count: u64): u64 {
@@ -87,9 +81,9 @@ fun fill(values: *Array[u64]) {
 }
 ```
 
-Arrays are reference values. Passing an array to a function gives that function
-the same array, so an element write through a `*Array[T]` changes the shared
-array while a read-only `Array[T]` cannot write.
+Arrays share rather than copy. Passing an array to a function hands over the
+same array, so an element write through a writable name changes the shared
+array.
 
 ## Generic functions
 
@@ -112,9 +106,7 @@ fun main() {
 ```
 
 VL infers `T` from the argument: it chooses `u64` for `numbers` and `String`
-for `words`, preserving `*Foo` when the actual is mutable. If inference is
-unclear, provide the type explicitly with the
-turbofish form `::[T]` (including capabilities, e.g. `::[*Foo]`):
+for `words`. If VL cannot figure it out, write the type in `::[...]`:
 
 ```vl
 fun first[T](values: Array[T]): T {
@@ -128,17 +120,17 @@ fun main() {
 
 ```
 
-The `::` is important. `first[T](...)` without it means indexing syntax, not a
-generic function call.
+The `::` matters. `first[T](...)` without it means something else, not a
+generic call.
 
-Each concrete use of a generic function gets its own compiled instance. A
-generic function that is never called produces no instance, and `main` itself
+Each concrete use of a generic function gets its own compiled copy. A
+generic function that is never called produces no copy, and `main` itself
 cannot be generic.
 
 ## Constrained generics
 
-An unconstrained `T` is fully opaque: it cannot use operators. Bounds unlock
-useful algorithms without full subtyping:
+An unconstrained `T` can only be moved around, not computed with. Bounds
+unlock operators for known families of types:
 
 ```vl
 fun add[T extends Numeric](a: T, b: T): T {
@@ -152,8 +144,7 @@ fun eq[T extends Comparable](a: T, b: T): bool {
 
 `Numeric` allows arithmetic (`+ - * /`), ordering, and equality over
 `u64`, `i64`, `f64`, and `u8`. `Comparable` allows equality (`== !=`) over
-numbers, `bool`, and `String`. A `Numeric` bound implies `Comparable`, so a
-`Numeric` value forwards to a `Comparable` function, but an unconstrained `T`
-cannot flow into either.
+numbers, `bool`, and `String`. A `Numeric` value can be used where
+`Comparable` is expected, but an unconstrained `T` fits neither.
 
-Continue with [modules and strings](/docs/modules).
+Continue with [objects](/docs/objects).

@@ -1,16 +1,15 @@
 ---
 layout: ../../layouts/Docs.astro
-title: Modules and strings
-description: Organize VL files with imports and work with strings and the standard library.
+title: Modules
+description: Split VL programs across files and reuse code with imports.
 eyebrow: Learn the language
 availability: VL 0.1+
 ---
 
-# Modules and strings
+# Modules
 
 As a program grows, put related code in separate files and reuse it with
-imports. VL also provides a small standard library for common operations such
-as printing (`std.println` appends a newline; `std.print` writes a string as-is).
+imports. Each `.vl` file is one module.
 
 ## Source files are modules
 
@@ -58,64 +57,38 @@ library catalog](/std) lists the modules and functions currently available.
 
 ## Sharing object types
 
-Object types are nominal and cross modules by fully qualified name. A
-`type Person` declared in module `my_app.person` is spelled
-`my_app.person.Person` everywhere else: in function signatures, annotations,
-and literals.
+An object type declared in another file keeps its full name everywhere else.
+A `type Person` in module `my_app.person` is written
+`my_app.person.Person` in annotations and literals:
 
 ```vl
 use my_app.person;
 
 fun main() {
-    var rose = person.new("Rose", 25);
-    val same: my_app.person.Person = rose;
     val lit: my_app.person.Person = my_app.person.Person { name = "Lit", age = 40 };
 }
 ```
 
-Two modules may each declare their own `Person`; the qualified name keeps
-them disjoint. Referring to a qualified type with no layout in scope is an
-error, just like a misspelled bare type.
+Writing the full name keeps same-named types from different files apart. A
+misspelled module or export is reported when you run `check`.
 
 ## The standard library
 
-The standard library has two layers. Native functions in the target provide
-low-level operations such as output, string conversion, and arithmetic. The
-VL source modules in [`crates/vl-stdlib/src/std/`](https://github.com/Araozu/vl/tree/main/crates/vl-stdlib/src/std)
-build small helpers on top of those natives. See the [standard library
-reference](/std) for both layers and the source file for each module.
-
-For example, `std.math` includes the VL helpers `max_u64`, `min_u64`,
-`clamp_u64`, `max_i64`, `min_i64`, `abs_i64`, `is_even`, and generic `max`.
-
-## Strings
-
-Strings use double quotes. They are byte strings for now, which means they are
-not yet a full Unicode text type. A string may contain escaped characters:
+The standard library is a set of ready-made modules: `std` for printing,
+`std.string` for text, `std.math` for numbers, and `std.fmt` for turning
+numbers into strings. See the [standard library](/std) for the full list.
 
 ```vl
-val greeting = "hello\nworld";
-val quote = "say \"hi\"";
-```
-
-The supported escapes are `\\0`, `\\n`, `\\r`, `\\t`, `\\\\`, and `\\"`.
-Newlines and unescaped double quotes cannot appear inside a string literal.
-
-The standard library provides functions that operate on strings:
-
-```vl
-use std.string;
+use std.math;
 
 fun main() {
-    val message = "hello";
-    val size = string.len(message);
-    val empty = string.is_empty(message);
+    val larger = math.max_u64(3u64, 8u64);
 }
 ```
 
 ## Putting the pieces together
 
-A small program can combine an import, a function, and a string:
+A small program combines an import, a function, and a string:
 
 ```vl
 use std;
@@ -131,6 +104,5 @@ fun main() {
 }
 ```
 
-When you are ready to explore available library functions, visit the [standard
-library](/std). For compiler commands and diagnostics, see the [CLI
-reference](/cli).
+For text values and their helpers, see [strings](/docs/strings). For compiler
+commands, see the [CLI reference](/cli).

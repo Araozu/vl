@@ -41,14 +41,24 @@ type parameters that let one function work with several element types.
 ## 6. Model named data
 
 [Objects](/docs/objects) explains object declarations, named literals, field
-access, and reference semantics.
+access, and sharing.
 
-## 7. Organize a program
+## 7. Model either-or data
 
-[Modules and strings](/docs/modules) covers imports, source files, text values,
-and the standard library.
+[Unions](/docs/unions) explains how to declare sum types, build variants,
+and choose between them with `match`.
 
-## 8. Use the command line
+## 8. Work with text
+
+[Strings](/docs/strings) covers string literals, escapes, and the standard
+string helpers.
+
+## 9. Organize a program
+
+[Modules](/docs/modules) covers imports, source files, and the standard
+library.
+
+## 10. Use the command line
 
 When you are ready to work with your own files, use the [CLI reference](/cli)
 to check, build, inspect, and select a target from the `vl` driver.
