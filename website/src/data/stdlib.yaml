@@ -1,58 +1,44 @@
-# VL standard library catalog.
+# The user-facing standard-library catalog.
 #
-# Docs mirror of the compiler-owned extern signatures (`vl-codegen::modules`).
-# The compiler enforces these; this file only renders them. Keep them in sync:
-# if a signature changes in `crates/vl-codegen/src/lib.rs`, update it here.
-# `id` is the URL slug (`/std/<id>`); `order` fixes sidebar order.
+# Native entries mirror `vl-codegen::modules`; source entries mirror the
+# embedded modules in `crates/vl-stdlib/src/std`. A module page combines both.
 
 - id: std
   order: 1
   module: std
-  summary: Output functions for small command-line programs.
+  summary: Output functions for command-line programs.
   title: std module
   description: Standard output functions for VL programs.
   intro: |
-    The `std` module contains the output functions used by the getting-started
-    example.
-
-    Import the module before calling it:
+    `std` contains the output functions available on the Naravm target.
+    Import the module before calling its functions:
   import_example: |
-    use std.println;
+    use std;
 
     fun main() {
-        println("Hello, world!");
+        std.println("Hello, world!");
     }
   functions:
     - name: print
       params:
         - name: value
           type: String
-          detail: Byte string to write. No implicit newline is added.
+          detail: Byte string to write. No newline is added.
       returns:
         type: void
-      detail: |
-        Writes one byte string to standard output. It does not add an implicit newline.
-
-        `std.print` is supported by the Naravm target and currently expects exactly one
-        String argument.
+      detail: Writes a string to standard output without adding a newline.
       example: |
-        print("ready\n");
+        std.print("ready");
     - name: println
       params:
         - name: value
           type: String
-          detail: Byte string to write. A single trailing newline is added.
+          detail: Byte string to write.
       returns:
         type: void
-      detail: |
-        Writes one byte string to standard output, followed by a newline.
-        `println("hi")` prints the same bytes as `print("hi\n")`.
-
-        `std.println` is supported by the Naravm target and currently expects exactly one
-        String argument. The VM has no native newline operation, so it lowers
-        to two `print` calls (the value, then `"\n"`).
+      detail: Writes a string to standard output followed by a newline.
       example: |
-        println("ready");
+        std.println("ready");
     - name: print_u64
       params:
         - name: value
@@ -60,91 +46,258 @@
           detail: Unsigned integer to write.
       returns:
         type: void
-      detail: |
-        Unsigned integer output. It is checked during general module checking
-        (`vl check`), but the current Naravm target does not emit it yet.
-  outro: |
-    For the current target and command options, see the [CLI reference](/cli).
-
-- id: fs
-  order: 2
-  module: std.fs
-  summary: File-system functions recognized by the language module catalog. Target support is still in progress.
-  title: std.fs module
-  description: File-system functions in the VL standard library catalog.
-  intro: |
-    The `std.fs` module reserves the file-system functions available to the
-    language. Import individual functions with a grouped import:
-  import_example: |
-    use std.fs.{open, read};
-
-    fun main() {
-        val f = open("data.txt");
-        val s = read(f);
-    }
-  functions:
-    - name: open
-      params:
-        - name: path
-          type: String
-          detail: Byte string path of the file to open.
-      returns:
-        type: File
-      detail: |
-        Opens a file, yielding a `File` reference/handle (Naravm `ObjectFile`).
-
-        Fallible at the VM level (`errno`/`0x30`); VL error handling is out of
-        scope for now, so the language surface is a plain `File` return. The
-        current Naravm target does not emit file-system calls yet.
+      detail: Writes an unsigned integer to standard output.
       example: |
-        val f = open("data.txt");
-    - name: read
-      params:
-        - name: file
-          type: File
-          detail: Open file to read from.
-      returns:
-        type: String
-      detail: |
-        Reads from an opened file, yielding a byte string.
-
-        Like `open`, fallible at the VM level but surfaced as a plain `String`
-        return until VL gains error handling. Not yet emitted by Naravm.
-      example: |
-        val s = read(f);
+        std.print_u64(42u64);
   outro: |
-    `File` is a built-in VL reference/handle type mapping to the VM `ObjectFile`;
-    it is distinct from user-defined `object` declarations. See [Basics](/docs/basics)
-    for the core type list.
+    The module has no VL source file; these functions are target-provided.
 
 - id: string
-  order: 3
+  order: 2
   module: std.string
-  summary: String helpers recognized by the language module catalog. Target support is still in progress.
+  source: crates/vl-stdlib/src/std/string.vl
+  summary: Native string operations and small VL string helpers.
   title: std.string module
-  description: String functions in the VL standard library catalog.
+  description: String operations and helpers in the VL standard library.
   intro: |
-    The `std.string` module holds helpers for measuring byte strings.
-    Import the functions you need:
+    `std.string` combines target-provided operations with helpers implemented
+    in VL. Import the module before using its qualified names:
   import_example: |
-    use std.string.{len};
+    use std.string;
 
     fun main() {
-        val n = len("hi");
+        val message = "hello";
+        val size = std.string.len(message);
+        val empty = std.string.is_empty(message);
     }
   functions:
     - name: len
       params:
         - name: value
           type: String
-          detail: Byte string to measure.
+          detail: String whose byte length should be measured.
       returns:
         type: u64
-      detail: |
-        Returns the length of a `String`. Checked during general module checking;
-        the current Naravm target does not emit it yet.
+      detail: Native operation that returns the byte length of a string.
       example: |
-        val n = len("hi");
+        val n = std.string.len("hi");
+    - name: concat
+      params:
+        - name: a
+          type: String
+          detail: First string.
+        - name: b
+          type: String
+          detail: Second string.
+      returns:
+        type: String
+      detail: Native operation that concatenates two byte strings.
+    - name: eq
+      params:
+        - name: a
+          type: String
+          detail: First string.
+        - name: b
+          type: String
+          detail: Second string.
+      returns:
+        type: bool
+      detail: Native operation that compares two byte strings.
+    - name: to_u64
+      params:
+        - name: value
+          type: String
+          detail: Decimal string to parse.
+      returns:
+        type: u64
+      detail: Native conversion from a decimal byte string to `u64`.
+    - name: hex_to_u64
+      params:
+        - name: value
+          type: String
+          detail: Hexadecimal string to parse.
+      returns:
+        type: u64
+      detail: Native conversion from a hexadecimal byte string to `u64`.
+    - name: is_empty
+      params:
+        - name: s
+          type: String
+          detail: String to test.
+      returns:
+        type: bool
+      detail: VL helper returning whether the string has zero bytes.
+      example: |
+        val empty = std.string.is_empty("hi");
+    - name: strings_equal
+      params:
+        - name: a
+          type: String
+          detail: First string.
+        - name: b
+          type: String
+          detail: Second string.
+      returns:
+        type: bool
+      detail: VL helper built on the native string equality operation.
+      example: |
+        val same = std.string.strings_equal("VL", "VL");
   outro: |
-    VL strings are byte strings for now. See [Modules and strings](/docs/modules)
-    for literal syntax and supported escapes.
+    The helpers are implemented in [`string.vl`](https://github.com/Araozu/vl/tree/main/crates/vl-stdlib/src/std/string.vl); the remaining entries are target natives.
+
+- id: math
+  order: 3
+  module: std.math
+  source: crates/vl-stdlib/src/std/math.vl
+  summary: Arithmetic native operations and VL numeric helpers.
+  title: std.math module
+  description: Numeric operations and helpers in the VL standard library.
+  intro: |
+    `std.math` contains one target native and helpers written in VL.
+  import_example: |
+    use std.math;
+
+    fun main() {
+        val larger = std.math.max_u64(3u64, 8u64);
+    }
+  functions:
+    - name: mod_u64
+      params:
+        - name: a
+          type: u64
+          detail: Dividend.
+        - name: b
+          type: u64
+          detail: Non-zero divisor.
+      returns:
+        type: u64
+      detail: Native unsigned remainder operation.
+      example: |
+        val remainder = std.math.mod_u64(17u64, 5u64);
+    - name: max_u64
+      params:
+        - name: a
+          type: u64
+          detail: First value.
+        - name: b
+          type: u64
+          detail: Second value.
+      returns:
+        type: u64
+      detail: VL helper returning the larger unsigned integer.
+    - name: min_u64
+      params:
+        - name: a
+          type: u64
+          detail: First value.
+        - name: b
+          type: u64
+          detail: Second value.
+      returns:
+        type: u64
+      detail: VL helper returning the smaller unsigned integer.
+    - name: clamp_u64
+      params:
+        - name: v
+          type: u64
+          detail: Value to clamp.
+        - name: lo
+          type: u64
+          detail: Lower bound.
+        - name: hi
+          type: u64
+          detail: Upper bound.
+      returns:
+        type: u64
+      detail: VL helper limiting a value to an inclusive range.
+    - name: max_i64
+      params:
+        - name: a
+          type: i64
+          detail: First value.
+        - name: b
+          type: i64
+          detail: Second value.
+      returns:
+        type: i64
+      detail: VL helper returning the larger signed integer.
+    - name: min_i64
+      params:
+        - name: a
+          type: i64
+          detail: First value.
+        - name: b
+          type: i64
+          detail: Second value.
+      returns:
+        type: i64
+      detail: VL helper returning the smaller signed integer.
+    - name: abs_i64
+      params:
+        - name: a
+          type: i64
+          detail: Signed integer.
+      returns:
+        type: i64
+      detail: VL helper returning the absolute value.
+    - name: is_even
+      params:
+        - name: v
+          type: u64
+          detail: Unsigned integer to test.
+      returns:
+        type: bool
+      detail: VL helper testing whether a number is even.
+    - name: max
+      params:
+        - name: a
+          type: T
+          detail: First numeric value.
+        - name: b
+          type: T
+          detail: Second numeric value.
+      returns:
+        type: T
+      detail: Generic VL helper for any `T extends Numeric`.
+      example: |
+        val larger = std.math.max(3u64, 8u64);
+  outro: |
+    The helpers are implemented in [`math.vl`](https://github.com/Araozu/vl/tree/main/crates/vl-stdlib/src/std/math.vl).
+
+- id: fmt
+  order: 4
+  module: std.fmt
+  source: crates/vl-stdlib/src/std/fmt.vl
+  summary: Formatting helpers built on the target's string conversion native.
+  title: std.fmt module
+  description: Formatting helpers in the VL standard library.
+  intro: |
+    `std.fmt` exposes a VL-named helper for converting unsigned integers to
+    strings.
+  import_example: |
+    use std.fmt;
+
+    fun main() {
+        val text = std.fmt.u64_to_string(42u64);
+    }
+  functions:
+    - name: u64_to_s
+      params:
+        - name: value
+          type: u64
+          detail: Unsigned integer to convert.
+      returns:
+        type: String
+      detail: Target-native unsigned integer to string conversion.
+    - name: u64_to_string
+      params:
+        - name: v
+          type: u64
+          detail: Unsigned integer to convert.
+      returns:
+        type: String
+      detail: VL helper wrapping `u64_to_s`.
+      example: |
+        val text = std.fmt.u64_to_string(42u64);
+  outro: |
+    The helper is implemented in [`fmt.vl`](https://github.com/Araozu/vl/tree/main/crates/vl-stdlib/src/std/fmt.vl).

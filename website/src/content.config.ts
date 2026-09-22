@@ -27,6 +27,7 @@ const stdlib = defineCollection({
     id: z.string(),
     order: z.number(),
     module: z.string(),
+    source: z.string().optional(),
     summary: z.string(),
     title: z.string(),
     description: z.string(),

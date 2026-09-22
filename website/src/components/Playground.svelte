@@ -45,8 +45,8 @@
   }
 
   function loadSample(kind: 'hello' | 'arith' | 'error') {
-    if (kind === 'hello') source = 'use std.println;\n\nfunction main() {\n    println("Hello, world!");\n}';
-    if (kind === 'arith') source = 'use std.println;\n\nfunction main() {\n    println("2 + 3 = 5");\n}';
+    if (kind === 'hello') source = 'use std;\n\nfun main() {\n    std.println("Hello, world!");\n}';
+    if (kind === 'arith') source = 'use std;\n\nfun main() {\n    std.println("2 + 3 = 5");\n}';
     if (kind === 'error') source = 'fun main() { undefined_var; }';
     artifact = null;
     output = ['// sample loaded — press Run'];

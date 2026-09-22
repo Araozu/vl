@@ -18,7 +18,7 @@ const modules = (await getCollection('stdlib')).sort((a, b) => a.data.order - b.
   <p>
     The standard library is the set of modules a VL program can import. Start with
     the <a href="/docs">learning path</a> if you are new to the language, then use these pages
-    to look up a module or function.
+    to look up a function or open the VL source behind a module.
   </p>
   <h2 id="modules">Modules</h2>
   {
@@ -35,9 +35,8 @@ const modules = (await getCollection('stdlib')).sort((a, b) => a.data.order - b.
   }
   <h2 id="availability">Availability</h2>
   <p>
-    VL 0.1 is being implemented in stages. A function may be accepted by the
-    language checker before a runnable target supports it. Each module page calls
-    out the current status; <code>std.print</code> and <code>std.println</code> are the
-    current Naravm examples.
+    These entries describe the current Naravm surface. Native functions are
+    supplied by the target; source modules are embedded into the compiled
+    program when one of their helpers is used.
   </p>
 </Docs>

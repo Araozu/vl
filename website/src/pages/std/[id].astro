@@ -37,6 +37,9 @@ for (const fn of mod.functions) {
   availability="VL 0.1+"
 >
   <h1 id={slug(mod.module)}><code>{mod.module}</code></h1>
+  {mod.source && (
+    <p class="text-[0.85rem] text-muted">VL source: <code>{mod.source}</code></p>
+  )}
   <Fragment set:html={renderParagraphs(mod.intro)} />
   <Fragment set:html={importHtml} />
   {
