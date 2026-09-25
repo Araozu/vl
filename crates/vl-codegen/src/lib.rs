@@ -197,6 +197,12 @@ enum NaraKind {
     /// maps to a value or reference slot by its own element kind; the
     /// vector holds the erased element kinds in source order.
     Tuple(Vec<NaraKind>),
+    /// Fallible value (`E!T`, a memory container): value slot 0 holds the
+    /// tag (0 = ok, 1 = error), value slot 1 holds the error code on the
+    /// err path or the first value-kind payload slot on the ok path, and
+    /// the remaining slots hold the `ok` payload's own value/reference
+    /// slots in order. The payload is `Void` for `E!void` (tag-only).
+    Fallible(Box<NaraKind>),
     /// Union value (a memory container): value slot 0 holds the `u64`
     /// discriminant tag, remaining value slots hold value-kind payloads in
     /// order, and reference slots hold reference-kind payloads in order.
@@ -233,6 +239,12 @@ impl NaraKind {
                 }
                 Some(NaraKind::Tuple(kinds))
             }
+            // Error sets are global `u64` codes (value lane); set
+            // membership is a static constraint with no runtime trace.
+            vl_typecheck::Ty::ErrorSet(_) => Some(NaraKind::U64),
+            vl_typecheck::Ty::Fallible(f) => {
+                Some(NaraKind::Fallible(Box::new(Self::of_ok(&f.ok)?)))
+            }
             // Capability-only: same representation as the read-only view.
             vl_typecheck::Ty::Mutable(inner) => Self::of_ty(inner),
             vl_typecheck::Ty::Param(_) | vl_typecheck::Ty::Void | vl_typecheck::Ty::Error => None,
@@ -240,9 +252,10 @@ impl NaraKind {
     }
 
     /// Reference kinds live in `rf`, everything else in `rv`.
-    /// Tuples and unions are heap containers (hence `rf`) with value copy
-    /// semantics at the language level for tuples (deep-copied on
-    /// `Copy`/param entry); unions copy as shared references like objects.
+    /// Tuples, unions, and fallibles are heap containers (hence `rf`) with
+    /// value copy semantics at the language level for tuples (deep-copied
+    /// on `Copy`/param entry); unions and fallibles copy as shared
+    /// references like objects.
     fn is_ref(&self) -> bool {
         matches!(
             self,
@@ -252,7 +265,18 @@ impl NaraKind {
                 | NaraKind::Array(_)
                 | NaraKind::Tuple(_)
                 | NaraKind::Union(_)
+                | NaraKind::Fallible(_)
         )
+    }
+
+    /// Erased lane kind of a fallible `ok` payload. `Void` (`E!void`)
+    /// maps to a dummy value lane: the container keeps its code slot on
+    /// every path, and the ok path simply never reads it.
+    fn of_ok(ok: &vl_typecheck::Ty) -> Option<Self> {
+        match ok {
+            vl_typecheck::Ty::Void => Some(NaraKind::U64),
+            _ => Self::of_ty(ok),
+        }
     }
 
     fn of_scalar(value: Scalar) -> Self {
@@ -526,6 +550,265 @@ fn nara_tuple_copy_into(
         e.free_rf.push(rf);
     }
     true
+}
+
+/// Container lane sizes for a fallible value: `(values, refs)`. Value
+/// slot 0 is the tag (0 = ok, 1 = error); value slot 1 is the error code
+/// on the err path or the first value-kind payload slot on the ok path.
+fn nara_fallible_lanes(ok: &NaraKind) -> (usize, usize) {
+    let (v, r) = match ok {
+        NaraKind::Tuple(kinds) => tuple_lanes(kinds),
+        kind if kind.is_ref() => (0, 1),
+        _ => (1, 0),
+    };
+    (1 + v.max(1), r)
+}
+
+/// Allocate a fallible container (`createi`) sized for an `ok` payload
+/// kind. E404 when a lane exceeds 255 slots.
+fn nara_fallible_create(e: &mut NaraEmit, ok: &NaraKind, span: Span) -> Option<u8> {
+    let (values, refs) = nara_fallible_lanes(ok);
+    if values > u8::MAX as usize || refs > u8::MAX as usize {
+        e.diags.push(
+            Diagnostic::error("Naravm fallible value has more than 255 slots in one register lane")
+                .with_label(span, "fallible allocated here")
+                .with_note("split the payload into smaller tuples")
+                .with_code("E404"),
+        );
+        return None;
+    }
+    let rf = e.fresh_rf(span)?;
+    e.bytecode
+        .extend_from_slice(&[0x27, rf, values as u8, refs as u8]); // createi
+    Some(rf)
+}
+
+/// Store the tag (0 = ok, 1 = error) into value slot 0 of a fallible
+/// container.
+fn nara_fallible_tag(e: &mut NaraEmit, dst: u8, tag: u64, span: Span) -> bool {
+    let Some(idx) = e.add_value(tag, span) else {
+        return false;
+    };
+    let Ok(idx) = u8::try_from(idx) else {
+        e.diags.push(
+            Diagnostic::error("Naravm value pool exhausted (compiler bug)")
+                .with_label(span, "fallible allocated here")
+                .with_code("E500"),
+        );
+        return false;
+    };
+    let Some(rv) = e.fresh_rv(span) else {
+        return false;
+    };
+    e.bytecode.extend_from_slice(&[0x02, rv, idx]); // lv
+    e.bytecode.extend_from_slice(&[0x2d, dst, 0, rv]); // setvati
+    e.free_rv.push(rv);
+    true
+}
+
+/// Store an ok payload into a fallible container (ok path). `payload` is
+/// a value reg for value-kind singles, a ref reg for reference singles, or
+/// a container for tuples. Value payload slot `j` lands in container value
+/// slot `j + 1` (slot 0 is the tag); reference slots keep their index.
+fn nara_fallible_store(e: &mut NaraEmit, dst: u8, payload: u8, ok: &NaraKind, span: Span) -> bool {
+    if let NaraKind::Tuple(nested) = ok {
+        let nested = nested.clone();
+        let (values, refs) = tuple_lanes(&nested);
+        let scratch_rv = if values > 0 {
+            match e.fresh_rv(span) {
+                Some(rv) => Some(rv),
+                None => return false,
+            }
+        } else {
+            None
+        };
+        let scratch_rf = if refs > 0 {
+            match e.fresh_rf(span) {
+                Some(rf) => Some(rf),
+                None => {
+                    if let Some(rv) = scratch_rv {
+                        e.free_rv.push(rv);
+                    }
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+        let mut failed = false;
+        for (i, kind) in nested.iter().enumerate() {
+            let Some((is_ref, slot)) = tuple_slot(&nested, i) else {
+                failed = true;
+                break;
+            };
+            let Ok(slot) = u8::try_from(slot) else {
+                e.diags.push(
+                    Diagnostic::error("Naravm tuple slot is out of range (compiler bug)")
+                        .with_label(span, "fallible payload stored here")
+                        .with_code("E500"),
+                );
+                failed = true;
+                break;
+            };
+            if let NaraKind::Tuple(inner) = kind {
+                // Nested tuples duplicate so the fallible owns every level.
+                let inner = inner.clone();
+                let (Some(nested_src), Some(nested_dst)) = (e.fresh_rf(span), e.fresh_rf(span))
+                else {
+                    failed = true;
+                    break;
+                };
+                e.bytecode
+                    .extend_from_slice(&[0x2e, nested_src, payload, slot]); // getrfati
+                if !nara_tuple_copy_into(e, nested_dst, nested_src, &inner, span) {
+                    e.free_rf.push(nested_src);
+                    e.free_rf.push(nested_dst);
+                    failed = true;
+                    break;
+                }
+                e.bytecode.extend_from_slice(&[0x2f, dst, slot, nested_dst]); // setrfati
+                e.free_rf.push(nested_src);
+                e.free_rf.push(nested_dst);
+                continue;
+            }
+            if is_ref {
+                let Some(tmp) = scratch_rf else {
+                    failed = true;
+                    break;
+                };
+                e.bytecode.extend_from_slice(&[0x2e, tmp, payload, slot]); // getrfati
+                e.bytecode.extend_from_slice(&[0x2f, dst, slot, tmp]); // setrfati
+            } else {
+                let Some(tmp) = scratch_rv else {
+                    failed = true;
+                    break;
+                };
+                // Value payload slot `j` lands in container value slot
+                // `j + 1` (slot 0 is the tag); lanes are ≤ 255 by
+                // construction, so the shift always fits.
+                let dst_slot = slot.saturating_add(1);
+                e.bytecode.extend_from_slice(&[0x2c, tmp, payload, slot]); // getvati
+                e.bytecode.extend_from_slice(&[0x2d, dst, dst_slot, tmp]); // setvati
+            }
+        }
+        if let Some(rv) = scratch_rv {
+            e.free_rv.push(rv);
+        }
+        if let Some(rf) = scratch_rf {
+            e.free_rf.push(rf);
+        }
+        return !failed;
+    }
+    if ok.is_ref() {
+        e.bytecode.extend_from_slice(&[0x2f, dst, 0, payload]); // setrfati
+    } else {
+        e.bytecode.extend_from_slice(&[0x2d, dst, 1, payload]); // setvati
+    }
+    true
+}
+
+/// Load an ok payload from a fallible container (ok path). Returns the
+/// lane and the fresh register holding the payload: a value reg, a ref
+/// reg, or (tuples) a freshly allocated container. The dummy `U64` lane
+/// covers `E!void` (unreachable live; keeps the instruction shape).
+fn nara_fallible_load(
+    e: &mut NaraEmit,
+    scrut: u8,
+    ok: &NaraKind,
+    span: Span,
+) -> Option<(bool, u8)> {
+    if let NaraKind::Tuple(nested) = ok {
+        let nested = nested.clone();
+        let (values, refs) = tuple_lanes(&nested);
+        if values > u8::MAX as usize || refs > u8::MAX as usize {
+            e.diags.push(
+                Diagnostic::error(
+                    "Naravm fallible value has more than 255 slots in one register lane",
+                )
+                .with_label(span, "fallible payload read here")
+                .with_code("E404"),
+            );
+            return None;
+        }
+        let dst = e.fresh_rf(span)?;
+        e.bytecode
+            .extend_from_slice(&[0x27, dst, values as u8, refs as u8]); // createi
+        let scratch_rv = if values > 0 { e.fresh_rv(span) } else { None };
+        let scratch_rf = if refs > 0 { e.fresh_rf(span) } else { None };
+        if (values > 0 && scratch_rv.is_none()) || (refs > 0 && scratch_rf.is_none()) {
+            if let Some(rv) = scratch_rv {
+                e.free_rv.push(rv);
+            }
+            if let Some(rf) = scratch_rf {
+                e.free_rf.push(rf);
+            }
+            e.free_rf.push(dst);
+            return None;
+        }
+        let mut failed = false;
+        for (i, kind) in nested.iter().enumerate() {
+            let (is_ref, slot) = match tuple_slot(&nested, i) {
+                Some(slot) => slot,
+                None => {
+                    failed = true;
+                    break;
+                }
+            };
+            let Ok(slot) = u8::try_from(slot) else {
+                failed = true;
+                break;
+            };
+            if let NaraKind::Tuple(inner) = kind {
+                let inner = inner.clone();
+                let (Some(nested_src), Some(nested_dst)) = (e.fresh_rf(span), e.fresh_rf(span))
+                else {
+                    failed = true;
+                    break;
+                };
+                e.bytecode
+                    .extend_from_slice(&[0x2e, nested_src, scrut, slot]); // getrfati
+                if !nara_tuple_copy_into(e, nested_dst, nested_src, &inner, span) {
+                    e.free_rf.push(nested_src);
+                    e.free_rf.push(nested_dst);
+                    failed = true;
+                    break;
+                }
+                e.bytecode.extend_from_slice(&[0x2f, dst, slot, nested_dst]); // setrfati
+                e.free_rf.push(nested_src);
+                e.free_rf.push(nested_dst);
+                continue;
+            }
+            if is_ref {
+                let tmp = scratch_rf.expect("ref scratch exists for ref payloads");
+                e.bytecode.extend_from_slice(&[0x2e, tmp, scrut, slot]); // getrfati
+                e.bytecode.extend_from_slice(&[0x2f, dst, slot, tmp]); // setrfati
+            } else {
+                let tmp = scratch_rv.expect("value scratch exists for value payloads");
+                let src_slot = slot.saturating_add(1);
+                e.bytecode.extend_from_slice(&[0x2c, tmp, scrut, src_slot]); // getvati
+                e.bytecode.extend_from_slice(&[0x2d, dst, slot, tmp]); // setvati
+            }
+        }
+        if let Some(rv) = scratch_rv {
+            e.free_rv.push(rv);
+        }
+        if let Some(rf) = scratch_rf {
+            e.free_rf.push(rf);
+        }
+        if failed {
+            e.free_rf.push(dst);
+            return None;
+        }
+        return Some((true, dst));
+    }
+    if ok.is_ref() {
+        let dst = e.fresh_rf(span)?;
+        e.bytecode.extend_from_slice(&[0x2e, dst, scrut, 0]); // getrfati
+        return Some((true, dst));
+    }
+    let dst = e.fresh_rv(span)?;
+    e.bytecode.extend_from_slice(&[0x2c, dst, scrut, 1]); // getvati
+    Some((false, dst))
 }
 
 struct NaraEmit {
@@ -829,6 +1112,15 @@ fn nara_last_use_fragment(
                     touch(*arg, idx);
                 }
             }
+            I::WrapOk { value, .. } => {
+                touch(*value, idx);
+            }
+            I::WrapErr { code, .. } => {
+                touch(*code, idx);
+            }
+            I::UnwrapOk { scrut, .. } | I::UnwrapErr { scrut, .. } => {
+                touch(*scrut, idx);
+            }
             I::TagOf { scrut, .. } => {
                 touch(*scrut, idx);
             }
@@ -940,6 +1232,10 @@ fn free_fragment_regs(e: &mut NaraEmit, instrs: &[Instr], result: &vl_lir::Reg) 
             | I::TupleLit { dst, .. }
             | I::TupleGet { dst, .. }
             | I::NewVariant { dst, .. }
+            | I::WrapOk { dst, .. }
+            | I::WrapErr { dst, .. }
+            | I::UnwrapOk { dst, .. }
+            | I::UnwrapErr { dst, .. }
             | I::TagOf { dst, .. }
             | I::PayloadGet { dst, .. }
             | I::GlobalLoad { dst, .. }
@@ -1560,6 +1856,9 @@ fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::R
                     touch(*arg, idx);
                 }
             }
+            I::WrapOk { value, .. } => touch(*value, idx),
+            I::WrapErr { code, .. } => touch(*code, idx),
+            I::UnwrapOk { scrut, .. } | I::UnwrapErr { scrut, .. } => touch(*scrut, idx),
             I::TagOf { scrut, .. } => touch(*scrut, idx),
             I::PayloadGet { scrut, .. } => touch(*scrut, idx),
             I::ObjectGet { object, .. } => touch(*object, idx),
@@ -1677,6 +1976,15 @@ fn nara_free_dead(e: &mut NaraEmit, ins: &Instr, idx: usize) {
         }
         I::NewVariant { args, .. } => {
             dead.extend(args.iter().copied());
+        }
+        I::WrapOk { value, .. } => {
+            dead.push(*value);
+        }
+        I::WrapErr { code, .. } => {
+            dead.push(*code);
+        }
+        I::UnwrapOk { scrut, .. } | I::UnwrapErr { scrut, .. } => {
+            dead.push(*scrut);
         }
         I::TagOf { scrut, .. } => {
             dead.push(*scrut);
@@ -2940,6 +3248,184 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             }
             e.kinds.insert(*dst, elem_kind);
         }
+        Instr::WrapOk {
+            dst,
+            value,
+            ok,
+            span,
+        } => {
+            let Some(ok_kind) = NaraKind::of_ok(ok) else {
+                e.diags.push(
+                    Diagnostic::error("Naravm backend found a non-runtime fallible payload")
+                        .with_label(*span, "ok value wrapped here")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            };
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, NaraKind::Fallible(Box::new(ok_kind)));
+                return;
+            }
+            if e.invalid.contains(value) {
+                e.invalid.insert(*dst);
+                return;
+            }
+            // Tuples and reference payloads live in `rf`; value payloads
+            // (and the `E!void` dummy) live in `rv`.
+            let payload = if matches!(&ok_kind, NaraKind::Tuple(_)) || ok_kind.is_ref() {
+                match e.rf_map.get(value).copied() {
+                    Some(rf) => rf,
+                    None => {
+                        e.diags.push(
+                            Diagnostic::error(
+                                "Naravm backend could not resolve a fallible payload register",
+                            )
+                            .with_label(*span, "ok value wrapped here")
+                            .with_code("E500"),
+                        );
+                        e.invalid.insert(*dst);
+                        return;
+                    }
+                }
+            } else {
+                match e.rv_map.get(value).copied() {
+                    Some(rv) => rv,
+                    None => {
+                        e.diags.push(
+                            Diagnostic::error(
+                                "Naravm backend could not resolve a fallible payload register",
+                            )
+                            .with_label(*span, "ok value wrapped here")
+                            .with_code("E500"),
+                        );
+                        e.invalid.insert(*dst);
+                        return;
+                    }
+                }
+            };
+            let Some(rf) = nara_fallible_create(e, &ok_kind, *span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            if !nara_fallible_tag(e, rf, 0, *span)
+                || !nara_fallible_store(e, rf, payload, &ok_kind, *span)
+            {
+                e.invalid.insert(*dst);
+                return;
+            }
+            e.rf_map.insert(*dst, rf);
+            e.kinds.insert(*dst, NaraKind::Fallible(Box::new(ok_kind)));
+        }
+        Instr::WrapErr {
+            dst,
+            code,
+            ok,
+            span,
+        } => {
+            let Some(ok_kind) = NaraKind::of_ok(ok) else {
+                e.diags.push(
+                    Diagnostic::error("Naravm backend found a non-runtime fallible payload")
+                        .with_label(*span, "error wrapped here")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            };
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, NaraKind::Fallible(Box::new(ok_kind)));
+                return;
+            }
+            if e.invalid.contains(code) {
+                e.invalid.insert(*dst);
+                return;
+            }
+            let Some(code_rv) = e.rv_map.get(code).copied() else {
+                e.diags.push(
+                    Diagnostic::error("Naravm backend could not resolve an error code register")
+                        .with_label(*span, "error wrapped here")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(rf) = nara_fallible_create(e, &ok_kind, *span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            if !nara_fallible_tag(e, rf, 1, *span) {
+                e.invalid.insert(*dst);
+                return;
+            }
+            e.bytecode.extend_from_slice(&[0x2d, rf, 1, code_rv]); // setvati (code slot)
+            e.rf_map.insert(*dst, rf);
+            e.kinds.insert(*dst, NaraKind::Fallible(Box::new(ok_kind)));
+        }
+        Instr::UnwrapOk {
+            dst,
+            scrut,
+            ok,
+            span,
+        } => {
+            let Some(ok_kind) = NaraKind::of_ok(ok) else {
+                e.diags.push(
+                    Diagnostic::error("Naravm backend found a non-runtime fallible payload")
+                        .with_label(*span, "ok payload read here")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            };
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, ok_kind);
+                return;
+            }
+            let Some(obj) = e.rf_map.get(scrut).copied() else {
+                if !e.invalid.contains(scrut) {
+                    e.diags.push(
+                        Diagnostic::error("Naravm backend expected a fallible reference")
+                            .with_label(*span, "ok payload read here")
+                            .with_code("E500"),
+                    );
+                }
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some((is_ref, reg)) = nara_fallible_load(e, obj, &ok_kind, *span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            if is_ref {
+                e.rf_map.insert(*dst, reg);
+            } else {
+                e.rv_map.insert(*dst, reg);
+            }
+            e.kinds.insert(*dst, ok_kind);
+        }
+        Instr::UnwrapErr { dst, scrut, span } => {
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, NaraKind::U64);
+                return;
+            }
+            let Some(obj) = e.rf_map.get(scrut).copied() else {
+                if !e.invalid.contains(scrut) {
+                    e.diags.push(
+                        Diagnostic::error("Naravm backend expected a fallible reference")
+                            .with_label(*span, "error code read here")
+                            .with_code("E500"),
+                    );
+                }
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(d) = e.fresh_rv(*span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            e.bytecode.extend_from_slice(&[0x2c, d, obj, 1]); // getvati (code slot)
+            e.rv_map.insert(*dst, d);
+            e.kinds.insert(*dst, NaraKind::U64);
+        }
         Instr::Ret { src, span } => nara_ret(e, ctx, *src, *span),
         Instr::GlobalLoad { dst, global, span } => {
             let Some((is_ref, slot)) = ctx.global_slots.get(global).copied() else {
@@ -3800,6 +4286,38 @@ mod tests {
         // createi = 0x27 (literal + copy allocations), getvati = 0x2c,
         // setvati = 0x2d.
         for op in [0x27u8, 0x2c, 0x2du8] {
+            assert!(bytes.contains(&op), "no {op:#x} in {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn naravm_emits_fallible_with_container_ops() {
+        // `E!u64` lowers to tag+payload containers: `createi` (0x27)
+        // allocates, `getvati` (0x2c) reads the tag/payload/code,
+        // `setvati` (0x2d) writes them. The error code rides the blob.
+        let lir = lir_of(
+            "type E = error { A, }; fun f(): E!u64 { return E.A; } fun g(): E!u64 { val x = try f(); return x; } fun main() { val v = g() catch 0u64; v; }",
+        );
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let bytes = artifact.unwrap().bytes.unwrap();
+        assert_eq!(&bytes[..4], b"nara");
+        for op in [0x27u8, 0x2c, 0x2du8] {
+            assert!(bytes.contains(&op), "no {op:#x} in {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn naravm_emits_fallible_string_and_void_payloads() {
+        let lir = lir_of(
+            "use std; type E = error { A, }; fun s(): E!String { return E.A; } fun t(): E!String { return \"hi\"; } fun v(): E!void { return; } fun main() { std.print(s() catch \"d\"); std.print(t() catch \"e\"); v() catch std.print(\"f\"); }",
+        );
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        let bytes = artifact.unwrap().bytes.unwrap();
+        assert_eq!(&bytes[..4], b"nara");
+        // Reference payloads add `getrfati` (0x2e) / `setrfati` (0x2f).
+        for op in [0x27u8, 0x2cu8, 0x2du8, 0x2eu8, 0x2fu8] {
             assert!(bytes.contains(&op), "no {op:#x} in {bytes:?}");
         }
     }

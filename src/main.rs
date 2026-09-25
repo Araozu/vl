@@ -104,6 +104,31 @@ fn read_input(file: &Path) -> Result<(String, String), String> {
     }
 }
 
+/// Entrypoint return check: `main` is infallible by definition (the VM
+/// loader owns startup failure). A fallible `main` gets its own E401;
+/// any other non-`void` return gets the classic one. `None` (already
+/// reported) stays quiet.
+fn main_ret_error(
+    ret: &Option<vl_common::VlType>,
+    span: vl_common::Span,
+) -> Option<vl_common::Diagnostic> {
+    match ret {
+        None | Some(vl_common::VlType::Void) => None,
+        Some(vl_common::VlType::Fallible { .. }) => Some(
+            vl_common::Diagnostic::error("`main` cannot be fallible")
+                .with_label(span, "entrypoint declared here")
+                .with_note("handle errors inside `main` (e.g. `catch`) instead")
+                .with_code("E401"),
+        ),
+        _ => Some(
+            vl_common::Diagnostic::error("`main` must return `void`")
+                .with_label(span, "entrypoint declared here")
+                .with_note("omit the return type (it defaults to `void`)")
+                .with_code("E401"),
+        ),
+    }
+}
+
 fn source_module(file: &Path) -> String {
     file.file_stem()
         .and_then(|stem| stem.to_str())
@@ -507,13 +532,8 @@ fn run_frontend_check(
                         .with_code("E401"),
                 );
             }
-            if mains[0].1 != Some(vl_common::VlType::Void) {
-                diags.push(
-                    vl_common::Diagnostic::error("`main` must return `void`")
-                        .with_label(mains[0].2, "entrypoint declared here")
-                        .with_note("omit the return type (it defaults to `void`)")
-                        .with_code("E401"),
-                );
+            if let Some(diag) = main_ret_error(&mains[0].1, mains[0].2) {
+                diags.push(diag);
             }
         }
     }
@@ -597,13 +617,8 @@ fn run_frontend(
             // The entrypoint returns nothing; `void` keeps VL's type surface
             // total while the VM decides its own halt representation.
             // (A generic `main` is rejected by typechecking with E401.)
-            if mains[0].1 != Some(vl_common::VlType::Void) {
-                diags.push(
-                    vl_common::Diagnostic::error("`main` must return `void`")
-                        .with_label(mains[0].2, "entrypoint declared here")
-                        .with_note("omit the return type (it defaults to `void`)")
-                        .with_code("E401"),
-                );
+            if let Some(diag) = main_ret_error(&mains[0].1, mains[0].2) {
+                diags.push(diag);
             }
         }
     }
@@ -959,13 +974,8 @@ fn batch_frontend(
                             .with_code("E401"),
                     );
                 }
-                if *ret != Some(vl_common::VlType::Void) {
-                    d.push(
-                        vl_common::Diagnostic::error("`main` must return `void`")
-                            .with_label(*span, "entrypoint declared here")
-                            .with_note("omit the return type (it defaults to `void`)")
-                            .with_code("E401"),
-                    );
+                if let Some(diag) = main_ret_error(ret, *span) {
+                    d.push(diag);
                 }
             }
         }

@@ -1742,3 +1742,142 @@ fn brace_type_import_errors_are_single_root_causes() {
         assert_eq!(errors[0].code.as_deref(), Some(code), "{units:?}: {err:?}");
     }
 }
+
+#[test]
+fn errors_example_wraps_propagates_and_catches_to_naravm() {
+    use vl_codegen::Target;
+    let src = std::fs::read_to_string("examples/errors.vl").unwrap();
+    let lir = frontend(&src).expect("errors.vl must compile");
+    let dump = lir.dump();
+    for op in ["wrap_ok", "wrap_err", "tag_of", "unwrap_ok", "unwrap_err"] {
+        assert!(dump.contains(op), "{op} missing in {dump}");
+    }
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+    // Fallible containers lower to memory-container ops: `createi` (0x27)
+    // allocates, `getvati` (0x2c) reads the tag/payload/code, `setvati`
+    // (0x2d) writes them.
+    for op in [0x27u8, 0x2c, 0x2d] {
+        assert!(bytes.contains(&op), "expected opcode {op:#x}");
+    }
+}
+
+#[test]
+fn inferred_error_sets_flow_into_named() {
+    let lir = frontend(
+        "type E = error { A, }; fun g(): !u64 { return 1u64; } fun f(): E!u64 { val x = try g(); return x; } fun main() { val v = f() catch 0u64; v; }",
+    )
+    .expect("inferred-to-named must compile");
+    assert!(lir.dump().contains("wrap_err"), "{}", lir.dump());
+}
+
+#[test]
+fn fallible_void_side_effects_compile_to_naravm() {
+    use vl_codegen::Target;
+    let lir = frontend(
+        "use std; type E = error { A, }; fun v(): E!void { return; } fun w(): E!void { } fun main() { v() catch std.print(\"a\"); w() catch std.print(\"b\"); }",
+    )
+    .expect("E!void must compile");
+    assert!(lir.dump().contains("wrap_ok"), "{}", lir.dump());
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+}
+
+#[test]
+fn err_error_examples_fail() {
+    for (file, code) in [
+        ("examples/err_try_type.vl", "E304"),
+        ("examples/err_unhandled.vl", "E309"),
+    ] {
+        let src = std::fs::read_to_string(file).unwrap();
+        let err = frontend(&src).expect_err("{file} must fail");
+        let errors = err.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{file}: {err:?}");
+        assert_eq!(errors[0].code.as_deref(), Some(code), "{file}: {err:?}");
+    }
+}
+
+#[test]
+fn fallible_misuse_is_single_root_causes() {
+    for (src, code) in [
+        ("fun main() { val x = try 5u64; x; }", "E304"),
+        ("fun main() { val x = 5u64 catch 0u64; x; }", "E304"),
+        (
+            "type E = error { A, }; fun f(): E!u64 { return 1u64; } fun g(): u64 { return try f(); } fun main() { g(); }",
+            "E307",
+        ),
+        (
+            "type A = error { X, }; type B = error { Y, }; fun f(): A!u64 { return B.Y; } fun main() { val v = f() catch 0u64; v; }",
+            "E307",
+        ),
+        (
+            "type E = error { A, }; fun f(): E!u64 { return E.A; } fun main() { val x = f() catch \"s\"; x; }",
+            "E309",
+        ),
+        (
+            "type E = error { A, }; fun main() { val x: E = E.Bogus; x; }",
+            "E302",
+        ),
+        ("fun f(): Bogus!u64 { return 1u64; } fun main() { val v = f() catch 0u64; v; }", "E105"),
+        (
+            "type E = error { A, }; fun main() { val x = E.A(1u64); x; }",
+            "E303",
+        ),
+    ] {
+        let err = frontend(src).expect_err("fallible probe must fail");
+        let errors = err.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{src}: {err:?}");
+        assert_eq!(errors[0].code.as_deref(), Some(code), "{src}: {err:?}");
+    }
+}
+
+#[test]
+fn cross_module_error_sets_compile_to_lir_and_naravm() {
+    use vl_codegen::Target;
+    let programs = frontend_project(&[
+        (
+            "vl.io",
+            "type Io = error { NotFound, Denied, }; fun read(n: u64): Io!u64 { if (n == 0u64) { return Io.NotFound; } return n; }",
+        ),
+        (
+            "vl.main",
+            "use std; use vl.io; fun main() { std.print_u64(io.read(3u64) catch 100u64); std.print_u64(io.read(0u64) catch 101u64); val e: vl.io.Io = vl.io.Io.Denied; e; }",
+        ),
+    ])
+    .expect("cross-module errors must compile");
+    assert_eq!(programs.len(), 2);
+    let importer_dump = programs[1].dump();
+    assert!(
+        importer_dump.contains("call vl.io::read"),
+        "{importer_dump}"
+    );
+    assert!(
+        importer_dump.contains("wrap_err") || importer_dump.contains("unwrap_ok"),
+        "{importer_dump}"
+    );
+    for lir in &programs {
+        let (artifact, diags) = vl_codegen::NaraVmTarget.emit(lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+    }
+}
+
+#[test]
+fn brace_imported_error_sets_construct() {
+    let programs = frontend_project(&[
+        ("vl.io", "type Io = error { NotFound, };"),
+        (
+            "vl.main",
+            "use vl.io.{Io}; fun f(): Io!u64 { return Io.NotFound; } fun main() { val v = f() catch 0u64; v; }",
+        ),
+    ])
+    .expect("brace-imported error sets must compile");
+    assert!(
+        programs[1].dump().contains("wrap_err"),
+        "{}",
+        programs[1].dump()
+    );
+}

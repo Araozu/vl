@@ -2,11 +2,11 @@ if exists('b:current_syntax')
   finish
 endif
 
-syntax keyword vlDeclaration var val fun use type object extends
+syntax keyword vlDeclaration var val fun use type object error extends
 syntax keyword vlOperatorKeyword as
 syntax keyword vlConditional if else
 syntax keyword vlRepeat while
-syntax keyword vlStatement break continue return
+syntax keyword vlStatement break continue return try catch
 syntax keyword vlBoolean true false
 syntax keyword vlNull null
 syntax keyword vlBuiltinType u64 i64 f64 u8 bool void String File Array Numeric Comparable

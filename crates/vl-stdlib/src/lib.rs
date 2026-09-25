@@ -136,6 +136,10 @@ fn hir_expr_has_generic_call(expr: &vl_hir::HirExpr, typed: &vl_typecheck::Typed
         vl_hir::HirExpr::Binary { lhs, rhs, .. } => {
             hir_expr_has_generic_call(lhs, typed) || hir_expr_has_generic_call(rhs, typed)
         }
+        vl_hir::HirExpr::Try { inner, .. } => hir_expr_has_generic_call(inner, typed),
+        vl_hir::HirExpr::Catch { lhs, fallback, .. } => {
+            hir_expr_has_generic_call(lhs, typed) || hir_expr_has_generic_call(fallback, typed)
+        }
         vl_hir::HirExpr::MethodCall {
             id, receiver, args, ..
         } => {
@@ -154,6 +158,7 @@ fn hir_expr_has_generic_call(expr: &vl_hir::HirExpr, typed: &vl_typecheck::Typed
         vl_hir::HirExpr::Literal { .. }
         | vl_hir::HirExpr::String { .. }
         | vl_hir::HirExpr::Null { .. }
+        | vl_hir::HirExpr::ErrorValue { .. }
         | vl_hir::HirExpr::Var { .. } => false,
     }
 }
@@ -697,7 +702,15 @@ impl Stdlib {
                 let Some((def, params, body)) = template else {
                     continue;
                 };
-                let lowered = vl_lir::lower_stdlib_mono(hir, typed, plan, &params, &body);
+                // The checked signature supplies the epilogue shape (in
+                // particular `E!void` fallthrough); the body below is
+                // overwritten with the same signature afterwards.
+                let sig_ret = def
+                    .as_ref()
+                    .and_then(|d| typed.func_sigs.get(&d.0))
+                    .map(|sig| sig.ret.clone())
+                    .unwrap_or(vl_typecheck::Ty::Error);
+                let lowered = vl_lir::lower_stdlib_mono(hir, typed, plan, &params, &body, &sig_ret);
                 let Some(mut lowered) = lowered else {
                     continue;
                 };

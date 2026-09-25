@@ -1,0 +1,10 @@
+// A discarded fallible drops the error: handle it with `try`/`catch`.
+type E = error { A, };
+
+fun f(): E!u64 {
+    return 1u64;
+}
+
+fun main() {
+    f();
+}

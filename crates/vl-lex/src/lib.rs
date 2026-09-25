@@ -23,6 +23,12 @@ pub enum TokenKind {
     Type,
     Object,
     Union,
+    /// Error-set introducer (`type E = error { A, };`).
+    Error,
+    /// Fallible propagation (`try expr` unwraps or returns the error).
+    Try,
+    /// Fallible fallback (`expr catch fallback`).
+    Catch,
     Match,
     If,
     Else,
@@ -394,6 +400,9 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                     "type" => TokenKind::Type,
                     "object" => TokenKind::Object,
                     "union" => TokenKind::Union,
+                    "error" => TokenKind::Error,
+                    "try" => TokenKind::Try,
+                    "catch" => TokenKind::Catch,
                     "match" => TokenKind::Match,
                     "if" => TokenKind::If,
                     "else" => TokenKind::Else,
@@ -479,6 +488,17 @@ mod tests {
         let (toks, diags) = lex("type Option = union { None, Some(u64), };");
         assert!(diags.is_empty(), "{diags:?}");
         assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Union)));
+    }
+
+    #[test]
+    fn lexes_error_try_catch_keywords() {
+        let (toks, diags) =
+            lex("type E = error { A, }; fun f(): E!u64 { return try g() catch 0u64; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Error)));
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Try)));
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Catch)));
+        assert!(toks.iter().any(|t| matches!(t.kind, TokenKind::Bang)));
     }
 
     #[test]

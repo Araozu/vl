@@ -166,4 +166,4 @@ The same rules apply everywhere else: variant names are uppercase,
 payloads cannot be empty (`Some()` is rejected), and matching checks the
 number of bindings per arm.
 
-Continue with [strings](/docs/strings).
+Continue with [errors](/docs/errors).

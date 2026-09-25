@@ -212,6 +212,17 @@ pub struct UnionExport {
     pub variants: Vec<UnionVariantSig>,
 }
 
+/// Exported nominal error set: its short name, its fully qualified identity
+/// (`<module>.<name>`), and its variant names in declaration order.
+/// Variants carry no data in this milestone (plain names only); the shape
+/// already mirrors unions so payloads can land here later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorExport {
+    pub name: String,
+    pub qualified: String,
+    pub variants: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleSpec {
     pub path: ModulePath,
@@ -220,6 +231,8 @@ pub struct ModuleSpec {
     pub objects: Vec<ObjectExport>,
     /// Exported nominal unions. Unions have no object layout or methods.
     pub unions: Vec<UnionExport>,
+    /// Exported nominal error sets (plain variants, no payloads yet).
+    pub errors: Vec<ErrorExport>,
     /// The provider had lexer/parser errors, so recovered AST omissions are
     /// not reliable evidence that an export does not exist.
     pub parse_poisoned: bool,
@@ -238,6 +251,7 @@ pub struct ModuleInterface {
     pub functions: Vec<Export>,
     pub objects: Vec<ObjectExport>,
     pub unions: Vec<UnionExport>,
+    pub errors: Vec<ErrorExport>,
     pub parse_poisoned: bool,
     pub poisoned_exports: Vec<String>,
     pub global_dependent_exports: Vec<String>,
@@ -250,6 +264,7 @@ impl ModuleInterface {
             exports: self.functions.clone(),
             objects: self.objects.clone(),
             unions: self.unions.clone(),
+            errors: self.errors.clone(),
             parse_poisoned: self.parse_poisoned,
             poisoned_exports: self.poisoned_exports.clone(),
             global_dependent_exports: self.global_dependent_exports.clone(),
@@ -272,6 +287,7 @@ impl ModuleSpec {
                 .collect(),
             objects: Vec::new(),
             unions: Vec::new(),
+            errors: Vec::new(),
             parse_poisoned: false,
             poisoned_exports: Vec::new(),
             global_dependent_exports: Vec::new(),
@@ -284,6 +300,7 @@ impl ModuleSpec {
             exports,
             objects: Vec::new(),
             unions: Vec::new(),
+            errors: Vec::new(),
             parse_poisoned: false,
             poisoned_exports: Vec::new(),
             global_dependent_exports: Vec::new(),
@@ -305,8 +322,13 @@ impl ModuleSpec {
         self.unions.iter().find(|u| u.name == name)
     }
 
-    /// Qualified identity (`<module>.<name>`) for an exported object or
-    /// union type, if either namespace defines it.
+    /// Look up one exported error set by its short name.
+    pub fn lookup_error(&self, name: &str) -> Option<&ErrorExport> {
+        self.errors.iter().find(|e| e.name == name)
+    }
+
+    /// Qualified identity (`<module>.<name>`) for an exported object,
+    /// union, or error-set type, if any namespace defines it.
     pub fn lookup_type_qualified(&self, name: &str) -> Option<&str> {
         self.lookup_object(name)
             .map(|o| o.qualified.as_str())
@@ -315,6 +337,12 @@ impl ModuleSpec {
                     .iter()
                     .find(|u| u.name == name)
                     .map(|u| u.qualified.as_str())
+            })
+            .or_else(|| {
+                self.errors
+                    .iter()
+                    .find(|e| e.name == name)
+                    .map(|e| e.qualified.as_str())
             })
     }
 
@@ -346,17 +374,25 @@ mod tests {
                 type_params: vec![],
                 variants: vec![],
             }],
+            errors: vec![ErrorExport {
+                name: "Trip".into(),
+                qualified: "vl.dog.Trip".into(),
+                variants: vec!["Fell".into()],
+            }],
             parse_poisoned: false,
             poisoned_exports: vec![],
             global_dependent_exports: vec![],
         };
         assert_eq!(spec.lookup_type_qualified("Dog"), Some("vl.dog.Dog"));
         assert_eq!(spec.lookup_type_qualified("Trick"), Some("vl.dog.Trick"));
+        assert_eq!(spec.lookup_type_qualified("Trip"), Some("vl.dog.Trip"));
         assert_eq!(spec.lookup_type_qualified("Missing"), None);
         // Type exports never surface as function exports.
         assert!(spec.lookup("Dog").is_none());
         assert!(spec.lookup_object("Trick").is_none());
         assert!(spec.lookup_union("Dog").is_none());
+        assert!(spec.lookup_error("Trip").is_some());
+        assert!(spec.lookup_error("Trick").is_none());
     }
 
     #[test]
@@ -424,11 +460,17 @@ mod tests {
                     payload: vec![VlType::Param("T".into())],
                 }],
             }],
+            errors: vec![ErrorExport {
+                name: "Oops".into(),
+                qualified: "demo.types.Oops".into(),
+                variants: vec!["Bad".into()],
+            }],
             parse_poisoned: false,
             poisoned_exports: Vec::new(),
             global_dependent_exports: Vec::new(),
         };
         let spec = interface.as_spec();
         assert_eq!(spec.unions, interface.unions);
+        assert_eq!(spec.errors, interface.errors);
     }
 }

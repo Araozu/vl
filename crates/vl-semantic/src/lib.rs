@@ -63,6 +63,18 @@ pub struct VariantUse {
     pub variant: String,
 }
 
+/// An error-value use site: `MyError.NotFound` (nullary field path).
+/// Recorded so later stages can tell error construction apart from field
+/// reads, which share the surface syntax. `set` is the canonical name
+/// (bare for local sets, module-qualified for imported ones, matching
+/// `typed.errors` keys). Error variants take no arguments, so a call tail
+/// (`E.V(args)`) is one E303 here and the site still records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorUse {
+    pub set: String,
+    pub variant: String,
+}
+
 /// Resolution result: every variable *use* span maps to its [`Def`].
 #[derive(Debug, Default)]
 pub struct Resolution {
@@ -79,6 +91,11 @@ pub struct Resolution {
     /// variant. `vl-hir` lowers these to variant nodes; `vl-typecheck`
     /// validates arity and payload types. No E201 is reported here.
     pub variants: HashMap<(usize, usize), VariantUse>,
+    /// Error-value construction sites: nullary field-path spans
+    /// (`MyError.NotFound`) map to the referenced error. `vl-hir` lowers
+    /// these to error-value nodes; `vl-typecheck` validates set membership.
+    /// No E201 is reported here.
+    pub error_uses: HashMap<(usize, usize), ErrorUse>,
     /// Canonical union names for `match` arm paths, keyed by the arm's path
     /// span. Import-alias heads (`alias.Union.Variant`) rewrite to the
     /// module-qualified spelling so later stages compare one identity;
@@ -170,6 +187,10 @@ struct Resolver {
     /// in declaration order. Variant construction (`Union.Variant(...)`,
     /// `Union.Variant`) resolves through this table without an import.
     local_unions: HashMap<String, Vec<String>>,
+    /// Bare error-set names declared in this module mapped to their variant
+    /// names in declaration order. Error construction (`E.V`) resolves
+    /// through this table without an import.
+    local_errors: HashMap<String, Vec<String>>,
 }
 
 pub fn resolve(prog: &Program) -> (Resolution, Vec<Diagnostic>) {
@@ -196,6 +217,7 @@ fn collect_interface_impl(
     let mut functions: Vec<vl_common::Export> = Vec::new();
     let mut objects: Vec<vl_common::ObjectExport> = Vec::new();
     let mut unions: Vec<vl_common::UnionExport> = Vec::new();
+    let mut errors: Vec<vl_common::ErrorExport> = Vec::new();
     let mut diags = Vec::new();
     let mut poisoned_exports = Vec::new();
     let mut global_dependent_exports = Vec::new();
@@ -215,7 +237,9 @@ fn collect_interface_impl(
         .items
         .iter()
         .filter_map(|item| match item {
-            Item::Object { name, .. } | Item::Union { name, .. } => Some(name.clone()),
+            Item::Object { name, .. } | Item::Union { name, .. } | Item::Error { name, .. } => {
+                Some(name.clone())
+            }
             _ => None,
         })
         .collect::<std::collections::HashSet<_>>();
@@ -236,6 +260,21 @@ fn collect_interface_impl(
     // `(key, params, body)` borrows keep free and associated units uniform.
     let mut fn_units: Vec<(String, &[vl_syntax::Param], &[Stmt])> = Vec::new();
     let mut direct_dependencies = HashMap::<String, Vec<String>>::new();
+    // Error-set declarations export nominal identity and variant names.
+    // They never acquire layouts, methods, or type parameters.
+    for item in &prog.items {
+        let Item::Error { name, variants, .. } = item else {
+            continue;
+        };
+        if errors.iter().any(|export| export.name == *name) {
+            continue;
+        }
+        errors.push(vl_common::ErrorExport {
+            name: name.clone(),
+            qualified: format!("{}.{}", prog.module, name),
+            variants: variants.iter().map(|v| v.name.clone()).collect(),
+        });
+    }
     // Union declarations export nominal identity and payload metadata, but
     // never acquire an object layout or associated-method namespace.
     for item in &prog.items {
@@ -502,6 +541,7 @@ fn collect_interface_impl(
             functions,
             objects,
             unions,
+            errors,
             parse_poisoned: false,
             poisoned_exports,
             global_dependent_exports,
@@ -560,6 +600,23 @@ fn qualify_export_ty(
                     .collect(),
             }
         }
+        vl_common::VlType::ErrorSet(name) if !name.contains('.') => {
+            if local_objects.contains(name) {
+                vl_common::VlType::ErrorSet(format!("{module}.{name}"))
+            } else {
+                ty.clone()
+            }
+        }
+        vl_common::VlType::Fallible { err, ok } => vl_common::VlType::Fallible {
+            err: err.as_ref().map(|set| {
+                if !set.contains('.') && local_objects.contains(set) {
+                    format!("{module}.{set}")
+                } else {
+                    set.clone()
+                }
+            }),
+            ok: Box::new(qualify_export_ty(ok, module, local_objects)),
+        },
         _ => ty.clone(),
     }
 }
@@ -595,7 +652,12 @@ fn collect_local_calls(stmts: &[Stmt], calls: &mut Vec<String>) {
             }
             Expr::Field { base, .. }
             | Expr::Unary { rhs: base, .. }
+            | Expr::Try { inner: base, .. }
             | Expr::Cast { inner: base, .. } => visit_expr(base, calls),
+            Expr::Catch { lhs, fallback, .. } => {
+                visit_expr(lhs, calls);
+                visit_expr(fallback, calls);
+            }
             Expr::Binary { lhs, rhs, .. } => {
                 visit_expr(lhs, calls);
                 visit_expr(rhs, calls);
@@ -709,7 +771,12 @@ fn function_depends_on_global(
             }
             Expr::Field { base, .. }
             | Expr::Unary { rhs: base, .. }
+            | Expr::Try { inner: base, .. }
             | Expr::Cast { inner: base, .. } => expr_depends(base, locals, globals, types),
+            Expr::Catch { lhs, fallback, .. } => {
+                expr_depends(lhs, locals, globals, types)
+                    || expr_depends(fallback, locals, globals, types)
+            }
             Expr::Call { callee, args, .. } => {
                 // Instance sugar reads its receiver: a global head is a
                 // global use. A head naming an object type (`Type.method`)
@@ -845,6 +912,7 @@ pub fn resolve_with_modules(
         poisoned_params: std::collections::HashSet::new(),
         loop_depth: 0,
         local_objects: std::collections::HashSet::new(),
+        local_errors: HashMap::new(),
         local_fields: HashMap::new(),
         assoc: HashMap::new(),
         local_unions: HashMap::new(),
@@ -857,6 +925,8 @@ pub fn resolve_with_modules(
     }
 
     // Pass 1: declare top-level names so forward references work.
+    // Objects, unions, and error sets share one type namespace: any two
+    // same-named declarations are one E200 here.
     let mut object_spans: HashMap<String, Span> = HashMap::new();
     for item in &prog.items {
         let (name, name_span) = match item {
@@ -864,6 +934,9 @@ pub fn resolve_with_modules(
                 name, name_span, ..
             }
             | Item::Union {
+                name, name_span, ..
+            }
+            | Item::Error {
                 name, name_span, ..
             } => (name, name_span),
             _ => continue,
@@ -913,6 +986,12 @@ pub fn resolve_with_modules(
                 .entry(name.clone())
                 .or_insert_with(|| variants.iter().map(|v| v.name.clone()).collect());
         }
+        // Error variant namespaces: same first-wins rule as unions.
+        if let Item::Error { name, variants, .. } = item {
+            r.local_errors
+                .entry(name.clone())
+                .or_insert_with(|| variants.iter().map(|v| v.name.clone()).collect());
+        }
     }
     // A bare type import clashes with a same-named local declaration: one
     // E206, the local type wins, and the import is dropped (no poison) so
@@ -934,7 +1013,7 @@ pub fn resolve_with_modules(
     for item in &prog.items {
         match item {
             Item::Use { .. } => {}
-            Item::Object { .. } | Item::Union { .. } => {}
+            Item::Object { .. } | Item::Union { .. } | Item::Error { .. } => {}
             Item::Let {
                 name,
                 name_span,
@@ -965,7 +1044,7 @@ pub fn resolve_with_modules(
                     r.resolve_fn_body(&m.params, &m.body);
                 }
             }
-            Item::Union { .. } => {}
+            Item::Union { .. } | Item::Error { .. } => {}
             Item::Let { value, .. } => {
                 r.resolve_expr(value);
             }
@@ -1431,6 +1510,20 @@ impl Resolver {
                             );
                             return;
                         }
+                        // An error value (`E.NotFound`): the spine heads an
+                        // error set, not a value. Record the site for HIR
+                        // lowering; typechecking validates set membership.
+                        if let Some((canonical, variants)) = self.canonical_error_head(head) {
+                            let display = head.join(".");
+                            self.record_error_use(
+                                *span,
+                                canonical,
+                                &variants,
+                                &variant[0],
+                                &display,
+                            );
+                            return;
+                        }
                     }
                 }
                 self.resolve_expr(base)
@@ -1532,6 +1625,36 @@ impl Resolver {
                     }
                     return;
                 }
+                // Error variants take no arguments: `E.V(args)` is one E303
+                // here, and the site still records so HIR lowers the error
+                // value (lowering is blocked on this error anyway).
+                if callee.len() >= 2 {
+                    let (head, variant) = callee.split_at(callee.len() - 1);
+                    if let Some((canonical, variants)) = self.canonical_error_head(head) {
+                        let display = head.join(".");
+                        if self.record_error_use(
+                            *callee_span,
+                            canonical,
+                            &variants,
+                            &variant[0],
+                            &display,
+                        ) {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "error variant `{display}.{}` takes no arguments",
+                                    variant[0]
+                                ))
+                                .with_label(*callee_span, "remove the `(...)` arguments")
+                                .with_note("error variants carry no data in this milestone")
+                                .with_code("E303"),
+                            );
+                        }
+                        for arg in args {
+                            self.resolve_expr(arg);
+                        }
+                        return;
+                    }
+                }
                 // Associated functions live in the type namespace: `Type.func`
                 // resolves through the object tables (no import needed, like
                 // `Array.new`). A `value.method` call whose head is a bound
@@ -1564,9 +1687,14 @@ impl Resolver {
                 }
             }
             Expr::Unary { rhs, .. } => self.resolve_expr(rhs),
+            Expr::Try { inner, .. } => self.resolve_expr(inner),
             Expr::Binary { lhs, rhs, .. } => {
                 self.resolve_expr(lhs);
                 self.resolve_expr(rhs);
+            }
+            Expr::Catch { lhs, fallback, .. } => {
+                self.resolve_expr(lhs);
+                self.resolve_expr(fallback);
             }
             Expr::Cast { inner, .. } => self.resolve_expr(inner),
         }
@@ -1630,6 +1758,7 @@ impl Resolver {
                                 exports: vec![],
                                 objects: vec![],
                                 unions: vec![],
+                                errors: vec![],
                                 parse_poisoned: parent.parse_poisoned,
                                 poisoned_exports: vec![],
                                 global_dependent_exports: vec![],
@@ -2051,6 +2180,84 @@ impl Resolver {
                 },
             );
         }
+        true
+    }
+
+    /// Canonical error-set name for an `E.Variant` head (`parts` = every
+    /// segment but the last). Returns the canonical spelling plus the
+    /// variant list: bare for local sets, module-qualified for imported
+    /// ones (matching `typed.errors` keys downstream). Own-module qualified
+    /// spellings (`m.E` inside `m`) fold to bare so one spelling
+    /// identifies local values. Mirrors
+    /// [`canonical_union_head`](Self::canonical_union_head) minus the
+    /// builtin (there is no builtin error set).
+    fn canonical_error_head(&self, parts: &[String]) -> Option<(String, Vec<String>)> {
+        if parts.len() == 1 {
+            if let Some(variants) = self.local_errors.get(&parts[0]) {
+                return Some((parts[0].clone(), variants.clone()));
+            }
+            // Bare imported set (`use vl.io.{Io}` then `Io.Variant`):
+            // canonicalize to the module-qualified identity.
+            if let Some(qualified) = self.imported_types.get(&parts[0]) {
+                for spec in &self.modules {
+                    if let Some(found) = spec.errors.iter().find(|e| e.qualified == *qualified) {
+                        return Some((found.qualified.clone(), found.variants.clone()));
+                    }
+                }
+            }
+            return None;
+        }
+        // Alias-qualified `alias.Set` (exactly two segments).
+        if parts.len() == 2 && self.imports.contains_key(&parts[0]) {
+            let spec = self.imports.get(&parts[0]).cloned()?;
+            let found = spec.errors.iter().find(|e| e.name == parts[1])?;
+            return Some((found.qualified.clone(), found.variants.clone()));
+        }
+        let joined = parts.join(".");
+        // Own-module qualified: fold to the bare local spelling.
+        if let Some(rest) = joined.strip_prefix(&format!("{}.", self.module)) {
+            if let Some(variants) = self.local_errors.get(rest) {
+                return Some((rest.to_string(), variants.clone()));
+            }
+        }
+        // Fully qualified without an import.
+        for spec in &self.modules {
+            if let Some(found) = spec.errors.iter().find(|e| e.qualified == joined) {
+                return Some((joined.clone(), found.variants.clone()));
+            }
+        }
+        None
+    }
+
+    /// Record one error-value use site (`at` = call callee span or field
+    /// span) after checking the variant exists. Returns whether the variant
+    /// is known (the site is fully handled either way: one E302 at most,
+    /// then quiet).
+    fn record_error_use(
+        &mut self,
+        at: Span,
+        canonical: String,
+        variants: &[String],
+        variant: &str,
+        set_display: &str,
+    ) -> bool {
+        if !variants.iter().any(|v| v == variant) {
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "error set `{set_display}` has no variant `{variant}`"
+                ))
+                .with_label(at, "unknown error variant")
+                .with_code("E302"),
+            );
+            return false;
+        }
+        self.out.error_uses.insert(
+            (at.start, at.end),
+            ErrorUse {
+                set: canonical,
+                variant: variant.to_string(),
+            },
+        );
         true
     }
 
@@ -2616,6 +2823,75 @@ mod tests {
         let (toks, _) = vl_lex::lex(src);
         let (prog, _) = vl_syntax::parse(&toks, src);
         resolve(&prog)
+    }
+
+    #[test]
+    fn error_values_resolve_to_use_sites() {
+        let (res, diags) = resolve_src("type E = error { A, B, }; fun main() { val x = E.A; x; }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_eq!(res.error_uses.len(), 1, "{res:?}");
+        let use_ = res.error_uses.values().next().expect("use");
+        assert_eq!(use_.set, "E");
+        assert_eq!(use_.variant, "A");
+    }
+
+    #[test]
+    fn error_interface_exports_sets_for_importers() {
+        let spec = provider_spec("type E = error { A, B, };", "vl.io");
+        let err = spec.lookup_error("E").expect("error export");
+        assert_eq!(err.qualified, "vl.io.E");
+        assert_eq!(err.variants, vec!["A", "B"]);
+        assert_eq!(spec.lookup_type_qualified("E"), Some("vl.io.E"));
+    }
+
+    #[test]
+    fn brace_error_import_registers_type_without_e203() {
+        let io = provider_spec("type E = error { A, };", "vl.io");
+        let (toks, _) = vl_lex::lex("use vl.io.{E}; fun main() { val x = E.A; x; }");
+        let (prog, pdiags) = vl_syntax::parse_with_module(&toks, "", "vl.main");
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, diags) = resolve_with_modules(&prog, &[io]);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_eq!(res.error_uses.len(), 1, "{res:?}");
+        let use_ = res.error_uses.values().next().expect("use");
+        // Bare imported sets canonicalize to the qualified identity.
+        assert_eq!(use_.set, "vl.io.E");
+    }
+
+    #[test]
+    fn unknown_error_variant_is_one_e302() {
+        let (_res, diags) = resolve_src("type E = error { A, }; fun main() { val x = E.B; x; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E302"));
+    }
+
+    #[test]
+    fn error_variant_call_tail_is_one_e303() {
+        let (res, diags) =
+            resolve_src("type E = error { A, }; fun main() { val x = E.A(1u64); x; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E303"));
+        // The site still records so lowering proceeds behind the error.
+        assert_eq!(res.error_uses.len(), 1, "{res:?}");
+    }
+
+    #[test]
+    fn duplicate_type_across_object_and_error_is_e200() {
+        let (_res, diags) = resolve_src("type E = object { v: u64, }; type E = error { A, };");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E200"));
+    }
+
+    #[test]
+    fn try_and_catch_bodies_resolve() {
+        let (res, diags) = resolve_src(
+            "type E = error { A, }; fun f(): E!u64 { return 1u64; } fun main() { val x = try f() catch 0u64; x; }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(res.error_uses.is_empty(), "{res:?}");
     }
 
     #[test]

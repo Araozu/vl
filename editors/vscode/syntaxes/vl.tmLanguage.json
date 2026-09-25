@@ -87,11 +87,11 @@
         },
         {
           "name": "keyword.control.vl",
-          "match": "\\b(?:if|else|while|break|continue|return)\\b"
+          "match": "\\b(?:if|else|while|break|continue|return|try|catch)\\b"
         },
         {
           "name": "keyword.other.vl",
-          "match": "\\b(?:use|as|extends|object)\\b"
+          "match": "\\b(?:use|as|extends|object|error)\\b"
         }
       ]
     },

@@ -158,6 +158,7 @@ calls infer them (`first(a)`) or pass them explicitly (`first::[u64](a)`)
 (see `examples/generics.vl`).
 Sum types use `union` declarations with uppercase variants (`type Option[T] = union { None, Some(T), };`); variants build as `Option.Some(1u64)` / `Option.None` (optional turbofish `Option.Some::[u64](...)`) and are read with `match (o) { Option.Some(v) { ... } Option.None { ... } else { ... } }` (see `examples/unions.vl` and the [unions guide](website/src/pages/docs/unions.md)).
 Nullables model missing values without a declaration: `?u64` is the type of a `u64` or `null`, sugar over the builtin `Option` union (see `examples/nullable.vl`). A plain `u64` value wraps as `Some` implicitly wherever `?u64` is expected, `x == null` / `x != null` test for presence, and `match` takes a `null` arm for the empty case (`match (o) { Option.Some(v) { ... } null { ... } }`).
+Error sets model failures Zig-style (see `examples/errors.vl`): `type Io = error { NotFound, };` declares plain variants (no payloads yet), `Io.NotFound` is an error value, and `Io!u64` (or `!u64` for the inferred set) is a fallible value. `try expr` unwraps or returns the error from the enclosing fallible function, `expr catch fallback` handles it inline, and `E!void` marks fallible side effects. A plain `T` value wraps as ok — and an `E` value as the error — wherever `E!T` is expected; discarding a fallible without `try`/`catch` is an error. `main` stays infallible: handle errors inside it with `catch`.
 Tuples are fixed-arity heterogeneous values with copy semantics
 (see `examples/tuples.vl`): `#(u64, String)` is unnamed (backtick indexing),
 `#(x: u64, y: String)` is named (`u.x` access), `#(1u64, "a")` /
@@ -196,5 +197,5 @@ target concepts. See the [lexical grammar](crates/vl-lex/GRAMMAR.md) and
 ## Roadmap
 
 1. Harden/add more `vl-codegen` backends.
-2. Fallible externs (`!File`, `!String` via `errno`/`0x30`) once VL gains error handling.
+2. Fallible externs (`!File`, `!String` via `errno`/`0x30`) now that VL has error sets; error payloads (like union variants).
 3. Bytecode/assembly emission + runner.

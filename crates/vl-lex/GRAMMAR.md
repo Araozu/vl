@@ -30,8 +30,9 @@ newline is then whitespace. An unterminated comment at EOF simply stops.
 ## Tokens
 
 ```text
-keyword    := "var" | "val" | "fun" | "type" | "object" | "union" | "match" | "if" | "else"
-            | "while" | "break" | "continue" | "return" | "as" | "extends" | "null"
+keyword    := "var" | "val" | "fun" | "type" | "object" | "union" | "error" | "match" | "if" | "else"
+             | "while" | "break" | "continue" | "return" | "as" | "extends" | "null"
+             | "try" | "catch"
 ident      := [a-zA-Z_] [a-zA-Z0-9_]*
 number     := digits ("." digits)? suffix?
 suffix     := "u64" | "i64" | "f64" | "u8"
@@ -39,7 +40,8 @@ boolean    := "true" | "false"
 null       := "null"   ; `Null`: nullable empty value (desugars to builtin `Option.None`)
 string     := `"` string_char* `"`
 operator   := "==" | "!=" | "<=" | ">=" | "&&" | "||"
-            | "+" | "-" | "*" | "/" | "=" | "!" | "<" | ">"
+             | "+" | "-" | "*" | "/" | "=" | "!" | "<" | ">"
+             ; `!` is unary negation in expressions and the fallible marker in types (`E!T`, `!T`)
 delimiter  := "::" | ";" | "(" | ")" | "{" | "}" | "[" | "]"
             | "," | "." | ":" | "#" | "`" | "?"
             ; `?` is the nullable prefix (`Question`: `?T` desugars to builtin `Option`)
@@ -62,7 +64,9 @@ bytes; no UTF-8 decoding is performed.
 
 | Spelling | `TokenKind` | Span |
 |---|---|---|
-| `var`, `val`, `fun`, `type`, `object`, `union`, `match`, `if`, `else`, `while`, `break`, `continue`, `return` | matching keyword | word span |
+| `var`, `val`, `fun`, `type`, `object`, `union`, `error`, `match`, `if`, `else`, `while`, `break`, `continue`, `return` | matching keyword | word span |
+| `try` | `Try` (fallible propagation) | word span |
+| `catch` | `Catch` (fallible fallback) | word span |
 | `as` | `As` | word span |
 | `extends` | `Extends` | word span |
 | `[a-zA-Z_][a-zA-Z0-9_]*` | `Ident(String)` | word span |

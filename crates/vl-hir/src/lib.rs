@@ -61,6 +61,13 @@ pub struct HirUnionVariant {
     pub payload: Vec<(VlType, Span)>,
 }
 
+/// One error-set variant: a plain name (no payloads in this milestone).
+#[derive(Debug, Clone)]
+pub struct HirErrorVariant {
+    pub name: String,
+    pub name_span: Span,
+}
+
 /// One `match` arm binding: a fresh implicit-`val` local for one payload
 /// position. `def` is `None` when resolution failed (already reported).
 #[derive(Debug, Clone)]
@@ -93,6 +100,11 @@ pub enum HirItem {
         name: String,
         type_params: Vec<HirTypeParam>,
         variants: Vec<HirUnionVariant>,
+        span: Span,
+    },
+    Error {
+        name: String,
+        variants: Vec<HirErrorVariant>,
         span: Span,
     },
     Let {
@@ -247,6 +259,31 @@ pub enum HirExpr {
         args: Vec<HirExpr>,
         span: Span,
     },
+    /// Error value construction: `E.NotFound`. Lowered from `Field` sites
+    /// recorded by `vl-semantic` (`Resolution::error_uses`); `set` is the
+    /// canonical set name (bare local, qualified imported) and `code` the
+    /// global FNV-1a runtime value, so every module agrees on the bits.
+    /// Error variants take no arguments (a call tail is E303 upstream).
+    ErrorValue {
+        id: HirId,
+        set: String,
+        variant: String,
+        code: u64,
+        span: Span,
+    },
+    /// Fallible propagation (`try expr`): unwrap or return the error.
+    Try {
+        id: HirId,
+        inner: Box<HirExpr>,
+        span: Span,
+    },
+    /// Fallible fallback (`expr catch fallback`).
+    Catch {
+        id: HirId,
+        lhs: Box<HirExpr>,
+        fallback: Box<HirExpr>,
+        span: Span,
+    },
     /// Element read: `array[index]`.
     Index {
         id: HirId,
@@ -380,6 +417,9 @@ impl HirExpr {
             | HirExpr::MethodCall { id, .. }
             | HirExpr::Binary { id, .. }
             | HirExpr::Unary { id, .. }
+            | HirExpr::ErrorValue { id, .. }
+            | HirExpr::Try { id, .. }
+            | HirExpr::Catch { id, .. }
             | HirExpr::Cast { id, .. } => *id,
         }
     }
@@ -401,14 +441,38 @@ impl HirExpr {
             | HirExpr::MethodCall { span, .. }
             | HirExpr::Binary { span, .. }
             | HirExpr::Unary { span, .. }
+            | HirExpr::ErrorValue { span, .. }
+            | HirExpr::Try { span, .. }
+            | HirExpr::Catch { span, .. }
             | HirExpr::Cast { span, .. } => *span,
         }
     }
 }
 
+/// Global runtime code for one error value (`set.variant`, both canonical).
+/// FNV-1a 64 over the qualified spelling, so every module in a compilation
+/// agrees on the bits without a shared table. Stable across compilations;
+/// the typechecker (not the code) enforces set membership.
+pub fn error_code(set: &str, variant: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in set
+        .as_bytes()
+        .iter()
+        .chain(std::iter::once(&b'.'))
+        .chain(variant.as_bytes())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 struct Lowerer<'a> {
     next: u32,
     res: &'a vl_semantic::Resolution,
+    /// Owning module, for global error-code qualification
+    /// (`E.V` locally means `<module>.E.V` on the wire).
+    module: String,
 }
 
 impl<'a> Lowerer<'a> {
@@ -454,6 +518,26 @@ impl<'a> Lowerer<'a> {
             }
             VlType::Array(elem) => VlType::Array(Box::new(self.canonical_ty(*elem))),
             VlType::Nullable(inner) => VlType::Nullable(Box::new(self.canonical_ty(*inner))),
+            VlType::ErrorSet(name) if !name.contains('.') => self
+                .res
+                .imported_types
+                .get(&name)
+                .map(|q| VlType::ErrorSet(q.clone()))
+                .unwrap_or(VlType::ErrorSet(name)),
+            VlType::Fallible { err, ok } => VlType::Fallible {
+                err: err.as_ref().map(|set| {
+                    if set.contains('.') {
+                        set.clone()
+                    } else {
+                        self.res
+                            .imported_types
+                            .get(set)
+                            .cloned()
+                            .unwrap_or_else(|| set.clone())
+                    }
+                }),
+                ok: Box::new(self.canonical_ty(*ok)),
+            },
             VlType::Mutable(inner) => VlType::Mutable(Box::new(self.canonical_ty(*inner))),
             VlType::Tuple(fields) => VlType::Tuple(
                 fields
@@ -493,7 +577,11 @@ impl<'a> Lowerer<'a> {
 /// (so typechecking, monomorphization, and LIR reuse the free-function
 /// paths); the fields-only `Object` item keeps the layout.
 pub fn lower(prog: &AstProgram, res: &vl_semantic::Resolution) -> HirProgram {
-    let mut l = Lowerer { next: 0, res };
+    let mut l = Lowerer {
+        next: 0,
+        res,
+        module: prog.module.clone(),
+    };
     let items = prog
         .items
         .iter()
@@ -567,6 +655,22 @@ impl<'a> Lowerer<'a> {
                 }
                 out
             }
+            AstItem::Error {
+                name,
+                variants,
+                span,
+                ..
+            } => vec![HirItem::Error {
+                name: name.clone(),
+                variants: variants
+                    .iter()
+                    .map(|v| HirErrorVariant {
+                        name: v.name.clone(),
+                        name_span: v.name_span,
+                    })
+                    .collect(),
+                span: *span,
+            }],
             AstItem::Union {
                 name,
                 type_params,
@@ -922,6 +1026,24 @@ impl<'a> Lowerer<'a> {
                 span: *span,
             },
             AstExpr::Field { base, name, span } => {
+                // An error value (`E.NotFound`) recorded by the resolver.
+                // Anything else falls through to variants, then field reads.
+                if let Some(use_) = self.res.error_uses.get(&(span.start, span.end)).cloned() {
+                    // Global wire identity is always fully qualified
+                    // (`E.V` locally means `<module>.E.V`).
+                    let qualified = if use_.set.contains('.') {
+                        use_.set.clone()
+                    } else {
+                        format!("{}.{}", self.module, use_.set)
+                    };
+                    return HirExpr::ErrorValue {
+                        id: self.id(),
+                        set: use_.set,
+                        variant: use_.variant.clone(),
+                        code: error_code(&qualified, &use_.variant),
+                        span: *span,
+                    };
+                }
                 // A nullary variant use (`Option.None`) recorded by the
                 // resolver. Anything else is an ordinary field read.
                 if let Some(use_) = self.res.variants.get(&(span.start, span.end)).cloned() {
@@ -971,6 +1093,27 @@ impl<'a> Lowerer<'a> {
                 span,
                 ..
             } => {
+                // Error construction with a call tail (`E.V(args)`, already
+                // E303 upstream): lower the error value, drop the arguments.
+                if let Some(use_) = self
+                    .res
+                    .error_uses
+                    .get(&(callee_span.start, callee_span.end))
+                    .cloned()
+                {
+                    let qualified = if use_.set.contains('.') {
+                        use_.set.clone()
+                    } else {
+                        format!("{}.{}", self.module, use_.set)
+                    };
+                    return HirExpr::ErrorValue {
+                        id: self.id(),
+                        set: use_.set,
+                        variant: use_.variant.clone(),
+                        code: error_code(&qualified, &use_.variant),
+                        span: *span,
+                    };
+                }
                 // Union variant construction (`Option.Some(args)`) recorded
                 // by the resolver. It shares call syntax but is not a call.
                 if let Some(use_) = self
@@ -1128,6 +1271,21 @@ impl<'a> Lowerer<'a> {
                 target_span: *target_span,
                 span: *span,
             },
+            AstExpr::Try { inner, span } => HirExpr::Try {
+                id: self.id(),
+                inner: Box::new(self.lower_expr(inner)),
+                span: *span,
+            },
+            AstExpr::Catch {
+                lhs,
+                fallback,
+                span,
+            } => HirExpr::Catch {
+                id: self.id(),
+                lhs: Box::new(self.lower_expr(lhs)),
+                fallback: Box::new(self.lower_expr(fallback)),
+                span: *span,
+            },
         }
     }
 }
@@ -1173,6 +1331,60 @@ mod tests {
                     matches!(&body[4], HirStmt::Destructure { bindings, .. } if bindings.len() == 2)
                 );
             }
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_sets_lower_with_stable_codes() {
+        let src = "type E = error { A, B, }; fun main() { val x = E.A; x; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        assert!(matches!(&hir.items[0], HirItem::Error { name, .. } if name == "E"));
+        match &hir.items[1] {
+            HirItem::Fn { body, .. } => match &body[0] {
+                HirStmt::Let { value, .. } => match value {
+                    HirExpr::ErrorValue {
+                        set, variant, code, ..
+                    } => {
+                        assert_eq!(set, "E");
+                        assert_eq!(variant, "A");
+                        // Global FNV-1a code over the qualified spelling.
+                        assert_eq!(*code, error_code("<anonymous>.E", "A"));
+                        assert_ne!(*code, error_code("<anonymous>.E", "B"));
+                    }
+                    other => panic!("expected error value, got {other:?}"),
+                },
+                other => panic!("expected let, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_and_catch_lower_to_nodes() {
+        let src = "type E = error { A, }; fun f(): E!u64 { return 1u64; } fun main() { val x = try f() catch 0u64; x; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[2] {
+            HirItem::Fn { body, .. } => match &body[0] {
+                HirStmt::Let { value, .. } => match value {
+                    HirExpr::Catch { lhs, fallback, .. } => {
+                        assert!(matches!(&**lhs, HirExpr::Try { .. }));
+                        assert!(matches!(&**fallback, HirExpr::Literal { .. }));
+                    }
+                    other => panic!("expected catch, got {other:?}"),
+                },
+                other => panic!("expected let, got {other:?}"),
+            },
             other => panic!("expected fn, got {other:?}"),
         }
     }

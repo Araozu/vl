@@ -1,0 +1,5 @@
+// `try` needs a fallible value.
+fun main() {
+    val x = try 5u64;
+    x;
+}

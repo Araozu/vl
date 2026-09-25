@@ -183,6 +183,41 @@ pub enum Instr {
         scrut: Reg,
         span: Span,
     },
+    /// Build an `E!T` ok value from a `T` payload. `ok` is the erased
+    /// payload type (selects value vs reference slots, like
+    /// [`Instr::NewVariant`]'s `tys`). Emitted for implicit `T` -> `E!T`
+    /// wraps (returns, bindings, `catch` fallbacks take the plain value).
+    WrapOk {
+        dst: Reg,
+        value: Reg,
+        ok: Ty,
+        span: Span,
+    },
+    /// Build an `E!T` error value from a `u64` error code. `ok` sizes the
+    /// container for the `ok` payload the error displaces. Emitted for
+    /// implicit `E.V` -> `E!T` wraps and `try` error-path rebuilds.
+    WrapErr {
+        dst: Reg,
+        code: Reg,
+        ok: Ty,
+        span: Span,
+    },
+    /// Read the `ok` payload of an `E!T` container (valid on the ok path,
+    /// after a tag check). `ok` is the erased payload type.
+    UnwrapOk {
+        dst: Reg,
+        scrut: Reg,
+        ok: Ty,
+        span: Span,
+    },
+    /// Read the error code (`u64`) of an `E!T` container (valid on the err
+    /// path, after a tag check). The code always lives in value slot 1,
+    /// so no type metadata is needed.
+    UnwrapErr {
+        dst: Reg,
+        scrut: Reg,
+        span: Span,
+    },
     /// Read payload position `index` of the matched variant. `tys` is the
     /// matched variant's erased payload types (slot mapping mirrors
     /// [`Instr::NewVariant`]).
@@ -344,6 +379,9 @@ impl LirProgram {
                     Ty::Array(elem) => bad(elem),
                     Ty::Union(u) => u.args.iter().any(bad),
                     Ty::Tuple(fields) => fields.iter().any(|(_, t)| bad(t)),
+                    // Error sets are plain `u64` codes (always runtime);
+                    // fallible containers recurse into the `ok` payload.
+                    Ty::Fallible(f) => bad(&f.ok),
                     _ => false,
                 }
         }
@@ -462,6 +500,9 @@ fn instr_ty(ins: &Instr) -> Option<&Ty> {
         | Instr::ArrayGet { elem, .. }
         | Instr::ArraySet { elem, .. } => Some(elem),
         Instr::ObjectGet { ty, .. } | Instr::ObjectSet { ty, .. } => Some(ty),
+        Instr::WrapOk { ok, .. } | Instr::WrapErr { ok, .. } | Instr::UnwrapOk { ok, .. } => {
+            Some(ok)
+        }
         Instr::Cast { target, .. } => Some(target),
         // Tuples and variants carry a `Vec<Ty>`; validated element-wise in
         // `validate_runtime`.
@@ -646,6 +687,18 @@ fn fmt_instr(ins: &Instr) -> String {
         Instr::TagOf { dst, scrut, .. } => {
             format!("%{} = tag_of %{}", dst.0, scrut.0)
         }
+        Instr::WrapOk { dst, value, ok, .. } => {
+            format!("%{} = wrap_ok %{} : {ok}", dst.0, value.0)
+        }
+        Instr::WrapErr { dst, code, ok, .. } => {
+            format!("%{} = wrap_err %{} : {ok}", dst.0, code.0)
+        }
+        Instr::UnwrapOk { dst, scrut, ok, .. } => {
+            format!("%{} = unwrap_ok %{} : {ok}", dst.0, scrut.0)
+        }
+        Instr::UnwrapErr { dst, scrut, .. } => {
+            format!("%{} = unwrap_err %{}", dst.0, scrut.0)
+        }
         Instr::PayloadGet {
             dst,
             scrut,
@@ -718,6 +771,10 @@ struct Lowerer<'t> {
     outer_key: Option<vl_typecheck::InstanceKey>,
     typed: &'t vl_typecheck::TypedProgram,
     module: &'t str,
+    /// Current function's return type (for bare `return;` in `E!void`
+    /// functions, which builds the ok container). Global initializers
+    /// carry `Void` (bare returns never occur there).
+    fn_ret: Ty,
 }
 
 /// Runtime-erased type: capability qualifiers removed recursively.
@@ -809,6 +866,13 @@ fn collect_import_expr(
             for a in args {
                 collect_import_expr(a, typed, out)
             }
+        }
+        // Error values hold no calls; `try`/`catch` may hide them inside.
+        HirExpr::ErrorValue { .. } => {}
+        HirExpr::Try { inner, .. } => collect_import_expr(inner, typed, out),
+        HirExpr::Catch { lhs, fallback, .. } => {
+            collect_import_expr(lhs, typed, out);
+            collect_import_expr(fallback, typed, out);
         }
         HirExpr::Index { base, index, .. } => {
             collect_import_expr(base, typed, out);
@@ -922,7 +986,7 @@ fn collect_imports(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> Vec
             }
             HirItem::Let { value, .. } => collect_import_expr(value, typed, &mut out),
             HirItem::Destructure { value, .. } => collect_import_expr(value, typed, &mut out),
-            HirItem::Object { .. } | HirItem::Union { .. } => {}
+            HirItem::Object { .. } | HirItem::Union { .. } | HirItem::Error { .. } => {}
         }
     }
     out
@@ -1099,20 +1163,46 @@ fn lower_fn_stmt(
 /// level does not end with an unconditional `return`. The payload is a
 /// normalized `u64` zero (`void` backends ignore it); never an unresolved
 /// `int`.
-fn lower_fn_epilogue(l: &mut Lowerer, topped_return: bool) {
+fn lower_fn_epilogue(l: &mut Lowerer, topped_return: bool, ret: &Ty) {
     let ends_with_ret = topped_return && matches!(l.instrs.last(), Some(Instr::Ret { .. }));
-    if !ends_with_ret {
-        let r = l.reg();
-        l.instrs.push(Instr::Const {
-            dst: r,
-            value: Scalar::U64(0),
-            span: Span::empty(0),
-        });
-        l.instrs.push(Instr::Ret {
-            src: r,
-            span: Span::empty(0),
-        });
+    if ends_with_ret {
+        return;
     }
+    // `E!void` fallthrough is success: build the ok container (tag 0, no
+    // payload) instead of the dummy zero that `void` backends ignore. The
+    // `value` register is unused for a void payload (backends skip it).
+    if let Ty::Fallible(f) = ret {
+        if f.ok == Ty::Void {
+            let zero = l.reg();
+            l.instrs.push(Instr::Const {
+                dst: zero,
+                value: Scalar::U64(0),
+                span: Span::empty(0),
+            });
+            let dst = l.reg();
+            l.instrs.push(Instr::WrapOk {
+                dst,
+                value: zero,
+                ok: Ty::Void,
+                span: Span::empty(0),
+            });
+            l.instrs.push(Instr::Ret {
+                src: dst,
+                span: Span::empty(0),
+            });
+            return;
+        }
+    }
+    let r = l.reg();
+    l.instrs.push(Instr::Const {
+        dst: r,
+        value: Scalar::U64(0),
+        span: Span::empty(0),
+    });
+    l.instrs.push(Instr::Ret {
+        src: r,
+        span: Span::empty(0),
+    });
 }
 
 /// Tuple position for one destructure binding given the base tuple type.
@@ -1328,6 +1418,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                 outer_key: None,
                 typed,
                 module: prog.module.as_str(),
+                fn_ret: Ty::Void,
             };
             // The hidden base global ran before us; load it and extract.
             // (Its own init lowered the shared base expression exactly once.)
@@ -1385,6 +1476,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
             outer_key: None,
             typed,
             module: prog.module.as_str(),
+            fn_ret: Ty::Void,
         };
         if let Some(r) = l.lower_expr(value, typed) {
             out.globals.push(Global {
@@ -1409,7 +1501,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
 
     for item in &prog.items {
         match item {
-            HirItem::Object { .. } | HirItem::Union { .. } => {}
+            HirItem::Object { .. } | HirItem::Union { .. } | HirItem::Error { .. } => {}
             HirItem::Let { .. } | HirItem::Destructure { .. } => {
                 // Already emitted as globals above; no `<global>` functions.
             }
@@ -1449,6 +1541,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                     outer_key: None,
                     typed,
                     module: prog.module.as_str(),
+                    fn_ret: ret_ty.clone(),
                 };
 
                 for (index, (_, def, _, span)) in params.iter().enumerate() {
@@ -1467,7 +1560,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                 for stmt in body {
                     lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
                 }
-                lower_fn_epilogue(&mut l, topped_return);
+                lower_fn_epilogue(&mut l, topped_return, &ret_ty);
                 out.functions.push(Function {
                     name: name.clone(),
                     param_tys,
@@ -1514,6 +1607,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
             outer_key: None,
             typed,
             module: prog.module.as_str(),
+            fn_ret: inst.sig.ret.clone(),
         };
         for (index, (_, def, _, span)) in params.iter().enumerate() {
             let dst = l.reg();
@@ -1530,7 +1624,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
         for stmt in body {
             lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
         }
-        lower_fn_epilogue(&mut l, topped_return);
+        lower_fn_epilogue(&mut l, topped_return, &inst.sig.ret);
         out.functions.push(Function {
             name: m.clone(),
             param_tys: inst.sig.param_tys.iter().map(rt).collect(),
@@ -1578,6 +1672,7 @@ pub fn lower_stdlib_instance(
         outer_key: Some(outer_key.clone()),
         typed,
         module: hir.module.as_str(),
+        fn_ret: inst.sig.ret.clone(),
     };
     for (index, (_, def, _, span)) in params.iter().enumerate() {
         let dst = l.reg();
@@ -1594,7 +1689,7 @@ pub fn lower_stdlib_instance(
     for stmt in body {
         lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
     }
-    lower_fn_epilogue(&mut l, topped_return);
+    lower_fn_epilogue(&mut l, topped_return, &inst.sig.ret);
     Some(Function {
         name: String::new(),
         param_tys: inst.sig.param_tys.iter().map(rt).collect(),
@@ -1617,6 +1712,7 @@ pub fn lower_stdlib_mono(
         Span,
     )],
     body: &[HirStmt],
+    ret: &Ty,
 ) -> Option<Function> {
     let global_map: HashMap<u32, u32> = HashMap::new();
     let mut l = Lowerer {
@@ -1632,6 +1728,7 @@ pub fn lower_stdlib_mono(
         outer_key: None,
         typed,
         module: hir.module.as_str(),
+        fn_ret: ret.clone(),
     };
     for (index, (_, def, _, span)) in params.iter().enumerate() {
         let dst = l.reg();
@@ -1648,7 +1745,7 @@ pub fn lower_stdlib_mono(
     for stmt in body {
         lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
     }
-    lower_fn_epilogue(&mut l, topped_return);
+    lower_fn_epilogue(&mut l, topped_return, ret);
     // Signature from HIR (monomorphic, runtime-erased).
     let param_tys = params
         .iter()
@@ -1757,6 +1854,7 @@ pub fn lower_project(
             outer_key: None,
             typed,
             module: prog.module.as_str(),
+            fn_ret: Ty::Void,
         };
         if let Some(r) = l.lower_expr(value, typed) {
             out.globals.push(Global {
@@ -1781,7 +1879,7 @@ pub fn lower_project(
 
     for item in &prog.items {
         match item {
-            HirItem::Object { .. } | HirItem::Union { .. } => {}
+            HirItem::Object { .. } | HirItem::Union { .. } | HirItem::Error { .. } => {}
             HirItem::Let { .. } | HirItem::Destructure { .. } => {}
             HirItem::Fn {
                 name,
@@ -1817,6 +1915,7 @@ pub fn lower_project(
                     outer_key: None,
                     typed,
                     module: prog.module.as_str(),
+                    fn_ret: ret_ty.clone(),
                 };
                 for (index, (_, def, _, span)) in params.iter().enumerate() {
                     let dst = l.reg();
@@ -1833,7 +1932,7 @@ pub fn lower_project(
                 for stmt in body {
                     lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
                 }
-                lower_fn_epilogue(&mut l, topped_return);
+                lower_fn_epilogue(&mut l, topped_return, &ret_ty);
                 out.functions.push(Function {
                     name: name.clone(),
                     param_tys,
@@ -1882,6 +1981,7 @@ pub fn lower_project(
                 outer: Some(m.clone()),
                 plan: Some(plan),
                 outer_key: Some(key.clone()),
+                fn_ret: inst.sig.ret.clone(),
                 typed,
                 module: prog.module.as_str(),
             };
@@ -1900,7 +2000,7 @@ pub fn lower_project(
             for stmt in body {
                 lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
             }
-            lower_fn_epilogue(&mut l, topped_return);
+            lower_fn_epilogue(&mut l, topped_return, &inst.sig.ret);
             out.functions.push(Function {
                 name: m,
                 param_tys: inst.sig.param_tys.iter().map(rt).collect(),
@@ -1955,6 +2055,7 @@ fn collect_project_imports(
         fn bad(ty: &Ty) -> bool {
             matches!(ty, Ty::Mutable(_) | Ty::Param(_) | Ty::Int | Ty::Error)
                 || matches!(ty, Ty::Array(elem) if bad(elem))
+                || matches!(ty, Ty::Fallible(f) if bad(&f.ok))
         }
         if param_tys.iter().any(bad) || bad(&ret) {
             return;
@@ -2061,6 +2162,7 @@ fn collect_project_imports(
                     fn bad(ty: &Ty) -> bool {
                         matches!(ty, Ty::Mutable(_) | Ty::Param(_) | Ty::Int | Ty::Error)
                             || matches!(ty, Ty::Array(elem) if bad(elem))
+                            || matches!(ty, Ty::Fallible(f) if bad(&f.ok))
                     }
                     if param_tys.iter().any(bad) || bad(&ret) {
                         return;
@@ -2136,6 +2238,7 @@ fn collect_project_imports(
                 fn bad(ty: &Ty) -> bool {
                     matches!(ty, Ty::Mutable(_) | Ty::Param(_) | Ty::Int | Ty::Error)
                         || matches!(ty, Ty::Array(elem) if bad(elem))
+                        || matches!(ty, Ty::Fallible(f) if bad(&f.ok))
                 }
                 if param_tys.iter().any(bad) || bad(&ret) {
                     return;
@@ -2166,9 +2269,15 @@ fn collect_project_imports(
             }
             HirExpr::Field { base, .. }
             | HirExpr::Unary { inner: base, .. }
+            | HirExpr::Try { inner: base, .. }
             | HirExpr::Cast { inner: base, .. } => {
                 walk_expr(prog, typed, plan, outer, base, by_symbol)
             }
+            HirExpr::Catch { lhs, fallback, .. } => {
+                walk_expr(prog, typed, plan, outer, lhs, by_symbol);
+                walk_expr(prog, typed, plan, outer, fallback, by_symbol);
+            }
+            HirExpr::ErrorValue { .. } => {}
             HirExpr::Binary { lhs, rhs, .. } => {
                 walk_expr(prog, typed, plan, outer, lhs, by_symbol);
                 walk_expr(prog, typed, plan, outer, rhs, by_symbol);
@@ -2318,7 +2427,62 @@ impl Lowerer<'_> {
         if typed.nullable_wraps.contains(&expr.id().0) {
             return self.lower_nullable_wrap(expr, typed);
         }
+        // Implicit `T` -> `E!T` (ok-wrap): the node's recorded type is the
+        // inner `T`; emit the inner value then wrap as the ok payload.
+        if typed.fallible_ok_wraps.contains(&expr.id().0) {
+            return self.lower_fallible_ok_wrap(expr, typed);
+        }
+        // Implicit `E.V` -> `E!T` (err-wrap): the node is recorded as the
+        // fallible itself; emit the code then wrap as the error.
+        if typed.fallible_err_wraps.contains(&expr.id().0) {
+            return self.lower_fallible_err_wrap(expr, typed);
+        }
         self.lower_expr_inner(expr, typed)
+    }
+
+    /// Emit `WrapOk(inner)` for an auto-wrapped `E!T` value. The node's
+    /// recorded type is the inner `T` (kept for literal lanes); the layout
+    /// comes from it directly.
+    fn lower_fallible_ok_wrap(
+        &mut self,
+        expr: &HirExpr,
+        typed: &vl_typecheck::TypedProgram,
+    ) -> Option<Reg> {
+        let inner_ty = self.resolved_ty(expr.id())?;
+        let ok = rt(&inner_ty);
+        let value = self.lower_expr_inner(expr, typed)?;
+        let dst = self.reg();
+        self.instrs.push(Instr::WrapOk {
+            dst,
+            value,
+            ok,
+            span: expr.span(),
+        });
+        Some(dst)
+    }
+
+    /// Emit `WrapErr(code)` for an auto-wrapped `E!T` error. The node's
+    /// recorded type is the fallible itself (carries the `ok` layout); the
+    /// code comes from lowering the inner error value.
+    fn lower_fallible_err_wrap(
+        &mut self,
+        expr: &HirExpr,
+        typed: &vl_typecheck::TypedProgram,
+    ) -> Option<Reg> {
+        let fall_ty = self.resolved_ty(expr.id())?;
+        let ok = match fall_ty {
+            Ty::Fallible(f) => rt(&f.ok),
+            _ => return None,
+        };
+        let code = self.lower_expr_inner(expr, typed)?;
+        let dst = self.reg();
+        self.instrs.push(Instr::WrapErr {
+            dst,
+            code,
+            ok,
+            span: expr.span(),
+        });
+        Some(dst)
     }
 
     /// Emit `Option.Some(inner)` for an auto-wrapped `?T` value. The node's
@@ -2913,6 +3077,25 @@ impl Lowerer<'_> {
                     Some(dst)
                 }
             },
+            HirExpr::ErrorValue { code, span, .. } => {
+                // Error values are global `u64` codes (set membership was
+                // validated by typechecking); fallible wraps lift them into
+                // containers.
+                let dst = self.reg();
+                self.instrs.push(Instr::Const {
+                    dst,
+                    value: Scalar::U64(*code),
+                    span: *span,
+                });
+                Some(dst)
+            }
+            HirExpr::Try { id, inner, span } => self.lower_try(*id, inner, *span, typed),
+            HirExpr::Catch {
+                lhs,
+                fallback,
+                span,
+                ..
+            } => self.lower_catch(lhs, fallback, *span, typed),
             HirExpr::Unary {
                 op, inner, span, ..
             } => match op {
@@ -3044,11 +3227,55 @@ impl Lowerer<'_> {
     ) {
         match value {
             Some(e) => {
+                // `return <void-expr>;` in an `E!void` function: lower for
+                // effects (a `try` still propagates), discard the value,
+                // and succeed like bare `return;`.
+                if let Ty::Fallible(f) = &self.fn_ret {
+                    if f.ok == Ty::Void && self.resolved_ty(e.id()).is_some_and(|t| t == Ty::Void) {
+                        let _ = self.lower_expr(e, typed);
+                        let zero = self.reg();
+                        self.instrs.push(Instr::Const {
+                            dst: zero,
+                            value: Scalar::U64(0),
+                            span,
+                        });
+                        let dst = self.reg();
+                        self.instrs.push(Instr::WrapOk {
+                            dst,
+                            value: zero,
+                            ok: Ty::Void,
+                            span,
+                        });
+                        self.instrs.push(Instr::Ret { src: dst, span });
+                        return;
+                    }
+                }
                 if let Some(r) = self.lower_expr(e, typed) {
                     self.instrs.push(Instr::Ret { src: r, span });
                 }
             }
             None => {
+                // Bare `return;` in an `E!void` function succeeds: build
+                // the ok container like the fallthrough epilogue does.
+                if let Ty::Fallible(f) = &self.fn_ret {
+                    if f.ok == Ty::Void {
+                        let zero = self.reg();
+                        self.instrs.push(Instr::Const {
+                            dst: zero,
+                            value: Scalar::U64(0),
+                            span,
+                        });
+                        let dst = self.reg();
+                        self.instrs.push(Instr::WrapOk {
+                            dst,
+                            value: zero,
+                            ok: Ty::Void,
+                            span,
+                        });
+                        self.instrs.push(Instr::Ret { src: dst, span });
+                        return;
+                    }
+                }
                 let r = self.reg();
                 self.instrs.push(Instr::Const {
                     dst: r,
@@ -3299,6 +3526,148 @@ impl Lowerer<'_> {
                 }
             }
         }
+    }
+
+    /// Emit the tag check shared by `try`/`catch`: `%is_ok = (tag_of %scrut == 0)`.
+    fn lower_fallible_tag(&mut self, scrut: Reg, span: Span) -> Option<Reg> {
+        let tag = self.reg();
+        self.instrs.push(Instr::TagOf {
+            dst: tag,
+            scrut,
+            span,
+        });
+        let zero = self.reg();
+        self.instrs.push(Instr::Const {
+            dst: zero,
+            value: Scalar::U64(0),
+            span,
+        });
+        let is_ok = self.reg();
+        self.instrs.push(Instr::BinOp {
+            dst: is_ok,
+            op: LirOp::Eq,
+            lhs: tag,
+            rhs: zero,
+            span,
+        });
+        Some(is_ok)
+    }
+
+    /// `try expr`: unwrap the ok payload inline; on error, rebuild the
+    /// enclosing function's `ok` shape around the code and return it. The
+    /// error path diverges, so the ok value needs no join register.
+    fn lower_try(
+        &mut self,
+        id: vl_hir::HirId,
+        inner: &HirExpr,
+        span: Span,
+        typed: &vl_typecheck::TypedProgram,
+    ) -> Option<Reg> {
+        let scrut = self.lower_expr(inner, typed)?;
+        let inner_ok = match self.resolved_ty(inner.id())? {
+            Ty::Fallible(f) => rt(&f.ok),
+            _ => return None,
+        };
+        // Enclosing `ok` shape (substituted per instance); recorded by
+        // typechecking because only it knows the function's return.
+        let rebuild = typed
+            .try_rebuilds
+            .get(&id.0)
+            .map(|t| rt(&subst_ty(t, &self.env)))?;
+        let is_ok = self.lower_fallible_tag(scrut, span)?;
+        let err_label = self.label();
+        let end_label = self.label();
+        self.instrs.push(Instr::BranchIfFalse {
+            cond: is_ok,
+            target: err_label,
+            span,
+        });
+        let value = self.reg();
+        self.instrs.push(Instr::UnwrapOk {
+            dst: value,
+            scrut,
+            ok: inner_ok,
+            span,
+        });
+        self.instrs.push(Instr::Jump {
+            target: end_label,
+            span,
+        });
+        self.instrs.push(Instr::Label {
+            id: err_label,
+            span,
+        });
+        let code = self.reg();
+        self.instrs.push(Instr::UnwrapErr {
+            dst: code,
+            scrut,
+            span,
+        });
+        let errv = self.reg();
+        self.instrs.push(Instr::WrapErr {
+            dst: errv,
+            code,
+            ok: rebuild,
+            span,
+        });
+        self.instrs.push(Instr::Ret { src: errv, span });
+        self.instrs.push(Instr::Label {
+            id: end_label,
+            span,
+        });
+        Some(value)
+    }
+
+    /// `lhs catch fallback`: the ok payload, or the fallback when `lhs`
+    /// is an error. Both paths join into one result register (`&&` idiom).
+    fn lower_catch(
+        &mut self,
+        lhs: &HirExpr,
+        fallback: &HirExpr,
+        span: Span,
+        typed: &vl_typecheck::TypedProgram,
+    ) -> Option<Reg> {
+        let scrut = self.lower_expr(lhs, typed)?;
+        let ok = match self.resolved_ty(lhs.id())? {
+            Ty::Fallible(f) => rt(&f.ok),
+            _ => return None,
+        };
+        let is_ok = self.lower_fallible_tag(scrut, span)?;
+        let dst = self.reg();
+        let err_label = self.label();
+        let end_label = self.label();
+        self.instrs.push(Instr::BranchIfFalse {
+            cond: is_ok,
+            target: err_label,
+            span,
+        });
+        let value = self.reg();
+        self.instrs.push(Instr::UnwrapOk {
+            dst: value,
+            scrut,
+            ok,
+            span,
+        });
+        self.instrs.push(Instr::Copy {
+            dst,
+            src: value,
+            span,
+        });
+        self.instrs.push(Instr::Jump {
+            target: end_label,
+            span,
+        });
+        self.instrs.push(Instr::Label {
+            id: err_label,
+            span,
+        });
+        let fb = self.lower_expr(fallback, typed)?;
+        self.instrs.push(Instr::Copy { dst, src: fb, span });
+        self.instrs.push(Instr::Label {
+            id: end_label,
+            span,
+        });
+        Some(dst)
     }
 
     /// Short-circuit `&&`: sides evaluate at most once, left to right.
@@ -3746,6 +4115,46 @@ mod tests {
         assert!(dump.contains("array_get"), "{dump}");
         assert!(dump.contains("array_set"), "{dump}");
         assert!(!dump.contains("Array.new"), "{dump}");
+    }
+
+    #[test]
+    fn fallible_values_lower_to_wrap_and_unwrap() {
+        let src = "type E = error { A, }; fun f(): E!u64 { return E.A; } fun g(): E!u64 { val x = try f(); return x; } fun main() { val v = g() catch 0u64; v; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(!typed.fallible_err_wraps.is_empty(), "{typed:?}");
+        assert!(!typed.try_rebuilds.is_empty(), "{typed:?}");
+        let dump = lower(&hir, &typed).dump();
+        assert!(dump.contains("wrap_err"), "{dump}");
+        assert!(dump.contains("wrap_ok"), "{dump}");
+        assert!(dump.contains("tag_of"), "{dump}");
+        assert!(dump.contains("unwrap_ok"), "{dump}");
+        assert!(dump.contains("unwrap_err"), "{dump}");
+        assert!(dump.contains("branch_if_false"), "{dump}");
+    }
+
+    #[test]
+    fn fallible_void_fallthrough_builds_ok() {
+        let src = "type E = error { A, }; fun f(): E!void { } fun main() { f(); }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        // The discarded `f();` is E309; lowering still proceeds for the dump.
+        assert!(
+            diags.iter().filter(|d| d.is_error()).count() == 1,
+            "{diags:?}"
+        );
+        let dump = lower(&hir, &typed).dump();
+        assert!(dump.contains("wrap_ok"), "{dump}");
     }
 
     #[test]

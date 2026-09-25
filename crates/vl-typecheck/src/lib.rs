@@ -46,6 +46,15 @@ pub enum Ty {
     /// `match`. Boxed to keep [`Ty`] small on the stack: generic-instance
     /// checking nests types dozens deep.
     Union(Box<UnionTy>),
+    /// Nominal error set (`MyError`). Values are global `u64` codes;
+    /// the set is a static membership constraint. Value semantics.
+    ErrorSet(String),
+    /// Fallible value (`MyError!u64`, or `!u64` for the inferred set).
+    /// `err` is `Some(set)` for a named set, `None` for `!T` (any error).
+    /// Reference semantics (heap tag + payload container, like unions):
+    /// tag 0 holds the `ok` payload, tag 1 holds the error code. Boxed
+    /// like [`Ty::Union`].
+    Fallible(Box<FallibleTy>),
     /// Fixed-length heap array of `T` (reference type, like `String`).
     Array(Box<Ty>),
     /// Fixed-arity heterogeneous tuple (`#(u64, String)`). Value semantics
@@ -69,6 +78,14 @@ pub enum Ty {
 pub struct UnionTy {
     pub name: String,
     pub args: Vec<Ty>,
+}
+
+/// Fallible instantiation: an optional error-set constraint plus the `ok`
+/// payload type. Boxed inside [`Ty::Fallible`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FallibleTy {
+    pub err: Option<String>,
+    pub ok: Ty,
 }
 
 impl std::fmt::Display for Ty {
@@ -106,6 +123,11 @@ impl std::fmt::Display for Ty {
                 Ok(())
             }
             Ty::Array(elem) => write!(f, "Array[{elem}]"),
+            Ty::ErrorSet(name) => write!(f, "{name}"),
+            Ty::Fallible(fall) => match &fall.err {
+                Some(set) => write!(f, "{set}!{}", fall.ok),
+                None => write!(f, "!{}", fall.ok),
+            },
             Ty::Tuple(fields) => {
                 write!(f, "#(")?;
                 for (i, (name, ty)) in fields.iter().enumerate() {
@@ -165,6 +187,22 @@ impl Ty {
             ),
             VlType::Param(name) => env.get(name).cloned().unwrap_or(Ty::Error),
             VlType::Void => Ty::Void,
+            VlType::ErrorSet(name) => {
+                // A generic parameter shadows an error set of the same name
+                // (like shadowing for objects/unions is E200 elsewhere, but
+                // parameters are resolved here first so instances stay sound).
+                if let Some(sub) = env.get(name) {
+                    return sub.clone();
+                }
+                Ty::ErrorSet(name.clone())
+            }
+            VlType::Fallible { err, ok } => Ty::Fallible(Box::new(FallibleTy {
+                // A set spelling naming a type parameter stays a string
+                // here; normalization rejects it ("error set cannot be a
+                // type parameter") where the error tables are in scope.
+                err: err.clone(),
+                ok: Self::from_vl_in(ok, env),
+            })),
             VlType::Mutable(inner) => Ty::Mutable(Box::new(Self::from_vl_in(inner, env))),
         }
     }
@@ -179,6 +217,7 @@ impl Ty {
             Ty::Array(elem) => elem.is_concrete(),
             Ty::Tuple(fields) => fields.iter().all(|(_, ty)| ty.is_concrete()),
             Ty::Union(u) => u.args.iter().all(|a| a.is_concrete()),
+            Ty::Fallible(f) => f.ok.is_concrete(),
             Ty::Mutable(inner) => inner.is_concrete(),
             Ty::Param(_) | Ty::Error | Ty::Int => false,
             _ => true,
@@ -235,6 +274,10 @@ impl Ty {
                 name: u.name.clone(),
                 args: u.args.iter().map(|a| a.erase_capability()).collect(),
             })),
+            Ty::Fallible(f) => Ty::Fallible(Box::new(FallibleTy {
+                err: f.err.clone(),
+                ok: f.ok.erase_capability(),
+            })),
             Ty::Tuple(fields) => Ty::Tuple(
                 fields
                     .iter()
@@ -258,6 +301,9 @@ impl Ty {
             Ty::String | Ty::File => true,
             Ty::Object(_) => true,
             Ty::Union { .. } => true,
+            // Fallible values are heap tag+payload containers (like
+            // unions); error sets themselves are `u64` codes (values).
+            Ty::Fallible { .. } => true,
             Ty::Array(_) => true,
             Ty::Tuple(_) => true,
             Ty::Mutable(inner) => inner.is_reference_type(),
@@ -274,6 +320,8 @@ impl Ty {
             Ty::Mutable(inner) => inner.is_void(),
             Ty::Array(elem) => elem.is_void(),
             Ty::Union(u) => u.args.iter().any(|a| a.is_void()),
+            // `E!void` is void (return position only); a bare set never is.
+            Ty::Fallible(f) => f.ok.is_void(),
             Ty::Tuple(fields) => fields.iter().any(|(_, ty)| ty.is_void()),
             _ => false,
         }
@@ -297,6 +345,12 @@ pub fn subst_ty(ty: &Ty, env: &HashMap<String, Ty>) -> Ty {
                 .collect(),
         ),
         Ty::Mutable(inner) => Ty::Mutable(Box::new(subst_ty(inner, env))),
+        Ty::Fallible(f) => Ty::Fallible(Box::new(FallibleTy {
+            // Set constraints are nominal, never parameters (a parameter
+            // in set position is E302 at the annotation).
+            err: f.err.clone(),
+            ok: subst_ty(&f.ok, env),
+        })),
         Ty::Param(name) => env.get(name).cloned().unwrap_or(Ty::Param(name.clone())),
         _ => ty.clone(),
     }
@@ -362,6 +416,20 @@ fn mangle_ty(ty: &Ty) -> String {
             format!("Tuple_{}", parts.join("_"))
         }
         Ty::Mutable(inner) => format!("Mut_{}", mangle_ty(inner)),
+        // `E!u64` -> `Fallible_E_u64`; `!u64` -> `Fallible_Any_u64`.
+        // `.` in qualified sets encodes as `_D` (never collides: `_`
+        // doubles to `__` first).
+        Ty::Fallible(fall) => {
+            let set = fall.err.as_deref().unwrap_or("Any");
+            format!(
+                "Fallible_{}_{}",
+                sanitize_object_name(set),
+                mangle_ty(&fall.ok)
+            )
+        }
+        // Error sets mangle like objects (nominal identity); `Ty::Error`
+        // (poison) never reaches mangling in valid programs.
+        Ty::ErrorSet(name) => format!("Error_{}", sanitize_object_name(name)),
         Ty::Param(name) => sanitize_object_name(name),
         Ty::Void => "void".into(),
         Ty::Error => "error".into(),
@@ -381,6 +449,14 @@ pub struct ObjectSigTy {
 pub struct UnionSigTy {
     pub type_params: Vec<String>,
     pub variants: Vec<UnionVariantSigTy>,
+}
+
+/// Declaration-only metadata for one nominal error set: variant names in
+/// declaration order. Variants carry no data in this milestone (plain
+/// names only); the shape already mirrors unions for future payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorSigTy {
+    pub variants: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,6 +482,11 @@ pub fn builtin_option_sig() -> UnionSigTy {
             },
         ],
     }
+}
+
+/// True for `E!void` (a fallible side effect): bare `return;` succeeds.
+pub fn is_fallible_void(ty: &Ty) -> bool {
+    matches!(ty, Ty::Fallible(f) if f.ok == Ty::Void)
 }
 
 /// True when `ty` is a nullable (`Option[T]`) instantiation, returning its
@@ -578,6 +659,17 @@ pub struct TypedProgram {
     pub objects: HashMap<String, ObjectSigTy>,
     /// Nominal union declarations, kept out of object layouts and methods.
     pub unions: HashMap<String, UnionSigTy>,
+    /// Nominal error-set declarations: canonical name (bare local,
+    /// module-qualified imported) maps to variant names in order.
+    pub errors: HashMap<String, ErrorSigTy>,
+    /// HIR nodes implicitly wrapped as the `ok` payload of an `E!T`
+    /// expectation (`val x: E!u64 = 5;`). LIR emits `WrapOk` around the
+    /// lowered inner value; the recorded type is the fallible.
+    pub fallible_ok_wraps: std::collections::HashSet<u32>,
+    /// HIR error-value nodes implicitly wrapped as the error of an `E!T`
+    /// expectation (`return E.Foo;`). LIR emits `WrapErr` around the
+    /// lowered code; the recorded type is the fallible.
+    pub fallible_err_wraps: std::collections::HashSet<u32>,
     /// Top-level value names in order (for LIR/codegen).
     pub globals: Vec<String>,
     /// Function `DefId.0` -> parameter count (for arity checks + LIR).
@@ -624,6 +716,10 @@ pub struct TypedProgram {
     /// expectation (`val x: ?u64 = 5;`). LIR emits a `NewVariant Some`
     /// around the lowered inner value; the recorded type is the nullable.
     pub nullable_wraps: std::collections::HashSet<u32>,
+    /// `try`-site (`HirId.0`) -> enclosing function's `ok` payload type
+    /// (unsubstituted; LIR applies the instance environment). The error
+    /// path rebuilds this shape with the propagated code and returns it.
+    pub try_rebuilds: HashMap<u32, Ty>,
 }
 
 /// Resolved target of one instance-sugar call.
@@ -785,7 +881,12 @@ fn template_expr_ids(e: &HirExpr, out: &mut HashSet<u32>) {
             template_expr_ids(lhs, out);
             template_expr_ids(rhs, out);
         }
-        HirExpr::Unary { inner, .. } => template_expr_ids(inner, out),
+        HirExpr::Unary { inner, .. } | HirExpr::Try { inner, .. } => template_expr_ids(inner, out),
+        HirExpr::Catch { lhs, fallback, .. } => {
+            template_expr_ids(lhs, out);
+            template_expr_ids(fallback, out);
+        }
+        HirExpr::ErrorValue { .. } => {}
         HirExpr::Cast { inner, .. } => template_expr_ids(inner, out),
         HirExpr::Literal { .. }
         | HirExpr::String { .. }
@@ -949,6 +1050,11 @@ fn ty_has_unknown_qualified(
             .args
             .iter()
             .any(|a| ty_has_unknown_qualified(a, objects, unions)),
+        // Qualified error sets are validated once by normalization (which
+        // owns the E302); the quiet-poison walk treats them as known so no
+        // follow-on mismatch cascades. Bare names were parser-validated.
+        Ty::ErrorSet(_) => false,
+        Ty::Fallible(f) => ty_has_unknown_qualified(&f.ok, objects, unions),
         Ty::Tuple(fields) => fields
             .iter()
             .any(|(_, ty)| ty_has_unknown_qualified(ty, objects, unions)),
@@ -960,10 +1066,91 @@ fn ty_has_unknown_qualified(
 /// Resolve union spellings in a converted annotation (see
 /// [`Checker::vl_to_ty`](Checker::vl_to_ty)). Free function so the module
 /// pre-pass (which owns no `Checker` yet) shares the exact rules.
+/// Normalize one error-set spelling: known sets stand; anything else is
+/// one E105 (bare) or E302 (qualified, or a nominal type of another kind).
+/// Out-of-line so the hot [`normalize_union_ty`] frame stays small for
+/// deeply nested generics (debug builds keep all locals alive).
+fn normalize_error_set(
+    diags: &mut Vec<Diagnostic>,
+    objects: &HashMap<String, ObjectSigTy>,
+    unions: &HashMap<String, UnionSigTy>,
+    errors: &HashMap<String, ErrorSigTy>,
+    name: String,
+    span: Span,
+) -> Ty {
+    if errors.contains_key(&name) {
+        return Ty::ErrorSet(name);
+    }
+    // A nominal type of another kind in the set position reads like an
+    // error set but is not one.
+    if objects.contains_key(&name) || unions.contains_key(&name) {
+        diags.push(
+            Diagnostic::error(format!("`{name}` is not an error set"))
+                .with_label(
+                    span,
+                    "only `error` sets name fallible types and error values",
+                )
+                .with_code("E302"),
+        );
+        return Ty::Error;
+    }
+    let mut diag = Diagnostic::error(format!("unknown error set `{name}`"))
+        .with_label(span, "no error set with this name is in scope")
+        .with_code(if name.contains('.') { "E302" } else { "E105" });
+    // Foreign sets need their qualified spelling; suggest it when
+    // unambiguous (mirrors the union path).
+    if !name.contains('.') {
+        let mut qualified: Vec<&String> = errors
+            .keys()
+            .filter(|k| k.rsplit('.').next().is_some_and(|short| short == name))
+            .collect();
+        qualified.sort();
+        qualified.dedup();
+        if qualified.len() == 1 {
+            diag = diag.with_note(format!(
+                "did you mean `{}`? (error sets from other modules need their qualified spelling)",
+                qualified[0]
+            ));
+        }
+    }
+    diags.push(diag);
+    Ty::Error
+}
+
+/// Validate one fallible set constraint. True when the set is known;
+/// otherwise one E302/E105. Out-of-line for the same hot-frame reason.
+fn check_error_set_name(
+    diags: &mut Vec<Diagnostic>,
+    objects: &HashMap<String, ObjectSigTy>,
+    unions: &HashMap<String, UnionSigTy>,
+    errors: &HashMap<String, ErrorSigTy>,
+    set: &str,
+    span: Span,
+) -> bool {
+    if errors.contains_key(set) {
+        return true;
+    }
+    if objects.contains_key(set) || unions.contains_key(set) {
+        diags.push(
+            Diagnostic::error(format!("`{set}` is not an error set"))
+                .with_label(span, "only `error` sets name fallible types")
+                .with_code("E302"),
+        );
+    } else {
+        diags.push(
+            Diagnostic::error(format!("unknown error set `{set}`"))
+                .with_label(span, "no error set with this name is in scope")
+                .with_code(if set.contains('.') { "E302" } else { "E105" }),
+        );
+    }
+    false
+}
+
 fn normalize_union_ty(
     diags: &mut Vec<Diagnostic>,
     unions: &HashMap<String, UnionSigTy>,
     objects: &HashMap<String, ObjectSigTy>,
+    errors: &HashMap<String, ErrorSigTy>,
     ty: Ty,
     span: Span,
 ) -> Ty {
@@ -973,7 +1160,7 @@ fn normalize_union_ty(
             let args = u
                 .args
                 .into_iter()
-                .map(|a| normalize_union_ty(diags, unions, objects, a, span))
+                .map(|a| normalize_union_ty(diags, unions, objects, errors, a, span))
                 .collect::<Vec<_>>();
             if args.iter().any(ty_has_error) {
                 return Ty::Error;
@@ -1091,10 +1278,17 @@ fn normalize_union_ty(
                 );
                 return Ty::Error;
             }
+            // An object spelling naming an error set: qualified spellings
+            // (`m.E`, which the parser cannot resolve) and bare imported
+            // shorts the HIR did not qualify land here. Objects win ties
+            // (same-module duplicates are E200 upstream).
+            if !objects.contains_key(&name) && errors.contains_key(&name) {
+                return Ty::ErrorSet(name);
+            }
             Ty::Object(name)
         }
         Ty::Array(elem) => {
-            let elem = normalize_union_ty(diags, unions, objects, *elem, span);
+            let elem = normalize_union_ty(diags, unions, objects, errors, *elem, span);
             if ty_has_error(&elem) {
                 return Ty::Error;
             }
@@ -1103,7 +1297,7 @@ fn normalize_union_ty(
         Ty::Tuple(fields) => {
             let mut out = Vec::with_capacity(fields.len());
             for (fname, fty) in fields {
-                let fty = normalize_union_ty(diags, unions, objects, fty, span);
+                let fty = normalize_union_ty(diags, unions, objects, errors, fty, span);
                 if ty_has_error(&fty) {
                     return Ty::Error;
                 }
@@ -1112,11 +1306,23 @@ fn normalize_union_ty(
             Ty::Tuple(out)
         }
         Ty::Mutable(inner) => {
-            let inner = normalize_union_ty(diags, unions, objects, *inner, span);
+            let inner = normalize_union_ty(diags, unions, objects, errors, *inner, span);
             if ty_has_error(&inner) {
                 return Ty::Error;
             }
             Ty::Mutable(Box::new(inner))
+        }
+        Ty::ErrorSet(name) => normalize_error_set(diags, objects, unions, errors, name, span),
+        Ty::Fallible(f) => {
+            let ok = normalize_union_ty(diags, unions, objects, errors, f.ok, span);
+            let mut bad = ty_has_error(&ok);
+            if let Some(set) = &f.err {
+                bad |= !check_error_set_name(diags, objects, unions, errors, set, span);
+            }
+            if bad {
+                return Ty::Error;
+            }
+            Ty::Fallible(Box::new(FallibleTy { err: f.err, ok }))
         }
         _ => ty,
     }
@@ -1132,19 +1338,22 @@ fn validate_qualified_types(
     prog: &HirProgram,
     objects: &HashMap<String, ObjectSigTy>,
     unions: &HashMap<String, UnionSigTy>,
+    errors: &HashMap<String, ErrorSigTy>,
 ) -> Vec<Diagnostic> {
     fn check_ty(
         ty: &VlType,
         span: Span,
         objects: &HashMap<String, ObjectSigTy>,
         unions: &HashMap<String, UnionSigTy>,
+        errors: &HashMap<String, ErrorSigTy>,
         diags: &mut Vec<Diagnostic>,
     ) {
         match ty {
             VlType::Object(name)
                 if name.contains('.')
                     && !objects.contains_key(name)
-                    && !unions.contains_key(name) =>
+                    && !unions.contains_key(name)
+                    && !errors.contains_key(name) =>
             {
                 diags.push(
                     Diagnostic::error(format!("cannot find object type `{name}`"))
@@ -1152,23 +1361,29 @@ fn validate_qualified_types(
                         .with_code("E302"),
                 );
             }
-            VlType::Array(elem) => check_ty(elem, span, objects, unions, diags),
-            VlType::Nullable(inner) => check_ty(inner, span, objects, unions, diags),
+            VlType::Array(elem) => check_ty(elem, span, objects, unions, errors, diags),
+            VlType::Nullable(inner) => check_ty(inner, span, objects, unions, errors, diags),
             VlType::Union { args, .. } => {
                 // Union heads are validated during conversion
                 // (`normalize_union_ty` owns E105/E302); only dotted names
                 // nested in the arguments still need the walk. Bare argument
                 // names were parser-validated.
                 for arg in args {
-                    check_ty(arg, span, objects, unions, diags);
+                    check_ty(arg, span, objects, unions, errors, diags);
                 }
             }
             VlType::Tuple(fields) => {
                 for f in fields {
-                    check_ty(&f.ty, span, objects, unions, diags);
+                    check_ty(&f.ty, span, objects, unions, errors, diags);
                 }
             }
-            VlType::Mutable(inner) => check_ty(inner, span, objects, unions, diags),
+            // Error-set spellings (bare or qualified) are validated once
+            // by normalization; only the `ok` payload still needs the
+            // walk for nested dotted names.
+            VlType::Fallible { ok, .. } => {
+                check_ty(ok, span, objects, unions, errors, diags);
+            }
+            VlType::Mutable(inner) => check_ty(inner, span, objects, unions, errors, diags),
             _ => {}
         }
     }
@@ -1176,12 +1391,13 @@ fn validate_qualified_types(
         expr: &HirExpr,
         objects: &HashMap<String, ObjectSigTy>,
         unions: &HashMap<String, UnionSigTy>,
+        errors: &HashMap<String, ErrorSigTy>,
         diags: &mut Vec<Diagnostic>,
     ) {
         match expr {
             HirExpr::Cast { inner, .. } => {
                 // Target owned by `check_cast`; it reports once itself.
-                check_expr(inner, objects, unions, diags);
+                check_expr(inner, objects, unions, errors, diags);
             }
             HirExpr::Call {
                 type_args,
@@ -1190,10 +1406,10 @@ fn validate_qualified_types(
                 ..
             } => {
                 for arg in type_args {
-                    check_ty(arg, *span, objects, unions, diags);
+                    check_ty(arg, *span, objects, unions, errors, diags);
                 }
                 for arg in args {
-                    check_expr(arg, objects, unions, diags);
+                    check_expr(arg, objects, unions, errors, diags);
                 }
             }
             HirExpr::MethodCall {
@@ -1204,21 +1420,21 @@ fn validate_qualified_types(
                 ..
             } => {
                 for arg in type_args {
-                    check_ty(arg, *span, objects, unions, diags);
+                    check_ty(arg, *span, objects, unions, errors, diags);
                 }
-                check_expr(receiver, objects, unions, diags);
+                check_expr(receiver, objects, unions, errors, diags);
                 for arg in args {
-                    check_expr(arg, objects, unions, diags);
+                    check_expr(arg, objects, unions, errors, diags);
                 }
             }
             HirExpr::ArrayLiteral { elems, .. } => {
                 for elem in elems {
-                    check_expr(elem, objects, unions, diags);
+                    check_expr(elem, objects, unions, errors, diags);
                 }
             }
             HirExpr::ObjectLiteral { fields, .. } => {
                 for (_, value) in fields {
-                    check_expr(value, objects, unions, diags);
+                    check_expr(value, objects, unions, errors, diags);
                 }
             }
             HirExpr::Variant {
@@ -1228,31 +1444,37 @@ fn validate_qualified_types(
                 ..
             } => {
                 for arg in type_args {
-                    check_ty(arg, *span, objects, unions, diags);
+                    check_ty(arg, *span, objects, unions, errors, diags);
                 }
                 for arg in args {
-                    check_expr(arg, objects, unions, diags);
+                    check_expr(arg, objects, unions, errors, diags);
                 }
             }
             HirExpr::Index { base, index, .. } => {
-                check_expr(base, objects, unions, diags);
-                check_expr(index, objects, unions, diags);
+                check_expr(base, objects, unions, errors, diags);
+                check_expr(index, objects, unions, errors, diags);
             }
             HirExpr::TupleLiteral { elems, .. } => {
                 for (_, value) in elems {
-                    check_expr(value, objects, unions, diags);
+                    check_expr(value, objects, unions, errors, diags);
                 }
             }
-            HirExpr::TupleIndex { base, .. } => check_expr(base, objects, unions, diags),
-            HirExpr::Field { base, .. } => check_expr(base, objects, unions, diags),
+            HirExpr::TupleIndex { base, .. } => check_expr(base, objects, unions, errors, diags),
+            HirExpr::Field { base, .. } => check_expr(base, objects, unions, errors, diags),
             HirExpr::Binary { lhs, rhs, .. } => {
-                check_expr(lhs, objects, unions, diags);
-                check_expr(rhs, objects, unions, diags);
+                check_expr(lhs, objects, unions, errors, diags);
+                check_expr(rhs, objects, unions, errors, diags);
             }
-            HirExpr::Unary { inner, .. } => check_expr(inner, objects, unions, diags),
+            HirExpr::Unary { inner, .. } => check_expr(inner, objects, unions, errors, diags),
+            HirExpr::Try { inner, .. } => check_expr(inner, objects, unions, errors, diags),
+            HirExpr::Catch { lhs, fallback, .. } => {
+                check_expr(lhs, objects, unions, errors, diags);
+                check_expr(fallback, objects, unions, errors, diags);
+            }
             HirExpr::Literal { .. }
             | HirExpr::String { .. }
             | HirExpr::Null { .. }
+            | HirExpr::ErrorValue { .. }
             | HirExpr::Var { .. } => {}
         }
     }
@@ -1260,6 +1482,7 @@ fn validate_qualified_types(
         stmts: &[HirStmt],
         objects: &HashMap<String, ObjectSigTy>,
         unions: &HashMap<String, UnionSigTy>,
+        errors: &HashMap<String, ErrorSigTy>,
         diags: &mut Vec<Diagnostic>,
     ) {
         for stmt in stmts {
@@ -1268,37 +1491,37 @@ fn validate_qualified_types(
                     ty, ty_span, value, ..
                 } => {
                     if let (Some(ty), Some(span)) = (ty, ty_span) {
-                        check_ty(ty, *span, objects, unions, diags);
+                        check_ty(ty, *span, objects, unions, errors, diags);
                     }
-                    check_expr(value, objects, unions, diags);
+                    check_expr(value, objects, unions, errors, diags);
                 }
-                HirStmt::Assign { value, .. } => check_expr(value, objects, unions, diags),
-                HirStmt::Expr(value) => check_expr(value, objects, unions, diags),
+                HirStmt::Assign { value, .. } => check_expr(value, objects, unions, errors, diags),
+                HirStmt::Expr(value) => check_expr(value, objects, unions, errors, diags),
                 HirStmt::IndexAssign {
                     array,
                     index,
                     value,
                     ..
                 } => {
-                    check_expr(array, objects, unions, diags);
-                    check_expr(index, objects, unions, diags);
-                    check_expr(value, objects, unions, diags);
+                    check_expr(array, objects, unions, errors, diags);
+                    check_expr(index, objects, unions, errors, diags);
+                    check_expr(value, objects, unions, errors, diags);
                 }
                 HirStmt::FieldAssign { base, value, .. } => {
-                    check_expr(base, objects, unions, diags);
-                    check_expr(value, objects, unions, diags);
+                    check_expr(base, objects, unions, errors, diags);
+                    check_expr(value, objects, unions, errors, diags);
                 }
                 HirStmt::TupleAssign { base, value, .. } => {
-                    check_expr(base, objects, unions, diags);
-                    check_expr(value, objects, unions, diags);
+                    check_expr(base, objects, unions, errors, diags);
+                    check_expr(value, objects, unions, errors, diags);
                 }
                 HirStmt::Destructure {
                     ty, ty_span, value, ..
                 } => {
                     if let (Some(ty), Some(span)) = (ty, ty_span) {
-                        check_ty(ty, *span, objects, unions, diags);
+                        check_ty(ty, *span, objects, unions, errors, diags);
                     }
-                    check_expr(value, objects, unions, diags);
+                    check_expr(value, objects, unions, errors, diags);
                 }
                 HirStmt::If {
                     condition,
@@ -1306,10 +1529,10 @@ fn validate_qualified_types(
                     else_body,
                     ..
                 } => {
-                    check_expr(condition, objects, unions, diags);
-                    check_stmts(then_body, objects, unions, diags);
+                    check_expr(condition, objects, unions, errors, diags);
+                    check_stmts(then_body, objects, unions, errors, diags);
                     if let Some(else_body) = else_body {
-                        check_stmts(else_body, objects, unions, diags);
+                        check_stmts(else_body, objects, unions, errors, diags);
                     }
                 }
                 HirStmt::Match {
@@ -1318,23 +1541,23 @@ fn validate_qualified_types(
                     else_body,
                     ..
                 } => {
-                    check_expr(scrutinee, objects, unions, diags);
+                    check_expr(scrutinee, objects, unions, errors, diags);
                     for arm in arms {
-                        check_stmts(&arm.body, objects, unions, diags);
+                        check_stmts(&arm.body, objects, unions, errors, diags);
                     }
                     if let Some(else_body) = else_body {
-                        check_stmts(else_body, objects, unions, diags);
+                        check_stmts(else_body, objects, unions, errors, diags);
                     }
                 }
                 HirStmt::While {
                     condition, body, ..
                 } => {
-                    check_expr(condition, objects, unions, diags);
-                    check_stmts(body, objects, unions, diags);
+                    check_expr(condition, objects, unions, errors, diags);
+                    check_stmts(body, objects, unions, errors, diags);
                 }
                 HirStmt::Return { value, .. } => {
                     if let Some(value) = value {
-                        check_expr(value, objects, unions, diags);
+                        check_expr(value, objects, unions, errors, diags);
                     }
                 }
                 HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
@@ -1347,32 +1570,34 @@ fn validate_qualified_types(
             HirItem::Object { fields, .. } => {
                 for (_, ty, span) in fields {
                     if let Some(ty) = ty {
-                        check_ty(ty, *span, objects, unions, &mut diags);
+                        check_ty(ty, *span, objects, unions, errors, &mut diags);
                     }
                 }
             }
             HirItem::Union { variants, .. } => {
                 for variant in variants {
                     for (ty, span) in &variant.payload {
-                        check_ty(ty, *span, objects, unions, &mut diags);
+                        check_ty(ty, *span, objects, unions, errors, &mut diags);
                     }
                 }
             }
+            // Error variants carry no payloads; nothing to walk.
+            HirItem::Error { .. } => {}
             HirItem::Let {
                 ty, ty_span, value, ..
             } => {
                 if let (Some(ty), Some(span)) = (ty, ty_span) {
-                    check_ty(ty, *span, objects, unions, &mut diags);
+                    check_ty(ty, *span, objects, unions, errors, &mut diags);
                 }
-                check_expr(value, objects, unions, &mut diags);
+                check_expr(value, objects, unions, errors, &mut diags);
             }
             HirItem::Destructure {
                 ty, ty_span, value, ..
             } => {
                 if let (Some(ty), Some(span)) = (ty, ty_span) {
-                    check_ty(ty, *span, objects, unions, &mut diags);
+                    check_ty(ty, *span, objects, unions, errors, &mut diags);
                 }
-                check_expr(value, objects, unions, &mut diags);
+                check_expr(value, objects, unions, errors, &mut diags);
             }
             HirItem::Fn {
                 params,
@@ -1383,13 +1608,13 @@ fn validate_qualified_types(
             } => {
                 for (_, _, ty, span) in params {
                     if let Some(ty) = ty {
-                        check_ty(ty, *span, objects, unions, &mut diags);
+                        check_ty(ty, *span, objects, unions, errors, &mut diags);
                     }
                 }
                 if let (Some(ret), Some(span)) = (ret, ret_span) {
-                    check_ty(ret, *span, objects, unions, &mut diags);
+                    check_ty(ret, *span, objects, unions, errors, &mut diags);
                 }
-                check_stmts(body, objects, unions, &mut diags);
+                check_stmts(body, objects, unions, errors, &mut diags);
             }
         }
     }
@@ -1506,6 +1731,17 @@ pub fn check_with_modules(
                 },
             );
         }
+        for export in &spec.errors {
+            if cx.typed.errors.contains_key(&export.qualified) {
+                continue;
+            }
+            cx.typed.errors.insert(
+                export.qualified.clone(),
+                ErrorSigTy {
+                    variants: export.variants.clone(),
+                },
+            );
+        }
     }
     // Predeclare every local nominal name before validating any declaration so
     // qualified forward/self references are known without manufacturing union
@@ -1534,6 +1770,18 @@ pub fn check_with_modules(
                     .objects
                     .entry(format!("{}.{}", prog.module, name))
                     .or_insert_with(|| ObjectSigTy { fields: Vec::new() });
+            }
+            HirItem::Error { name, variants, .. } => {
+                // First declaration wins (semantic reported the E200);
+                // keyed bare and qualified like unions.
+                let sig = ErrorSigTy {
+                    variants: variants.iter().map(|v| v.name.clone()).collect(),
+                };
+                cx.typed.errors.entry(name.clone()).or_insert(sig.clone());
+                cx.typed
+                    .errors
+                    .entry(format!("{}.{}", prog.module, name))
+                    .or_insert(sig);
             }
             _ => {}
         }
@@ -1565,6 +1813,7 @@ pub fn check_with_modules(
                             &mut cx.diags,
                             &cx.typed.unions,
                             &cx.typed.objects,
+                            &cx.typed.errors,
                             ty,
                             &env,
                             *span,
@@ -1607,6 +1856,7 @@ pub fn check_with_modules(
                             &mut cx.diags,
                             &cx.typed.unions,
                             &cx.typed.objects,
+                            &cx.typed.errors,
                             v,
                             &HashMap::new(),
                             *span,
@@ -1644,6 +1894,7 @@ pub fn check_with_modules(
         prog,
         &cx.typed.objects,
         &cx.typed.unions,
+        &cx.typed.errors,
     ));
     // Pass 1: collect function signatures so calls resolve arity + types
     // regardless of definition order (matches the resolver pre-pass).
@@ -1677,6 +1928,7 @@ pub fn check_with_modules(
                             &mut cx.diags,
                             &cx.typed.unions,
                             &cx.typed.objects,
+                            &cx.typed.errors,
                             v,
                             &env,
                             *pspan,
@@ -1712,6 +1964,7 @@ pub fn check_with_modules(
                         &mut cx.diags,
                         &cx.typed.unions,
                         &cx.typed.objects,
+                        &cx.typed.errors,
                         v,
                         &env,
                         ret_span.unwrap_or(*span),
@@ -1866,6 +2119,16 @@ impl Checker {
     /// `Array[Option[u64]]` works. Reports once per call; callers poison via
     /// the returned [`Ty::Error`].
     fn vl_to_ty(&mut self, v: &VlType, span: Span) -> Ty {
+        if let VlType::Fallible { err: Some(set), .. } = v {
+            if self.type_env.contains_key(set) {
+                self.diags.push(
+                    Diagnostic::error(format!("`{set}` is a type parameter, not an error set"))
+                        .with_label(span, "error sets cannot be generic parameters")
+                        .with_code("E302"),
+                );
+                return Ty::Error;
+            }
+        }
         let ty = Ty::from_vl_in(v, &self.type_env);
         self.normalize_union_ty(ty, span)
     }
@@ -1877,12 +2140,23 @@ impl Checker {
         diags: &mut Vec<Diagnostic>,
         unions: &HashMap<String, UnionSigTy>,
         objects: &HashMap<String, ObjectSigTy>,
+        errors: &HashMap<String, ErrorSigTy>,
         v: &VlType,
         env: &HashMap<String, Ty>,
         span: Span,
     ) -> Ty {
+        if let VlType::Fallible { err: Some(set), .. } = v {
+            if env.contains_key(set) {
+                diags.push(
+                    Diagnostic::error(format!("`{set}` is a type parameter, not an error set"))
+                        .with_label(span, "error sets cannot be generic parameters")
+                        .with_code("E302"),
+                );
+                return Ty::Error;
+            }
+        }
         let ty = Ty::from_vl_in(v, env);
-        normalize_union_ty(diags, unions, objects, ty, span)
+        normalize_union_ty(diags, unions, objects, errors, ty, span)
     }
 
     fn normalize_union_ty(&mut self, ty: Ty, span: Span) -> Ty {
@@ -1890,6 +2164,7 @@ impl Checker {
             &mut self.diags,
             &self.typed.unions,
             &self.typed.objects,
+            &self.typed.errors,
             ty,
             span,
         )
@@ -1912,6 +2187,7 @@ impl Checker {
         match item {
             HirItem::Object { .. } => {}
             HirItem::Union { .. } => {}
+            HirItem::Error { .. } => {}
             HirItem::Let {
                 id,
                 def,
@@ -2038,10 +2314,11 @@ impl Checker {
                 if poisoned_sig {
                     return;
                 }
-                if ret_ty == Ty::Void {
+                if ret_ty == Ty::Void || is_fallible_void(&ret_ty) {
                     // `return;` is optional; bare expression values are
-                    // discarded. Any body is accepted, but still warn on
-                    // unreachable code.
+                    // discarded. `E!void` falls through as success (the LIR
+                    // epilogue builds the ok container). Any body is
+                    // accepted, but still warn on unreachable code.
                     check_unreachable(body, &mut self.diags);
                     return;
                 }
@@ -2554,14 +2831,34 @@ impl Checker {
                         self.record(e.id(), defaulted);
                     }
                 }
+                // A discarded fallible silently drops the error: require
+                // `try` (propagate) or `catch` (handle), like Zig.
+                if let Some(fall) = self.typed.type_of_id(e.id()) {
+                    if matches!(fall, Ty::Fallible(_)) {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "fallible value `{fall}` is discarded without handling the error"
+                            ))
+                            .with_label(e.span(), "unhandled error here")
+                            .with_note(
+                                "use `try expr` to propagate or `expr catch fallback` to handle",
+                            )
+                            .with_code("E309"),
+                        );
+                    }
+                }
             }
             HirStmt::Return { value, span } => {
                 match value {
                     None => {
-                        // Bare `return;`: only valid for `void` (or poisoned).
-                        // Any `return` diverges, so the missing-return check
+                        // Bare `return;`: valid for `void` (or poisoned) and
+                        // for `E!void` (success with no value). Any `return`
+                        // diverges, so the missing-return check
                         // (definite-return analysis) stays quiet — one error.
-                        if ty_has_error(&self.fn_ret) || self.fn_ret == Ty::Void {
+                        if ty_has_error(&self.fn_ret)
+                            || self.fn_ret == Ty::Void
+                            || is_fallible_void(&self.fn_ret)
+                        {
                             return;
                         }
                         self.diags.push(
@@ -2593,6 +2890,12 @@ impl Checker {
                                 )
                                 .with_code("E307"),
                             );
+                            return;
+                        }
+                        // `return <void-expr>;` in an `E!void` function runs
+                        // the expression for effects (a `try` still
+                        // propagates) and succeeds: same as bare `return;`.
+                        if got == Ty::Void && is_fallible_void(&self.fn_ret) {
                             return;
                         }
                         if !can_coerce(&got, &self.fn_ret) {
@@ -4322,6 +4625,128 @@ impl Checker {
     /// A contextual `null` already recorded its nullable via
     /// `infer_expr_expected`; honor it. Out-of-line so the hot `infer_expr`
     /// frame stays small for deeply nested generics.
+    /// Look up an error set by spelling (bare local or qualified imported).
+    fn error_sig(&self, name: &str) -> Option<ErrorSigTy> {
+        self.typed.errors.get(name).cloned()
+    }
+
+    /// Check an error value (`E.Variant`): the set must be declared and the
+    /// variant a member. Unreachable through the driver (semantic owns
+    /// unknown sets/variants and records no site), but poison loudly rather
+    /// than silently for hand-built HIR.
+    fn check_error_value(&mut self, id: vl_hir::HirId, set: &str, variant: &str, span: Span) -> Ty {
+        match self.error_sig(set) {
+            Some(sig) if sig.variants.iter().any(|v| v == variant) => {
+                self.record(id, Ty::ErrorSet(set.to_string()))
+            }
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(format!("cannot find error value `{set}.{variant}`"))
+                        .with_label(span, "unknown error value")
+                        .with_code("E302"),
+                );
+                self.record(id, Ty::Error)
+            }
+        }
+    }
+
+    /// Check `try expr`: the operand must be fallible `E!T` (result: `T`),
+    /// and the enclosing function must be fallible with a compatible set
+    /// (the error implicitly returns). Records the enclosing `ok` payload
+    /// for LIR's error-path rebuild.
+    fn check_try(&mut self, id: vl_hir::HirId, inner: &HirExpr, span: Span) -> Ty {
+        let inner_ty = self.infer_expr(inner);
+        if ty_has_error(&inner_ty) {
+            return self.record(id, Ty::Error);
+        }
+        let (err, ok) = match &inner_ty {
+            Ty::Fallible(f) => (f.err.clone(), f.ok.clone()),
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(format!("`try` needs a fallible value, got `{inner_ty}`"))
+                        .with_label(span, "only `E!T` propagates with `try`")
+                        .with_code("E304"),
+                );
+                return self.record(id, Ty::Error);
+            }
+        };
+        match &self.fn_ret {
+            Ty::Fallible(f) => {
+                let compat = match (&f.err, &err) {
+                    (None, _) | (_, None) => true,
+                    (Some(a), Some(b)) => a == b,
+                };
+                if !compat {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "cannot propagate `{}` from a function returning `{}`",
+                            inner_ty, self.fn_ret
+                        ))
+                        .with_label(span, "incompatible error sets here")
+                        .with_note("`try` returns the error; both sets must agree")
+                        .with_code("E307"),
+                    );
+                    return self.record(id, Ty::Error);
+                }
+                self.typed.try_rebuilds.insert(id.0, f.ok.clone());
+            }
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "cannot use `try` in a function returning `{}`",
+                        self.fn_ret
+                    ))
+                    .with_label(span, "only fallible functions (`E!T`) propagate with `try`")
+                    .with_code("E307"),
+                );
+                return self.record(id, Ty::Error);
+            }
+        }
+        self.record(id, ok)
+    }
+
+    /// Check `expr catch fallback`: the left side must be fallible `E!T`
+    /// and the fallback must supply `T` (result: `T`).
+    fn check_catch(
+        &mut self,
+        id: vl_hir::HirId,
+        lhs: &HirExpr,
+        fallback: &HirExpr,
+        span: Span,
+    ) -> Ty {
+        let lhs_ty = self.infer_expr(lhs);
+        if ty_has_error(&lhs_ty) {
+            let _ = self.infer_expr(fallback);
+            return self.record(id, Ty::Error);
+        }
+        let ok = match &lhs_ty {
+            Ty::Fallible(f) => f.ok.clone(),
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(format!("`catch` needs a fallible value, got `{lhs_ty}`"))
+                        .with_label(span, "only `E!T` handles with `catch`")
+                        .with_note("write `fallible() catch fallback`")
+                        .with_code("E304"),
+                );
+                let _ = self.infer_expr(fallback);
+                return self.record(id, Ty::Error);
+            }
+        };
+        let fb_ty = self.infer_expr_expected(fallback, &ok);
+        if ty_has_error(&fb_ty) {
+            return self.record(id, Ty::Error);
+        }
+        if !can_coerce(&fb_ty, &ok) {
+            self.diags.push(
+                Diagnostic::error(format!("`catch` fallback is `{fb_ty}`, expected `{ok}`"))
+                    .with_label(span, "mismatched fallback")
+                    .with_code("E309"),
+            );
+            return self.record(id, Ty::Error);
+        }
+        self.record(id, ok)
+    }
+
     fn check_bare_null(&mut self, id: vl_hir::HirId, span: Span) -> Ty {
         match self.typed.type_of_id(id) {
             Some(t) if ty_has_error(&t) => return self.record(id, Ty::Error),
@@ -4439,6 +4864,80 @@ impl Checker {
         None
     }
 
+    /// Fallible prefix of `infer_expr_expected`: error-value and plain-`T`
+    /// auto-wraps for an `E!T` (or `!T`) expectation. Returns `Some(ty)`
+    /// when the fallible sugar handled `expr` fully (an err-wrap, an
+    /// ok-wrap, or a poisoned re-visit); `None` to fall through to the
+    /// general paths below. Mirrors
+    /// [`infer_nullable_prefix`](Self::infer_nullable_prefix).
+    fn infer_fallible_prefix(&mut self, expr: &HirExpr, expected: &Ty) -> Option<Ty> {
+        let (err, ok) = match expected {
+            Ty::Fallible(f) => (f.err.clone(), f.ok.clone()),
+            _ => return None,
+        };
+        if ty_has_error(expected) {
+            return None;
+        }
+        // Error value under a compatible set: record the node as the
+        // fallible itself; LIR emits `WrapErr` around the lowered code.
+        if let HirExpr::ErrorValue { set, variant, .. } = expr {
+            let compat = match &err {
+                None => true,
+                Some(want) => want == set,
+            };
+            if !compat {
+                // Wrong set: fall through to the general mismatch below
+                // (one error at the boundary).
+                return None;
+            }
+            let set_ty = self.check_error_value(expr.id(), set, variant, expr.span());
+            if ty_has_error(&set_ty) {
+                return Some(self.record(expr.id(), Ty::Error));
+            }
+            self.typed.fallible_err_wraps.insert(expr.id().0);
+            return Some(self.record(expr.id(), expected.clone()));
+        }
+        if matches!(expr, HirExpr::Variant { .. }) {
+            return None;
+        }
+        // Exact match first: an `E!T` value where `E!T` is expected needs
+        // no wrap (avoids a spurious inner probe).
+        let current = self.infer_expr(expr);
+        if ty_has_error(&current) {
+            return Some(self.record(expr.id(), Ty::Error));
+        }
+        if can_coerce(&current, expected) {
+            return None;
+        }
+        // An error-typed value (a variable holding an error, a `catch`
+        // arm, ...) under a compatible set wraps like a literal: record
+        // the node as the fallible so LIR finds the `ok` layout.
+        if let Ty::ErrorSet(set) = &current {
+            let compat = match &err {
+                None => true,
+                Some(want) => want == set,
+            };
+            if compat {
+                self.typed.fallible_err_wraps.insert(expr.id().0);
+                return Some(self.record(expr.id(), expected.clone()));
+            }
+        }
+        let probe = self.infer_expr_expected(expr, &ok);
+        if !ty_has_error(&probe) && !ty_has_error(&ok) && can_coerce(&probe, &ok) {
+            // Keep the node's recorded type as the inner `T` (so literals
+            // lower in the right lane); the wrap set tells LIR to emit
+            // `WrapOk` around it.
+            self.typed.fallible_ok_wraps.insert(expr.id().0);
+            return Some(expected.clone());
+        }
+        if ty_has_error(&probe) {
+            return Some(self.record(expr.id(), Ty::Error));
+        }
+        // Inner rejects the value: fall through to the general mismatch
+        // below (one error at the boundary).
+        None
+    }
+
     fn infer_expr_expected(&mut self, expr: &HirExpr, expected: &Ty) -> Ty {
         // Fast path guard: only enter the nullable helper when the
         // expectation could be a `?T` (`Option` union, possibly under `*`)
@@ -4449,6 +4948,15 @@ impl Checker {
             && !matches!(expr, HirExpr::Variant { .. });
         if maybe_nullable {
             if let Some(ty) = self.infer_nullable_prefix(expr, expected) {
+                return ty;
+            }
+        }
+        // Fallible sugar (`T` -> `E!T` ok-wrap, `E.V` -> `E!T` err-wrap)
+        // runs before the general paths so fallible boundaries coerce like
+        // nullable ones. `try`/`catch` results flow through as ordinary
+        // `T` values (checked at their own nodes).
+        if matches!(expected, Ty::Fallible(_)) {
+            if let Some(ty) = self.infer_fallible_prefix(expr, expected) {
                 return ty;
             }
         }
@@ -5638,6 +6146,20 @@ impl Checker {
                 args,
                 span: *span,
             }),
+            HirExpr::ErrorValue {
+                id,
+                set,
+                variant,
+                span,
+                ..
+            } => self.check_error_value(*id, set, variant, *span),
+            HirExpr::Try { id, inner, span } => self.check_try(*id, inner, *span),
+            HirExpr::Catch {
+                id,
+                lhs,
+                fallback,
+                span,
+            } => self.check_catch(*id, lhs, fallback, *span),
             HirExpr::Unary {
                 id,
                 op,
@@ -6492,6 +7014,17 @@ pub(crate) fn can_coerce(got: &Ty, want: &Ty) -> bool {
     if same_type(got, want) {
         return true;
     }
+    // Fallible flows when the `ok` payloads coerce and the error
+    // constraint is compatible: the inferred set (`!T`) flows either way,
+    // named sets only into themselves. Layouts are identical (global
+    // codes), so no wrap is needed.
+    if let (Ty::Fallible(f1), Ty::Fallible(f2)) = (got, want) {
+        let err_ok = match (&f1.err, &f2.err) {
+            (None, _) | (_, None) => true,
+            (Some(a), Some(b)) => a == b,
+        };
+        return err_ok && can_coerce(&f1.ok, &f2.ok);
+    }
     // One implicit downgrade: `*R` supplies a read-only `R`.
     if let Ty::Mutable(inner) = got {
         return same_type(inner, want);
@@ -6700,7 +7233,15 @@ fn validate_capability(ty: &Ty, span: Span, diags: &mut Vec<Diagnostic>) -> bool
                     );
                     return false;
                 }
-                Ty::U64 | Ty::I64 | Ty::F64 | Ty::Bool | Ty::U8 | Ty::Int => {
+                Ty::Fallible(_) => {
+                    diags.push(
+                        Diagnostic::error(format!("`*{inner}` cannot take a mutable view"))
+                            .with_label(span, "fallible values are shared through `try`/`catch`")
+                            .with_code("E106"),
+                    );
+                    return false;
+                }
+                Ty::U64 | Ty::I64 | Ty::F64 | Ty::Bool | Ty::U8 | Ty::Int | Ty::ErrorSet(_) => {
                     diags.push(
                         Diagnostic::error(format!("`*{inner}` is not a reference type"))
                             .with_label(span, "only reference types take `*`")
@@ -6769,6 +7310,8 @@ pub(crate) fn is_capability_valid(ty: &Ty) -> bool {
                 | Ty::Bool
                 | Ty::U8
                 | Ty::Int
+                | Ty::ErrorSet(_)
+                | Ty::Fallible(_)
                 | Ty::Mutable(_) => return false,
                 Ty::String | Ty::File | Ty::Object(_) | Ty::Error => {
                     return is_capability_valid(inner);
@@ -7857,20 +8400,32 @@ mod tests {
         assert!(diags[0].message.contains("not generic"), "{diags:?}");
     }
 
-    /// Build a `main` calling `id` once per nesting depth `0..count`
-    /// (`1u64`, `[1u64]`, `[[1u64]]`, ...), each a distinct instance.
+    /// Build a `main` calling `id` once per distinct shallow type
+    /// (`1u64`, `1i64`, tuples `#(1u64, ...)`, ...), each a distinct
+    /// instance. Types stay shallow on purpose: deep nesting (e.g. 65-deep
+    /// arrays) also creates distinct instances but nests 65 `infer_expr`
+    /// frames, which overflows the 2 MiB debug test threads by a hair —
+    /// the budget under test counts instances, not depth.
     fn nested_id_calls(count: usize) -> String {
+        fn arg_for(i: usize) -> String {
+            match i {
+                0 => "1u64".to_string(),
+                1 => "1i64".to_string(),
+                2 => "1.5f64".to_string(),
+                3 => "true".to_string(),
+                4 => "1u8".to_string(),
+                5 => "\"s\"".to_string(),
+                // Tuples of increasing arity (`#(u64, u64)`, ...): one
+                // distinct instance per width, depth 1.
+                n => {
+                    let elems = vec!["1u64"; n - 3].join(", ");
+                    format!("#({elems})")
+                }
+            }
+        }
         let mut src = String::from("fun id[T](x: T): T { return x; } fun main() { ");
-        for depth in 0..count {
-            src.push_str("id(");
-            for _ in 0..depth {
-                src.push('[');
-            }
-            src.push_str("1u64");
-            for _ in 0..depth {
-                src.push(']');
-            }
-            src.push_str("); ");
+        for i in 0..count {
+            src.push_str(&format!("id({}); ", arg_for(i)));
         }
         src.push('}');
         src
@@ -7943,6 +8498,76 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
         assert!(typed.validate_normalized(&hir, &diags).is_empty());
         assert!(typed.instances.contains_key("id$u64"));
+    }
+
+    #[test]
+    fn fallible_values_wrap_and_propagate() {
+        let (typed, diags) = check_src(
+            "type E = error { A, }; fun f(): E!u64 { return E.A; } fun g(): E!u64 { val x = try f(); return x; } fun main() { val v = g() catch 0u64; v; }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(!typed.fallible_err_wraps.is_empty(), "{typed:?}");
+        assert!(!typed.try_rebuilds.is_empty(), "{typed:?}");
+        assert!(typed.types.values().any(|t| matches!(
+            t,
+            Ty::Fallible(f) if f.err.as_deref() == Some("E") && f.ok == Ty::U64
+        )));
+    }
+
+    #[test]
+    fn inferred_error_set_flows_into_named() {
+        let (typed, diags) = check_src(
+            "type E = error { A, }; fun g(): !u64 { return 1u64; } fun f(): E!u64 { val x = try g(); return x; } fun main() { val v = f() catch 0u64; v; }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(typed.types.values().any(|t| matches!(
+            t,
+            Ty::Fallible(f) if f.err.is_none() && f.ok == Ty::U64
+        )));
+    }
+
+    #[test]
+    fn fallible_void_accepts_bare_return_and_fallthrough() {
+        let (typed, diags) = check_src(
+            "type E = error { A, }; fun a(): E!void { return; } fun b(): E!void { } fun main() { a(); b(); }",
+        );
+        // Discarded fallibles in `main` are E309 (two statements, two errors).
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 2, "{diags:?}");
+        assert!(errors.iter().all(|d| d.code.as_deref() == Some("E309")));
+        let _ = typed;
+    }
+
+    #[test]
+    fn fallible_misuse_is_single_root_errors() {
+        for (src, code) in [
+            ("fun main() { val x = try 5u64; x; }", "E304"),
+            ("fun main() { val x = 5u64 catch 0u64; x; }", "E304"),
+            (
+                "type E = error { A, }; fun f(): E!u64 { return 1u64; } fun main() { f(); }",
+                "E309",
+            ),
+            (
+                "type A = error { X, }; type B = error { Y, }; fun f(): A!u64 { return B.Y; } fun main() { f(); }",
+                "E307",
+            ),
+            (
+                "type E = error { A, }; fun f(): E!u64 { return 1u64; } fun g(): u64 { return try f(); } fun main() { g(); }",
+                "E307",
+            ),
+            (
+                "type E = error { A, }; fun f(): E!u64 { return E.A; } fun main() { val x = f() catch \"s\"; x; }",
+                "E309",
+            ),
+            ("fun f(): Bogus!u64 { return 1u64; } fun main() { f(); }", "E105"),
+        ] {
+            let (_, diags) = check_src(src);
+            let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+            // `f();` discards in `main` add one E309 each; accept the first
+            // error as the probe's root cause.
+            assert!(!errors.is_empty(), "{src}: {diags:?}");
+            assert_eq!(errors[0].code.as_deref(), Some(code), "{src}: {diags:?}");
+        }
     }
 
     #[test]

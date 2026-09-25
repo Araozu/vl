@@ -74,6 +74,7 @@ already reported the cause.
 - Learn the syntax and values in [Basics](/docs/basics), then continue through
   [conditions and loops](/docs/control-flow) and [functions](/docs/functions).
 - Learn about [arrays and generics](/docs/arrays), [objects](/docs/objects),
-  [unions](/docs/unions), [strings](/docs/strings), and [modules](/docs/modules).
+  [unions](/docs/unions), [errors](/docs/errors), [strings](/docs/strings),
+  and [modules](/docs/modules).
 - See every command and inspection option in the [CLI reference](/cli).
 - Look up modules and functions in the [standard library](/std).

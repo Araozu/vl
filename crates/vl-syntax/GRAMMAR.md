@@ -9,7 +9,7 @@ Parser recovers per-item (and per-stmt inside `fun`); one bad item hides no othe
 
 ```text
 program := item*
-item    := use_item | binding_item | function_item | object_item | union_item
+item    := use_item | binding_item | function_item | object_item | union_item | error_item
 use_item := "use" path ("." "{" ident ("," ident)* "}")? ";"
 binding_item := ("var" | "val") (ident | destructure) (":" type)? "=" expr ";"
 destructure := "#" "(" destructure_binding ("," destructure_binding)* ","? ")"
@@ -21,15 +21,22 @@ object_item := "type" ident "=" "object" "{" object_member* "}" ";"
 union_item := "type" ident type_params? "=" "union" "{" union_variants? "}" ";"
 union_variants := union_variant ("," union_variant)* ","?
 union_variant := ident ("(" type ("," type)* ")")?
+error_item := "type" ident "=" "error" "{" error_variants? "}" ";"
+error_variants := error_variant ("," error_variant)* ","?
+error_variant := ident   ; plain names only, uppercase; payload tails are E104
+                         ; (the AST reserves the shape for future data)
 object_member := object_field | assoc_fn
 object_field := ident ":" type ","?    ; the comma may be omitted before `fun` or `}`
 assoc_fn := "fun" ident type_params? "(" params? ")" (":" type)? block ","?
                                        ; a trailing comma after a `fun` member is allowed, never required
 params   := param ("," param)*          ; no trailing comma
 param    := ident ":" type
-type     := nullable_type | mutable_type | type_atom
+type     := nullable_type | mutable_type | fallible_type | type_atom
 nullable_type := "?" type               ; nullable sugar (`?u64` desugars to the builtin `Option` union)
 mutable_type := "*" (type_atom | nullable_type)   ; one capability qualifier (`*Foo`, `*Array[T]`, `*?Foo`)
+fallible_type := "!" type               ; inferred set (`!u64` = any error)
+             | error_set "!" type        ; named set (`Io!u64`); `E!void` is return-only
+error_set := ident                       ; a declared `error` set (bare or qualified)
 type_atom := "u64" | "i64" | "f64" | "bool" | "u8" | "String" | "File" | ident | union_type | "Array" "[" type "]" | tuple_type | "void"
 union_type := ident ("[" type ("," type)* "]")?   ; bare `Option` or applied `Option[u64]` when `ident` names a union
 tuple_type := "#" "(" tuple_type_elem ("," tuple_type_elem)* ","? ")"
@@ -56,14 +63,15 @@ return_stmt := "return" expr? ";"
 branch   := block | stmt
 expr_stmt := expr ";"                   ; mandatory; value discarded (no implicit return)
 expr     := or
-or       := and ("||" and)*
+or       := catch ("||" catch)*
+catch    := and ("catch" or)?           ; right-assoc fallback, tighter than `||`
 and      := equality ("&&" equality)*
 equality := cast (("==" | "!=") cast)*
 cast     := comparison ("as" type)*
 comparison := term (("<" | "<=" | ">" | ">=") term)*
 term     := factor (("+" | "-") factor)* ; left-assoc
 factor   := unary (("*" | "/") unary)*   ; left-assoc
-unary    := ("-" | "!") unary | postfix
+unary    := ("-" | "!" | "try") unary | postfix   ; `try` propagates the error or unwraps
 call     := path ("::" "[" type ("," type)* "]")? "(" args? ")"
 postfix  := primary ("[" expr "]" | "." ident | backtick_index)*
 primary  := literal | string | "null" | array_literal | tuple_literal | object_literal | call | path | "(" expr ")"
@@ -77,8 +85,8 @@ literal  := int | i64 | u64 | f64 | u8 | bool
 path     := ident ("." ident)*
 ```
 
-Terminal names are `vl-lex` `TokenKind`s: `Var Val Fun Type Object Union Match If Else While Break
-Continue Return As Extends Eq EqEq Bang BangEq Lt LtEq Gt GtEq AmpAmp PipePipe
+Terminal names are `vl-lex` `TokenKind`s: `Var Val Fun Type Object Union Error Try Catch Match
+If Else While Break Continue Return As Extends Eq EqEq Bang BangEq Lt LtEq Gt GtEq AmpAmp PipePipe
 Plus Minus Star Slash Semi LParen RParen LBrace RBrace LBracket RBracket Comma
 Dot Colon Hash Backtick ColonColon Question Null Ident Int I64 U64 F64 U8 Bool String Invalid Eof`.
 
@@ -113,6 +121,17 @@ Dot Colon Hash Backtick ColonColon Question Null Ident Int I64 U64 F64 U8 Bool S
   `Some(T)` is valid, while `Some()` and `Some(T,)` are rejected. Variant separators
   and the optional final union comma are accepted. Variants must begin with an uppercase
   letter and duplicate variant names produce one `E200`.
+* Error sets declare plain uppercase variants with no payloads or type
+  parameters (`type Io = error { NotFound, };`): a parenthesized tail is one
+  `E104` (`error payloads are not supported yet`), duplicates are one `E200`.
+  Values construct as paths (`Io.NotFound`, like nullary union variants) and
+  flow through fallible types (`Io!u64`, `!u64`), `try`, and `catch`.
+  A fallible payload can never itself be fallible, and only error sets take
+  `!` (anything else is one `E104`).
+* `catch` binds tighter than `||` (`a || b catch c` is `a || (b catch c)`)
+  and chains right (`a catch b catch c` is `a catch (b catch c)`); the
+  fallback is a full `or` expression. `try` is prefix like `-`/`!`, so
+  `try f() catch d` parses as `(try f()) catch d`.
 * Union types spell instantiations with brackets: `Option` (monomorphic) or
   `Option[u64]` (applied). Only names declared as `union` in the file parse
   this way; other `Name[...]` spellings are a typecheck error. Annotations for
@@ -154,7 +173,9 @@ Item ::= Use { path, names, span }
        | Function { name, name_span, type_params: Vec<TypeParam>, params: Vec<Param>, ret: Option<VlType>, ret_span, body: Vec<Stmt>, span }
        | Object { name, name_span, fields: Vec<ObjectField>, methods: Vec<AssociatedFn>, span }
        | Union { name, name_span, type_params: Vec<TypeParam>, variants: Vec<UnionVariant>, span }
+       | Error { name, name_span, variants: Vec<ErrorVariant>, span }
 UnionVariant ::= { name, name_span, payload: Vec<(VlType, Span)> }
+ErrorVariant ::= { name, name_span, payload: Vec<(VlType, Span)> }   ; always empty for now
 AssociatedFn ::= { name, name_span, type_params: Vec<TypeParam>, params: Vec<Param>, ret: Option<VlType>, ret_span, body: Vec<Stmt>, span }
        ; same shape as Function; the owner lives on the enclosing Object
 TypeParam ::= { name, span, bound: Option<GenericBound> }
@@ -181,6 +202,7 @@ Expr ::= Literal(Scalar, Span) | String(Vec<u8>, Span) | ArrayLiteral { elems, s
          | Field { base, name, span } | Var { path, span }
          | Call { callee: path, callee_span, type_args, type_args_span, args, span }
          | Unary { op, rhs, span } | Binary { op, lhs, rhs, span }
+         | Try { inner, span } | Catch { lhs, fallback, span }
          | Cast { inner, target, target_span, span }
 BinOp ::= Add | Sub | Mul | Div | Eq | Ne | Lt | Le | Gt | Ge | And | Or
 UnOp  ::= Neg | Not

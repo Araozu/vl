@@ -104,6 +104,13 @@
 //! needed): `?u64` is the type, `null` the empty value, a plain `u64` value
 //! wraps as `Some` implicitly, `x == null` / `x != null` test the tag, and a
 //! `null` arm matches the empty case in `match`.
+//!
+//! Error sets are Zig-style (`type Io = error { NotFound, };`): plain
+//! uppercase variants with no payloads yet. `Io.NotFound` is an error value;
+//! `Io!u64` (or `!u64` for the inferred set) is a fallible value. `try expr`
+//! unwraps or returns the error from the enclosing fallible function;
+//! `expr catch fallback` handles it inline. `E!void` marks fallible side
+//! effects (`main` itself stays infallible).
 //! Semicolons are mandatory: every binding, every `return`, and every
 //! expression statement ends with `;` (no bare trailing value like Rust).
 //! There are no implicit returns: a function yields a value only through an
@@ -168,6 +175,16 @@ pub struct ObjectField {
 /// convention that they begin with an uppercase letter.
 #[derive(Debug, Clone)]
 pub struct UnionVariant {
+    pub name: String,
+    pub name_span: Span,
+    pub payload: Vec<(VlType, Span)>,
+}
+
+/// One error-set variant: a plain name for now (`NotFound`).
+/// `payload` is reserved for future per-variant data (like unions) and is
+/// always empty in this milestone; the parser rejects `(...)` tails.
+#[derive(Debug, Clone)]
+pub struct ErrorVariant {
     pub name: String,
     pub name_span: Span,
     pub payload: Vec<(VlType, Span)>,
@@ -255,6 +272,14 @@ pub enum Item {
         name_span: Span,
         type_params: Vec<TypeParam>,
         variants: Vec<UnionVariant>,
+        span: Span,
+    },
+    /// Nominal error set (`type E = error { A, B, };`). Plain variants only;
+    /// values construct as `E.A` and flow through `E!T` / `try` / `catch`.
+    Error {
+        name: String,
+        name_span: Span,
+        variants: Vec<ErrorVariant>,
         span: Span,
     },
     Let {
@@ -450,6 +475,19 @@ pub enum Expr {
         rhs: Box<Expr>,
         span: Span,
     },
+    /// Fallible propagation (`try expr`): unwrap the `ok` payload or return
+    /// the error from the enclosing fallible function.
+    Try {
+        inner: Box<Expr>,
+        span: Span,
+    },
+    /// Fallible fallback (`expr catch fallback`): the `ok` payload, or the
+    /// fallback value when `expr` is an error.
+    Catch {
+        lhs: Box<Expr>,
+        fallback: Box<Expr>,
+        span: Span,
+    },
     Binary {
         op: BinOp,
         lhs: Box<Expr>,
@@ -503,7 +541,11 @@ impl Expr {
             Expr::Var { span, .. } => *span,
             Expr::Null(span) => *span,
             Expr::Call { span, .. } => *span,
-            Expr::Unary { span, .. } | Expr::Binary { span, .. } | Expr::Cast { span, .. } => *span,
+            Expr::Unary { span, .. }
+            | Expr::Binary { span, .. }
+            | Expr::Cast { span, .. }
+            | Expr::Try { span, .. }
+            | Expr::Catch { span, .. } => *span,
         }
     }
 }
@@ -519,6 +561,10 @@ struct Parser<'a> {
     /// Union annotations (`Option`, `Option[u64]`) resolve through this set;
     /// object names never do.
     known_unions: std::collections::HashSet<String>,
+    /// Bare names declared as `error` in this file (subset of
+    /// `known_types`). Error-set annotations (`E`, `E!u64`) resolve through
+    /// this set; anything else is an object spelling.
+    known_errors: std::collections::HashSet<String>,
 }
 
 pub fn parse(toks: &[Token], src: &str) -> (Program, Vec<Diagnostic>) {
@@ -598,6 +644,7 @@ fn use_imported_type_names(toks: &[Token]) -> Vec<String> {
 pub fn parse_with_module(toks: &[Token], _src: &str, module: &str) -> (Program, Vec<Diagnostic>) {
     let mut known_types = std::collections::HashSet::new();
     let mut known_unions = std::collections::HashSet::new();
+    let mut known_errors = std::collections::HashSet::new();
     let mut i = 0;
     while i < toks.len() {
         if !matches!(toks[i].kind, TokenKind::Type) {
@@ -633,12 +680,15 @@ pub fn parse_with_module(toks: &[Token], _src: &str, module: &str) -> (Program, 
         if matches!(toks.get(j).map(|t| &t.kind), Some(TokenKind::Eq))
             && matches!(
                 toks.get(j + 1).map(|t| &t.kind),
-                Some(TokenKind::Object | TokenKind::Union)
+                Some(TokenKind::Object | TokenKind::Union | TokenKind::Error)
             )
         {
             known_types.insert(name.clone());
             if matches!(toks.get(j + 1).map(|t| &t.kind), Some(TokenKind::Union)) {
                 known_unions.insert(name.clone());
+            }
+            if matches!(toks.get(j + 1).map(|t| &t.kind), Some(TokenKind::Error)) {
+                known_errors.insert(name.clone());
             }
         }
         i += 1;
@@ -655,6 +705,7 @@ pub fn parse_with_module(toks: &[Token], _src: &str, module: &str) -> (Program, 
         diags: vec![],
         known_types,
         known_unions,
+        known_errors,
     };
     let mut items = Vec::new();
     while !p.at_eof() {
@@ -788,6 +839,18 @@ impl<'a> Parser<'a> {
         if matches!(self.peek().kind, TokenKind::Union) {
             return self.parse_union_item(type_tok.span, name, name_span, type_params);
         }
+        if matches!(self.peek().kind, TokenKind::Error) {
+            if !type_params.is_empty() {
+                let t = self.peek().clone();
+                self.diags.push(
+                    Diagnostic::error("error sets cannot have type parameters")
+                        .with_label(t.span, "remove the `[...]` parameters")
+                        .with_code("E104"),
+                );
+                return None;
+            }
+            return self.parse_error_item(type_tok.span, name, name_span);
+        }
         if !type_params.is_empty() {
             let t = self.peek().clone();
             self.diags.push(
@@ -858,13 +921,13 @@ impl<'a> Parser<'a> {
                             .with_label(t.span, "write `A` for a payload-free variant")
                             .with_code("E104"),
                     );
-                    self.recover_union_item();
+                    self.recover_braced_type_item();
                     return None;
                 }
                 loop {
                     let parsed = self.parse_type(&allowed, true);
                     let Some((ty, span)) = parsed else {
-                        self.recover_union_item();
+                        self.recover_braced_type_item();
                         return None;
                     };
                     if ty.is_void() {
@@ -886,7 +949,7 @@ impl<'a> Parser<'a> {
                                 .with_label(comma.span, "remove this comma")
                                 .with_code("E100"),
                         );
-                        self.recover_union_item();
+                        self.recover_braced_type_item();
                         return None;
                     }
                 }
@@ -894,7 +957,7 @@ impl<'a> Parser<'a> {
                     .expect(&TokenKind::RParen, "`)` after union payload")
                     .is_none()
                 {
-                    self.recover_union_item();
+                    self.recover_braced_type_item();
                     return None;
                 }
             }
@@ -912,7 +975,7 @@ impl<'a> Parser<'a> {
                         .with_label(t.span, "separate union variants with commas")
                         .with_code("E100"),
                 );
-                self.recover_union_item();
+                self.recover_braced_type_item();
                 return None;
             }
         }
@@ -927,7 +990,94 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn recover_union_item(&mut self) {
+    /// Parse `type E = error { A, B, };`: plain uppercase variants, comma
+    /// separated, optional trailing comma (empty sets allowed). Payload
+    /// tails (`A(u64)`) are rejected: variants carry no data in this
+    /// milestone, but the AST already reserves the shape for later.
+    fn parse_error_item(&mut self, start: Span, name: String, name_span: Span) -> Option<Item> {
+        self.bump(); // error
+        self.expect(&TokenKind::LBrace, "`{` after `error`")?;
+        let mut variants = Vec::new();
+        let mut variant_spans: std::collections::HashMap<String, Span> =
+            std::collections::HashMap::new();
+        while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
+            let (variant, variant_span) = self.parse_ident()?;
+            if let Some(previous) = variant_spans.insert(variant.clone(), variant_span) {
+                self.diags.push(
+                    Diagnostic::error(format!("duplicate error variant `{variant}`"))
+                        .with_label(variant_span, "redefined here")
+                        .with_bare_label(previous)
+                        .with_code("E200"),
+                );
+            }
+            if !variant.chars().next().is_some_and(char::is_uppercase) {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "error variant `{variant}` must start with an uppercase letter"
+                    ))
+                    .with_label(variant_span, "capitalize error variants, e.g. `NotFound`")
+                    .with_code("E200"),
+                );
+            }
+            if matches!(self.peek().kind, TokenKind::LParen) {
+                let paren = self.bump();
+                // Consume the balanced tail for recovery so one bad variant
+                // hides no later items.
+                let mut depth = 1usize;
+                while !self.at_eof() && depth > 0 {
+                    match self.peek().kind {
+                        TokenKind::LParen => {
+                            depth += 1;
+                            self.bump();
+                        }
+                        TokenKind::RParen => {
+                            depth -= 1;
+                            self.bump();
+                        }
+                        TokenKind::Semi | TokenKind::Eof => break,
+                        _ => {
+                            self.bump();
+                        }
+                    }
+                }
+                self.diags.push(
+                    Diagnostic::error("error payloads are not supported yet")
+                        .with_label(paren.span, "write a plain name here, e.g. `NotFound`")
+                        .with_note("error variants carry no data in this milestone")
+                        .with_code("E104"),
+                );
+                self.recover_braced_type_item();
+                return None;
+            }
+            variants.push(ErrorVariant {
+                name: variant,
+                name_span: variant_span,
+                payload: Vec::new(),
+            });
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.bump();
+            } else if !matches!(self.peek().kind, TokenKind::RBrace) {
+                let t = self.peek().clone();
+                self.diags.push(
+                    Diagnostic::error(format!("expected `,` or `}}`, found {}", describe(&t.kind)))
+                        .with_label(t.span, "separate error variants with commas")
+                        .with_code("E100"),
+                );
+                self.recover_braced_type_item();
+                return None;
+            }
+        }
+        let close = self.expect(&TokenKind::RBrace, "`}` after error variants")?;
+        let semi = self.expect(&TokenKind::Semi, "`;` after error declaration")?;
+        Some(Item::Error {
+            name,
+            name_span,
+            variants,
+            span: Span::new(start.start, semi.span.end.max(close.span.end)),
+        })
+    }
+
+    fn recover_braced_type_item(&mut self) {
         while !self.at_eof() {
             match self.peek().kind {
                 TokenKind::RBrace => {
@@ -1162,7 +1312,115 @@ impl<'a> Parser<'a> {
         if matches!(self.peek().kind, TokenKind::Star) {
             return self.parse_mutable_type(allowed, strict);
         }
-        self.parse_type_atom(allowed, strict)
+        if matches!(self.peek().kind, TokenKind::Bang) {
+            return self.parse_fallible_type(allowed, strict);
+        }
+        let (atom, span) = self.parse_type_atom(allowed, strict)?;
+        // Named fallible (`E!T`): only an error-set (or object spelling that
+        // resolves to one) takes `!`. Anything else is one E104; the tail
+        // is still consumed so one bad annotation hides no later items.
+        if matches!(self.peek().kind, TokenKind::Bang) {
+            match atom {
+                VlType::ErrorSet(name) | VlType::Object(name) => {
+                    return self.parse_named_fallible_tail(name, span, allowed, strict);
+                }
+                _ => {
+                    self.bump(); // `!`
+                                 // Consume the tail for recovery; when it already
+                                 // reported, stay quiet so one site yields one error.
+                    let tail = self.parse_type(allowed, strict);
+                    if let Some((_, tail_span)) = tail {
+                        self.diags.push(
+                            Diagnostic::error(format!("only error sets take `!`, found `{atom}`"))
+                                .with_label(
+                                    Span::new(span.start, tail_span.end),
+                                    "write `E!T` with a declared error set",
+                                )
+                                .with_code("E104"),
+                        );
+                    }
+                    return None;
+                }
+            }
+        }
+        Some((atom, span))
+    }
+
+    /// Parse `!T` (inferred error set): any error with an `ok` payload `T`.
+    /// Recurses through `parse_type` so `!Array[u64]`, `!?u64`, and `!*Foo`
+    /// all work. `!void` is allowed (a fallible side effect); a fallible
+    /// payload can never itself be fallible.
+    fn parse_fallible_type(&mut self, allowed: &[String], strict: bool) -> Option<(VlType, Span)> {
+        let bang = self.bump(); // `!`
+        if !matches!(
+            self.peek().kind,
+            TokenKind::Ident(_)
+                | TokenKind::Hash
+                | TokenKind::Star
+                | TokenKind::Question
+                | TokenKind::Bang
+        ) {
+            let t = self.peek().clone();
+            let span = Span::new(bang.span.start, bang.span.end.max(t.span.start));
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "expected a type after `!`, found {}",
+                    describe(&t.kind)
+                ))
+                .with_label(span, "write `!T`, e.g. `!u64`")
+                .with_code("E104"),
+            );
+            return None;
+        }
+        // A plausible type start that fails to parse already reported once;
+        // stay quiet here, like `?T`.
+        let (ok, ok_span) = self.parse_type(allowed, strict)?;
+        let span = Span::new(bang.span.start, ok_span.end);
+        if matches!(ok, VlType::Fallible { .. }) {
+            self.diags.push(
+                Diagnostic::error("a fallible payload cannot itself be fallible")
+                    .with_label(span, "write one `!` only")
+                    .with_code("E104"),
+            );
+            return None;
+        }
+        Some((
+            VlType::Fallible {
+                err: None,
+                ok: Box::new(ok),
+            },
+            span,
+        ))
+    }
+
+    /// Parse the `!T` tail of a named fallible (`E!T`). `head` is the error
+    /// set spelling (bare or qualified). Only error sets take `!`; anything
+    /// else is one E104. A fallible payload can never itself be fallible.
+    fn parse_named_fallible_tail(
+        &mut self,
+        head: String,
+        head_span: Span,
+        allowed: &[String],
+        strict: bool,
+    ) -> Option<(VlType, Span)> {
+        self.bump(); // `!` (established by lookahead)
+        let (ok, ok_span) = self.parse_type(allowed, strict)?;
+        let span = Span::new(head_span.start, ok_span.end);
+        if matches!(ok, VlType::Fallible { .. }) {
+            self.diags.push(
+                Diagnostic::error("a fallible payload cannot itself be fallible")
+                    .with_label(span, "write one `!` only")
+                    .with_code("E104"),
+            );
+            return None;
+        }
+        Some((
+            VlType::Fallible {
+                err: Some(head),
+                ok: Box::new(ok),
+            },
+            span,
+        ))
     }
 
     /// Parse `?T` (nullable): surface sugar for the builtin `Option` union
@@ -1468,8 +1726,18 @@ impl<'a> Parser<'a> {
                         },
                         t.span,
                     )),
+                    Err(_) if self.known_errors.contains(&name) => {
+                        Some((VlType::ErrorSet(name), t.span))
+                    }
                     Err(_) if self.known_types.contains(&name) => {
                         Some((VlType::Object(name), t.span))
+                    }
+                    // An unknown name followed by `!` is optimistically an
+                    // error set so `Bogus!u64` yields one typecheck error
+                    // (`unknown error set`) instead of an E105 plus a
+                    // stray-`!` cascade.
+                    Err(_) if matches!(self.peek().kind, TokenKind::Bang) => {
+                        Some((VlType::ErrorSet(name), t.span))
                     }
                     Err(_) if !strict => Some((VlType::Param(name), t.span)),
                     Err(e) => {
@@ -1968,9 +2236,21 @@ impl<'a> Parser<'a> {
         match self.parse_type(allowed, true) {
             Some((ty, ty_span)) => {
                 if ty.is_void() {
+                    // `E!void` reads as void here (only the return slot
+                    // carries an empty success); name the actual spelling.
+                    let (what, hint) = match &ty {
+                        VlType::Fallible { .. } => (
+                            format!("parameter `{name}` cannot be `{ty}`"),
+                            "fallible `void` is only a return type",
+                        ),
+                        _ => (
+                            format!("parameter `{name}` cannot be `void`"),
+                            "`void` is not a value type",
+                        ),
+                    };
                     self.diags.push(
-                        Diagnostic::error(format!("parameter `{name}` cannot be `void`"))
-                            .with_label(ty_span, "`void` is not a value type")
+                        Diagnostic::error(what)
+                            .with_label(ty_span, hint)
                             .with_code("E104"),
                     );
                     return Some(Param {
@@ -2619,10 +2899,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_or(&mut self) -> Option<Expr> {
-        let mut lhs = self.parse_and()?;
+        let mut lhs = self.parse_catch()?;
         while matches!(self.peek().kind, TokenKind::PipePipe) {
             self.bump();
-            let rhs = self.parse_and()?;
+            let rhs = self.parse_catch()?;
             let span = lhs.span().merge(rhs.span());
             lhs = Expr::Binary {
                 op: BinOp::Or,
@@ -2632,6 +2912,25 @@ impl<'a> Parser<'a> {
             };
         }
         Some(lhs)
+    }
+
+    /// Fallible fallback (`expr catch fallback`): binds tighter than `||`
+    /// (so `a || b catch c` is `a || (b catch c)`) and chains right
+    /// (`a catch b catch c` is `a catch (b catch c)`). The fallback is a
+    /// full `or` expression so `x catch y || z` reads as `x catch (y || z)`.
+    fn parse_catch(&mut self) -> Option<Expr> {
+        let lhs = self.parse_and()?;
+        if !matches!(self.peek().kind, TokenKind::Catch) {
+            return Some(lhs);
+        }
+        self.bump(); // `catch`
+        let fallback = self.parse_or()?;
+        let span = lhs.span().merge(fallback.span());
+        Some(Expr::Catch {
+            lhs: Box::new(lhs),
+            fallback: Box::new(fallback),
+            span,
+        })
     }
 
     fn parse_and(&mut self) -> Option<Expr> {
@@ -2780,6 +3079,15 @@ impl<'a> Parser<'a> {
                 Some(Expr::Unary {
                     op: UnOp::Not,
                     rhs: Box::new(rhs),
+                    span,
+                })
+            }
+            TokenKind::Try => {
+                let t = self.bump();
+                let rhs = self.parse_unary()?;
+                let span = Span::new(t.span.start, rhs.span().end);
+                Some(Expr::Try {
+                    inner: Box::new(rhs),
                     span,
                 })
             }
@@ -3110,6 +3418,9 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::Type => "`type`".into(),
         TokenKind::Object => "`object`".into(),
         TokenKind::Union => "`union`".into(),
+        TokenKind::Error => "`error`".into(),
+        TokenKind::Try => "`try`".into(),
+        TokenKind::Catch => "`catch`".into(),
         TokenKind::Match => "`match`".into(),
         TokenKind::If => "`if`".into(),
         TokenKind::Else => "`else`".into(),
@@ -3305,6 +3616,154 @@ mod tests {
         assert_eq!(errors.len(), 1, "{diags:?}");
         assert_eq!(errors[0].code.as_deref(), Some("E105"));
         assert!(matches!(&prog.items[..], [Item::Function { name, .. }] if name == "ok"));
+    }
+
+    #[test]
+    fn parses_error_set_with_plain_variants() {
+        let (prog, diags) = parse_src("type Io = error { NotFound, Denied, };");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Error { name, variants, .. } => {
+                assert_eq!(name, "Io");
+                assert_eq!(
+                    variants.iter().map(|v| v.name.clone()).collect::<Vec<_>>(),
+                    vec!["NotFound", "Denied"]
+                );
+                assert!(variants.iter().all(|v| v.payload.is_empty()));
+            }
+            other => panic!("expected error set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_declaration_validation_is_single_root_errors() {
+        for (src, code, message) in [
+            (
+                "type E = error { A, A, };",
+                "E200",
+                "duplicate error variant",
+            ),
+            ("type E = error { oops, };", "E200", "uppercase"),
+            (
+                "type E = error { A(u64), };",
+                "E104",
+                "payloads are not supported",
+            ),
+            ("type E = error { A B, };", "E100", "expected `,`"),
+            ("type E[T] = error { A, };", "E104", "type parameters"),
+        ] {
+            let (prog, diags) = parse_src(src);
+            let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{src}: {diags:?}");
+            assert_eq!(errors[0].code.as_deref(), Some(code), "{src}: {diags:?}");
+            assert!(errors[0].message.contains(message), "{src}: {diags:?}");
+            let _ = prog;
+        }
+    }
+
+    #[test]
+    fn parses_fallible_types_named_and_inferred() {
+        let (prog, diags) = parse_src(
+            "type E = error { A, }; fun f(): E!u64 { return 1u64; } fun g(): !String { return \"s\"; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[1] {
+            Item::Function { ret, .. } => assert_eq!(
+                ret,
+                &Some(VlType::Fallible {
+                    err: Some("E".into()),
+                    ok: Box::new(VlType::U64),
+                })
+            ),
+            other => panic!("expected function, got {other:?}"),
+        }
+        match &prog.items[2] {
+            Item::Function { ret, .. } => assert_eq!(
+                ret,
+                &Some(VlType::Fallible {
+                    err: None,
+                    ok: Box::new(VlType::String),
+                })
+            ),
+            other => panic!("expected function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallible_type_misuse_is_one_error() {
+        for (src, code, message) in [
+            (
+                "fun f(): u64!u64 { return 1u64; }",
+                "E104",
+                "only error sets take `!`",
+            ),
+            (
+                "fun f(): E!E!u64 { return 1u64; }",
+                "E104",
+                "itself be fallible",
+            ),
+            (
+                "type E = error { A, }; fun f(): E!!u64 { return 1u64; }",
+                "E104",
+                "itself be fallible",
+            ),
+        ] {
+            let (_prog, diags) = parse_src(src);
+            let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{src}: {diags:?}");
+            assert_eq!(errors[0].code.as_deref(), Some(code), "{src}: {diags:?}");
+            assert!(errors[0].message.contains(message), "{src}: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn fallible_void_is_return_only() {
+        // `E!void` params name the actual spelling in the diagnostic.
+        let (_prog, diags) =
+            parse_src("type E = error { A, }; fun f(g: E!void): u64 { return 1u64; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E104"));
+        assert!(errors[0].message.contains("E!void"), "{diags:?}");
+        // `E!void` returns parse cleanly.
+        let (_prog, diags) = parse_src("type E = error { A, }; fun f(): E!void { return; }");
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn parses_try_and_catch_with_precedence() {
+        // `try` is prefix (binds tightest); `catch` binds tighter than
+        // `||` and chains right: `(try f()) catch (g() || h())`.
+        let (prog, diags) = parse_src("fun main() { val x = try f() catch g() || h(); x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { body, .. } => match &body[0] {
+                Stmt::Let { value, .. } => match value {
+                    Expr::Catch { lhs, fallback, .. } => {
+                        assert!(matches!(&**lhs, Expr::Try { .. }));
+                        assert!(matches!(&**fallback, Expr::Binary { .. }));
+                    }
+                    other => panic!("expected catch, got {other:?}"),
+                },
+                other => panic!("expected let, got {other:?}"),
+            },
+            other => panic!("expected function, got {other:?}"),
+        }
+        // Right chains: `a catch b catch c` is `a catch (b catch c)`.
+        let (prog, diags) = parse_src("fun main() { val x = a() catch b() catch c(); x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Function { body, .. } => match &body[0] {
+                Stmt::Let { value, .. } => match value {
+                    Expr::Catch { fallback, .. } => {
+                        assert!(matches!(&**fallback, Expr::Catch { .. }));
+                    }
+                    other => panic!("expected catch, got {other:?}"),
+                },
+                other => panic!("expected let, got {other:?}"),
+            },
+            other => panic!("expected function, got {other:?}"),
+        }
     }
 
     #[test]

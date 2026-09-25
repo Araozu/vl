@@ -249,10 +249,16 @@ fn calls_in_template(prog: &HirProgram, typed: &TypedProgram, def: u32) -> Vec<N
                 walk_expr(prog, typed, rhs, out);
             }
             HirExpr::Unary { inner, .. } => walk_expr(prog, typed, inner, out),
+            HirExpr::Try { inner, .. } => walk_expr(prog, typed, inner, out),
+            HirExpr::Catch { lhs, fallback, .. } => {
+                walk_expr(prog, typed, lhs, out);
+                walk_expr(prog, typed, fallback, out);
+            }
             HirExpr::Cast { inner, .. } => walk_expr(prog, typed, inner, out),
             HirExpr::Literal { .. }
             | HirExpr::String { .. }
             | HirExpr::Null { .. }
+            | HirExpr::ErrorValue { .. }
             | HirExpr::Var { .. } => {}
         }
     }
@@ -676,10 +682,16 @@ pub fn validate_plan(
                     expr_ids(rhs, out);
                 }
                 HirExpr::Unary { inner, .. } => expr_ids(inner, out),
+                HirExpr::Try { inner, .. } => expr_ids(inner, out),
+                HirExpr::Catch { lhs, fallback, .. } => {
+                    expr_ids(lhs, out);
+                    expr_ids(fallback, out);
+                }
                 HirExpr::Cast { inner, .. } => expr_ids(inner, out),
                 HirExpr::Literal { .. }
                 | HirExpr::String { .. }
                 | HirExpr::Null { .. }
+                | HirExpr::ErrorValue { .. }
                 | HirExpr::Var { .. } => {}
             }
         }

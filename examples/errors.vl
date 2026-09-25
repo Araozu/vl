@@ -1,0 +1,37 @@
+// Error sets and fallible values (`E!T`), Zig-style.
+//
+// `type Io = error { ... };` declares plain-named variants (no payloads
+// yet). `Io.NotFound` is an error value; `Io!u64` is a fallible `u64`
+// (or `!u64` for the inferred set). `try expr` unwraps or returns the
+// error from the enclosing fallible function; `expr catch fallback`
+// handles it inline. `E!void` marks fallible side effects.
+use std;
+
+type Io = error { NotFound, Denied, };
+
+fun read_byte(ok: bool): Io!u64 {
+    if (ok) {
+        return 42u64;
+    }
+    return Io.NotFound;
+}
+
+fun read_two(a: bool, b: bool): Io!u64 {
+    val x = try read_byte(a);
+    val y = try read_byte(b);
+    return x + y;
+}
+
+fun deny(): Io!void {
+    return Io.Denied;
+}
+
+fun main() {
+    std.print_u64(read_byte(true) catch 0u64);
+    std.print_u64(read_byte(false) catch 7u64);
+    std.print_u64(read_two(true, true) catch 8u64);
+    std.print_u64(read_two(true, false) catch 9u64);
+    deny() catch std.print("denied\n");
+    val e: Io = Io.NotFound;
+    e;
+}

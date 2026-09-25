@@ -50,6 +50,19 @@ pub enum VlType {
     /// desugars it to `Union { name: "Option", args: [T] }` so LIR and
     /// backends only ever see the union representation ("sugar all the way").
     Nullable(Box<VlType>),
+    /// A nominal error set (`type MyError = error { ... };`). Values are
+    /// global `u64` codes; the set is a static membership constraint.
+    /// Variants carry no data in this milestone (plain names only); the
+    /// declaration shape already reserves room for payloads (like unions).
+    ErrorSet(String),
+    /// A fallible value (`MyError!u64`, or `!u64` for the inferred set).
+    /// `err` is `Some(set)` for a named set, `None` for `!T` (any error).
+    /// Runtime representation is a heap tag+payload container (like unions):
+    /// tag 0 holds an `ok` payload, tag 1 holds the error code.
+    Fallible {
+        err: Option<String>,
+        ok: Box<VlType>,
+    },
     Array(Box<VlType>),
     /// Fixed-arity heterogeneous tuple (`#(u64, String)` / `#(x: u64)`).
     /// Value semantics (copy on bind/assign); heap container on the target.
@@ -87,6 +100,11 @@ impl fmt::Display for VlType {
                 Ok(())
             }
             VlType::Nullable(inner) => write!(f, "?{inner}"),
+            VlType::ErrorSet(name) => write!(f, "{name}"),
+            VlType::Fallible { err, ok } => match err {
+                Some(set) => write!(f, "{set}!{ok}"),
+                None => write!(f, "!{ok}"),
+            },
             VlType::Array(elem) => write!(f, "Array[{elem}]"),
             VlType::Tuple(fields) => {
                 write!(f, "#(")?;
@@ -159,6 +177,8 @@ impl VlType {
             VlType::Array(elem) => elem.is_void(),
             VlType::Tuple(fields) => fields.iter().any(|f| f.ty.is_void()),
             VlType::Union { args, .. } => args.iter().any(|a| a.is_void()),
+            // `E!void` is void (return position only); a bare set never is.
+            VlType::Fallible { ok, .. } => ok.is_void(),
             _ => false,
         }
     }
@@ -193,6 +213,9 @@ impl VlType {
             VlType::Object(_) => true,
             VlType::Union { .. } => true,
             VlType::Nullable(_) => true,
+            // Fallible values are heap tag+payload containers (like unions);
+            // error sets themselves are plain `u64` codes (value type).
+            VlType::Fallible { .. } => true,
             VlType::Array(_) => true,
             VlType::Tuple(_) => true,
             VlType::Mutable(inner) => inner.is_reference_type(),
@@ -230,6 +253,10 @@ impl VlType {
         match self {
             VlType::Mutable(inner) => inner.erase_capability(),
             VlType::Nullable(inner) => VlType::Nullable(Box::new(inner.erase_capability())),
+            VlType::Fallible { err, ok } => VlType::Fallible {
+                err: err.clone(),
+                ok: Box::new(ok.erase_capability()),
+            },
             VlType::Array(elem) => VlType::Array(Box::new(elem.erase_capability())),
             VlType::Union { name, args } => VlType::Union {
                 name: name.clone(),
@@ -274,11 +301,19 @@ impl VlType {
                         "`*{name}` needs a reference-kind bound (unconstrained `T` cannot grant mutation authority)"
                     )),
                     VlType::Void => Some("`*void` is not a valid type".to_string()),
+                    // Fallible containers manage their own tag+payload
+                    // layout; a mutable view over one has no meaning yet.
+                    VlType::Fallible { .. } => Some(format!(
+                        "`*{inner}` cannot take a mutable view (fallible values are shared through `try`/`catch`)"
+                    )),
                     VlType::U64
                     | VlType::I64
                     | VlType::F64
                     | VlType::Bool
-                    | VlType::U8 => Some(format!("`*{inner}` is not a reference type")),
+                    | VlType::U8
+                    | VlType::ErrorSet(_) => {
+                        Some(format!("`*{inner}` is not a reference type"))
+                    }
                     VlType::String | VlType::File | VlType::Object(_) | VlType::Union { .. } | VlType::Nullable(_) | VlType::Array(_) | VlType::Tuple(_) => {
                         // The payload itself may still be malformed
                         // (e.g. `*Array[*u64]`).
@@ -288,6 +323,7 @@ impl VlType {
             }
             VlType::Array(elem) => elem.mutable_wellformed_error(),
             VlType::Nullable(inner) => inner.mutable_wellformed_error(),
+            VlType::Fallible { ok, .. } => ok.mutable_wellformed_error(),
             VlType::Tuple(fields) => fields.iter().find_map(|f| f.ty.mutable_wellformed_error()),
             VlType::Union { args, .. } => args.iter().find_map(|a| a.mutable_wellformed_error()),
             _ => None,
@@ -523,6 +559,56 @@ mod tests {
             VlType::Mutable(Box::new(unnamed)).mutable_wellformed_error(),
             None
         );
+    }
+
+    #[test]
+    fn error_sets_and_fallible_spellings() {
+        let set = VlType::ErrorSet("MyError".into());
+        assert_eq!(set.to_string(), "MyError");
+        assert!(!set.is_reference_type());
+        assert!(!set.is_void());
+        let named = VlType::Fallible {
+            err: Some("MyError".into()),
+            ok: Box::new(VlType::U64),
+        };
+        assert_eq!(named.to_string(), "MyError!u64");
+        let inferred = VlType::Fallible {
+            err: None,
+            ok: Box::new(VlType::U64),
+        };
+        assert_eq!(inferred.to_string(), "!u64");
+        // Fallible values are heap containers (reference lane, like unions).
+        assert!(named.is_reference_type());
+        assert!(!named.is_void());
+        // `E!void` is void (return position only).
+        let void_fallible = VlType::Fallible {
+            err: Some("MyError".into()),
+            ok: Box::new(VlType::Void),
+        };
+        assert!(void_fallible.is_void());
+        // Capability erasure recurses into the payload.
+        assert_eq!(
+            VlType::Mutable(Box::new(obj("Foo"))).erase_capability(),
+            obj("Foo")
+        );
+        assert_eq!(
+            VlType::Fallible {
+                err: Some("MyError".into()),
+                ok: Box::new(VlType::Mutable(Box::new(obj("Foo")))),
+            }
+            .erase_capability(),
+            VlType::Fallible {
+                err: Some("MyError".into()),
+                ok: Box::new(obj("Foo")),
+            }
+        );
+        // `*` over error sets and fallibles is rejected.
+        assert!(VlType::Mutable(Box::new(set))
+            .mutable_wellformed_error()
+            .is_some());
+        assert!(VlType::Mutable(Box::new(named))
+            .mutable_wellformed_error()
+            .is_some());
     }
 
     #[test]

@@ -383,10 +383,16 @@ fn calls_in_item(
                 walk_expr(typed, rhs, out);
             }
             HirExpr::Unary { inner, .. } => walk_expr(typed, inner, out),
+            HirExpr::Try { inner, .. } => walk_expr(typed, inner, out),
+            HirExpr::Catch { lhs, fallback, .. } => {
+                walk_expr(typed, lhs, out);
+                walk_expr(typed, fallback, out);
+            }
             HirExpr::Cast { inner, .. } => walk_expr(typed, inner, out),
             HirExpr::Literal { .. }
             | HirExpr::String { .. }
             | HirExpr::Null { .. }
+            | HirExpr::ErrorValue { .. }
             | HirExpr::Var { .. } => {}
         }
     }
