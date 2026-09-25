@@ -960,6 +960,9 @@ impl Resolver {
     fn resolve_fn_body(&mut self, params: &[vl_syntax::Param], body: &[Stmt]) {
         self.scopes.push(HashMap::new());
         for p in params {
+            if self.live_import_span(&p.name).is_some() {
+                self.import_shadow_error(&p.name, p.name_span, "a parameter");
+            }
             if self
                 .scopes
                 .last()
@@ -1061,7 +1064,34 @@ impl Resolver {
         global.insert(name, id);
     }
 
+    /// Import span when `name` names a live (unpoisoned) import alias.
+    /// Poisoned aliases stay quiet here so the original E202/E203/E206/E208
+    /// remains the single root cause.
+    fn live_import_span(&self, name: &str) -> Option<Span> {
+        if self.poisoned_imports.contains(name) {
+            return None;
+        }
+        if self.imports.contains_key(name) || self.import_symbols.contains_key(name) {
+            return self.import_spans.get(name).copied();
+        }
+        None
+    }
+
+    fn import_shadow_error(&mut self, name: &str, span: Span, what: &str) {
+        let mut diagnostic =
+            Diagnostic::error(format!("import alias `{name}` conflicts with {what}"))
+                .with_label(span, "definition declared here")
+                .with_code("E206");
+        if let Some(previous) = self.import_spans.get(name) {
+            diagnostic = diagnostic.with_bare_label(*previous);
+        }
+        self.diags.push(diagnostic);
+    }
+
     fn declare_local(&mut self, name: String, span: Span, binding: BindingKind) {
+        if self.live_import_span(&name).is_some() {
+            self.import_shadow_error(&name, span, "a local definition");
+        }
         let top = self.scopes.last_mut().unwrap();
         if top.contains_key(&name) {
             self.diags.push(
@@ -1936,10 +1966,11 @@ impl Resolver {
     ///
     /// Resolution order at each site: poisoned heads stay quiet, then local
     /// `Type.method`, then instance sugar when the head is a bound value
-    /// (values shadow module aliases, like bare names), then alias-qualified
-    /// `alias.Type.method`, then fully qualified `mod.Type.method` (no import
-    /// needed, like object types). A head naming a local object type always
-    /// wins over a same-named value.
+    /// (values still win over module aliases here for recovery, like bare
+    /// names, even though shadowing an import is E206 at the declaration),
+    /// then alias-qualified `alias.Type.method`, then fully qualified
+    /// `mod.Type.method` (no import needed, like object types). A head naming
+    /// a local object type always wins over a same-named value.
     fn resolve_assoc_or_sugar_call(
         &mut self,
         callee: &[String],
@@ -2031,11 +2062,11 @@ impl Resolver {
             return true;
         }
         // Instance sugar `head.rest.method(args)`: the head is a bound value.
-        // Values shadow module aliases here, exactly like bare names (a
-        // same-named parameter wins over `use` aliases); the receiver path
-        // and the self-type gate are validated by `vl-typecheck`, which
-        // reports loudly when sugar does not apply. Only object type names
-        // take precedence over values. The site records its receiver head
+        // Shadowing an import is E206 at the declaration, but resolution still
+        // prefers the bound value here for recovery (like bare names); the
+        // receiver path and the self-type gate are validated by `vl-typecheck`,
+        // which reports loudly when sugar does not apply. Only object type
+        // names take precedence over values. The site records its receiver head
         // so no E201 fires.
         if !self.local_objects.contains(&callee[0]) {
             if let Some(head) = self.lookup(&callee[0]) {
@@ -2819,10 +2850,10 @@ mod tests {
     }
 
     #[test]
-    fn sugar_receiver_shadows_module_alias() {
-        // A value-headed `foo.m()` prefers the bound value (like bare
-        // names), even when `foo` is also a module alias. Typechecking
-        // validates loudly; no silent module call happens here.
+    fn sugar_receiver_shadowing_module_alias_is_e206() {
+        // Shadowing an import is E206 at the declaration. Resolution still
+        // prefers the bound value for recovery (no silent module call), so the
+        // sugar receiver is recorded alongside the error.
         let module = ModuleSpec::new(&["foo"], &[("m", &[], vl_common::VlType::Void)]);
         let (toks, _) = vl_lex::lex(
             "use foo; type L = object { v: u64, fun m(self: L): u64 { return self.v; }, }; fun f(foo: *L) { foo.m(); }",
@@ -2830,7 +2861,9 @@ mod tests {
         let (prog, pdiags) = vl_syntax::parse(&toks, "");
         assert!(pdiags.is_empty(), "{pdiags:?}");
         let (res, diags) = resolve_with_modules(&prog, &[module]);
-        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E206"), "{diags:?}");
         assert_eq!(res.sugar_receivers.len(), 1);
     }
 
@@ -3001,6 +3034,70 @@ mod tests {
         );
         // Shadowing is a warning; rebinding the local is fine.
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+    }
+
+    #[test]
+    fn local_val_shadowing_bare_import_is_e206() {
+        // `use foo.bar` brings `bar`; any `val bar` must fail, even inside a
+        // function body. No shadowing, ever.
+        let (_, diags) = resolve_src("use std.string.len; fun main() { val len = 1u64; len; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E206"), "{diags:?}");
+        assert!(errors[0].message.contains("`len`"), "{diags:?}");
+    }
+
+    #[test]
+    fn local_var_and_module_alias_shadowing_is_e206() {
+        for src in [
+            "use std.string.len; fun main() { var len = 1u64; len; }",
+            "use std.string; fun main() { val string = 1u64; string; }",
+            "use std.string.{len, eq}; fun main() { val len = 1u64; len; }",
+            "use std.string.len; fun main() { if (true) { val len = 1u64; len; } }",
+        ] {
+            let (_, diags) = resolve_src(src);
+            let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{src}: {diags:?}");
+            assert_eq!(errors[0].code.as_deref(), Some("E206"), "{src}: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn parameter_shadowing_import_is_e206() {
+        let (_, diags) = resolve_src("use std.string.len; fun f(len: u64): u64 { return len; }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E206"), "{diags:?}");
+    }
+
+    #[test]
+    fn destructure_and_match_bindings_shadowing_imports_are_e206() {
+        let (_, diags) = resolve_src(
+            "use std.string.len; fun main() { val t = #(1u64, 2u64); val #(len, y) = t; y; }",
+        );
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E206"), "{diags:?}");
+
+        let (_, diags) = resolve_src(
+            "type U = union { A(u64), }; use std.string.len; fun main() { val u = U.A(1u64); match (u) { U.A(len) { len; } else { 0u64; } } }",
+        );
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E206"), "{diags:?}");
+    }
+
+    #[test]
+    fn local_shadowing_poisoned_import_stays_quiet() {
+        // A failed import is already one root cause (E202); reusing its name
+        // locally must not add an E206 cascade.
+        let (toks, _) = vl_lex::lex("use missing.{f}; fun main() { val f = 1u64; f; }");
+        let (prog, pdiags) = vl_syntax::parse(&toks, "");
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (_, diags) = resolve_with_modules(&prog, &[]);
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E202"), "{diags:?}");
     }
 
     #[test]
