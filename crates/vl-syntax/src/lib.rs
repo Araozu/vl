@@ -525,6 +525,76 @@ pub fn parse(toks: &[Token], src: &str) -> (Program, Vec<Diagnostic>) {
     parse_with_module(toks, src, "<anonymous>")
 }
 
+/// Bare names a file brings in through `use` that may name types.
+/// `use m.{Foo}` admits every braced name; `use a.b.Leaf` admits an
+/// uppercase leaf (types read uppercase; modules and functions read
+/// lowercase, so their diagnostics keep their wording). The parser has
+/// no module catalog, so these are admitted as object spellings only:
+/// `vl-semantic` still reports genuinely unknown exports and
+/// `vl-typecheck` still rejects a function name misused as a type.
+fn use_imported_type_names(toks: &[Token]) -> Vec<String> {
+    let mut out = Vec::new();
+    let ident_at = |idx: usize| -> Option<String> {
+        match toks.get(idx).map(|t| &t.kind) {
+            Some(TokenKind::Ident(name)) => Some(name.clone()),
+            _ => None,
+        }
+    };
+    let mut i = 0;
+    while i < toks.len() {
+        let is_use = matches!(&toks[i].kind, TokenKind::Ident(n) if n == "use");
+        if !is_use {
+            i += 1;
+            continue;
+        }
+        let Some(first) = ident_at(i + 1) else {
+            i += 1;
+            continue;
+        };
+        let mut segments = vec![first];
+        let mut j = i + 1;
+        while matches!(toks.get(j + 1).map(|t| &t.kind), Some(TokenKind::Dot))
+            && ident_at(j + 2).is_some()
+        {
+            segments.push(ident_at(j + 2).expect("checked above"));
+            j += 2;
+        }
+        // Trailing dot plus brace (`use m.{Foo}`): harvest the braced names.
+        if matches!(toks.get(j + 1).map(|t| &t.kind), Some(TokenKind::Dot))
+            && matches!(toks.get(j + 2).map(|t| &t.kind), Some(TokenKind::LBrace))
+        {
+            let mut m = j + 3;
+            loop {
+                match toks.get(m).map(|t| &t.kind) {
+                    Some(TokenKind::Ident(name)) => {
+                        out.push(name.clone());
+                        m += 1;
+                        if matches!(toks.get(m).map(|t| &t.kind), Some(TokenKind::Comma)) {
+                            m += 1;
+                            continue;
+                        }
+                        if matches!(toks.get(m).map(|t| &t.kind), Some(TokenKind::RBrace)) {
+                            break;
+                        }
+                        break;
+                    }
+                    Some(TokenKind::RBrace) => break,
+                    _ => break,
+                }
+            }
+        } else if segments.len() >= 2
+            && segments
+                .last()
+                .is_some_and(|leaf| leaf.chars().next().is_some_and(char::is_uppercase))
+        {
+            // Single-path import of a type (`use vl.dog.Dog`).
+            out.push(segments.last().expect("checked above").clone());
+        }
+        i += 1;
+    }
+    out
+}
+
 pub fn parse_with_module(toks: &[Token], _src: &str, module: &str) -> (Program, Vec<Diagnostic>) {
     let mut known_types = std::collections::HashSet::new();
     let mut known_unions = std::collections::HashSet::new();
@@ -572,6 +642,12 @@ pub fn parse_with_module(toks: &[Token], _src: &str, module: &str) -> (Program, 
             }
         }
         i += 1;
+    }
+    // Same-file `use` imports may name types from other modules; admit
+    // them as object spellings so annotations (`val x: Dog`) parse.
+    // Unknown exports are still reported by `vl-semantic` (E203).
+    for name in use_imported_type_names(toks) {
+        known_types.insert(name);
     }
     let mut p = Parser {
         toks,
@@ -3427,6 +3503,24 @@ mod tests {
         assert!(
             matches!(&prog.items[0], Item::Use { path, names: Some(names), .. } if path == &vec![String::from("std"), String::from("string")] && names.len() == 1)
         );
+    }
+
+    #[test]
+    fn use_harvests_braced_and_uppercase_type_names() {
+        let (toks, _) =
+            vl_lex::lex("use vl.dog.{Dog}; use vl.dog.Dog; use std.string; use std.string.{len};");
+        let names = use_imported_type_names(&toks);
+        assert!(names.iter().any(|n| n == "Dog"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "string"), "{names:?}");
+    }
+
+    #[test]
+    fn brace_imported_type_parses_as_annotation() {
+        let (prog, diags) = parse_src(
+            "use vl.dog.{Dog}; fun main() { val x: Dog = Dog { name = \"a\" }; val y: *Dog = Dog.new(\"b\"); y; x; }",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(prog.items.len(), 2);
     }
 
     #[test]

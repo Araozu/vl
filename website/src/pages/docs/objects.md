@@ -164,7 +164,9 @@ fun main() {
 
 Functions on objects may use their own type parameters, just like free
 generic functions. Across files, call them through the type
-(`person.Person.birthday(rose)`); the short receiver form (`rose.birthday()`)
-works from the value alone and needs no import.
+(`person.Person.birthday(rose)`), or import the type first and use the bare
+name (`use my_app.person.{Person}` then `Person.birthday(rose)`); the short
+receiver form (`rose.birthday()`) works from the value alone and needs no
+import.
 
 Continue with [unions](/docs/unions).

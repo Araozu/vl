@@ -14,7 +14,7 @@
 //! operations. Binding assignment (`Assign`), field writes
 //! (`FieldAssign`), and element writes (`IndexAssign`) stay distinct.
 
-use vl_common::{GenericBound, Scalar, Span, VlType};
+use vl_common::{GenericBound, Scalar, Span, TupleField, VlType};
 
 pub use vl_semantic::DefId;
 use vl_syntax::{
@@ -427,6 +427,63 @@ impl<'a> Lowerer<'a> {
     fn def_at_site(&self, span: Span) -> Option<DefId> {
         self.res.def_at(span).map(|d| d.id.clone())
     }
+
+    /// Rewrite a bare imported type to its module-qualified identity
+    /// (`Dog` -> `vl.dog.Dog` after `use vl.dog.{Dog}`); every other
+    /// spelling passes through untouched. Recurses through `Array`/`?`/`*`/
+    /// tuples and union arguments so `Array[Dog]` and `*Dog` work too.
+    /// Type parameters (`Param`) are never rewritten: the parser emits
+    /// those only for names bound by an enclosing `fun f[T]`.
+    fn canonical_ty(&self, ty: VlType) -> VlType {
+        match ty {
+            VlType::Object(name) if !name.contains('.') => self
+                .res
+                .imported_types
+                .get(&name)
+                .map(|q| VlType::Object(q.clone()))
+                .unwrap_or(VlType::Object(name)),
+            VlType::Union { name, args } if !name.contains('.') => {
+                let args = args.into_iter().map(|a| self.canonical_ty(a)).collect();
+                match self.res.imported_types.get(&name) {
+                    Some(q) => VlType::Union {
+                        name: q.clone(),
+                        args,
+                    },
+                    None => VlType::Union { name, args },
+                }
+            }
+            VlType::Array(elem) => VlType::Array(Box::new(self.canonical_ty(*elem))),
+            VlType::Nullable(inner) => VlType::Nullable(Box::new(self.canonical_ty(*inner))),
+            VlType::Mutable(inner) => VlType::Mutable(Box::new(self.canonical_ty(*inner))),
+            VlType::Tuple(fields) => VlType::Tuple(
+                fields
+                    .into_iter()
+                    .map(|f| TupleField {
+                        name: f.name,
+                        ty: Box::new(self.canonical_ty(*f.ty)),
+                    })
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+
+    fn canonical_ty_opt(&self, ty: Option<VlType>) -> Option<VlType> {
+        ty.map(|t| self.canonical_ty(t))
+    }
+
+    /// Rewrite a bare imported object name in literal position
+    /// (`Dog { ... }` -> `vl.dog.Dog { ... }`).
+    fn canonical_name(&self, name: &str) -> String {
+        if name.contains('.') {
+            return name.to_owned();
+        }
+        self.res
+            .imported_types
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_owned())
+    }
 }
 
 /// Lower a parsed program with its resolution map. Infallible by design:
@@ -467,7 +524,13 @@ impl<'a> Lowerer<'a> {
                     name: name.clone(),
                     fields: fields
                         .iter()
-                        .map(|f| (f.name.clone(), f.ty.clone(), f.name_span))
+                        .map(|f| {
+                            (
+                                f.name.clone(),
+                                self.canonical_ty_opt(f.ty.clone()),
+                                f.name_span,
+                            )
+                        })
                         .collect(),
                     span: *span,
                 });
@@ -491,12 +554,12 @@ impl<'a> Lowerer<'a> {
                                 (
                                     p.name.clone(),
                                     self.def_at_site(p.name_span),
-                                    p.ty.clone(),
+                                    self.canonical_ty_opt(p.ty.clone()),
                                     p.name_span,
                                 )
                             })
                             .collect(),
-                        ret: m.ret.clone(),
+                        ret: self.canonical_ty_opt(m.ret.clone()),
                         ret_span: m.ret_span,
                         body: m.body.iter().map(|s| self.lower_stmt(s)).collect(),
                         span: m.span,
@@ -524,7 +587,11 @@ impl<'a> Lowerer<'a> {
                     .map(|v| HirUnionVariant {
                         name: v.name.clone(),
                         name_span: v.name_span,
-                        payload: v.payload.clone(),
+                        payload: v
+                            .payload
+                            .iter()
+                            .map(|(ty, span)| (self.canonical_ty(ty.clone()), *span))
+                            .collect(),
                     })
                     .collect(),
                 span: *span,
@@ -543,7 +610,7 @@ impl<'a> Lowerer<'a> {
                     id: self.id(),
                     def,
                     kind: *kind,
-                    ty: ty.clone(),
+                    ty: self.canonical_ty_opt(ty.clone()),
                     ty_span: *ty_span,
                     value: self.lower_expr(value),
                     span: *span,
@@ -573,7 +640,7 @@ impl<'a> Lowerer<'a> {
                     id: self.id(),
                     kind: *kind,
                     bindings: lowered,
-                    ty: ty.clone(),
+                    ty: self.canonical_ty_opt(ty.clone()),
                     ty_span: *ty_span,
                     value: self.lower_expr(value),
                     span: *span,
@@ -606,12 +673,12 @@ impl<'a> Lowerer<'a> {
                         (
                             p.name.clone(),
                             self.def_at_site(p.name_span),
-                            p.ty.clone(),
+                            self.canonical_ty_opt(p.ty.clone()),
                             p.name_span,
                         )
                     })
                     .collect(),
-                ret: ret.clone(),
+                ret: self.canonical_ty_opt(ret.clone()),
                 ret_span: *ret_span,
                 body: body.iter().map(|s| self.lower_stmt(s)).collect(),
                 span: *span,
@@ -635,7 +702,7 @@ impl<'a> Lowerer<'a> {
                     id: self.id(),
                     def,
                     kind: *kind,
-                    ty: ty.clone(),
+                    ty: self.canonical_ty_opt(ty.clone()),
                     ty_span: *ty_span,
                     value: self.lower_expr(value),
                     span: *span,
@@ -719,7 +786,7 @@ impl<'a> Lowerer<'a> {
                     id: self.id(),
                     kind: *kind,
                     bindings: lowered,
-                    ty: ty.clone(),
+                    ty: self.canonical_ty_opt(ty.clone()),
                     ty_span: *ty_span,
                     value: self.lower_expr(value),
                     span: *span,
@@ -782,13 +849,15 @@ impl<'a> Lowerer<'a> {
                             .split_last()
                             .expect("parser guarantees 2+ segments");
                         // Import-alias heads were canonicalized by the
-                        // resolver to the module-qualified spelling.
+                        // resolver to the module-qualified spelling; bare
+                        // imported heads (`use m.{U}` then `U.V`) arrive the
+                        // same way via `match_patterns`.
                         let union = self
                             .res
                             .match_patterns
                             .get(&(arm.path_span.start, arm.path_span.end))
                             .cloned()
-                            .unwrap_or_else(|| union_path.join("."));
+                            .unwrap_or_else(|| self.canonical_name(&union_path.join(".")));
                         HirMatchArm {
                             union,
                             variant: variant.clone(),
@@ -839,7 +908,7 @@ impl<'a> Lowerer<'a> {
                 name, fields, span, ..
             } => HirExpr::ObjectLiteral {
                 id: self.id(),
-                name: name.clone(),
+                name: self.canonical_name(name),
                 fields: fields
                     .iter()
                     .map(|(name, _, value)| (name.clone(), self.lower_expr(value)))
@@ -914,7 +983,10 @@ impl<'a> Lowerer<'a> {
                         id: self.id(),
                         union: use_.union,
                         variant: use_.variant,
-                        type_args: type_args.clone(),
+                        type_args: type_args
+                            .iter()
+                            .map(|t| self.canonical_ty(t.clone()))
+                            .collect(),
                         args: args.iter().map(|a| self.lower_expr(a)).collect(),
                         span: *span,
                     };
@@ -948,7 +1020,10 @@ impl<'a> Lowerer<'a> {
                         receiver: Box::new(receiver),
                         method: callee[callee.len() - 1].clone(),
                         method_span: *callee_span,
-                        type_args: type_args.clone(),
+                        type_args: type_args
+                            .iter()
+                            .map(|t| self.canonical_ty(t.clone()))
+                            .collect(),
                         args: args.iter().map(|a| self.lower_expr(a)).collect(),
                         span: *span,
                     };
@@ -982,7 +1057,10 @@ impl<'a> Lowerer<'a> {
                     extern_kind,
                     symbol,
                     name: callee.join("."),
-                    type_args: type_args.clone(),
+                    type_args: type_args
+                        .iter()
+                        .map(|t| self.canonical_ty(t.clone()))
+                        .collect(),
                     args: args.iter().map(|a| self.lower_expr(a)).collect(),
                     span: *span,
                 }
@@ -1046,7 +1124,7 @@ impl<'a> Lowerer<'a> {
             } => HirExpr::Cast {
                 id: self.id(),
                 inner: Box::new(self.lower_expr(inner)),
-                target: target.clone(),
+                target: self.canonical_ty(target.clone()),
                 target_span: *target_span,
                 span: *span,
             },
@@ -1248,6 +1326,48 @@ mod tests {
         let hir = lower(&prog, &res);
         assert_eq!(hir.items.len(), 1);
         assert!(matches!(hir.items[0], HirItem::Let { .. }));
+    }
+
+    #[test]
+    fn imported_type_annotations_canonicalize_to_qualified() {
+        let (ptoks, _) = vl_lex::lex("type Dog = object { name: String, };");
+        let (pprog, _) = vl_syntax::parse_with_module(&ptoks, "", "vl.dog");
+        let (iface, _) = vl_semantic::collect_interface_quiet(&pprog);
+        let (toks, _) =
+            vl_lex::lex("use vl.dog.{Dog}; fun main() { val x: Dog = Dog { name = \"a\" }; val y: *Array[Dog] = [x]; y; }");
+        let (prog, pdiags) = vl_syntax::parse_with_module(&toks, "", "vl.main");
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve_with_modules(&prog, &[iface.as_spec()]);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Fn { body, .. } => {
+                match &body[0] {
+                    HirStmt::Let { ty, value, .. } => {
+                        assert_eq!(*ty, Some(VlType::Object("vl.dog.Dog".into())), "{ty:?}");
+                        assert!(
+                            matches!(value, HirExpr::ObjectLiteral { name, .. } if name == "vl.dog.Dog"),
+                            "{value:?}"
+                        );
+                    }
+                    other => panic!("expected let, got {other:?}"),
+                }
+                match &body[1] {
+                    HirStmt::Let { ty, .. } => {
+                        // `*Array[Dog]` canonicalizes its nested element too.
+                        assert_eq!(
+                            *ty,
+                            Some(VlType::Mutable(Box::new(VlType::Array(Box::new(
+                                VlType::Object("vl.dog.Dog".into())
+                            ))))),
+                            "{ty:?}"
+                        );
+                    }
+                    other => panic!("expected let, got {other:?}"),
+                }
+            }
+            other => panic!("expected fn, got {other:?}"),
+        }
     }
 
     #[test]

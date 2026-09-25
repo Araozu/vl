@@ -72,6 +72,23 @@ fun main() {
 Writing the full name keeps same-named types from different files apart. A
 misspelled module or export is reported when you run `check`.
 
+## Importing a type by name
+
+An object or union type can also be imported with braces. This brings the
+bare name into scope for annotations, literals, and associated calls:
+
+```vl
+use my_app.person.{Person};
+
+fun main() {
+    val lit: Person = Person { name = "Lit", age = 40 };
+}
+```
+
+The bare name still means the fully qualified type (`my_app.person.Person`
+above), so nominal identity never collides: importing the same name from
+two modules, or alongside a local type of the same name, is an error.
+
 ## The standard library
 
 The standard library is a set of ready-made modules: `std` for printing,

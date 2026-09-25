@@ -87,6 +87,13 @@ pub struct Resolution {
     /// Import names poisoned by an upstream provider diagnostic. Downstream
     /// stages use this to keep the poison quiet without inventing E500s.
     pub poisoned_imports: bool,
+    /// Bare type names brought in through `use` (`use vl.dog.{Dog}` then
+    /// `Dog`): bare spelling maps to the module-qualified identity
+    /// (`vl.dog.Dog`). `vl-hir` canonicalizes every type position to the
+    /// qualified spelling, so nominal identity never collides across
+    /// modules. Functions live in [`Resolution::uses`]; types never enter
+    /// the value scope.
+    pub imported_types: HashMap<String, String>,
 }
 
 impl Resolution {
@@ -140,6 +147,10 @@ struct Resolver {
     module: String,
     imports: HashMap<String, ModuleSpec>,
     import_symbols: HashMap<String, SymbolRef>,
+    /// Bare type imports (`Dog` -> `vl.dog.Dog`), kept out of the value
+    /// scope: types and functions occupy separate namespaces, so a type
+    /// import never conflicts with a same-named function import.
+    imported_types: HashMap<String, String>,
     poisoned_imports: std::collections::HashSet<String>,
     import_spans: HashMap<String, Span>,
     /// Parameter `DefId`s shadowed by a duplicate declaration in the same
@@ -828,6 +839,7 @@ pub fn resolve_with_modules(
         module: prog.module.clone(),
         imports: HashMap::new(),
         import_symbols: HashMap::new(),
+        imported_types: HashMap::new(),
         poisoned_imports: std::collections::HashSet::new(),
         import_spans: HashMap::new(),
         poisoned_params: std::collections::HashSet::new(),
@@ -902,6 +914,23 @@ pub fn resolve_with_modules(
                 .or_insert_with(|| variants.iter().map(|v| v.name.clone()).collect());
         }
     }
+    // A bare type import clashes with a same-named local declaration: one
+    // E206, the local type wins, and the import is dropped (no poison) so
+    // later stages resolve the bare spelling locally without cascading.
+    for bare in r.imported_types.keys().cloned().collect::<Vec<_>>() {
+        if let Some(local_span) = object_spans.get(&bare) {
+            let import_span = r.import_spans.get(&bare).copied().unwrap_or(*local_span);
+            r.diags.push(
+                Diagnostic::error(format!(
+                    "import alias `{bare}` conflicts with a top-level definition"
+                ))
+                .with_label(*local_span, "definition declared here")
+                .with_bare_label(import_span)
+                .with_code("E206"),
+            );
+            r.imported_types.remove(&bare);
+        }
+    }
     for item in &prog.items {
         match item {
             Item::Use { .. } => {}
@@ -950,6 +979,7 @@ pub fn resolve_with_modules(
     }
 
     r.out.poisoned_imports = !r.poisoned_imports.is_empty();
+    r.out.imported_types = r.imported_types.clone();
     (r.out, r.diags)
 }
 
@@ -1019,6 +1049,35 @@ impl Resolver {
         self.diags.push(diagnostic);
         self.poisoned_imports.insert(alias.to_string());
         true
+    }
+
+    /// Bring one type name into scope (`use vl.dog.{Dog}` then bare `Dog`
+    /// means `vl.dog.Dog`). Types share one namespace across objects and
+    /// unions, but never conflict with same-named functions or values.
+    /// Importing the same spelling from two modules is one E206; the
+    /// first mapping is kept so downstream stays quiet behind the single
+    /// root cause. Clashes with a local declaration are settled after
+    /// the declaration pre-pass below (the local type wins).
+    fn import_type(&mut self, bare: String, qualified: String, span: Span) {
+        if let Some(existing) = self.imported_types.get(&bare) {
+            if *existing == qualified {
+                return;
+            }
+            let mut diagnostic = Diagnostic::error(format!("duplicate import alias `{bare}`"))
+                .with_label(span, "imported again here")
+                .with_code("E206");
+            if let Some(previous) = self.import_spans.get(&bare) {
+                diagnostic = diagnostic.with_bare_label(*previous);
+            }
+            self.diags.push(diagnostic);
+            self.poison_import(bare, span);
+            return;
+        }
+        if self.poisoned_imports.contains(&bare) {
+            return;
+        }
+        self.imported_types.insert(bare.clone(), qualified);
+        self.import_spans.insert(bare, span);
     }
 
     fn declare_global(&mut self, name: String, span: Span, binding: Option<BindingKind>) {
@@ -1578,6 +1637,14 @@ impl Resolver {
                         );
                         return;
                     }
+                    // Single-type import (`use vl.dog.Dog;` then bare `Dog`):
+                    // types never enter the value scope, so no alias
+                    // reservation or synthetic module entry is needed.
+                    if let Some(qualified) = parent.lookup_type_qualified(&leaf) {
+                        let qualified = qualified.to_owned();
+                        self.import_type(leaf, qualified, span);
+                        return;
+                    }
                     self.poison_import(leaf.clone(), span);
                     self.poison_import(key.clone(), span);
                     if parent.parse_poisoned {
@@ -1623,10 +1690,22 @@ impl Resolver {
             }
             Some(names) => {
                 for name in names {
-                    if self.reserve_import_alias(name, span) {
-                        continue;
+                    // Types and functions share the `use m.{name}` spelling
+                    // but live in separate namespaces: import whatever the
+                    // module exports under this spelling (both, either, or
+                    // neither). Only a missing-everywhere name is E203.
+                    let qualified_type = module.lookup_type_qualified(name).map(str::to_owned);
+                    if let Some(qualified) = qualified_type {
+                        self.import_type(name.clone(), qualified, span);
                     }
                     if module.lookup(name).is_none() {
+                        if module.lookup_type_qualified(name).is_some() {
+                            // Pure type import: no value binding to reserve.
+                            continue;
+                        }
+                        if self.reserve_import_alias(name, span) {
+                            continue;
+                        }
                         if module.poisoned_exports.iter().any(|export| export == name) {
                             self.poison_import(name.clone(), span);
                             continue;
@@ -1642,6 +1721,9 @@ impl Resolver {
                                 .with_code("E203"),
                         );
                     } else {
+                        if self.reserve_import_alias(name, span) {
+                            continue;
+                        }
                         if module
                             .global_dependent_exports
                             .iter()
@@ -1866,6 +1948,20 @@ impl Resolver {
             if let Some(variants) = self.local_unions.get(&parts[0]) {
                 return Some((parts[0].clone(), variants.clone()));
             }
+            // Bare imported union (`use vl.types.{U}` then `U.Variant`):
+            // canonicalize to the module-qualified identity. An explicit
+            // import shadows the builtin `Option`, like a local
+            // `type Option` declaration does.
+            if let Some(qualified) = self.imported_types.get(&parts[0]) {
+                for spec in &self.modules {
+                    if let Some(found) = spec.unions.iter().find(|u| u.qualified == *qualified) {
+                        return Some((
+                            found.qualified.clone(),
+                            found.variants.iter().map(|v| v.name.clone()).collect(),
+                        ));
+                    }
+                }
+            }
             // Builtin `Option` (nullable `?T` / `null` sugar): available in
             // every module without a `type Option` declaration. A local
             // `type Option` shadows it (first declaration wins above).
@@ -1965,12 +2061,13 @@ impl Resolver {
     /// errors. Returns false to fall through to [`lookup_path`](Self::lookup_path).
     ///
     /// Resolution order at each site: poisoned heads stay quiet, then local
-    /// `Type.method`, then instance sugar when the head is a bound value
+    /// `Type.method`, then bare imported `Type.method` (`use vl.dog.{Dog}`),
+    /// then instance sugar when the head is a bound value
     /// (values still win over module aliases here for recovery, like bare
     /// names, even though shadowing an import is E206 at the declaration),
     /// then alias-qualified `alias.Type.method`, then fully qualified
     /// `mod.Type.method` (no import needed, like object types). A head naming
-    /// a local object type always wins over a same-named value.
+    /// a local or imported object type always wins over a same-named value.
     fn resolve_assoc_or_sugar_call(
         &mut self,
         callee: &[String],
@@ -2006,6 +2103,34 @@ impl Resolver {
                 &callee[1],
                 &union,
             );
+        }
+        // Bare imported union (`use vl.types.{U}` then `U.Variant(...)`).
+        // Non-union imports (objects) fall through to the method logic below.
+        if callee.len() == 2 && !self.local_unions.contains_key(&callee[0]) && callee[0] != "Option"
+        {
+            if let Some(qualified) = self.imported_types.get(&callee[0]).cloned() {
+                let found = self.modules.iter().find_map(|m| {
+                    m.unions.iter().find(|u| u.qualified == qualified).map(|u| {
+                        u.variants
+                            .iter()
+                            .map(|v| v.name.clone())
+                            .collect::<Vec<_>>()
+                    })
+                });
+                if let Some(variants) = found {
+                    let display = callee[0].clone();
+                    for arg in args {
+                        self.resolve_expr(arg);
+                    }
+                    return self.record_variant_use(
+                        callee_span,
+                        qualified,
+                        &variants,
+                        &callee[1],
+                        &display,
+                    );
+                }
+            }
         }
         if callee.len() >= 3 {
             let head = &callee[..callee.len() - 1];
@@ -2061,14 +2186,105 @@ impl Resolver {
             }
             return true;
         }
+        // Bare imported `Type.method` (`use vl.dog.{Dog}` then
+        // `Dog.new(...)`). Like local type names, the imported type wins
+        // over a same-named value; union imports were consumed as variant
+        // construction above, so a non-object head falls through.
+        if callee.len() == 2 && !self.local_objects.contains(&callee[0]) {
+            if let Some(qualified) = self.imported_types.get(&callee[0]).cloned() {
+                let provider = self.modules.iter().find_map(|m| {
+                    m.objects
+                        .iter()
+                        .find(|o| o.qualified == qualified)
+                        .map(|o| (m.clone(), o.clone()))
+                });
+                if let Some((spec, obj)) = provider {
+                    let method = callee[1].clone();
+                    let dotted = format!("{}.{}", obj.name, method);
+                    if spec.poisoned_exports.iter().any(|e| e == &dotted) {
+                        let id = self.external_def(
+                            full.clone(),
+                            callee_span,
+                            None,
+                            DefKind::ImportedFunction,
+                            None,
+                        );
+                        self.out
+                            .uses
+                            .insert((callee_span.start, callee_span.end), id);
+                        for arg in args {
+                            self.resolve_expr(arg);
+                        }
+                        return true;
+                    }
+                    match obj.lookup_method(&method) {
+                        None => {
+                            self.diags.push(self.missing_method_diag(
+                                &obj.qualified,
+                                &method,
+                                callee_span,
+                                obj.fields.iter().any(|f| f.name == method),
+                            ));
+                        }
+                        Some(export) => {
+                            if spec.global_dependent_exports.iter().any(|e| e == &dotted) {
+                                self.diags.push(
+                                    Diagnostic::error(format!(
+                                        "imported function `{}.{}` depends on module globals",
+                                        spec.path.as_string(),
+                                        dotted
+                                    ))
+                                    .with_label(callee_span, "unsupported cross-module boundary")
+                                    .with_code("E208"),
+                                );
+                                self.poisoned_imports.insert(full.clone());
+                                let id = self.external_def(
+                                    full,
+                                    callee_span,
+                                    None,
+                                    DefKind::ImportedFunction,
+                                    None,
+                                );
+                                self.out
+                                    .uses
+                                    .insert((callee_span.start, callee_span.end), id);
+                                for arg in args {
+                                    self.resolve_expr(arg);
+                                }
+                                return true;
+                            }
+                            let id = self.external_def_with_kind(
+                                full,
+                                callee_span,
+                                Some(export.sig.clone()),
+                                Some(export.kind),
+                                DefKind::ImportedFunction,
+                                Some(SymbolRef {
+                                    module: spec.path.clone(),
+                                    name: dotted,
+                                }),
+                            );
+                            self.out
+                                .uses
+                                .insert((callee_span.start, callee_span.end), id);
+                        }
+                    }
+                    for arg in args {
+                        self.resolve_expr(arg);
+                    }
+                    return true;
+                }
+            }
+        }
         // Instance sugar `head.rest.method(args)`: the head is a bound value.
         // Shadowing an import is E206 at the declaration, but resolution still
         // prefers the bound value here for recovery (like bare names); the
         // receiver path and the self-type gate are validated by `vl-typecheck`,
         // which reports loudly when sugar does not apply. Only object type
-        // names take precedence over values. The site records its receiver head
-        // so no E201 fires.
-        if !self.local_objects.contains(&callee[0]) {
+        // names (local or imported) take precedence over values. The site
+        // records its receiver head so no E201 fires.
+        if !self.local_objects.contains(&callee[0]) && !self.imported_types.contains_key(&callee[0])
+        {
             if let Some(head) = self.lookup(&callee[0]) {
                 self.out
                     .sugar_receivers
@@ -2715,6 +2931,62 @@ mod tests {
         let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
         assert_eq!(errors.len(), 1, "{diags:?}");
         assert_eq!(errors[0].code.as_deref(), Some("E302"));
+    }
+
+    fn provider_spec(src: &str, module: &str) -> vl_common::ModuleSpec {
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse_with_module(&toks, src, module);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (interface, idiags) = collect_interface_quiet(&prog);
+        assert!(idiags.is_empty(), "{idiags:?}");
+        interface.as_spec()
+    }
+
+    #[test]
+    fn brace_object_import_registers_type_without_e203() {
+        let dog = provider_spec(
+            "type Dog = object { name: String, fun new(name: String): *Dog { return Dog { name = name, }; } };",
+            "vl.dog",
+        );
+        let (toks, _) = vl_lex::lex("use vl.dog.{Dog}; fun main() { val d = Dog.new(\"x\"); d; }");
+        let (prog, pdiags) = vl_syntax::parse_with_module(&toks, "", "vl.main");
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, diags) = resolve_with_modules(&prog, &[dog]);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_eq!(
+            res.imported_types.get("Dog"),
+            Some(&"vl.dog.Dog".to_string())
+        );
+        // The bare call resolves to the provider method, not a sugar receiver.
+        let def = res
+            .defs
+            .iter()
+            .find(|d| d.kind == DefKind::ImportedFunction)
+            .expect("imported Dog.new def");
+        assert_eq!(def.name, "Dog.new");
+        assert_eq!(
+            def.symbol
+                .as_ref()
+                .map(|s| (s.module.as_string(), s.name.as_str())),
+            Some(("vl.dog".to_string(), "Dog.new"))
+        );
+        assert!(res.sugar_receivers.is_empty());
+    }
+
+    #[test]
+    fn brace_union_import_canonicalizes_variant_heads() {
+        let shapes = provider_spec("type Shape = union { Circle(u64), Point, };", "vl.shapes");
+        let (toks, _) = vl_lex::lex(
+            "use vl.shapes.{Shape}; fun main() { val a = Shape.Circle(1u64); match (a) { Shape.Circle(r) { r; } Shape.Point { 0u64; } else { 0u64; } } }",
+        );
+        let (prog, pdiags) = vl_syntax::parse_with_module(&toks, "", "vl.main");
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, diags) = resolve_with_modules(&prog, &[shapes]);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let mut unions: Vec<String> = res.variants.values().map(|u| u.union.clone()).collect();
+        unions.sort();
+        unions.dedup();
+        assert_eq!(unions, vec!["vl.shapes.Shape".to_string()]);
     }
 
     #[test]

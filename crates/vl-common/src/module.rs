@@ -295,6 +295,29 @@ impl ModuleSpec {
         self.exports.iter().find(|e| e.name == name)
     }
 
+    /// Look up one exported object type by its short name.
+    pub fn lookup_object(&self, name: &str) -> Option<&ObjectExport> {
+        self.objects.iter().find(|o| o.name == name)
+    }
+
+    /// Look up one exported union by its short name.
+    pub fn lookup_union(&self, name: &str) -> Option<&UnionExport> {
+        self.unions.iter().find(|u| u.name == name)
+    }
+
+    /// Qualified identity (`<module>.<name>`) for an exported object or
+    /// union type, if either namespace defines it.
+    pub fn lookup_type_qualified(&self, name: &str) -> Option<&str> {
+        self.lookup_object(name)
+            .map(|o| o.qualified.as_str())
+            .or_else(|| {
+                self.unions
+                    .iter()
+                    .find(|u| u.name == name)
+                    .map(|u| u.qualified.as_str())
+            })
+    }
+
     /// Export names only (resolution fast path / diagnostics).
     pub fn export_names(&self) -> impl Iterator<Item = &str> {
         self.exports.iter().map(|e| e.name.as_str())
@@ -305,6 +328,36 @@ impl ModuleSpec {
 mod tests {
     use super::*;
     use crate::ty::GenericBound;
+
+    #[test]
+    fn type_lookups_resolve_qualified_identity() {
+        let spec = ModuleSpec {
+            path: ModulePath::from_dotted("vl.dog"),
+            exports: vec![],
+            objects: vec![ObjectExport {
+                name: "Dog".into(),
+                qualified: "vl.dog.Dog".into(),
+                fields: vec![],
+                methods: vec![],
+            }],
+            unions: vec![UnionExport {
+                name: "Trick".into(),
+                qualified: "vl.dog.Trick".into(),
+                type_params: vec![],
+                variants: vec![],
+            }],
+            parse_poisoned: false,
+            poisoned_exports: vec![],
+            global_dependent_exports: vec![],
+        };
+        assert_eq!(spec.lookup_type_qualified("Dog"), Some("vl.dog.Dog"));
+        assert_eq!(spec.lookup_type_qualified("Trick"), Some("vl.dog.Trick"));
+        assert_eq!(spec.lookup_type_qualified("Missing"), None);
+        // Type exports never surface as function exports.
+        assert!(spec.lookup("Dog").is_none());
+        assert!(spec.lookup_object("Trick").is_none());
+        assert!(spec.lookup_union("Dog").is_none());
+    }
 
     #[test]
     fn monomorphic_and_generic_signatures_with_bounds() {

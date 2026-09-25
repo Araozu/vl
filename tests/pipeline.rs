@@ -1634,3 +1634,111 @@ fn err_union_examples_fail() {
         );
     }
 }
+
+#[test]
+fn brace_imported_object_type_calls_annotations_and_sugar_compile() {
+    use vl_codegen::Target;
+    let programs = frontend_project(&[
+        (
+            "vl.dog",
+            "use std; type Dog = object { name: String, fun new(name: String): *Dog { return Dog { name = name, }; } fun barf(self: Dog) { std.println(\"BARF!\"); } };",
+        ),
+        (
+            "vl.main",
+            "use std; use vl.dog.{Dog}; fun main() { val dog = Dog.new(\"Doug\"); dog.barf(); val lit: Dog = Dog { name = \"Lit\" }; val back: *Dog = Dog.new(\"Bo\"); back.barf(); lit; }",
+        ),
+    ])
+    .expect("brace-imported object types must compile");
+    assert_eq!(programs.len(), 2);
+    let importer_dump = programs[1].dump();
+    assert!(
+        importer_dump.contains("call vl.dog::Dog.new"),
+        "{importer_dump}"
+    );
+    assert!(
+        importer_dump.contains("call vl.dog::Dog.barf"),
+        "{importer_dump}"
+    );
+    assert!(
+        programs[1]
+            .imports
+            .iter()
+            .any(|i| i.symbol.module == "vl.dog" && i.symbol.function == "Dog.new"),
+        "{:?}",
+        programs[1].imports
+    );
+    for lir in &programs {
+        let (artifact, diags) = vl_codegen::NaraVmTarget.emit(lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+    }
+}
+
+#[test]
+fn single_imported_object_type_compiles() {
+    let programs = frontend_project(&[
+        (
+            "vl.dog",
+            "type Dog = object { name: String, fun new(name: String): *Dog { return Dog { name = name, }; } };",
+        ),
+        (
+            "vl.main",
+            "use vl.dog.Dog; fun main() { val dog: *Dog = Dog.new(\"Doug\"); dog; }",
+        ),
+    ])
+    .expect("single-imported object types must compile");
+    assert!(programs[1].dump().contains("call vl.dog::Dog.new"));
+}
+
+#[test]
+fn brace_imported_union_constructs_and_matches() {
+    let programs = frontend_project(&[
+        ("vl.shapes", "type Shape = union { Circle(u64), Point, };"),
+        (
+            "vl.main",
+            "use vl.shapes.{Shape}; fun area(s: Shape): u64 { match (s) { Shape.Circle(r) { return r; } Shape.Point { return 0u64; } } } fun main() { val a = Shape.Circle(3u64); val b: Shape = Shape.Point; val r = area(a); r; b; }",
+        ),
+    ])
+    .expect("brace-imported unions must compile");
+    let dump = programs[1].dump();
+    assert!(dump.contains("Circle#0"), "{dump}");
+    assert!(dump.contains("Point#1"), "{dump}");
+    assert!(dump.contains("vl.shapes.Shape"), "{dump}");
+}
+
+#[test]
+fn brace_type_import_errors_are_single_root_causes() {
+    for (units, code) in [
+        (
+            vec![
+                ("vl.dog", "type Dog = object { name: String, };"),
+                ("vl.main", "use vl.dog.{Missing}; fun main() { }"),
+            ],
+            "E203",
+        ),
+        (
+            vec![
+                ("vl.a", "type Dog = object { v: u64, };"),
+                ("vl.b", "type Dog = object { v: u64, };"),
+                ("vl.main", "use vl.a.{Dog}; use vl.b.{Dog}; fun main() { }"),
+            ],
+            "E206",
+        ),
+        (
+            vec![
+                ("vl.dog", "type Dog = object { v: u64, };"),
+                (
+                    "vl.main",
+                    "use vl.dog.{Dog}; type Dog = object { v: u64, }; fun main() { }",
+                ),
+            ],
+            "E206",
+        ),
+    ] {
+        let units: Vec<(&str, &str)> = units;
+        let err = frontend_project(&units).expect_err("type import probe must fail");
+        let errors = err.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{units:?}: {err:?}");
+        assert_eq!(errors[0].code.as_deref(), Some(code), "{units:?}: {err:?}");
+    }
+}
