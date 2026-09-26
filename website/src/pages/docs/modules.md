@@ -52,6 +52,19 @@ fun main() {
 }
 ```
 
+`self` in a group also imports the module itself, so one line can bring
+both the qualified name and its exports into scope:
+
+```vl
+use std.net.tcp.{self, TcpError};
+
+fun fetch(sock: u64): TcpError!String {
+    val #(data, eof) = try tcp.read(sock, 64u64);
+    eof;
+    return data;
+}
+```
+
 Unknown modules and exports are reported when you run `check`. The [standard
 library catalog](/std) lists the modules and functions currently available.
 

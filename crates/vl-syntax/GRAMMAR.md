@@ -10,7 +10,8 @@ Parser recovers per-item (and per-stmt inside `fun`); one bad item hides no othe
 ```text
 program := item*
 item    := use_item | binding_item | function_item | object_item | union_item | error_item
-use_item := "use" path ("." "{" ident ("," ident)* "}")? ";"
+use_item := "use" path ("." "{" use_name ("," use_name)* "}")? ";"
+use_name := "self" | ident   ; `self` imports the module itself (`use m.{self, Foo}` also brings `m` into scope)
 binding_item := ("var" | "val") (ident | destructure) (":" type)? "=" expr ";"
 destructure := "#" "(" destructure_binding ("," destructure_binding)* ","? ")"
 destructure_binding := ident (":" ident)?
@@ -265,6 +266,8 @@ Missing `;` (`val x = 1`) → `E100`; `@` never reaches here (lexer `E000`).
 Each source file is a module named after its filename without the `.vl`
 extension. `use std.string;` brings the `string` module name into scope, but
 not its exports, so members are written `string.len()`. Grouped imports bring
-only listed exports into scope: `use std.fs.{open, read};`. A trailing export
+only listed exports into scope: `use std.fs.{open, read};`. `self` in a group
+imports the module itself: `use std.net.tcp.{self, TcpError};` brings both
+`tcp` and `TcpError` into scope. A trailing export
 can be imported directly: `use std.print;` behaves like `use std.{print};` and
 brings `print` into scope.

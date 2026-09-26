@@ -501,6 +501,17 @@ fn tcp_try_propagates_the_named_set() {
 }
 
 #[test]
+fn tcp_self_and_error_import_in_one_line() {
+    // `use m.{self, T}` is one line for the module alias plus the type.
+    let lir = frontend(
+        "use std.net.tcp.{self, TcpError}; fun f(s: u64): TcpError!u64 { return try tcp.accept(s); } fun main() { val x = f(1u64) catch 0u64; x; }",
+    )
+    .expect("braced self import must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("call std.net.tcp::accept"), "{dump}");
+}
+
+#[test]
 fn tcp_listen_and_read_return_destructurable_pairs() {
     let lir = frontend(
         "use std.net.tcp; fun main() { val #(l, port) = tcp.listen(\"\", 0u64, 8u64) catch #(0u64, 0u64); val #(data, eof) = tcp.read(l, 8u64) catch #(\"e\", true); l; port; data; eof; }",

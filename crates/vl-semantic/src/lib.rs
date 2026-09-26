@@ -1819,6 +1819,17 @@ impl Resolver {
             }
             Some(names) => {
                 for name in names {
+                    // `self` in a braced list imports the module itself under
+                    // its leaf name (`use std.net.tcp.{self, TcpError}` also
+                    // brings `tcp` into scope, like `use std.net.tcp;`).
+                    if name == "self" {
+                        let alias = path.last().cloned().unwrap_or_default();
+                        if !self.reserve_import_alias(&alias, span) {
+                            self.imports.insert(alias.clone(), module.clone());
+                            self.import_spans.insert(alias, span);
+                        }
+                        continue;
+                    }
                     // Types and functions share the `use m.{name}` spelling
                     // but live in separate namespaces: import whatever the
                     // module exports under this spelling (both, either, or
@@ -3479,6 +3490,43 @@ mod tests {
         let (_, diags) = resolve_src("use std.string.bogus; fun main() { bogus(); }");
         assert_eq!(diags.iter().filter(|d| d.is_error()).count(), 1);
         assert!(diags[0].message.contains("no export `bogus`"));
+    }
+
+    #[test]
+    fn braced_self_imports_the_module_alias() {
+        // `use m.{self, Foo}` brings both the module (`string.len(...)`)
+        // and the listed export (`len(...)`) into scope in one line.
+        let (res, diags) = resolve_src(
+            "use std.string.{self, len}; fun main() { string.len(\"s\"); len(\"s\"); }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let imported: Vec<_> = res
+            .defs
+            .iter()
+            .filter(|d| d.kind == DefKind::ImportedFunction)
+            .collect();
+        assert_eq!(imported.len(), 2, "{res:?}");
+    }
+
+    #[test]
+    fn braced_self_alone_imports_the_module_alias() {
+        let (res, diags) = resolve_src("use std.string.{self}; fun main() { string.len(\"s\"); }");
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            res.defs
+                .iter()
+                .any(|d| d.kind == DefKind::ImportedFunction && d.name == "string.len"),
+            "{res:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_self_and_module_import_is_e206() {
+        let (_, diags) =
+            resolve_src("use std.string; use std.string.{self}; fun main() { string.len(\"s\"); }");
+        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diags:?}");
+        assert_eq!(errors[0].code.as_deref(), Some("E206"));
     }
 
     #[test]

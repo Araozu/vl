@@ -14,8 +14,7 @@
 // s.accept(); print(c.recv(64)); c.sendall(b'world')"`, then build and run
 // this. Without a server every step reports through `catch`.
 use std;
-use std.net.tcp;
-use std.net.tcp.{TcpError};
+use std.net.tcp.{self, TcpError};
 
 fun fetch(sock: u64): TcpError!String {
     val n = try tcp.write(sock, "hello");

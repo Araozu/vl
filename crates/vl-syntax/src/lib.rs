@@ -572,7 +572,8 @@ pub fn parse(toks: &[Token], src: &str) -> (Program, Vec<Diagnostic>) {
 }
 
 /// Bare names a file brings in through `use` that may name types.
-/// `use m.{Foo}` admits every braced name; `use a.b.Leaf` admits an
+/// `use m.{Foo}` admits every braced name except `self` (which imports the
+/// module itself, not a type); `use a.b.Leaf` admits an
 /// uppercase leaf (types read uppercase; modules and functions read
 /// lowercase, so their diagnostics keep their wording). The parser has
 /// no module catalog, so these are admitted as object spellings only:
@@ -613,7 +614,9 @@ fn use_imported_type_names(toks: &[Token]) -> Vec<String> {
             loop {
                 match toks.get(m).map(|t| &t.kind) {
                     Some(TokenKind::Ident(name)) => {
-                        out.push(name.clone());
+                        if name != "self" {
+                            out.push(name.clone());
+                        }
                         m += 1;
                         if matches!(toks.get(m).map(|t| &t.kind), Some(TokenKind::Comma)) {
                             m += 1;
@@ -3971,6 +3974,20 @@ mod tests {
         let names = use_imported_type_names(&toks);
         assert!(names.iter().any(|n| n == "Dog"), "{names:?}");
         assert!(!names.iter().any(|n| n == "string"), "{names:?}");
+    }
+
+    #[test]
+    fn braced_self_parses_and_is_not_a_type_name() {
+        let (prog, diags) =
+            parse_src("use std.net.tcp.{self, TcpError}; fun main() { tcp.connect(\"h\", 1u64); }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(
+            matches!(&prog.items[0], Item::Use { path, names: Some(names), .. } if path == &vec![String::from("std"), String::from("net"), String::from("tcp")] && names == &vec![String::from("self"), String::from("TcpError")])
+        );
+        let (toks, _) = vl_lex::lex("use std.net.tcp.{self, TcpError};");
+        let names = use_imported_type_names(&toks);
+        assert!(names.iter().any(|n| n == "TcpError"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "self"), "{names:?}");
     }
 
     #[test]
