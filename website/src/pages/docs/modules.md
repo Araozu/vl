@@ -92,8 +92,9 @@ two modules, or alongside a local type of the same name, is an error.
 ## The standard library
 
 The standard library is a set of ready-made modules: `std` for printing,
-`std.string` for text, `std.math` for numbers, and `std.fmt` for turning
-numbers into strings. See the [standard library](/std) for the full list.
+`std.string` for text, `std.math` for numbers, `std.fmt` for turning
+numbers into strings, and `std.fs` for files (native linux-x86_64 only,
+not available in the wasm32 playground). See the [standard library](/std) for the full list.
 
 ```vl
 use std.math;

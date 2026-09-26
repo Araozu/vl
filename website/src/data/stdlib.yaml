@@ -301,3 +301,52 @@
         val text = std.fmt.u64_to_string(42u64);
   outro: |
     The helper is implemented in [`fmt.vl`](https://github.com/Araozu/vl/tree/main/crates/vl-stdlib/src/std/fmt.vl).
+
+- id: fs
+  order: 5
+  module: std.fs
+  summary: Native file operations for native targets (not wasm32).
+  title: std.fs module
+  description: File operations in the VL standard library.
+  intro: |
+    `std.fs` exposes the file operations available on native targets.
+    `open` returns a `File` handle; `read` returns the file's contents.
+    Import the module before using its qualified names:
+
+    Native-only: available when running on linux-x86_64. Not available
+    in the browser playground (wasm32-freestanding), which has no
+    filesystem or socket support.
+  import_example: |
+    use std.fs;
+
+    fun main() {
+        val handle = std.fs.open("data.txt");
+        val text = std.fs.read(handle);
+    }
+  functions:
+    - name: open
+      params:
+        - name: path
+          type: String
+          detail: Path of the file to open.
+      returns:
+        type: File
+      detail: Native operation that opens a file and returns its handle.
+      example: |
+        val handle = std.fs.open("data.txt");
+    - name: read
+      params:
+        - name: file
+          type: File
+          detail: Open file handle.
+      returns:
+        type: String
+      detail: Native operation that reads a file's contents into a string.
+      example: |
+        val text = std.fs.read(handle);
+  outro: |
+    The module has no VL source file; these functions are target-provided.
+    They are unavailable in wasm32-freestanding builds (including the
+    browser playground); run them on linux-x86_64 instead. Socket support
+    (`std::net::tcp` in the VM) follows the same rule: native-only,
+    not available in the playground.

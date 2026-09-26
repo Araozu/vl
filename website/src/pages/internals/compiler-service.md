@@ -22,7 +22,8 @@ the compiled vmfile through `alloc_input`, calls `run_bytecode`, and renders
 stdout, stderr, and the exit status (`ok`, `invalid_input`, `manager_error`,
 `entrypoint_error`, `init_error`, `runtime_error`). The WASM build registers
 the wasm-safe std subset (`std::{print,print_u64,string,math,fmt}`);
-`std::fs` / `std::process` stay native-only. Override the URL with
+`std::fs` / `std::process` / `std::net::tcp` (files, processes, sockets)
+stay native-only (linux-x86_64, not wasm32). Override the URL with
 `PUBLIC_NARAVM_WASM_URL` when building the site.
 
 ## Compile

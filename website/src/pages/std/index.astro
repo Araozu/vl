@@ -39,4 +39,10 @@ const modules = (await getCollection('stdlib')).sort((a, b) => a.data.order - b.
     supplied by the target; source modules are embedded into the compiled
     program when one of their helpers is used.
   </p>
+  <p>
+    `std`, `std.string`, `std.math`, and `std.fmt` work everywhere, including
+    the browser playground (wasm32-freestanding). `std.fs` — and socket
+    support (`std::net::tcp` in the VM) — are native-only: available when
+    running on linux-x86_64, not available in the playground.
+  </p>
 </Docs>
