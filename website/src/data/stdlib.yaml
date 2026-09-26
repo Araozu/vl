@@ -347,6 +347,117 @@
   outro: |
     The module has no VL source file; these functions are target-provided.
     They are unavailable in wasm32-freestanding builds (including the
-    browser playground); run them on linux-x86_64 instead. Socket support
-    (`std::net::tcp` in the VM) follows the same rule: native-only,
+    browser playground); run them on linux-x86_64 instead. TCP sockets
+    ([std.net.tcp](/std/tcp)) follow the same rule: native-only,
     not available in the playground.
+
+- id: tcp
+  order: 6
+  module: std.net.tcp
+  summary: Blocking TCP sockets with typed errors (native targets only).
+  title: std.net.tcp module
+  description: TCP socket operations in the VL standard library.
+  intro: |
+    `std.net.tcp` exposes blocking TCP operations backed by the VM's native
+    `std::net::tcp` module. Every call returns `TcpError!T`: the native
+    status becomes a typed error and the result registers become the ok
+    payload. Import the module (and the error set, to name it) before use:
+
+    Native-only: freestanding WASM hosts do not register `std::net::tcp`,
+    so linked TCP programs need a native host. Handles are opaque `u64`
+    values; closing a handle invalidates it. Reads perform one stream read
+    of up to `max_bytes` (1-65536); writes may be partial, so resend any
+    remainder. Ports are 1-65535 for connections; listeners may bind port 0
+    for an ephemeral port. An empty listen address binds `0.0.0.0`.
+  import_example: |
+    use std.net.tcp;
+    use std.net.tcp.{TcpError};
+
+    fun fetch(sock: u64): TcpError!String {
+        val #(data, eof) = try tcp.read(sock, 64u64);
+        eof;
+        return data;
+    }
+  functions:
+    - name: connect
+      params:
+        - name: host
+          type: String
+          detail: Hostname or IP literal to connect to.
+        - name: port
+          type: u64
+          detail: Port to connect to (1-65535).
+      returns:
+        type: TcpError!u64
+      detail: Native operation that connects and returns a socket handle.
+      example: |
+        val sock = tcp.connect("127.0.0.1", 80u64) catch 0u64;
+    - name: listen
+      params:
+        - name: address
+          type: String
+          detail: IPv4/IPv6 literal to bind, or empty for all interfaces.
+        - name: port
+          type: u64
+          detail: Port to bind, or 0 for an ephemeral port.
+        - name: backlog
+          type: u64
+          detail: Pending-connection queue length.
+      returns:
+        type: TcpError!#(u64, u64)
+      detail: Native operation that binds a listener; returns the listener handle and the bound port.
+      example: |
+        val #(listener, port) = tcp.listen("", 0u64, 8u64) catch #(0u64, 0u64);
+    - name: accept
+      params:
+        - name: listener
+          type: u64
+          detail: Listener handle to accept from.
+      returns:
+        type: TcpError!u64
+      detail: Native operation that blocks for the next connection and returns its socket handle.
+      example: |
+        val sock = tcp.accept(listener) catch 0u64;
+    - name: read
+      params:
+        - name: socket
+          type: u64
+          detail: Socket handle to read from.
+        - name: max_bytes
+          type: u64
+          detail: Maximum bytes for this read (1-65536).
+      returns:
+        type: TcpError!#(String, bool)
+      detail: Native operation performing one stream read; returns the bytes and whether EOF was reached.
+      example: |
+        val #(data, eof) = tcp.read(sock, 64u64) catch #("ERR", true);
+    - name: write
+      params:
+        - name: socket
+          type: u64
+          detail: Socket handle to write to.
+        - name: data
+          type: String
+          detail: Byte string to send (may contain NUL or non-UTF-8 bytes).
+      returns:
+        type: TcpError!u64
+      detail: Native operation that sends bytes; returns how many were written.
+      example: |
+        val n = tcp.write(sock, "hello") catch 0u64;
+    - name: close
+      params:
+        - name: handle
+          type: u64
+          detail: Socket or listener handle to close.
+      returns:
+        type: TcpError!void
+      detail: Native operation that closes a handle, invalidating it.
+      example: |
+        tcp.close(sock) catch std.print("close failed\n");
+  outro: |
+    The module has no VL source file; these functions are target-provided.
+    `TcpError` has one variant per native status: `InvalidArgument`,
+    `IoError`, `InvalidHandle`, `WrongHandleKind`, `TooManyHandles`,
+    `OutOfMemory`, and `CapabilityUnavailable`. Unavailable in
+    wasm32-freestanding builds (including the browser playground); run them
+    on linux-x86_64 instead.

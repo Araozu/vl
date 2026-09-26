@@ -41,8 +41,9 @@ const modules = (await getCollection('stdlib')).sort((a, b) => a.data.order - b.
   </p>
   <p>
     `std`, `std.string`, `std.math`, and `std.fmt` work everywhere, including
-    the browser playground (wasm32-freestanding). `std.fs` — and socket
-    support (`std::net::tcp` in the VM) — are native-only: available when
-    running on linux-x86_64, not available in the playground.
+    the browser playground (wasm32-freestanding). `std.fs` and `std.net.tcp`
+    are native-only: available when running on linux-x86_64, not available
+    in the playground (freestanding WASM hosts do not register filesystem
+    or socket support).
   </p>
 </Docs>
