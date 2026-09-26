@@ -7,7 +7,9 @@
 //!   wrapper. Integer/float arithmetic, comparisons, and control flow
 //!   plus `std.print` / `std.println` / `std.print_u64`, the `std.string`
 //!   natives (`len`, `concat`, `eq`, `to_u64`, `hex_to_u64`), `std.math.mod_u64`,
-//!   `std.fmt.u64_to_s`, and user-function calls lower to `calli`.
+//!   `std.fmt.u64_to_s`, the checked `std.net.tcp` natives (each `rv10`
+//!   status becomes a `TcpError!T` value), and user-function calls lower to
+//!   `calli`.
 //!
 //! Rule: new targets = new types implementing [`Target`]. Never branch
 //! the LIR or the driver on target names.
@@ -24,11 +26,38 @@ pub struct Artifact {
     /// Binary payloads are used by targets whose output is not text.
     pub bytes: Option<Vec<u8>>,
 }
-
 /// Every backend implements this. Keep it object-safe (`&self`, no generics).
 pub trait Target {
     fn name(&self) -> &'static str;
     fn emit(&self, prog: &LirProgram) -> (Option<Artifact>, Vec<Diagnostic>);
+}
+
+/// Qualified identity of the TCP error set (`<module>.<name>`, matching the
+/// resolver's canonicalization for `use std.net.tcp.{TcpError}`). Extern
+/// signatures spell the set qualified so `try` compatibility compares the
+/// same string the importer-side `TcpError!T` normalizes to.
+pub const TCP_ERROR_SET: &str = "std.net.tcp.TcpError";
+
+/// `std::net::tcp` status codes 1-7 in order, each with its `TcpError`
+/// variant. Status 0 is success (never wrapped); anything else the VM may
+/// report in the future surfaces as `IoError`.
+pub const TCP_STATUS_VARIANTS: [(u64, &str); 7] = [
+    (1, "InvalidArgument"),
+    (2, "IoError"),
+    (3, "InvalidHandle"),
+    (4, "WrongHandleKind"),
+    (5, "TooManyHandles"),
+    (6, "OutOfMemory"),
+    (7, "CapabilityUnavailable"),
+];
+
+/// Wrap an `ok` payload type in the named `TcpError` fallible shared by the
+/// `std.net.tcp` externs.
+fn tcp_fallible(ok: vl_common::VlType) -> vl_common::VlType {
+    vl_common::VlType::Fallible {
+        err: Some(TCP_ERROR_SET.into()),
+        ok: Box::new(ok),
+    }
 }
 
 /// Modules known to the target environment. Frontend resolution consumes the
@@ -37,17 +66,19 @@ pub trait Target {
 /// This is where the language's extern type surface is *declared*: every
 /// export carries VL-level param names/types and a return type. Backends map
 /// these VL types to target concepts (e.g. VL `String` -> Naravm blob).
-/// Fallible VM operations (`!File`, `!String` via `errno`/`0x30`) are modeled
-/// as plain returns for now; error handling is out of scope for VL.
 ///
 /// The `std.string` / `std.math` / `std.fmt` entries below cover only the
 /// infallible-or-trapping VM natives (e.g. `byte_count`, `concat`, `mod_u64`).
-/// Natives that report errors through `rv10` (`byte_at`, `slice`) and the
-/// container bridges (`bytes`, `from_container`) stay out until VL has an
-/// error story; likewise `std.fs` / `std.process` stay broad-catalog-only.
+/// `std.net.tcp` is the first fallible surface: every native reports a
+/// `std::net::tcp` status code in `rv10`, which the Naravm backend checks and
+/// wraps into a `TcpError!T` container (see `nara_tcp_call`). Natives that
+/// report errors through `rv10` without a typed wrapper yet (`byte_at`,
+/// `slice`) and the container bridges (`bytes`, `from_container`) stay out
+/// until they get the same treatment; likewise `std.fs` / `std.process` stay
+/// broad-catalog-only.
 pub fn modules() -> Vec<vl_common::ModuleSpec> {
     use vl_common::VlType as T;
-    vec![
+    let mut catalog = vec![
         vl_common::ModuleSpec::new(
             &["std"],
             &[
@@ -81,12 +112,83 @@ pub fn modules() -> Vec<vl_common::ModuleSpec> {
             &["std", "fmt"],
             &[("u64_to_s", &[("value", T::U64)], T::String)],
         ),
-    ]
+        vl_common::ModuleSpec::new(
+            &["std", "net", "tcp"],
+            &[
+                (
+                    "connect",
+                    &[("host", T::String), ("port", T::U64)],
+                    tcp_fallible(T::U64),
+                ),
+                (
+                    "listen",
+                    &[
+                        ("address", T::String),
+                        ("port", T::U64),
+                        ("backlog", T::U64),
+                    ],
+                    tcp_fallible(T::Tuple(vec![
+                        vl_common::TupleField {
+                            name: None,
+                            ty: Box::new(T::U64),
+                        },
+                        vl_common::TupleField {
+                            name: None,
+                            ty: Box::new(T::U64),
+                        },
+                    ])),
+                ),
+                ("accept", &[("listener", T::U64)], tcp_fallible(T::U64)),
+                (
+                    "read",
+                    &[("socket", T::U64), ("max_bytes", T::U64)],
+                    tcp_fallible(T::Tuple(vec![
+                        vl_common::TupleField {
+                            name: None,
+                            ty: Box::new(T::String),
+                        },
+                        vl_common::TupleField {
+                            name: None,
+                            ty: Box::new(T::Bool),
+                        },
+                    ])),
+                ),
+                (
+                    "write",
+                    &[("socket", T::U64), ("data", T::String)],
+                    tcp_fallible(T::U64),
+                ),
+                ("close", &[("handle", T::U64)], tcp_fallible(T::Void)),
+            ],
+        ),
+    ];
+    // The `TcpError` variants mirror the `std::net::tcp` status codes 1-7
+    // one-to-one (see `TCP_STATUS_VARIANTS`); the backend maps `rv10` to the
+    // matching variant's global error code.
+    catalog
+        .iter_mut()
+        .find(|m| m.path.as_string() == "std.net.tcp")
+        .expect("std.net.tcp declared above")
+        .errors
+        .push(vl_common::ErrorExport {
+            name: "TcpError".into(),
+            qualified: TCP_ERROR_SET.into(),
+            variants: TCP_STATUS_VARIANTS
+                .iter()
+                .map(|(_, variant)| (*variant).into())
+                .collect(),
+        });
+    catalog
 }
 
 /// Module surface available to a concrete backend. The broad `modules`
 /// catalog remains useful to frontend/library tests; drivers should resolve
 /// against this target-specific view so accepted calls are actually emit-able.
+///
+/// Only `std.fs` is filtered for Naravm: its host file natives predate the
+/// fallible-call machinery. `std.net.tcp` stays in: its `rv10` statuses lower
+/// to typed `TcpError!T` values on native runs. Freestanding WASM hosts do
+/// not register `std::net::tcp`, so linked TCP programs need a native host.
 pub fn modules_for_target(target: &str) -> Vec<vl_common::ModuleSpec> {
     match target {
         "naravm" => {
@@ -121,8 +223,9 @@ pub fn lookup(name: &str) -> Option<Box<dyn Target>> {
 /// without `main` still compiles (a library); entrypoint presence is the
 /// VM/loader's check, not the compiler's. Calls to
 /// `std.print` / `std.println` / `std.print_u64`, the `std.string` natives,
-/// `std.math.mod_u64`, `std.fmt.u64_to_s`, and to user functions lower
-/// to `calli`;
+/// `std.math.mod_u64`, `std.fmt.u64_to_s`, the checked `std.net.tcp` natives
+/// (each `rv10` status becomes a `TcpError!T` value), and to user functions
+/// lower to `calli`;
 /// `Array[T]` values lower to memory containers (`create`/`getvat`/`setvat`
 /// for value elements, `getrfat`/`setrfat` for reference elements);
 /// modules without `main` retain their ordered global initializer as the
@@ -175,6 +278,12 @@ fn nara_extern_target(module: &str, function: &str) -> Option<(&'static str, &'s
         ("std.string", "hex_to_u64") => Some(("std::string", "hex_to_u64")),
         ("std.math", "mod_u64") => Some(("std::math", "mod_u64")),
         ("std.fmt", "u64_to_s") => Some(("std::fmt", "u64_to_s")),
+        ("std.net.tcp", "connect") => Some(("std::net::tcp", "connect")),
+        ("std.net.tcp", "listen") => Some(("std::net::tcp", "listen")),
+        ("std.net.tcp", "accept") => Some(("std::net::tcp", "accept")),
+        ("std.net.tcp", "read") => Some(("std::net::tcp", "read")),
+        ("std.net.tcp", "write") => Some(("std::net::tcp", "write")),
+        ("std.net.tcp", "close") => Some(("std::net::tcp", "close")),
         _ => None,
     }
 }
@@ -562,6 +671,26 @@ fn nara_fallible_lanes(ok: &NaraKind) -> (usize, usize) {
         _ => (1, 0),
     };
     (1 + v.max(1), r)
+}
+
+/// Allocate a fallible container (`createi`) sized for an `ok` payload
+/// kind into an already-reserved register. E404 when a lane exceeds 255
+/// slots. Both arms of a checked call build into the same register so the
+/// join sees one value.
+fn nara_fallible_create_into(e: &mut NaraEmit, into: u8, ok: &NaraKind, span: Span) -> bool {
+    let (values, refs) = nara_fallible_lanes(ok);
+    if values > u8::MAX as usize || refs > u8::MAX as usize {
+        e.diags.push(
+            Diagnostic::error("Naravm fallible value has more than 255 slots in one register lane")
+                .with_label(span, "fallible allocated here")
+                .with_note("split the payload into smaller tuples")
+                .with_code("E404"),
+        );
+        return false;
+    }
+    e.bytecode
+        .extend_from_slice(&[0x27, into, values as u8, refs as u8]); // createi
+    true
 }
 
 /// Allocate a fallible container (`createi`) sized for an `ok` payload
@@ -2236,6 +2365,18 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             args,
             span,
         } => {
+            // Checked TCP natives first: like `std.print`, they bypass the
+            // single-result user-call path (their results live in several
+            // registers behind an `rv10` status check).
+            if callee.module == "std.net.tcp"
+                && matches!(
+                    callee.function.as_str(),
+                    "connect" | "listen" | "accept" | "read" | "write" | "close"
+                )
+            {
+                nara_tcp_call(e, ctx, *dst, callee, args, *span);
+                return;
+            }
             // User functions first: a user function may share a bare name
             // with a std export, and the LIR callee spelling alone cannot
             // tell them apart (imports are resolved away before lowering).
@@ -2344,7 +2485,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                     ))
                     .with_label(*span, "unsupported call")
                     .with_note(
-                        "only `std.print`, `std.println`, `std.print_u64`, the `std.string`/`std.math`/`std.fmt` natives, and user functions lower to Naravm calls",
+                        "only `std.print`, `std.println`, `std.print_u64`, the `std.string`/`std.math`/`std.fmt`/`std.net.tcp` natives, and user functions lower to Naravm calls",
                     )
                     .with_code("E404"),
                 );
@@ -3673,6 +3814,507 @@ enum NaraSpill {
     F(u8),
 }
 
+/// Patch one forward jump (`jz`/`jmp`) once its target position is known.
+/// Offsets are `i16` big-endian relative to the end of the instruction,
+/// matching `nara_resolve_jumps`.
+fn nara_patch_jump(e: &mut NaraEmit, pos: usize, len: usize, target: usize, span: Span) -> bool {
+    let offset = target as isize - (pos + len) as isize;
+    let Ok(offset) = i16::try_from(offset) else {
+        e.diags.push(
+            Diagnostic::error("Naravm jump offset out of range (function too large)")
+                .with_label(span, "call emitted here")
+                .with_code("E500"),
+        );
+        return false;
+    };
+    let bytes = offset.to_be_bytes();
+    e.bytecode[pos + len - 2] = bytes[0];
+    e.bytecode[pos + len - 1] = bytes[1];
+    true
+}
+
+/// Emit `jz reg, <forward>` with a zero placeholder; returns the patch site.
+fn nara_emit_jz(e: &mut NaraEmit, reg: u8) -> usize {
+    let pos = e.bytecode.len();
+    e.bytecode.extend_from_slice(&[0x24, reg, 0, 0]); // jz
+    pos
+}
+
+/// Emit `jmp <forward>` with a zero placeholder; returns the patch site.
+fn nara_emit_jmp(e: &mut NaraEmit) -> usize {
+    let pos = e.bytecode.len();
+    e.bytecode.extend_from_slice(&[0x22, 0, 0]); // jmp
+    pos
+}
+
+/// Call a `std.net.tcp` native: move actuals into the native slots
+/// (`rv11+` for values, `rf31+` for references — the same convention as
+/// `nara_user_call`, minus spills since natives are leaves), `calli`, then
+/// check the `rv10` status: 0 builds the `TcpError!T` ok container from the
+/// result registers, nonzero maps to the matching `TcpError` variant code
+/// and builds the error container. `dst` always names the container.
+///
+/// Result registers per native (see `docs/tcp-sockets.md` upstream):
+/// `connect`/`accept` return the handle in `rv11`; `write` the byte count in
+/// `rv11`; `close` returns nothing (`E!void` dummy payload); `listen`
+/// returns `(listener, port)` in `rv11`/`rv12`; `read` returns
+/// `(data, eof)` in `rf31`/`rv12` (the byte count equals the string length).
+fn nara_tcp_call(
+    e: &mut NaraEmit,
+    ctx: &NaraFnCtx,
+    dst: vl_lir::Reg,
+    callee: &vl_lir::FunctionRef,
+    args: &[vl_lir::Reg],
+    span: Span,
+) {
+    let Some(import) = ctx.imports.get(callee) else {
+        e.diags.push(
+            Diagnostic::error(format!(
+                "codegen: missing import for `{callee}` (compiler bug)"
+            ))
+            .with_label(span, "call emitted here")
+            .with_code("E500"),
+        );
+        e.invalid.insert(dst);
+        return;
+    };
+    let (param_tys, ret) = (import.param_tys.clone(), import.ret.clone());
+    // Poisoned actuals stay quiet.
+    for arg in args {
+        if e.invalid.contains(arg) {
+            e.invalid.insert(dst);
+            return;
+        }
+    }
+    if args.len() != param_tys.len() {
+        e.diags.push(
+            Diagnostic::error(format!(
+                "codegen: arity mismatch calling `{callee}` (compiler bug)"
+            ))
+            .with_label(span, "call emitted here")
+            .with_code("E500"),
+        );
+        e.invalid.insert(dst);
+        return;
+    }
+    // The import must be the declared fallible shape (`TcpError!T`); anything
+    // else means `modules()` drifted from this emitter.
+    let ok_ty = match &ret {
+        vl_typecheck::Ty::Fallible(f) if f.err.as_deref() == Some(TCP_ERROR_SET) => f.ok.clone(),
+        _ => {
+            e.diags.push(
+                Diagnostic::error(format!(
+                    "codegen: `{callee}` is not a `TcpError!T` import (compiler bug)"
+                ))
+                .with_label(span, "call emitted here")
+                .with_code("E500"),
+            );
+            e.invalid.insert(dst);
+            return;
+        }
+    };
+    let Some(ok_kind) = NaraKind::of_ok(&ok_ty) else {
+        e.diags.push(
+            Diagnostic::error("Naravm backend found a non-runtime TCP payload type")
+                .with_label(span, "call emitted here")
+                .with_code("E500"),
+        );
+        e.invalid.insert(dst);
+        return;
+    };
+    // Move actuals into the native slots, checking lanes against the import.
+    let mut vi = 0u8;
+    let mut ri = 0u8;
+    for (ty, arg) in param_tys.iter().zip(args.iter()) {
+        let Some(kind) = NaraKind::of_ty(ty) else {
+            e.diags.push(
+                Diagnostic::error("Naravm backend found a non-runtime TCP argument type")
+                    .with_label(span, "call emitted here")
+                    .with_code("E500"),
+            );
+            e.invalid.insert(dst);
+            return;
+        };
+        if kind.is_ref() {
+            if kind != NaraKind::String {
+                e.diags.push(
+                    Diagnostic::error("Naravm backend requires a String argument to `std.net.tcp`")
+                        .with_label(span, "unsupported argument")
+                        .with_code("E402"),
+                );
+                e.invalid.insert(dst);
+                return;
+            }
+            let Some(src) = e.rf_map.get(arg).copied() else {
+                e.diags.push(
+                    Diagnostic::error(
+                        "Naravm backend could not resolve a TCP call argument (compiler bug)",
+                    )
+                    .with_label(span, "call emitted here")
+                    .with_code("E500"),
+                );
+                e.invalid.insert(dst);
+                return;
+            };
+            e.bytecode.extend_from_slice(&[0x05, 0x31 + ri, src]); // cprf
+            ri += 1;
+        } else {
+            let Some(src) = e.rv_map.get(arg).copied() else {
+                e.diags.push(
+                    Diagnostic::error(
+                        "Naravm backend could not resolve a TCP call argument (compiler bug)",
+                    )
+                    .with_label(span, "call emitted here")
+                    .with_code("E500"),
+                );
+                e.invalid.insert(dst);
+                return;
+            };
+            e.bytecode.extend_from_slice(&[0x04, 0x11 + vi, src]); // cpv
+            vi += 1;
+        }
+    }
+    let Some(fn_idx) = ctx.imported_fn_consts.get(callee).copied() else {
+        e.diags.push(
+            Diagnostic::error(format!(
+                "codegen: missing function constant for `{callee}` (compiler bug)"
+            ))
+            .with_label(span, "call emitted here")
+            .with_code("E500"),
+        );
+        e.invalid.insert(dst);
+        return;
+    };
+    nara_calli(e, fn_idx, span);
+    if !e.last_use.contains_key(&dst) {
+        // Dead result (e.g. a bare `tcp.close(h);` statement): the call's
+        // side effects stand, but no container is built.
+        e.kinds.insert(dst, NaraKind::Fallible(Box::new(ok_kind)));
+        return;
+    }
+    // Copy the status out of the reserved channel, then split ok/err.
+    let Some(status) = e.fresh_rv(span) else {
+        e.invalid.insert(dst);
+        return;
+    };
+    e.bytecode.extend_from_slice(&[0x04, status, 0x10]); // cpv status, rv10
+    let to_ok = nara_emit_jz(e, status);
+    // Err path: select the variant code for statuses 1-7; anything else the
+    // VM may report in the future surfaces as `IoError`.
+    let (Some(code), Some(sc), Some(tt)) = (e.fresh_rv(span), e.fresh_rv(span), e.fresh_rv(span))
+    else {
+        e.invalid.insert(dst);
+        return;
+    };
+    let mut to_have_code = Vec::with_capacity(TCP_STATUS_VARIANTS.len());
+    for (status_value, variant) in TCP_STATUS_VARIANTS {
+        let (Some(status_idx), Some(code_idx)) = (
+            e.add_value(status_value, span),
+            e.add_value(vl_hir::error_code(TCP_ERROR_SET, variant), span),
+        ) else {
+            e.invalid.insert(dst);
+            return;
+        };
+        let (Ok(status_idx), Ok(code_idx)) = (u8::try_from(status_idx), u8::try_from(code_idx))
+        else {
+            e.diags.push(
+                Diagnostic::error("Naravm constant pool exhausted (compiler bug)")
+                    .with_label(span, "call emitted here")
+                    .with_code("E500"),
+            );
+            e.invalid.insert(dst);
+            return;
+        };
+        e.bytecode.extend_from_slice(&[0x02, sc, status_idx]); // lv
+        e.bytecode.extend_from_slice(&[0x0a, tt, status, sc]); // eq
+        let to_next = nara_emit_jz(e, tt);
+        e.bytecode.extend_from_slice(&[0x02, code, code_idx]); // lv
+        to_have_code.push(nara_emit_jmp(e));
+        if !nara_patch_jump(e, to_next, 4, e.bytecode.len(), span) {
+            e.invalid.insert(dst);
+            return;
+        }
+    }
+    let (_, fallthrough) = TCP_STATUS_VARIANTS
+        .iter()
+        .find(|(_, v)| *v == "IoError")
+        .expect("IoError variant declared");
+    let Some(fallthrough_idx) = e.add_value(vl_hir::error_code(TCP_ERROR_SET, fallthrough), span)
+    else {
+        e.invalid.insert(dst);
+        return;
+    };
+    let Ok(fallthrough_idx) = u8::try_from(fallthrough_idx) else {
+        e.diags.push(
+            Diagnostic::error("Naravm constant pool exhausted (compiler bug)")
+                .with_label(span, "call emitted here")
+                .with_code("E500"),
+        );
+        e.invalid.insert(dst);
+        return;
+    };
+    e.bytecode.extend_from_slice(&[0x02, code, fallthrough_idx]); // lv
+    let have_code = e.bytecode.len();
+    for jmp in to_have_code {
+        if !nara_patch_jump(e, jmp, 3, have_code, span) {
+            e.invalid.insert(dst);
+            return;
+        }
+    }
+    // One container register for both arms: only the taken arm's `createi`
+    // executes, and the join below (plus all later uses of `dst`) sees it.
+    let Some(cont) = e.fresh_rf(span) else {
+        e.invalid.insert(dst);
+        return;
+    };
+    if !nara_fallible_create_into(e, cont, &ok_kind, span) {
+        e.invalid.insert(dst);
+        return;
+    }
+    if !nara_fallible_tag(e, cont, 1, span) {
+        e.invalid.insert(dst);
+        return;
+    }
+    e.bytecode.extend_from_slice(&[0x2d, cont, 1, code]); // setvati (code slot)
+    let to_end_err = nara_emit_jmp(e);
+    // Ok path: collect the result registers into the payload, then wrap.
+    let ok_pos = e.bytecode.len();
+    if !nara_patch_jump(e, to_ok, 4, ok_pos, span) {
+        e.invalid.insert(dst);
+        return;
+    }
+    // Backend temporaries below die at the join; freed together there.
+    let mut temps_rv: Vec<u8> = vec![status, code, sc, tt];
+    let mut temps_rf: Vec<u8> = Vec::new();
+    let ok_built = match callee.function.as_str() {
+        // Single value result in `rv11` (handle or byte count).
+        "connect" | "accept" | "write" => {
+            if ok_kind != NaraKind::U64 {
+                e.diags.push(
+                    Diagnostic::error(format!(
+                        "codegen: `{callee}` payload drifted from `u64` (compiler bug)"
+                    ))
+                    .with_label(span, "call emitted here")
+                    .with_code("E500"),
+                );
+                e.invalid.insert(dst);
+                return;
+            }
+            let Some(payload) = e.fresh_rv(span) else {
+                e.invalid.insert(dst);
+                return;
+            };
+            e.bytecode.extend_from_slice(&[0x04, payload, 0x11]); // cpv
+            temps_rv.push(payload);
+            nara_tcp_wrap_ok(e, dst, cont, payload, &ok_kind, span)
+        }
+        // No result (`E!void` keeps its dummy value lane).
+        "close" => {
+            if ok_ty != vl_typecheck::Ty::Void {
+                e.diags.push(
+                    Diagnostic::error(format!(
+                        "codegen: `{callee}` payload drifted from `void` (compiler bug)"
+                    ))
+                    .with_label(span, "call emitted here")
+                    .with_code("E500"),
+                );
+                e.invalid.insert(dst);
+                return;
+            }
+            let Some(zero) = e.ensure_zero(span) else {
+                e.invalid.insert(dst);
+                return;
+            };
+            nara_tcp_wrap_ok(e, dst, cont, zero, &ok_kind, span)
+        }
+        // `(listener, port)` in `rv11`/`rv12`.
+        "listen" => nara_tcp_wrap_tuple(
+            e,
+            dst,
+            cont,
+            callee,
+            span,
+            &[(false, 0x11), (false, 0x12)],
+            &ok_ty,
+            &ok_kind,
+            &mut temps_rv,
+            &mut temps_rf,
+        ),
+        // `(data, eof)` in `rf31`/`rv12` (count equals the string length).
+        "read" => nara_tcp_wrap_tuple(
+            e,
+            dst,
+            cont,
+            callee,
+            span,
+            &[(true, 0x31), (false, 0x12)],
+            &ok_ty,
+            &ok_kind,
+            &mut temps_rv,
+            &mut temps_rf,
+        ),
+        _ => {
+            e.diags.push(
+                Diagnostic::error(format!(
+                    "Naravm backend does not support call `{callee}` yet"
+                ))
+                .with_label(span, "unsupported call")
+                .with_code("E404"),
+            );
+            e.invalid.insert(dst);
+            return;
+        }
+    };
+    if !ok_built {
+        e.invalid.insert(dst);
+        return;
+    }
+    let end_pos = e.bytecode.len();
+    if !nara_patch_jump(e, to_end_err, 3, end_pos, span) {
+        e.invalid.insert(dst);
+        return;
+    }
+    for rv in temps_rv {
+        e.free_rv.push(rv);
+    }
+    for rf in temps_rf {
+        e.free_rf.push(rf);
+    }
+}
+
+/// Wrap one value-reg payload into the `dst` fallible container (tag 0),
+/// building into the pre-reserved `cont` register shared with the error arm.
+fn nara_tcp_wrap_ok(
+    e: &mut NaraEmit,
+    dst: vl_lir::Reg,
+    cont: u8,
+    payload: u8,
+    ok_kind: &NaraKind,
+    span: Span,
+) -> bool {
+    if !(nara_fallible_create_into(e, cont, ok_kind, span)
+        && nara_fallible_tag(e, cont, 0, span)
+        && nara_fallible_store(e, cont, payload, ok_kind, span))
+    {
+        return false;
+    }
+    e.rf_map.insert(dst, cont);
+    e.kinds
+        .insert(dst, NaraKind::Fallible(Box::new(ok_kind.clone())));
+    true
+}
+
+/// Build a 2-tuple payload from fixed result registers, then wrap it into
+/// the `dst` fallible container (tag 0), building into the pre-reserved
+/// `cont` register shared with the error arm. `elems` is `(is_ref,
+/// machine_reg)` per tuple position in order; the declared tuple shape is
+/// validated against the import so `modules()` cannot drift from this
+/// emitter.
+#[allow(clippy::too_many_arguments)]
+fn nara_tcp_wrap_tuple(
+    e: &mut NaraEmit,
+    dst: vl_lir::Reg,
+    cont: u8,
+    callee: &vl_lir::FunctionRef,
+    span: Span,
+    elems: &[(bool, u8)],
+    ok_ty: &vl_typecheck::Ty,
+    ok_kind: &NaraKind,
+    temps_rv: &mut Vec<u8>,
+    temps_rf: &mut Vec<u8>,
+) -> bool {
+    let fields = match ok_ty {
+        vl_typecheck::Ty::Tuple(fields) if fields.len() == elems.len() => fields.clone(),
+        _ => {
+            e.diags.push(
+                Diagnostic::error(format!(
+                    "codegen: `{callee}` payload drifted from its 2-tuple (compiler bug)"
+                ))
+                .with_label(span, "call emitted here")
+                .with_code("E500"),
+            );
+            return false;
+        }
+    };
+    let mut kinds = Vec::with_capacity(fields.len());
+    for (_, ty) in &fields {
+        let Some(kind) = NaraKind::of_ty(ty) else {
+            e.diags.push(
+                Diagnostic::error("Naravm backend found a non-runtime TCP payload type")
+                    .with_label(span, "call emitted here")
+                    .with_code("E500"),
+            );
+            return false;
+        };
+        kinds.push(kind);
+    }
+    let (values, refs) = tuple_lanes(&kinds);
+    if values > u8::MAX as usize || refs > u8::MAX as usize {
+        e.diags.push(
+            Diagnostic::error("Naravm TCP tuple has more than 255 elements in one register lane")
+                .with_label(span, "call emitted here")
+                .with_code("E404"),
+        );
+        return false;
+    }
+    let Some(tup) = e.fresh_rf(span) else {
+        return false;
+    };
+    e.bytecode
+        .extend_from_slice(&[0x27, tup, values as u8, refs as u8]); // createi
+    for (i, (want_ref, src)) in elems.iter().enumerate() {
+        let Some((is_ref, slot)) = tuple_slot(&kinds, i) else {
+            return false;
+        };
+        if is_ref != *want_ref {
+            e.diags.push(
+                Diagnostic::error(format!(
+                    "codegen: `{callee}` result lane drifted from its tuple (compiler bug)"
+                ))
+                .with_label(span, "call emitted here")
+                .with_code("E500"),
+            );
+            return false;
+        }
+        let Ok(slot) = u8::try_from(slot) else {
+            e.diags.push(
+                Diagnostic::error("Naravm tuple slot is out of range (compiler bug)")
+                    .with_label(span, "call emitted here")
+                    .with_code("E500"),
+            );
+            return false;
+        };
+        if is_ref {
+            let Some(tmp) = e.fresh_rf(span) else {
+                return false;
+            };
+            e.bytecode.extend_from_slice(&[0x05, tmp, *src]); // cprf
+            e.bytecode.extend_from_slice(&[0x2f, tup, slot, tmp]); // setrfati
+            temps_rf.push(tmp);
+        } else {
+            let Some(tmp) = e.fresh_rv(span) else {
+                return false;
+            };
+            e.bytecode.extend_from_slice(&[0x04, tmp, *src]); // cpv
+            e.bytecode.extend_from_slice(&[0x2d, tup, slot, tmp]); // setvati
+            temps_rv.push(tmp);
+        }
+    }
+    temps_rf.push(tup);
+    let tuple_kind = NaraKind::Tuple(kinds);
+    if tuple_kind != *ok_kind {
+        e.diags.push(
+            Diagnostic::error(format!(
+                "codegen: `{callee}` payload kind drifted from its tuple (compiler bug)"
+            ))
+            .with_label(span, "call emitted here")
+            .with_code("E500"),
+        );
+        return false;
+    }
+    nara_tcp_wrap_ok(e, dst, cont, tup, ok_kind, span)
+}
+
 /// Call a user function: spill live caller registers (the register file is
 /// VM-global, shared across frames), move actuals into the callee's param
 /// slots, `calli`, copy the return out, then restore the spills.
@@ -3700,7 +4342,7 @@ fn nara_user_call(
             ))
             .with_label(span, "unsupported call")
             .with_note(
-                "only `std.print`, `std.println`, `std.print_u64`, the `std.string`/`std.math`/`std.fmt` natives, and user functions lower to Naravm calls",
+                "only `std.print`, `std.println`, `std.print_u64`, the `std.string`/`std.math`/`std.fmt`/`std.net.tcp` natives, and user functions lower to Naravm calls",
             )
             .with_code("E404"),
         );
@@ -4857,6 +5499,178 @@ fun main() {
         assert!(
             diags.iter().any(|d| d.code.as_deref() == Some("E500")),
             "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn tcp_module_declares_fallible_externs_and_error_set() {
+        let catalog = modules();
+        let tcp = catalog
+            .iter()
+            .find(|m| m.path.as_string() == "std.net.tcp")
+            .expect("std.net.tcp in modules()");
+        assert_eq!(
+            tcp.export_names().collect::<Vec<_>>(),
+            vec!["connect", "listen", "accept", "read", "write", "close"],
+        );
+        let set = tcp.lookup_error("TcpError").expect("TcpError set");
+        assert_eq!(set.qualified, TCP_ERROR_SET);
+        assert_eq!(
+            set.variants,
+            TCP_STATUS_VARIANTS
+                .iter()
+                .map(|(_, v)| (*v).to_string())
+                .collect::<Vec<_>>(),
+        );
+        // Every export returns the named fallible (never a bare status).
+        for export in &tcp.exports {
+            match &export.sig.ret {
+                vl_common::VlType::Fallible { err, .. } => {
+                    assert_eq!(err.as_deref(), Some(TCP_ERROR_SET), "{}", export.name)
+                }
+                other => panic!("{} returns {other:?}, want TcpError!T", export.name),
+            }
+        }
+        // The naravm target keeps TCP (only `std.fs` is filtered); the
+        // broad catalog and the target view agree on the surface.
+        let target = modules_for_target("naravm");
+        let target_tcp = target
+            .iter()
+            .find(|m| m.path.as_string() == "std.net.tcp")
+            .expect("std.net.tcp emittable on naravm");
+        assert_eq!(target_tcp.exports.len(), tcp.exports.len());
+    }
+
+    #[test]
+    fn tcp_status_codes_map_to_distinct_variant_hashes() {
+        // The emitter's status dispatch is a 1-1 loop over this table, so
+        // the codes must be unambiguous inputs with unambiguous outputs.
+        let mut statuses = std::collections::HashSet::new();
+        let mut hashes = std::collections::HashSet::new();
+        for (status, variant) in TCP_STATUS_VARIANTS {
+            assert!(statuses.insert(status), "duplicate status {status}");
+            let hash = vl_hir::error_code(TCP_ERROR_SET, variant);
+            assert_ne!(hash, 0, "{variant} must not collide with success");
+            assert!(hashes.insert(hash), "duplicate code for {variant}");
+        }
+    }
+
+    /// Hand-built `call std.net.tcp::connect` (value payload) plus
+    /// `call std.net.tcp::read` (tuple payload with a reference lane):
+    /// the backend checks `rv10`, wraps ok/err containers, and intern the
+    /// native spelling. Real sources cover the rest in `tests/pipeline.rs`.
+    fn tcp_test_lir(callee: &str, param_tys: Vec<vl_typecheck::Ty>) -> LirProgram {
+        use vl_common::Span;
+        use vl_lir::{Function, FunctionImport, FunctionRef, Instr, LirProgram, Reg};
+        let ret = modules()
+            .into_iter()
+            .find(|m| m.path.as_string() == "std.net.tcp")
+            .and_then(|m| m.lookup(callee).map(|e| e.sig.ret.clone()))
+            .expect("tcp export");
+        let ret = vl_typecheck::Ty::from_vl(&ret);
+        let symbol = FunctionRef {
+            module: "std.net.tcp".into(),
+            function: callee.into(),
+        };
+        let mut instrs = Vec::new();
+        let mut args = Vec::new();
+        for (i, ty) in param_tys.iter().enumerate() {
+            let dst = Reg(i as u32);
+            match NaraKind::of_ty(ty).is_some_and(|k| k.is_ref()) {
+                true => instrs.push(Instr::StringConst {
+                    dst,
+                    value: b"h".to_vec(),
+                    span: Span::empty(0),
+                }),
+                false => instrs.push(Instr::Const {
+                    dst,
+                    value: vl_common::Scalar::U64(1),
+                    span: Span::empty(0),
+                }),
+            }
+            args.push(dst);
+        }
+        let dst = Reg(args.len() as u32);
+        instrs.push(Instr::Call {
+            dst,
+            callee: symbol.clone(),
+            args,
+            span: Span::empty(0),
+        });
+        instrs.push(Instr::Ret {
+            src: dst,
+            span: Span::empty(0),
+        });
+        LirProgram {
+            module: "t".into(),
+            entrypoint: false,
+            entrypoint_module: None,
+            objects: vec![],
+            globals: vec![],
+            imports: vec![FunctionImport {
+                symbol,
+                param_tys,
+                ret,
+            }],
+            functions: vec![Function {
+                name: "main".into(),
+                param_tys: vec![],
+                ret: vl_typecheck::Ty::Void,
+                instrs,
+            }],
+        }
+    }
+
+    #[test]
+    fn naravm_emits_checked_tcp_calls_with_status_dispatch() {
+        // `connect` exercises the value-payload arm, `read` the tuple arm
+        // with a reference element (`setrfati` 0x2f).
+        for (callee, params) in [
+            (
+                "connect",
+                vec![vl_typecheck::Ty::String, vl_typecheck::Ty::U64],
+            ),
+            ("read", vec![vl_typecheck::Ty::U64, vl_typecheck::Ty::U64]),
+        ] {
+            let lir = tcp_test_lir(callee, params);
+            let (artifact, diags) = NaraVmTarget.emit(&lir);
+            assert!(diags.is_empty(), "{callee}: {diags:?}");
+            let bytes = artifact.unwrap().bytes.unwrap();
+            assert_eq!(&bytes[..4], b"nara");
+            // calli, status-branch (jz), err-arm joins (jmp), status
+            // compares (eq), ok/err containers (createi/setvati).
+            for op in [0x20u8, 0x24, 0x22, 0x0a, 0x27, 0x2d] {
+                assert!(bytes.contains(&op), "{callee}: no {op:#x} in {bytes:?}");
+            }
+            // Native spelling (not the dotted VL spelling).
+            assert!(
+                bytes
+                    .windows(b"std::net::tcp".len())
+                    .any(|w| w == b"std::net::tcp"),
+                "{callee}: native module missing"
+            );
+            // Every status input and every variant output is interned.
+            for status in 1u64..=7 {
+                assert!(
+                    bytes.windows(8).any(|w| w == status.to_be_bytes()),
+                    "{callee}: status {status} missing"
+                );
+            }
+            for (_, variant) in TCP_STATUS_VARIANTS {
+                let hash = vl_hir::error_code(TCP_ERROR_SET, variant);
+                assert!(
+                    bytes.windows(8).any(|w| w == hash.to_be_bytes()),
+                    "{callee}: code for {variant} missing"
+                );
+            }
+        }
+        // The tuple arm moves a reference result (`setrfati` 0x2f).
+        let lir = tcp_test_lir("read", vec![vl_typecheck::Ty::U64, vl_typecheck::Ty::U64]);
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(
+            artifact.unwrap().bytes.unwrap().contains(&0x2f),
+            "no setrfati for the read data lane"
         );
     }
 }
