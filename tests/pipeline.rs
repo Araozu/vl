@@ -459,6 +459,84 @@ fn extern_call_arity_is_checked() {
 }
 
 #[test]
+fn tcp_example_compiles_to_checked_vmfile() {
+    // End to end through the real example: fallible TCP calls lower to
+    // checked native calls (`std.net.tcp::connect`, not the dotted VL
+    // spelling) and emit an executable vmfile.
+    let src = std::fs::read_to_string("examples/tcp.vl").unwrap();
+    let lir = frontend(&src).expect("tcp.vl must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("call std.net.tcp::connect"), "{dump}");
+    assert!(dump.contains("call std.net.tcp::read"), "{dump}");
+    assert!(dump.contains("call std.net.tcp::write"), "{dump}");
+    assert!(dump.contains("call std.net.tcp::close"), "{dump}");
+    assert!(!dump.contains("call std.net.tcp.connect"), "{dump}");
+
+    use vl_codegen::Target;
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+    assert!(
+        bytes
+            .windows(b"std::net::tcp".len())
+            .any(|w| w == b"std::net::tcp"),
+        "native module missing"
+    );
+    // Status dispatch needs both jump forms; the error arms wrap codes.
+    assert!(bytes.contains(&0x20), "no calli in {bytes:?}");
+    assert!(bytes.contains(&0x24), "no jz in {bytes:?}");
+}
+
+#[test]
+fn tcp_try_propagates_the_named_set() {
+    // The externs' qualified `TcpError!T` unifies with an importer-spelled
+    // `TcpError!T` annotation, so `try` propagates across the boundary.
+    let lir = frontend(
+        "use std.net.tcp; use std.net.tcp.{TcpError}; fun f(s: u64): TcpError!u64 { return try tcp.accept(s); } fun main() { val x = f(1u64) catch 0u64; x; }",
+    )
+    .expect("named try over a tcp call must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("call std.net.tcp::accept"), "{dump}");
+}
+
+#[test]
+fn tcp_listen_and_read_return_destructurable_pairs() {
+    let lir = frontend(
+        "use std.net.tcp; fun main() { val #(l, port) = tcp.listen(\"\", 0u64, 8u64) catch #(0u64, 0u64); val #(data, eof) = tcp.read(l, 8u64) catch #(\"e\", true); l; port; data; eof; }",
+    )
+    .expect("tcp pairs must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("call std.net.tcp::listen"), "{dump}");
+    assert!(dump.contains("call std.net.tcp::read"), "{dump}");
+
+    use vl_codegen::Target;
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+}
+
+#[test]
+fn tcp_arg_types_are_checked() {
+    let err = frontend("use std.net.tcp; fun main() { tcp.connect(1u64, 2u64); }")
+        .expect_err("connect expects a String host");
+    assert!(
+        err.iter().any(|d| d.message.contains("expects `String`")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn unknown_tcp_export_is_a_single_error() {
+    // Same shape as a misspelled thin extern: the module resolves, the
+    // export does not, and exactly one root diagnostic stays quiet
+    // downstream.
+    let err = frontend("use std.net.tcp; fun main() { tcp.bogus(1u64); }")
+        .expect_err("unknown tcp export must fail");
+    assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1, "{err:?}");
+}
+
+#[test]
 fn while_countdown_lowers_to_jumps_copies_and_runs_on_naravm() {
     let src = std::fs::read_to_string("examples/cond_loop.vl").unwrap();
     let lir = frontend(&src).expect("cond_loop.vl must compile");

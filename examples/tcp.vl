@@ -1,0 +1,36 @@
+// TCP sockets (`std.net.tcp`): a blocking client over the VM's native
+// `std::net::tcp` module.
+//
+// Every call returns `TcpError!T`: the native `rv10` status becomes a typed
+// error (`InvalidArgument`, `IoError`, `InvalidHandle`, `WrongHandleKind`,
+// `TooManyHandles`, `OutOfMemory`, `CapabilityUnavailable`) and the result
+// registers become the ok payload. Handles are opaque `u64` values.
+// `listen` and `read` return pairs; `close` returns `E!void`. Fallible
+// functions compose with `try`; `catch` handles errors inline.
+//
+// Needs a native host (freestanding WASM does not register this module).
+// Run a loopback server first, e.g. `python3 -c
+// "import socket; s = socket.create_server(('127.0.0.1', 18923)); c, _ =
+// s.accept(); print(c.recv(64)); c.sendall(b'world')"`, then build and run
+// this. Without a server every step reports through `catch`.
+use std;
+use std.net.tcp;
+use std.net.tcp.{TcpError};
+
+fun fetch(sock: u64): TcpError!String {
+    val n = try tcp.write(sock, "hello");
+    n;
+    val #(data, eof) = try tcp.read(sock, 64u64);
+    eof;
+    return data;
+}
+
+fun main() {
+    val sock = tcp.connect("127.0.0.1", 18923u64) catch 0u64;
+    if (sock == 0u64) {
+        std.print("no server: connect failed\n");
+    } else {
+        std.print(fetch(sock) catch "fetch failed\n");
+        tcp.close(sock) catch std.print("close failed\n");
+    }
+}

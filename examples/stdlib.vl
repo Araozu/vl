@@ -1,11 +1,13 @@
 // Standard library v1: VM natives plus VL helpers in real modules.
 //
 // Thin externs (`std.string`, `std.math`, `std.fmt`) map to natives the VM
-// already registers; helpers (`math.max_u64`, `string.is_empty`, ...,
+// already registers; `std.net.tcp` maps to the fallible `std::net::tcp`
+// natives, whose `rv10` statuses lower to typed `TcpError!T` values (see
+// `examples/tcp.vl`). Helpers (`math.max_u64`, `string.is_empty`, ...,
 // plus the generic `math.max[T extends Numeric]`) live in embedded `std/*.vl`
 // sources merged into the same module view and linked inline. Everything
-// needs an explicit `use`. Fallible natives (`byte_at`, `slice`) and `std.fs`
-// stay out until VL has an error story.
+// needs an explicit `use`. Untyped fallible natives (`byte_at`, `slice`)
+// and `std.fs` stay out until they get the same checked treatment.
 use std;
 use std.string;
 use std.math;
