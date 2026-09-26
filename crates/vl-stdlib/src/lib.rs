@@ -907,7 +907,8 @@ mod tests {
         let (res, mut d) = vl_semantic::resolve_with_modules(&prog, &catalog);
         diags.append(&mut d);
         let hir = vl_hir::lower(&prog, &res);
-        let (typed, mut d) = vl_typecheck::check(&hir);
+        // Same merged catalog as resolution, like the driver.
+        let (typed, mut d) = vl_typecheck::check_with_modules(&hir, &catalog);
         diags.append(&mut d);
         diags.append(&mut typed.validate_normalized(&hir, &diags));
         assert!(diags.is_empty(), "{diags:?}");

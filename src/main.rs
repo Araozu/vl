@@ -538,7 +538,12 @@ fn run_frontend_check(
         }
     }
     let hir = vl_hir::lower(&ast, &res);
-    let (typed, mut d) = vl_typecheck::check(&hir);
+    // Check against the same merged catalog resolution used, so nominal
+    // types imported from target modules (e.g. `TcpError` from
+    // `std.net.tcp`) validate like local ones. Previously this was a bare
+    // `check` (empty tables), which only worked because no target module
+    // exported nominal types.
+    let (typed, mut d) = vl_typecheck::check_with_modules(&hir, &catalog);
     diags.append(&mut d);
     if !res.poisoned_imports {
         diags.append(&mut typed.validate_normalized(&hir, &diags));
@@ -623,7 +628,9 @@ fn run_frontend(
         }
     }
     let hir = vl_hir::lower(&ast, &res);
-    let (typed, mut d) = vl_typecheck::check(&hir);
+    // Same merged catalog as resolution (see `run_frontend_check`): nominal
+    // types imported from target modules validate like local ones.
+    let (typed, mut d) = vl_typecheck::check_with_modules(&hir, &catalog);
     diags.append(&mut d);
     // Boundary guard: no unresolved `int`/`Param`/nested-`Error` type may
     // reach lowering without a diagnostic. E500s here are compiler bugs.

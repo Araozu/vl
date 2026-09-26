@@ -13,7 +13,9 @@ fn frontend(src: &str) -> Result<vl_lir::LirProgram, Vec<vl_common::Diagnostic>>
     let (res, mut d) = vl_semantic::resolve_with_modules(&ast, &catalog);
     diags.append(&mut d);
     let hir = vl_hir::lower(&ast, &res);
-    let (typed, mut d) = vl_typecheck::check(&hir);
+    // Same merged catalog as resolution, like the driver: nominal types
+    // imported from target modules validate here too.
+    let (typed, mut d) = vl_typecheck::check_with_modules(&hir, &catalog);
     diags.append(&mut d);
     // Same boundary guard as the driver: no unresolved type reaches LIR.
     diags.append(&mut typed.validate_normalized(&hir, &diags));
