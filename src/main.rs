@@ -50,6 +50,15 @@ enum Cmd {
     Run { name: Option<String> },
     /// List available codegen backends.
     Targets,
+    /// Format `.vl` files in place (zig fmt style, non-overridable defaults).
+    Fmt {
+        /// Files or directories to format (directories recurse for `.vl`).
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Report files that would change without writing them.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -776,6 +785,7 @@ fn main() -> ExitCode {
             None => build_project(&target, emit, out.as_ref()),
         },
         Cmd::Run { name } => run_project_script(name.as_deref()),
+        Cmd::Fmt { paths, check } => fmt_paths(&paths, check),
         Cmd::Targets => {
             let mut output = String::new();
             for t in vl_codegen::all_targets() {
@@ -1545,6 +1555,81 @@ fn check_project(project: &Project) -> ExitCode {
         failed = true;
     }
     if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Collect `.vl` files from `paths` (files directly, directories
+/// recursively), for `vl fmt`. Errors on missing paths and non-`.vl` files.
+fn collect_fmt_files(paths: &[PathBuf], files: &mut Vec<PathBuf>) -> Result<(), String> {
+    for path in paths {
+        let meta = fs::symlink_metadata(path)
+            .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+        if meta.is_dir() {
+            collect_vl_files(path, files)?;
+        } else if meta.is_file() && path.extension().is_some_and(|ext| ext == "vl") {
+            files.push(path.clone());
+        } else {
+            return Err(format!(
+                "cannot format {}: not a `.vl` file",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `vl fmt`: rewrite files canonically, or with `--check` only report the
+/// ones that would change. Files with lex/parse errors are reported (exit 1)
+/// and left untouched.
+fn fmt_paths(paths: &[PathBuf], check: bool) -> ExitCode {
+    let mut files = Vec::new();
+    if let Err(message) = collect_fmt_files(paths, &mut files) {
+        emit_driver_error(&message, "E600");
+        return ExitCode::from(2);
+    }
+    files.sort();
+    if files.is_empty() {
+        emit_driver_error("no `.vl` files to format", "E600");
+        return ExitCode::from(2);
+    }
+    let mut failed = false;
+    let mut dirty = Vec::new();
+    for file in &files {
+        let (name, text) = match read_input(file) {
+            Ok(v) => v,
+            Err(e) => {
+                emit_driver_error(&e, "E600");
+                failed = true;
+                continue;
+            }
+        };
+        let module = source_module(file);
+        match vl_fmt::format(&text, &module) {
+            Ok(formatted) => {
+                if formatted != text {
+                    if check {
+                        dirty.push(name);
+                    } else if let Err(e) = fs::write(file, formatted) {
+                        emit_driver_error(&format!("cannot write {}: {e}", file.display()), "E601");
+                        failed = true;
+                    }
+                }
+            }
+            Err(diags) => {
+                emit_all(&diags, &name, &text);
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        ExitCode::from(1)
+    } else if check && !dirty.is_empty() {
+        for name in &dirty {
+            println!("would reformat: {name}");
+        }
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
