@@ -109,6 +109,7 @@ cargo run -- check examples/err_undefined.vl
 | `cargo check --workspace --all-targets` | fast typecheck |
 | `cargo clippy --workspace --all-targets -- -D warnings` | lints, deny warnings |
 | `cargo fmt --all -- --check` | formatting gate |
+| `vl fmt <files...> [--check]` | VL formatter (zig fmt style: 4 spaces, trailing-comma steering, `else` on its own line; non-overridable, fails on parse errors) |
 
 Golden tests: `tests/pipeline.rs` compiles `examples/*.vl` and diffs
 `examples/arith.vl` against `tests/golden/arith.lir`. Regenerate a golden

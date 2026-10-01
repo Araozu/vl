@@ -6,6 +6,11 @@ cd "$(dirname "$0")/.."
 echo "== fmt =="
 cargo fmt --all -- --check
 
+echo "== vl fmt =="
+# err_syntax.vl is intentionally unparseable; `vl fmt` refuses it by design.
+# shellcheck disable=SC2086
+cargo run -q -- fmt $(ls examples/*.vl crates/vl-stdlib/src/std/*.vl | grep -v 'examples/err_syntax.vl') --check
+
 echo "== check =="
 cargo check --workspace --all-targets
 
