@@ -115,6 +115,9 @@
 //! expression statement ends with `;` (no bare trailing value like Rust).
 //! There are no implicit returns: a function yields a value only through an
 //! explicit `return expr;` (`return;` for `void`).
+//! Every `,`-separated list in the grammar above allows one trailing comma
+//! (trailing commas steer `vl fmt` layout), except union/error payloads
+//! (`A(T, U)`), which forbid it.
 //! Function boundaries are typed: every param needs `: type`; the return
 //! type may be omitted and defaults to `void`.
 //!
@@ -1248,6 +1251,10 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 self.bump();
+                // Allow one trailing comma: `use m.{a, b,}`.
+                if matches!(self.peek().kind, TokenKind::RBrace) {
+                    break;
+                }
             }
             self.expect(&TokenKind::RBrace, "`}` after imported names")?;
             Some(names)
@@ -1846,6 +1853,10 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.bump();
+            // Allow one trailing comma: `Option[u64,]`, steered by `vl-fmt`.
+            if matches!(self.peek().kind, TokenKind::RBracket) {
+                break;
+            }
         }
         let close = self.expect(&TokenKind::RBracket, "`]` after union type arguments")?;
         let span = Span::new(head_span.start, close.span.end);
@@ -2356,6 +2367,10 @@ impl<'a> Parser<'a> {
             match &self.peek().kind {
                 TokenKind::Comma => {
                     self.bump();
+                    // Allow one trailing comma: `fun f[T,]`, steered by `vl-fmt`.
+                    if matches!(self.peek().kind, TokenKind::RBracket) {
+                        break;
+                    }
                 }
                 _ => break,
             }
@@ -2433,6 +2448,10 @@ impl<'a> Parser<'a> {
                 match &self.peek().kind {
                     TokenKind::Comma => {
                         self.bump();
+                        // Allow one trailing comma: `fun f(a: u64,)`, steered by `vl-fmt`.
+                        if matches!(self.peek().kind, TokenKind::RParen) {
+                            break;
+                        }
                     }
                     _ => break,
                 }
@@ -3235,6 +3254,10 @@ impl<'a> Parser<'a> {
             match &self.peek().kind {
                 TokenKind::Comma => {
                     self.bump();
+                    // Allow one trailing comma: `f::[u64,]`, steered by `vl-fmt`.
+                    if matches!(self.peek().kind, TokenKind::RBracket) {
+                        break;
+                    }
                 }
                 _ => break,
             }
@@ -3307,6 +3330,10 @@ impl<'a> Parser<'a> {
                             match &self.peek().kind {
                                 TokenKind::Comma => {
                                     self.bump();
+                                    // Allow one trailing comma: `f(a,)`, steered by `vl-fmt`.
+                                    if matches!(self.peek().kind, TokenKind::RParen) {
+                                        break;
+                                    }
                                 }
                                 _ => break,
                             }
