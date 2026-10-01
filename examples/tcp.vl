@@ -28,7 +28,8 @@ fun main() {
     val sock = tcp.connect("127.0.0.1", 18923u64) catch 0u64;
     if (sock == 0u64) {
         std.print("no server: connect failed\n");
-    } else {
+    }
+    else {
         std.print(fetch(sock) catch "fetch failed\n");
         tcp.close(sock) catch std.print("close failed\n");
     }

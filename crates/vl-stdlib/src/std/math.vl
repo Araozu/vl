@@ -6,7 +6,8 @@ use std.math;
 fun max_u64(a: u64, b: u64): u64 {
     if (a > b) {
         return a;
-    } else {
+    }
+    else {
         return b;
     }
 }
@@ -14,7 +15,8 @@ fun max_u64(a: u64, b: u64): u64 {
 fun min_u64(a: u64, b: u64): u64 {
     if (a < b) {
         return a;
-    } else {
+    }
+    else {
         return b;
     }
 }
@@ -26,7 +28,8 @@ fun clamp_u64(v: u64, lo: u64, hi: u64): u64 {
 fun max_i64(a: i64, b: i64): i64 {
     if (a > b) {
         return a;
-    } else {
+    }
+    else {
         return b;
     }
 }
@@ -34,7 +37,8 @@ fun max_i64(a: i64, b: i64): i64 {
 fun min_i64(a: i64, b: i64): i64 {
     if (a < b) {
         return a;
-    } else {
+    }
+    else {
         return b;
     }
 }
@@ -42,7 +46,8 @@ fun min_i64(a: i64, b: i64): i64 {
 fun abs_i64(a: i64): i64 {
     if (a < 0i64) {
         return 0i64 - a;
-    } else {
+    }
+    else {
         return a;
     }
 }
@@ -57,7 +62,8 @@ fun is_even(v: u64): bool {
 fun max[T extends Numeric](a: T, b: T): T {
     if (a > b) {
         return a;
-    } else {
+    }
+    else {
         return b;
     }
 }

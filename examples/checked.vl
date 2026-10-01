@@ -20,9 +20,15 @@ fun main() {
     std.print(string.slice("hello", 1u64, 4u64) catch "fallback");
     std.print("\n");
     match (string.slice("hello", 9u64, 10u64)) {
-        std.string.StringError.OutOfBounds { std.print("oob\n"); }
-        std.string.StringError.InvalidRange { std.print("range\n"); }
-        else { std.print("ok\n"); }
+        std.string.StringError.OutOfBounds {
+            std.print("oob\n");
+        }
+        std.string.StringError.InvalidRange {
+            std.print("range\n");
+        }
+        else {
+            std.print("ok\n");
+        }
     }
     std.print(fs.read_file("data.txt") catch "no-file");
 }

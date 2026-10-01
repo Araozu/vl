@@ -1,7 +1,10 @@
 // Variant construction with the wrong payload arity: `B` takes one value.
-type U = union { A, B(u64), };
+type U = union {
+    A,
+    B(u64),
+};
 
 fun main() {
-  val u = U.B(1u64, 2u64);
-  u;
+    val u = U.B(1u64, 2u64);
+    u;
 }

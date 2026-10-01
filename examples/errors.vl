@@ -11,7 +11,11 @@
 // value plus unlisted variants. `E!void` marks fallible side effects.
 use std;
 
-type Io = error { NotFound, Denied, Missing(String), };
+type Io = error {
+    NotFound,
+    Denied,
+    Missing(String),
+};
 
 fun read_byte(ok: bool): Io!u64 {
     if (ok) {
@@ -45,13 +49,23 @@ fun main() {
     deny() catch std.print("denied\n");
     val e: Io = Io.NotFound;
     match (e) {
-        Io.NotFound { std.print("not-found\n"); }
-        Io.Denied { std.print("denied\n"); }
-        Io.Missing { std.print("missing\n"); }
+        Io.NotFound {
+            std.print("not-found\n");
+        }
+        Io.Denied {
+            std.print("denied\n");
+        }
+        Io.Missing {
+            std.print("missing\n");
+        }
     }
     match (load(true)) {
-        Io.Missing(path) { std.print(path); }
-        else { std.print("loaded\n"); }
+        Io.Missing(path) {
+            std.print(path);
+        }
+        else {
+            std.print("loaded\n");
+        }
     }
     std.print(load(false) catch "fallback");
 }

@@ -7,7 +7,8 @@ fun main() {
     while (i > 0) {
         if (i == 3) {
             std.print("three\n");
-        } else {
+        }
+        else {
             std.print_u64(i);
         }
         i = i - 1;

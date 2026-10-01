@@ -1,7 +1,9 @@
 // Payloads only survive inside fallible values: a plain `Io` holds just
 // the error code, so constructing `Io.Missing` with arguments here is one
 // E303 (annotate `Io!u64` to keep the payload).
-type Io = error { Missing(String), };
+type Io = error {
+    Missing(String),
+};
 
 fun main() {
     val x: Io = Io.Missing("gone");

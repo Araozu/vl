@@ -1,5 +1,5 @@
 // Tuple index out of range.
 fun main() {
-  val t = #(1u64, "a");
-  val x = t.`5;
+    val t = #(1u64, "a");
+    val x = t.`5;
 }

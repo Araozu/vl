@@ -1,6 +1,8 @@
 // Error payload arity is checked like union variants: `Missing` takes one
 // `String`, so zero arguments is one E303.
-type Io = error { Missing(String), };
+type Io = error {
+    Missing(String),
+};
 
 fun main() {
     val x: Io!u64 = Io.Missing;

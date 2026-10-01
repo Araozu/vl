@@ -20,7 +20,8 @@ fun main() {
     val ok = eq(add(1u64, 2u64), 3u64);
     if (ok) {
         std.print("bounded ok\n");
-    } else {
+    }
+    else {
         std.print("bounded mismatch\n");
     }
 }
