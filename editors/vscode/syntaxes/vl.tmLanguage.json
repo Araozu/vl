@@ -91,7 +91,7 @@
         },
         {
           "name": "keyword.other.vl",
-          "match": "\\b(?:use|as|extends|object|error)\\b"
+          "match": "\\b(?:use|as|extends|object|union|error|match|self)\\b"
         }
       ]
     },
@@ -143,7 +143,7 @@
       "patterns": [
         {
           "name": "keyword.operator.vl",
-          "match": "==|!=|<=|>=|&&|\\|\\||::|[+\\-*/=!<>?]"
+          "match": "==|!=|<=|>=|&&|\\|\\||::|[+\\-*/=!<>?#`]"
         }
       ]
     }

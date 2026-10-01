@@ -359,3 +359,297 @@ fun main() {
                 (path
                   (identifier)
                   (identifier))))))))))
+
+===============================
+unions, error sets, try/catch
+===============================
+
+type Option[T] = union {
+  None,
+  Some(T),
+};
+
+type Io = error {
+  NotFound,
+  Missing(String),
+};
+
+fun f(ok: bool): Io!u64 {
+  val x = try g(ok);
+  return x catch 0u64;
+}
+
+---
+
+(source_file
+  (type_declaration
+    name: (type_identifier)
+    (type_parameters
+      (type_parameter
+        name: (type_identifier)))
+    body: (union_type
+      (union_variant
+        name: (type_identifier))
+      (union_variant
+        name: (type_identifier)
+        (type
+          (type_atom
+            (type_identifier))))))
+  (type_declaration
+    name: (type_identifier)
+    body: (error_type
+      (error_variant
+        name: (type_identifier))
+      (error_variant
+        name: (type_identifier)
+        (type
+          (type_atom
+            (primitive_type))))))
+  (function_declaration
+    name: (identifier)
+    (parameters
+      (parameter
+        name: (identifier)
+        type: (type
+          (type_atom
+            (primitive_type)))))
+    return_type: (type
+      (fallible_type
+        set: (type_identifier)
+        inner: (type
+          (type_atom
+            (primitive_type)))))
+    body: (block
+      (statement
+        (variable_declaration
+          kind: (binding_keyword)
+          name: (identifier)
+          value: (expression
+            (unary_expression
+              (expression
+                (postfix_expression
+                  (primary_expression
+                    (path
+                      (identifier)))
+                  (expression
+                    (postfix_expression
+                      (primary_expression
+                        (path
+                          (identifier)))))))))))
+      (statement
+        (return_statement
+          (expression
+            (catch_expression
+              (expression
+                (postfix_expression
+                  (primary_expression
+                    (path
+                      (identifier)))))
+              (expression
+                (postfix_expression
+                  (primary_expression
+                    (literal
+                      (u64_literal))))))))))))
+
+===============================
+match, nullables, qualified imports
+===============================
+
+use std.net.tcp.{self, TcpError};
+
+fun f(o: ?u64): u64 {
+  match (o) {
+    Option.Some(v) {
+      return v;
+    }
+    null {
+      return 0u64;
+    }
+    else {
+      return 1u64;
+    }
+  }
+}
+
+---
+
+(source_file
+  (use_declaration
+    (module_path
+      (identifier)
+      (identifier)
+      (identifier)
+      (grouped_imports
+        (identifier)
+        (type_identifier))))
+  (function_declaration
+    name: (identifier)
+    (parameters
+      (parameter
+        name: (identifier)
+        type: (type
+          (nullable_type
+            inner: (type
+              (type_atom
+                (primitive_type)))))))
+    return_type: (type
+      (type_atom
+        (primitive_type)))
+    body: (block
+      (statement
+        (match_statement
+          scrutinee: (expression
+            (postfix_expression
+              (primary_expression
+                (path
+                  (identifier)))))
+          (match_arm
+            pattern: (path
+              (type_identifier)
+              (type_identifier))
+            (match_bindings
+              (identifier))
+            body: (block
+              (statement
+                (return_statement
+                  (expression
+                    (postfix_expression
+                      (primary_expression
+                        (path
+                          (identifier)))))))))
+          (match_arm
+            pattern: (null_literal)
+            body: (block
+              (statement
+                (return_statement
+                  (expression
+                    (postfix_expression
+                      (primary_expression
+                        (literal
+                          (u64_literal)))))))))
+          alternative: (branch
+            (block
+              (statement
+                (return_statement
+                  (expression
+                    (postfix_expression
+                      (primary_expression
+                        (literal
+                          (u64_literal))))))))))))))
+
+===============================
+tuples, backticks, destructuring
+===============================
+
+fun main() {
+  val t: #(u64, String) = #(1u64, "a");
+  val a = t.`0;
+  val #(p, q) = t;
+  val u: #(x: u64, y: String) = #(x = 2u64, y = "b");
+  val b = u.x;
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    body: (block
+      (statement
+        (variable_declaration
+          kind: (binding_keyword)
+          name: (identifier)
+          type: (type
+            (type_atom
+              (tuple_type
+                (tuple_type_element
+                  type: (type
+                    (type_atom
+                      (primitive_type))))
+                (tuple_type_element
+                  type: (type
+                    (type_atom
+                      (primitive_type)))))))
+          value: (expression
+            (postfix_expression
+              (primary_expression
+                (tuple_literal
+                  (tuple_element
+                    value: (expression
+                      (postfix_expression
+                        (primary_expression
+                          (literal
+                            (u64_literal))))))
+                  (tuple_element
+                    value: (expression
+                      (postfix_expression
+                        (primary_expression
+                          (string)))))))))))
+      (statement
+        (variable_declaration
+          kind: (binding_keyword)
+          name: (identifier)
+          value: (expression
+            (postfix_expression
+              (primary_expression
+                (path
+                  (identifier)))
+              (backtick_index
+                (integer_literal))))))
+      (statement
+        (variable_declaration
+          kind: (binding_keyword)
+          name: (destructure_pattern
+            (destructure_binding
+              name: (identifier))
+            (destructure_binding
+              name: (identifier)))
+          value: (expression
+            (postfix_expression
+              (primary_expression
+                (path
+                  (identifier)))))))
+      (statement
+        (variable_declaration
+          kind: (binding_keyword)
+          name: (identifier)
+          type: (type
+            (type_atom
+              (tuple_type
+                (tuple_type_element
+                  name: (identifier)
+                  type: (type
+                    (type_atom
+                      (primitive_type))))
+                (tuple_type_element
+                  name: (identifier)
+                  type: (type
+                    (type_atom
+                      (primitive_type)))))))
+          value: (expression
+            (postfix_expression
+              (primary_expression
+                (tuple_literal
+                  (tuple_element
+                    name: (identifier)
+                    value: (expression
+                      (postfix_expression
+                        (primary_expression
+                          (literal
+                            (u64_literal))))))
+                  (tuple_element
+                    name: (identifier)
+                    value: (expression
+                      (postfix_expression
+                        (primary_expression
+                          (string)))))))))))
+      (statement
+        (variable_declaration
+          kind: (binding_keyword)
+          name: (identifier)
+          value: (expression
+            (postfix_expression
+              (primary_expression
+                (path
+                  (identifier)))
+              (identifier))))))))

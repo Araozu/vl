@@ -2,11 +2,12 @@ if exists('b:current_syntax')
   finish
 endif
 
-syntax keyword vlDeclaration var val fun use type object error extends
+syntax keyword vlDeclaration var val fun use type object union error extends
 syntax keyword vlOperatorKeyword as
-syntax keyword vlConditional if else
+syntax keyword vlConditional if else match
 syntax keyword vlRepeat while
 syntax keyword vlStatement break continue return try catch
+syntax keyword vlSelf self
 syntax keyword vlBoolean true false
 syntax keyword vlNull null
 syntax keyword vlBuiltinType u64 i64 f64 u8 bool void String File Array Numeric Comparable
@@ -28,13 +29,14 @@ syntax region vlString start=+"+ skip=+\\\\\|\\"+ end=+"+ oneline contains=vlEsc
 
 syntax keyword vlTodo TODO FIXME XXX NOTE contained
 syntax match vlComment '//.*$' contains=vlTodo
-syntax match vlOperator '\(==\|!=\|<=\|>=\|&&\|||\|::\|[+*/=!<>?-]\)'
+syntax match vlOperator '\(==\|!=\|<=\|>=\|&&\|||\|::\|[+*/=!<>?#`-]\)'
 
 highlight default link vlDeclaration Keyword
 highlight default link vlOperatorKeyword Operator
 highlight default link vlConditional Conditional
 highlight default link vlRepeat Repeat
 highlight default link vlStatement Statement
+highlight default link vlSelf Identifier
 highlight default link vlBoolean Boolean
 highlight default link vlNull Constant
 highlight default link vlBuiltinType Type
