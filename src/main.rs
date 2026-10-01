@@ -31,10 +31,17 @@ enum Cmd {
     /// Parse a file and print the AST.
     Parse { file: PathBuf },
     /// Run the full frontend (lex..typecheck) and report errors.
-    Check { file: PathBuf },
+    Check {
+        /// Source file (`-` reads stdin as module `stdin`, no project lookup).
+        file: PathBuf,
+        /// Render diagnostics as human text or machine-readable JSON.
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+    },
     /// Compile a file or the current project; print or write target output.
     Build {
         /// Source file. Omit this to build the current directory's project.
+        /// (`-` reads stdin as module `stdin`, no project lookup.)
         file: Option<PathBuf>,
         /// Which backend to use.
         #[arg(long, default_value = "naravm")]
@@ -43,8 +50,12 @@ enum Cmd {
         #[arg(long, value_enum)]
         emit: Option<Emit>,
         /// Write a single-file artifact here, or override a project's output folder.
+        /// Required with `--format json` so stdout stays pure JSON.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Render diagnostics as human text or machine-readable JSON.
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
     },
     /// Run a project script; omit the name to run the `run` script.
     Run { name: Option<String> },
@@ -106,11 +117,67 @@ enum Emit {
     Asm,
 }
 
+/// Diagnostic rendering for `check` and `build`.
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+enum Format {
+    /// Ariadne pretty errors on stderr (default).
+    #[default]
+    Human,
+    /// One JSON document on stdout: `{"ok":bool,"diagnostics":[...]}`.
+    /// Each diagnostic carries its file, severity, message, optional code
+    /// and note, plus labelled spans with byte offsets and 1-based
+    /// line/column (columns count Unicode scalar values).
+    Json,
+}
+
 fn read_input(file: &Path) -> Result<(String, String), String> {
     match fs::read_to_string(file) {
         Ok(text) => Ok((file.display().to_string(), text)),
         Err(e) => Err(format!("cannot read {}: {e}", file.display())),
     }
+}
+
+/// `-` means stdin (module `stdin`): for editors and tooling that already
+/// hold the buffer. Never does project discovery.
+fn is_stdin(file: &Path) -> bool {
+    file.as_os_str() == "-"
+}
+
+fn read_stdin() -> Result<(String, String), String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::io::stdin()
+        .read_to_string(&mut text)
+        .map_err(|e| format!("cannot read stdin: {e}"))?;
+    Ok(("<stdin>".to_string(), text))
+}
+
+/// Print one JSON diagnostics document to stdout (machine-readable mode).
+/// Returns true if any diagnostic is an error.
+fn emit_json(entries: &[(&str, &str, &[vl_common::Diagnostic])]) -> bool {
+    let mut collected = Vec::new();
+    for (file, text, diags) in entries {
+        collected.append(&mut vl_frontend::collect_json(file, text, diags));
+    }
+    let failed = collected.iter().any(|d| d.severity == "error");
+    write_out(&None, &vl_frontend::render_json(collected));
+    failed
+}
+
+/// One driver-level diagnostic for JSON mode (aggregated under `<driver>`).
+fn driver_diagnostic(message: &str, code: &str) -> vl_common::Diagnostic {
+    vl_common::Diagnostic::error(message).with_code(code)
+}
+
+/// Immediate driver failure: render per `fmt` and exit 2.
+fn fail_driver(fmt: Format, message: &str, code: &str) -> ExitCode {
+    if fmt == Format::Json {
+        let diag = driver_diagnostic(message, code);
+        emit_json(&[("<driver>", "", std::slice::from_ref(&diag))]);
+    } else {
+        emit_driver_error(message, code);
+    }
+    ExitCode::from(2)
 }
 
 /// Entrypoint return check: `main` is infallible by definition (the VM
@@ -500,87 +567,30 @@ fn modules_with_stdlib(modules: &[vl_common::ModuleSpec]) -> Vec<vl_common::Modu
     catalog
 }
 
+/// Immutable checked stdlib modules as world refs for
+/// [`vl_frontend::check_text`].
+fn stdlib_world_refs() -> Vec<(
+    &'static vl_hir::HirProgram,
+    &'static vl_typecheck::TypedProgram,
+)> {
+    stdlib()
+        .checked_modules()
+        .iter()
+        .map(|(hir, typed)| (hir, typed))
+        .collect()
+}
+
 /// Single-file check: validate frontend + world plan, stopping successfully
 /// after validation (no lowering). Used by `vl check` for standalone files.
+/// Thin wrapper over the shared in-memory [`vl_frontend::check_text`].
 fn run_frontend_check(
     text: &str,
     modules: &[vl_common::ModuleSpec],
     module: &str,
 ) -> Result<(), Vec<vl_common::Diagnostic>> {
-    let mut diags = Vec::new();
-    let (toks, mut d) = vl_lex::lex(text);
-    diags.append(&mut d);
-    let (ast, mut d) = vl_syntax::parse_with_module(&toks, text, module);
-    diags.append(&mut d);
-    if diags.iter().any(|d| d.is_error()) {
-        return Err(diags);
-    }
     let catalog = modules_with_stdlib(modules);
-    let (res, mut d) = vl_semantic::resolve_with_modules(&ast, &catalog);
-    diags.append(&mut d);
-    if !diags.iter().any(|d| d.is_error()) {
-        let mains = ast
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                vl_syntax::Item::Function {
-                    name,
-                    params,
-                    ret,
-                    span,
-                    ..
-                } if name == "main" => Some((params.len(), ret.clone(), *span)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if !mains.is_empty() {
-            if mains[0].0 != 0 {
-                diags.push(
-                    vl_common::Diagnostic::error("`main` must not take parameters")
-                        .with_label(mains[0].2, "entrypoint declared here")
-                        .with_code("E401"),
-                );
-            }
-            if let Some(diag) = main_ret_error(&mains[0].1, mains[0].2) {
-                diags.push(diag);
-            }
-        }
-    }
-    let hir = vl_hir::lower(&ast, &res);
-    // Check against the same merged catalog resolution used, so nominal
-    // types imported from target modules (e.g. `TcpError` from
-    // `std.net.tcp`) validate like local ones. Previously this was a bare
-    // `check` (empty tables), which only worked because no target module
-    // exported nominal types.
-    let (typed, mut d) = vl_typecheck::check_with_modules(&hir, &catalog);
-    diags.append(&mut d);
-    if !res.poisoned_imports {
-        diags.append(&mut typed.validate_normalized(&hir, &diags));
-    }
-    if diags.iter().any(|d| d.is_error()) {
-        return Err(diags);
-    }
-    let stdlib_checked = stdlib().checked_modules();
-    let mut world_refs: Vec<(&vl_hir::HirProgram, &vl_typecheck::TypedProgram)> =
-        Vec::with_capacity(1 + stdlib_checked.len());
-    world_refs.push((&hir, &typed));
-    for (shir, styped) in stdlib_checked {
-        world_refs.push((shir, styped));
-    }
-    let (plan, world_diags) = vl_typecheck::world::plan_world(&world_refs);
-    for (_, diag) in world_diags {
-        diags.push(diag);
-    }
-    if diags.iter().any(|d| d.is_error()) {
-        return Err(diags);
-    }
-    for (_, diag) in vl_typecheck::world::validate_plan(&plan, &world_refs, &diags) {
-        diags.push(diag);
-    }
-    if diags.iter().any(|d| d.is_error()) {
-        return Err(diags);
-    }
-    Ok(())
+    let extra = stdlib_world_refs();
+    vl_frontend::check_text(text, module, &catalog, &extra).map(|_| ())
 }
 
 fn run_frontend(
@@ -588,99 +598,14 @@ fn run_frontend(
     modules: &[vl_common::ModuleSpec],
     module: &str,
 ) -> Result<Frontend, Vec<vl_common::Diagnostic>> {
-    let mut diags = Vec::new();
-
-    let (toks, mut d) = vl_lex::lex(text);
-    diags.append(&mut d);
-    let (ast, mut d) = vl_syntax::parse_with_module(&toks, text, module);
-    diags.append(&mut d);
-    if diags.iter().any(|d| d.is_error()) {
-        return Err(diags);
-    }
     // Referenced stdlib helpers resolve through the merged catalog and
-    // link inline below; nothing is implicitly in scope.
+    // link inline below; nothing is implicitly in scope. Checked by the
+    // shared in-memory frontend; lowering here only runs on success.
     let catalog = modules_with_stdlib(modules);
-    let (res, mut d) = vl_semantic::resolve_with_modules(&ast, &catalog);
-    diags.append(&mut d);
-    if !diags.iter().any(|d| d.is_error()) {
-        // `main` is optional, but its signature is checked wherever it is
-        // declared. Project ownership is decided after all source modules
-        // have been inspected.
-        let mains = ast
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                vl_syntax::Item::Function {
-                    name,
-                    params,
-                    ret,
-                    span,
-                    ..
-                } if name == "main" => Some((params.len(), ret.clone(), *span)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if !mains.is_empty() {
-            if mains[0].0 != 0 {
-                diags.push(
-                    vl_common::Diagnostic::error("`main` must not take parameters")
-                        .with_label(mains[0].2, "entrypoint declared here")
-                        .with_code("E401"),
-                );
-            }
-            // The entrypoint returns nothing; `void` keeps VL's type surface
-            // total while the VM decides its own halt representation.
-            // (A generic `main` is rejected by typechecking with E401.)
-            if let Some(diag) = main_ret_error(&mains[0].1, mains[0].2) {
-                diags.push(diag);
-            }
-        }
-    }
-    let hir = vl_hir::lower(&ast, &res);
-    // Same merged catalog as resolution (see `run_frontend_check`): nominal
-    // types imported from target modules validate like local ones.
-    let (typed, mut d) = vl_typecheck::check_with_modules(&hir, &catalog);
-    diags.append(&mut d);
-    // Boundary guard: no unresolved `int`/`Param`/nested-`Error` type may
-    // reach lowering without a diagnostic. E500s here are compiler bugs.
-    if !res.poisoned_imports {
-        diags.append(&mut typed.validate_normalized(&hir, &diags));
-    }
-
-    if diags.iter().any(|d| d.is_error()) {
-        return Err(diags);
-    }
-    // Single-file world: one project module plus immutable checked stdlib
-    // modules, sharing the same fixed-point machinery as projects. The
-    // single-file path still cannot import arbitrary source modules without
-    // a project catalog.
-    let stdlib_checked = stdlib().checked_modules();
-    let mut world_refs: Vec<(&vl_hir::HirProgram, &vl_typecheck::TypedProgram)> =
-        Vec::with_capacity(1 + stdlib_checked.len());
-    world_refs.push((&hir, &typed));
-    for (shir, styped) in stdlib_checked {
-        world_refs.push((shir, styped));
-    }
-    let (plan, world_diags) = vl_typecheck::world::plan_world(&world_refs);
-    for (owner, diag) in world_diags {
-        // Stdlib owners have no user file; attribute to the single file
-        // (stdlib templates are trusted, so this is defensive).
-        let _ = owner;
-        diags.push(diag);
-    }
-    if diags.iter().any(|d| d.is_error()) {
-        return Err(diags);
-    }
-    // Validate every planned instance (signatures, args, substituted bodies)
-    // before lowering; `check` stops successfully after this validation.
-    for (_, diag) in vl_typecheck::world::validate_plan(&plan, &world_refs, &diags) {
-        diags.push(diag);
-    }
-    if diags.iter().any(|d| d.is_error()) {
-        return Err(diags);
-    }
-    let mut lir = vl_lir::lower_project(&hir, &typed, &plan);
-    stdlib().link_with_plan(&mut lir, &plan);
+    let extra = stdlib_world_refs();
+    let ok = vl_frontend::check_text(text, module, &catalog, &extra)?;
+    let mut lir = vl_lir::lower_project(&ok.hir, &ok.typed, &ok.plan);
+    stdlib().link_with_plan(&mut lir, &ok.plan);
     // Standalone builds are programs, whereas project builds set ownership
     // explicitly below. This preserves the existing single-file CLI behavior.
     lir.entrypoint = true;
@@ -736,53 +661,79 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
-        Cmd::Check { file } => {
+        Cmd::Check { file, format } => {
+            let json = format == Format::Json;
+            if is_stdin(&file) {
+                let (name, text) = match read_stdin() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if json {
+                            let diag = driver_diagnostic(&e, "E600");
+                            emit_json(&[("<driver>", "", std::slice::from_ref(&diag))]);
+                        } else {
+                            emit_driver_error(&e, "E600");
+                        }
+                        return ExitCode::from(2);
+                    }
+                };
+                return check_single_text(&name, &text, "stdin", format);
+            }
             match discover_project(&file) {
-                Ok(Some(project)) => return check_project(&project),
+                Ok(Some(project)) => return check_project(&project, format),
                 Ok(None) => {}
                 Err(message) => {
-                    emit_driver_error(&message, "E602");
+                    if json {
+                        let diag = driver_diagnostic(&message, "E602");
+                        emit_json(&[("<driver>", "", std::slice::from_ref(&diag))]);
+                    } else {
+                        emit_driver_error(&message, "E602");
+                    }
                     return ExitCode::from(2);
                 }
             }
             let (name, text) = match read_input(&file) {
                 Ok(v) => v,
                 Err(e) => {
-                    emit_driver_error(&e, "E600");
+                    if json {
+                        let diag = driver_diagnostic(&e, "E600");
+                        emit_json(&[("<driver>", "", std::slice::from_ref(&diag))]);
+                    } else {
+                        emit_driver_error(&e, "E600");
+                    }
                     return ExitCode::from(2);
                 }
             };
-            // `check` validates frontend semantics independently of a codegen
-            // target; target capability checks belong to `build`. It stops
-            // after validation (no lowering).
-            let modules = vl_codegen::modules();
             let module = source_module(&file);
-            match run_frontend_check(&text, &modules, &module) {
-                Ok(_) => {
-                    write_out(&None, &format!("ok: {name} checks clean\n"));
-                    ExitCode::SUCCESS
-                }
-                Err(diags) => {
-                    emit_all(&diags, &name, &text);
-                    ExitCode::from(1)
-                }
-            }
+            check_single_text(&name, &text, &module, format)
         }
         Cmd::Build {
             file,
             target,
             emit,
             out,
+            format,
         } => match file {
-            Some(file) => match discover_project(&file) {
-                Ok(Some(project)) => build_project_at(&project, &target, emit, out.as_ref()),
-                Ok(None) => build_single(&file, &target, emit, &out),
-                Err(message) => {
-                    emit_driver_error(&message, "E602");
-                    ExitCode::from(2)
+            Some(file) => {
+                if is_stdin(&file) {
+                    return build_single(&file, &target, emit, &out, format);
                 }
-            },
-            None => build_project(&target, emit, out.as_ref()),
+                match discover_project(&file) {
+                    Ok(Some(project)) => {
+                        build_project_at(&project, &target, emit, out.as_ref(), format)
+                    }
+                    Ok(None) => build_single(&file, &target, emit, &out, format),
+                    Err(message) => {
+                        if format == Format::Json {
+                            let diag = driver_diagnostic(&message, "E602");
+                            emit_json(&[("<driver>", "", std::slice::from_ref(&diag))]);
+                        } else {
+                            emit_driver_error(&message, "E602");
+                        }
+                        ExitCode::from(2)
+                    }
+                }
+            }
+            None => build_project(&target, emit, out.as_ref(), format),
         },
         Cmd::Run { name } => run_project_script(name.as_deref()),
         Cmd::Fmt { paths, check } => fmt_paths(&paths, check),
@@ -798,12 +749,76 @@ fn main() -> ExitCode {
     }
 }
 
-fn build_single(file: &Path, target: &str, emit: Option<Emit>, out: &Option<PathBuf>) -> ExitCode {
-    let (name, text) = match read_input(file) {
-        Ok(v) => v,
-        Err(e) => {
-            emit_driver_error(&e, "E600");
-            return ExitCode::from(2);
+/// Single-text check shared by the `vl check` file/stdin paths.
+fn check_single_text(name: &str, text: &str, module: &str, fmt: Format) -> ExitCode {
+    let json = fmt == Format::Json;
+    // `check` validates frontend semantics independently of a codegen
+    // target; target capability checks belong to `build`. It stops
+    // after validation (no lowering).
+    let modules = vl_codegen::modules();
+    match run_frontend_check(text, &modules, module) {
+        Ok(_) => {
+            if json {
+                emit_json(&[]);
+            } else {
+                write_out(&None, &format!("ok: {name} checks clean\n"));
+            }
+            ExitCode::SUCCESS
+        }
+        Err(diags) => {
+            let failed = if json {
+                emit_json(&[(name, text, diags.as_slice())])
+            } else {
+                emit_all(&diags, name, text)
+            };
+            debug_assert!(failed);
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn build_single(
+    file: &Path,
+    target: &str,
+    emit: Option<Emit>,
+    out: &Option<PathBuf>,
+    fmt: Format,
+) -> ExitCode {
+    let json = fmt == Format::Json;
+    // Machine mode keeps stdout pure JSON: dumps and artifacts need `--out`.
+    if json && out.is_none() {
+        let diag = driver_diagnostic(
+            "cannot use `--format json` without `--out` (stdout carries the JSON report)",
+            "E601",
+        );
+        emit_json(&[("<driver>", "", std::slice::from_ref(&diag))]);
+        return ExitCode::from(2);
+    }
+    let (name, text) = if is_stdin(file) {
+        match read_stdin() {
+            Ok(v) => v,
+            Err(e) => {
+                if json {
+                    let diag = driver_diagnostic(&e, "E600");
+                    emit_json(&[("<driver>", "", std::slice::from_ref(&diag))]);
+                } else {
+                    emit_driver_error(&e, "E600");
+                }
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        match read_input(file) {
+            Ok(v) => v,
+            Err(e) => {
+                if json {
+                    let diag = driver_diagnostic(&e, "E600");
+                    emit_json(&[("<driver>", "", std::slice::from_ref(&diag))]);
+                } else {
+                    emit_driver_error(&e, "E600");
+                }
+                return ExitCode::from(2);
+            }
         }
     };
     // Lex/parse emits are intentionally shallow: they remain useful for
@@ -818,7 +833,13 @@ fn build_single(file: &Path, target: &str, emit: Option<Emit>, out: &Option<Path
             format!("{toks:#?}\n")
         };
         write_out(out, &dump);
-        return if emit_all(&diags, &name, &text) {
+        return if json {
+            if emit_json(&[(name.as_str(), text.as_str(), diags.as_slice())]) {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            }
+        } else if emit_all(&diags, &name, &text) {
             ExitCode::from(1)
         } else {
             ExitCode::SUCCESS
@@ -833,17 +854,28 @@ fn build_single(file: &Path, target: &str, emit: Option<Emit>, out: &Option<Path
     } else {
         vl_codegen::modules()
     };
-    let module = source_module(file);
+    let module = if is_stdin(file) {
+        "stdin".to_string()
+    } else {
+        source_module(file)
+    };
     let fe = match run_frontend(&text, &modules, &module) {
         Ok(fe) => fe,
         Err(diags) => {
-            emit_all(&diags, &name, &text);
+            if json {
+                emit_json(&[(name.as_str(), text.as_str(), diags.as_slice())]);
+            } else {
+                emit_all(&diags, &name, &text);
+            }
             return ExitCode::from(1);
         }
     };
 
     if let Some(dump) = matches!(emit, Some(Emit::Lir)).then(|| fe.lir.dump()) {
         write_out(out, &dump);
+        if json {
+            emit_json(&[]);
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -853,12 +885,20 @@ fn build_single(file: &Path, target: &str, emit: Option<Emit>, out: &Option<Path
             vl_codegen::all_targets().join(", ")
         ))
         .with_code("E501");
-        emit_all(&[d], &name, &text);
+        if json {
+            emit_json(&[(name.as_str(), text.as_str(), std::slice::from_ref(&d))]);
+        } else {
+            emit_all(&[d], &name, &text);
+        }
         return ExitCode::from(2);
     };
 
     let (artifact, backend_diags) = backend.emit(&fe.lir);
-    let failed = emit_all(&backend_diags, &name, &text);
+    let failed = if json {
+        emit_json(&[(name.as_str(), text.as_str(), backend_diags.as_slice())])
+    } else {
+        emit_all(&backend_diags, &name, &text)
+    };
     match artifact {
         Some(a) if !failed => {
             write_artifact(out, &a);
@@ -1085,41 +1125,46 @@ fn build_project_at(
     target: &str,
     emit: Option<Emit>,
     out_override: Option<&PathBuf>,
+    fmt: Format,
 ) -> ExitCode {
+    let json = fmt == Format::Json;
+    // JSON mode aggregates every diagnostic into one stdout document;
+    // driver problems accumulate instead of printing immediately.
+    let mut driver_diags: Vec<vl_common::Diagnostic> = Vec::new();
+    let mut json_entries: Vec<(String, String, Vec<vl_common::Diagnostic>)> = Vec::new();
     let source_dir =
         match resolve_project_path(&project.root, &project.config.source).canonicalize() {
             Ok(path) => path,
             Err(error) => {
-                emit_driver_error(
+                return fail_driver(
+                    fmt,
                     &format!("cannot resolve project source folder: {error}"),
                     "E603",
                 );
-                return ExitCode::from(2);
             }
         };
     if !source_dir.is_dir() {
-        emit_driver_error(
+        return fail_driver(
+            fmt,
             &format!(
                 "project source folder does not exist: {}",
                 source_dir.display()
             ),
             "E603",
         );
-        return ExitCode::from(2);
     }
 
     let mut files = Vec::new();
     if let Err(message) = collect_vl_files(&source_dir, &mut files) {
-        emit_driver_error(&message, "E603");
-        return ExitCode::from(2);
+        return fail_driver(fmt, &message, "E603");
     }
     files.sort();
     if files.is_empty() {
-        emit_driver_error(
+        return fail_driver(
+            fmt,
             &format!("no `.vl` files found in {}", source_dir.display()),
             "E603",
         );
-        return ExitCode::from(2);
     }
 
     let needs_backend = matches!(emit, Some(Emit::Asm) | None);
@@ -1129,7 +1174,11 @@ fn build_project_at(
             vl_codegen::all_targets().join(", ")
         ))
         .with_code("E501");
-        emit_all(&[diagnostic], "<driver>", "");
+        if json {
+            emit_json(&[("<driver>", "", std::slice::from_ref(&diagnostic))]);
+        } else {
+            emit_all(&[diagnostic], "<driver>", "");
+        }
         return ExitCode::from(2);
     }
 
@@ -1138,29 +1187,28 @@ fn build_project_at(
         .unwrap_or_else(|| resolve_project_path(&project.root, &project.config.out));
     let out_dir = canonical_or_normalized(&out_dir);
     if paths_overlap(&source_dir, &out_dir) {
-        emit_driver_error(
+        return fail_driver(
+            fmt,
             &format!("output path overlaps project source: {}", out_dir.display()),
             "E602",
         );
-        return ExitCode::from(2);
     }
     if out_dir.exists() && !out_dir.is_dir() {
-        emit_driver_error(
+        return fail_driver(
+            fmt,
             &format!("output path is not a directory: {}", out_dir.display()),
             "E601",
         );
-        return ExitCode::from(2);
     }
     let Some(out_parent) = out_dir.parent() else {
-        emit_driver_error("cannot determine output folder parent", "E601");
-        return ExitCode::from(2);
+        return fail_driver(fmt, "cannot determine output folder parent", "E601");
     };
     if let Err(e) = fs::create_dir_all(out_parent) {
-        emit_driver_error(
+        return fail_driver(
+            fmt,
             &format!("cannot create output parent {}: {e}", out_parent.display()),
             "E601",
         );
-        return ExitCode::from(2);
     }
 
     let mut units = Vec::new();
@@ -1169,7 +1217,11 @@ fn build_project_at(
         let (filename, text) = match read_input(&file) {
             Ok(input) => input,
             Err(message) => {
-                emit_driver_error(&message, "E600");
+                if json {
+                    driver_diags.push(driver_diagnostic(&message, "E600"));
+                } else {
+                    emit_driver_error(&message, "E600");
+                }
                 driver_failed = true;
                 continue;
             }
@@ -1177,7 +1229,11 @@ fn build_project_at(
         let module = match project_module_for_file(&project.config, &source_dir, &file) {
             Ok(module) => module,
             Err(message) => {
-                emit_driver_error(&message, "E602");
+                if json {
+                    driver_diags.push(driver_diagnostic(&message, "E602"));
+                } else {
+                    emit_driver_error(&message, "E602");
+                }
                 driver_failed = true;
                 continue;
             }
@@ -1210,16 +1266,30 @@ fn build_project_at(
         };
         let new_source = source_names.insert(module.clone());
         if !new_source {
-            emit_driver_error(&format!("duplicate source module `{module}`"), "E602");
+            if json {
+                driver_diags.push(driver_diagnostic(
+                    &format!("duplicate source module `{module}`"),
+                    "E602",
+                ));
+            } else {
+                emit_driver_error(&format!("duplicate source module `{module}`"), "E602");
+            }
             driver_failed = true;
         }
         let collides = source_module_collides(module, &compiler_modules, &target_modules);
         if collides {
             if !catalog_collision_reported {
-                emit_driver_error(
-                    &format!("source module `{module}` is reserved by the compiler module catalog (collides with a target module)"),
-                    "E602",
-                );
+                if json {
+                    driver_diags.push(driver_diagnostic(
+                        &format!("source module `{module}` is reserved by the compiler module catalog (collides with a target module)"),
+                        "E602",
+                    ));
+                } else {
+                    emit_driver_error(
+                        &format!("source module `{module}` is reserved by the compiler module catalog (collides with a target module)"),
+                        "E602",
+                    );
+                }
                 catalog_collision_reported = true;
             }
             driver_failed = true;
@@ -1270,9 +1340,14 @@ fn build_project_at(
                 output: Some(output),
                 diags: unit_diags,
             };
-            let file_failed = emit_all(&built.diags, &filename, &text);
-            failed |= file_failed;
-            if let Some(output) = built.output {
+            let ProjectFileBuild { output, diags } = built;
+            if json {
+                failed |= diags.iter().any(|d| d.is_error());
+                json_entries.push((filename, text, diags));
+            } else {
+                failed |= emit_all(&diags, &filename, &text);
+            }
+            if let Some(output) = output {
                 let path = project_output_path(&out_dir, &module, &extension);
                 outputs.push((path, output));
             }
@@ -1284,7 +1359,12 @@ fn build_project_at(
         let batch = batch_frontend(&mut units, &modules, entrypoint_module.as_deref());
         // Emit per-unit diagnostics (frontend + world) in module order.
         for (filename, text, _, _, unit_diags, _) in &units {
-            failed |= emit_all(unit_diags, filename, text);
+            if json {
+                failed |= unit_diags.iter().any(|d| d.is_error());
+                json_entries.push((filename.clone(), text.clone(), unit_diags.clone()));
+            } else {
+                failed |= emit_all(unit_diags, filename, text);
+            }
         }
         if let Some((checked, plan)) = batch {
             for (idx, (filename, text, module, _, _, _)) in units.iter().enumerate() {
@@ -1305,7 +1385,12 @@ fn build_project_at(
                     let backend = vl_codegen::lookup(target)
                         .expect("project target was validated before building");
                     let (artifact, backend_diags) = backend.emit(&lir);
-                    if emit_all(&backend_diags, filename, text) {
+                    if json {
+                        if backend_diags.iter().any(|d| d.is_error()) {
+                            failed = true;
+                        }
+                        json_entries.push((filename.clone(), text.clone(), backend_diags));
+                    } else if emit_all(&backend_diags, filename, text) {
                         failed = true;
                     }
                     if let Some(a) = artifact {
@@ -1332,10 +1417,17 @@ fn build_project_at(
     if (!failed && !driver_failed) || (shallow_emit && !driver_failed) {
         let mut paths = HashSet::new();
         if let Some((path, _)) = outputs.iter().find(|(path, _)| !paths.insert(path.clone())) {
-            emit_driver_error(
-                &format!("multiple source files produce {}", path.display()),
-                "E602",
-            );
+            if json {
+                driver_diags.push(driver_diagnostic(
+                    &format!("multiple source files produce {}", path.display()),
+                    "E602",
+                ));
+            } else {
+                emit_driver_error(
+                    &format!("multiple source files produce {}", path.display()),
+                    "E602",
+                );
+            }
             driver_failed = true;
         }
         if !driver_failed {
@@ -1348,26 +1440,47 @@ fn build_project_at(
             let backup =
                 out_parent.join(format!(".{output_name}.vl-backup-{}", std::process::id()));
             if staging.exists() {
-                emit_driver_error(
-                    &format!("staging path already exists: {}", staging.display()),
-                    "E601",
-                );
+                if json {
+                    driver_diags.push(driver_diagnostic(
+                        &format!("staging path already exists: {}", staging.display()),
+                        "E601",
+                    ));
+                } else {
+                    emit_driver_error(
+                        &format!("staging path already exists: {}", staging.display()),
+                        "E601",
+                    );
+                }
                 driver_failed = true;
             } else if let Err(error) = fs::create_dir(&staging) {
-                emit_driver_error(
-                    &format!(
-                        "cannot create staging folder {}: {error}",
-                        staging.display()
-                    ),
-                    "E601",
-                );
+                if json {
+                    driver_diags.push(driver_diagnostic(
+                        &format!(
+                            "cannot create staging folder {}: {error}",
+                            staging.display()
+                        ),
+                        "E601",
+                    ));
+                } else {
+                    emit_driver_error(
+                        &format!(
+                            "cannot create staging folder {}: {error}",
+                            staging.display()
+                        ),
+                        "E601",
+                    );
+                }
                 driver_failed = true;
             } else {
                 for (path, output) in &outputs {
                     let staged_path =
                         staging.join(path.file_name().expect("output path has a filename"));
                     if let Err(message) = write_project_output(&staged_path, output) {
-                        emit_driver_error(&message, "E601");
+                        if json {
+                            driver_diags.push(driver_diagnostic(&message, "E601"));
+                        } else {
+                            emit_driver_error(&message, "E601");
+                        }
                         driver_failed = true;
                         break;
                     }
@@ -1375,25 +1488,55 @@ fn build_project_at(
                 if !driver_failed {
                     if backup.exists() {
                         driver_failed = true;
-                        emit_driver_error(
-                            &format!("backup path already exists: {}", backup.display()),
-                            "E601",
-                        );
+                        if json {
+                            driver_diags.push(driver_diagnostic(
+                                &format!("backup path already exists: {}", backup.display()),
+                                "E601",
+                            ));
+                        } else {
+                            emit_driver_error(
+                                &format!("backup path already exists: {}", backup.display()),
+                                "E601",
+                            );
+                        }
                     } else if out_dir.exists() && fs::rename(&out_dir, &backup).is_err() {
                         driver_failed = true;
-                        emit_driver_error(
-                            &format!("cannot stage existing output folder {}", out_dir.display()),
-                            "E601",
-                        );
+                        if json {
+                            driver_diags.push(driver_diagnostic(
+                                &format!(
+                                    "cannot stage existing output folder {}",
+                                    out_dir.display()
+                                ),
+                                "E601",
+                            ));
+                        } else {
+                            emit_driver_error(
+                                &format!(
+                                    "cannot stage existing output folder {}",
+                                    out_dir.display()
+                                ),
+                                "E601",
+                            );
+                        }
                     } else if let Err(error) = fs::rename(&staging, &out_dir) {
                         driver_failed = true;
-                        emit_driver_error(
-                            &format!(
-                                "cannot publish output folder {}: {error}",
-                                out_dir.display()
-                            ),
-                            "E601",
-                        );
+                        if json {
+                            driver_diags.push(driver_diagnostic(
+                                &format!(
+                                    "cannot publish output folder {}: {error}",
+                                    out_dir.display()
+                                ),
+                                "E601",
+                            ));
+                        } else {
+                            emit_driver_error(
+                                &format!(
+                                    "cannot publish output folder {}: {error}",
+                                    out_dir.display()
+                                ),
+                                "E601",
+                            );
+                        }
                         if backup.exists() {
                             let _ = fs::rename(&backup, &out_dir);
                         }
@@ -1408,6 +1551,17 @@ fn build_project_at(
         }
     }
 
+    if json {
+        let mut refs: Vec<(&str, &str, &[vl_common::Diagnostic])> = Vec::new();
+        if !driver_diags.is_empty() {
+            refs.push(("<driver>", "", &driver_diags));
+        }
+        for (filename, text, diags) in &json_entries {
+            refs.push((filename, text, diags));
+        }
+        emit_json(&refs);
+    }
+
     if driver_failed {
         ExitCode::from(2)
     } else if failed {
@@ -1417,34 +1571,39 @@ fn build_project_at(
     }
 }
 
-fn build_project(target: &str, emit: Option<Emit>, out_override: Option<&PathBuf>) -> ExitCode {
+fn build_project(
+    target: &str,
+    emit: Option<Emit>,
+    out_override: Option<&PathBuf>,
+    fmt: Format,
+) -> ExitCode {
     let project = match load_project(Path::new(".")) {
         Ok(project) => project,
         Err(message) => {
-            emit_driver_error(&message, "E602");
-            return ExitCode::from(2);
+            return fail_driver(fmt, &message, "E602");
         }
     };
-    build_project_at(&project, target, emit, out_override)
+    build_project_at(&project, target, emit, out_override, fmt)
 }
 
-fn check_project(project: &Project) -> ExitCode {
+fn check_project(project: &Project, fmt: Format) -> ExitCode {
+    let json = fmt == Format::Json;
+    let mut driver_diags: Vec<vl_common::Diagnostic> = Vec::new();
     let source = match resolve_project_path(&project.root, &project.config.source).canonicalize() {
         Ok(path) => path,
         Err(error) => {
-            emit_driver_error(
+            return fail_driver(
+                fmt,
                 &format!("cannot resolve project source folder: {error}"),
                 "E603",
             );
-            return ExitCode::from(2);
         }
     };
     let target_modules = vl_codegen::modules();
     let compiler_modules = vl_codegen::modules();
     let mut files = Vec::new();
     if let Err(message) = collect_vl_files(&source, &mut files) {
-        emit_driver_error(&message, "E603");
-        return ExitCode::from(2);
+        return fail_driver(fmt, &message, "E603");
     }
     files.sort();
     let mut units = Vec::new();
@@ -1457,7 +1616,11 @@ fn check_project(project: &Project) -> ExitCode {
         let (name, text) = match read_input(&file) {
             Ok(value) => value,
             Err(message) => {
-                emit_driver_error(&message, "E600");
+                if json {
+                    driver_diags.push(driver_diagnostic(&message, "E600"));
+                } else {
+                    emit_driver_error(&message, "E600");
+                }
                 failed = true;
                 continue;
             }
@@ -1465,7 +1628,11 @@ fn check_project(project: &Project) -> ExitCode {
         let module = match project_module_for_file(&project.config, &source, &file) {
             Ok(value) => value,
             Err(message) => {
-                emit_driver_error(&message, "E602");
+                if json {
+                    driver_diags.push(driver_diagnostic(&message, "E602"));
+                } else {
+                    emit_driver_error(&message, "E602");
+                }
                 failed = true;
                 continue;
             }
@@ -1473,17 +1640,31 @@ fn check_project(project: &Project) -> ExitCode {
         let collides = source_module_collides(&module, &compiler_modules, &target_modules);
         if collides {
             if !catalog_collision_reported {
-                emit_driver_error(
-                    &format!("source module `{module}` is reserved by the compiler module catalog (collides with a target module)"),
-                    "E602",
-                );
+                if json {
+                    driver_diags.push(driver_diagnostic(
+                        &format!("source module `{module}` is reserved by the compiler module catalog (collides with a target module)"),
+                        "E602",
+                    ));
+                } else {
+                    emit_driver_error(
+                        &format!("source module `{module}` is reserved by the compiler module catalog (collides with a target module)"),
+                        "E602",
+                    );
+                }
                 catalog_collision_reported = true;
             }
             failed = true;
         }
         let new_source = source_names.insert(module.clone());
         if !new_source {
-            emit_driver_error(&format!("duplicate source module `{module}`"), "E602");
+            if json {
+                driver_diags.push(driver_diagnostic(
+                    &format!("duplicate source module `{module}`"),
+                    "E602",
+                ));
+            } else {
+                emit_driver_error(&format!("duplicate source module `{module}`"), "E602");
+            }
             failed = true;
         }
         let (tokens, mut diags) = vl_lex::lex(&text);
@@ -1543,16 +1724,39 @@ fn check_project(project: &Project) -> ExitCode {
     // Batch frontend runs the world fixed point and validates; `check` stops
     // successfully after validation (no lowering).
     let batch = batch_frontend(&mut batch_units, &modules, entrypoint_module.as_deref());
-    for (name, text, _, _, diags, _) in &batch_units {
-        failed |= emit_all(diags, name, text);
+    if json {
+        for (_, _, _, _, diags, _) in &batch_units {
+            failed |= diags.iter().any(|d| d.is_error());
+        }
+    } else {
+        for (name, text, _, _, diags, _) in &batch_units {
+            failed |= emit_all(diags, name, text);
+        }
     }
     if batch.is_none()
         && !batch_units
             .iter()
             .any(|(_, _, _, _, diags, _)| diags.iter().any(|d| d.is_error()))
+        && driver_diags.iter().all(|d| !d.is_error())
     {
         // Defensive: world produced no plan without diagnostics (impossible).
+        if json {
+            driver_diags.push(driver_diagnostic(
+                "internal error: world produced no plan without diagnostics",
+                "E500",
+            ));
+        }
         failed = true;
+    }
+    if json {
+        let mut refs: Vec<(&str, &str, &[vl_common::Diagnostic])> = Vec::new();
+        if !driver_diags.is_empty() {
+            refs.push(("<driver>", "", &driver_diags));
+        }
+        for (name, text, _, _, diags, _) in &batch_units {
+            refs.push((name, text, diags));
+        }
+        emit_json(&refs);
     }
     if failed {
         ExitCode::from(1)

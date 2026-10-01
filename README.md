@@ -15,8 +15,10 @@ Ariadne error reporting, and a Naravm backend with target-neutral LIR.
   ▼  vl-lir        typed HIR -> three-address code (target-agnostic)
   │  vl-codegen    LIR -> backend output via `Target` trait
   ▼
-  vl (driver)      CLI wiring + the ONLY place that prints diagnostics
-  vl-common        spans, source table, Ariadne-backed `Diagnostic`
+   vl (driver)      CLI wiring + the ONLY place that prints diagnostics
+   vl-frontend      in-memory `check_text` (lex..typecheck + world plan),
+                    `LineIndex`, JSON diagnostics — the tooling/LSP foundation
+   vl-common        spans, source table, Ariadne-backed `Diagnostic`
 ```
 
 Dependency rule: each crate depends only on stages below it; everything
@@ -36,6 +38,8 @@ the token definitions and recursive-descent parser when the language changes.
 
 ```sh
 cargo run -- check examples/hello.vl        # frontend end-to-end
+cargo run -- check examples/hello.vl --format json  # machine-readable diagnostics
+echo 'val x = 1' | cargo run -- check - --format json  # stdin as module `stdin`
 cargo run -- build examples/hello.vl        # compile (Naravm backend)
 cargo run -- build examples/arith.vl --emit lir
 cargo run -- build examples/arith.vl --target naravm

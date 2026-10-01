@@ -25,6 +25,17 @@ cargo run -- check examples/hello.vl
 The command exits 0 when the file is valid. Errors are printed with source
 locations and the command exits 1.
 
+Pass `-` instead of a file to check stdin (module `stdin`, no project
+lookup), and `--format json` for a machine-readable report on stdout —
+one `{"ok": bool, "diagnostics": [...]}` document where each diagnostic
+carries its file, severity, message, optional code/note, and labelled spans
+with byte offsets plus 1-based line/column:
+
+```sh
+cargo run -- check examples/hello.vl --format json
+echo 'val x = 1' | cargo run -- check - --format json
+```
+
 ### `build <file>`
 
 Compile a source file. The default target is `naravm`.
@@ -72,7 +83,8 @@ cargo run -- targets
 | --- | --- |
 | `--target <name>` | Select `naravm`. |
 | `--emit <kind>` | Dump `tokens`, `ast`, `lir`, or `asm` instead of the final artifact. |
-| `--out <path>` | Write output to a file instead of stdout. |
+| `--out <path>` | Write output to a file instead of stdout. Required with `--format json` so stdout stays pure JSON. |
+| `--format <human\|json>` | Render diagnostics as text (stderr) or one JSON document (stdout). |
 
 Examples:
 

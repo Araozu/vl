@@ -651,3 +651,99 @@ fn malformed_manifest_is_not_checked_as_a_standalone_file() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot parse project configuration"));
     fs::remove_dir_all(root).expect("remove temporary project");
 }
+
+fn parse_stdout_json(output: &Output) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&stdout).expect("stdout must be one JSON document")
+}
+
+#[test]
+fn check_json_reports_machine_readable_diagnostics() {
+    let root = temp_project("check-json");
+    let file = root.join("bad.vl");
+    fs::write(&file, "val x = y;\n").expect("write source");
+
+    let output = run(&root, &["check", "bad.vl", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let report = parse_stdout_json(&output);
+    assert_eq!(report["ok"], false);
+    let diags = report["diagnostics"].as_array().expect("diagnostics array");
+    assert_eq!(diags.len(), 1);
+    assert_eq!(diags[0]["severity"], "error");
+    assert_eq!(diags[0]["code"], "E201");
+    let span = &diags[0]["labels"][0]["span"];
+    assert_eq!(span["line_start"], 1);
+    assert_eq!(span["column_start"], 9);
+
+    fs::write(&file, "fun main() { }\n").expect("write clean source");
+    let output = run(&root, &["check", "bad.vl", "--format", "json"]);
+    assert!(output.status.success());
+    let report = parse_stdout_json(&output);
+    assert_eq!(report["ok"], true);
+    assert!(report["diagnostics"].as_array().expect("array").is_empty());
+    // Human mode still prints the friendly line and stays exit 0.
+    let output = run(&root, &["check", "bad.vl"]);
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("checks clean"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
+
+#[test]
+fn check_json_reads_stdin_without_project_lookup() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let root = temp_project("check-stdin");
+    // A vl.toml exists, but `-` must not trigger project discovery.
+    fs::write(root.join("vl.toml"), "module = \"demo\"\n").expect("write config");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vl"))
+        .current_dir(&root)
+        .args(["check", "-", "--format", "json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn vl");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"val x = 1")
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait");
+    assert_eq!(output.status.code(), Some(1));
+    let report = parse_stdout_json(&output);
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["diagnostics"][0]["file"], "<stdin>");
+    assert_eq!(report["diagnostics"][0]["code"], "E100");
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
+
+#[test]
+fn build_json_requires_out_and_reports_on_stdout() {
+    let root = temp_project("build-json");
+    fs::write(root.join("bad.vl"), "fun main() { }\n").expect("write source");
+
+    // Without `--out` the artifact would share stdout with the report.
+    let output = run(&root, &["build", "bad.vl", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(2));
+    let report = parse_stdout_json(&output);
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["diagnostics"][0]["code"], "E601");
+
+    let output = run(
+        &root,
+        &["build", "bad.vl", "--format", "json", "--out", "bad.out"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = parse_stdout_json(&output);
+    assert_eq!(report["ok"], true);
+    assert!(root.join("bad.out").is_file());
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
