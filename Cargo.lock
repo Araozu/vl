@@ -297,6 +297,7 @@ dependencies = [
  "toml",
  "vl-codegen",
  "vl-common",
+ "vl-fmt",
  "vl-hir",
  "vl-lex",
  "vl-lir",
@@ -324,6 +325,15 @@ name = "vl-common"
 version = "0.1.0"
 dependencies = [
  "ariadne",
+]
+
+[[package]]
+name = "vl-fmt"
+version = "0.1.0"
+dependencies = [
+ "vl-common",
+ "vl-lex",
+ "vl-syntax",
 ]
 
 [[package]]
