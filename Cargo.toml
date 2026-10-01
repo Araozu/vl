@@ -22,6 +22,7 @@ members = [
     "crates/vl-codegen",
     "crates/vl-stdlib",
     "crates/vl-fmt",
+    "crates/vl-frontend",
 ]
 resolver = "2"
 
@@ -36,7 +37,11 @@ vl-lir = { path = "crates/vl-lir" }
 vl-codegen = { path = "crates/vl-codegen" }
 vl-stdlib = { path = "crates/vl-stdlib" }
 vl-fmt = { path = "crates/vl-fmt" }
+vl-frontend = { path = "crates/vl-frontend" }
 clap = { version = "4", features = ["derive"] }
 ariadne = "0.4"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+
+[dev-dependencies]
+serde_json = "1"

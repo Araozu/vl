@@ -14,7 +14,9 @@ Workspace crates (dependency order, lower first):
 `vl-common` → `vl-lex` → `vl-syntax` → `vl-semantic` → `vl-hir` →
 `vl-typecheck` → `vl-lir` → `vl-codegen`, plus `vl-stdlib` (embedded
 `std/*.vl` modules over VM natives, merged into the catalog and linked
-inline by the driver) and the `vl` driver binary
+inline by the driver), `vl-frontend` (in-memory `check_text` over
+lex..typecheck + world plan, `LineIndex`, JSON diagnostics for tooling;
+takes a pre-merged catalog, owns no I/O) and the `vl` driver binary
 (`src/main.rs`) that wires them together.
 
 - `vl-common`: `Span`, `Sources`, `Diagnostic`. Everyone depends on it.
