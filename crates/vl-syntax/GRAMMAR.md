@@ -24,8 +24,7 @@ union_variants := union_variant ("," union_variant)* ","?
 union_variant := ident ("(" type ("," type)* ")")?
 error_item := "type" ident "=" "error" "{" error_variants? "}" ";"
 error_variants := error_variant ("," error_variant)* ","?
-error_variant := ident   ; plain names only, uppercase; payload tails are E104
-                         ; (the AST reserves the shape for future data)
+error_variant := ident ("(" type ("," type)* ")")?
 object_member := object_field | assoc_fn
 object_field := ident ":" type ","?    ; the comma may be omitted before `fun` or `}`
 assoc_fn := "fun" ident type_params? "(" params? ")" (":" type)? block ","?
@@ -55,7 +54,7 @@ backtick_index := "." "`" int   ; unnamed tuples only, e.g. t.`0
 if_stmt  := "if" "(" expr ")" branch ("else" branch)?
 match_stmt := "match" "(" expr ")" "{" match_arm* ("else" branch)? "}"
 match_arm := (path ("(" ident ("," ident)* ","? ")")? | "null") block
-           ; `path` is `Union.Variant` (2+ segments); bindings are implicit `val`s; `else` must be last
+           ; `path` is `Union.Variant` or `ErrorSet.Variant` (2+ segments); bindings are implicit `val`s; `else` must be last
            ; `null` matches the empty case of a `?T` scrutinee (sugar for `Option.None`, no bindings)
 while_stmt := "while" "(" expr ")" branch
 break_stmt := "break" ";"
@@ -122,11 +121,16 @@ Dot Colon Hash Backtick ColonColon Question Null Ident Int I64 U64 F64 U8 Bool S
   `Some(T)` is valid, while `Some()` and `Some(T,)` are rejected. Variant separators
   and the optional final union comma are accepted. Variants must begin with an uppercase
   letter and duplicate variant names produce one `E200`.
-* Error sets declare plain uppercase variants with no payloads or type
-  parameters (`type Io = error { NotFound, };`): a parenthesized tail is one
-  `E104` (`error payloads are not supported yet`), duplicates are one `E200`.
-  Values construct as paths (`Io.NotFound`, like nullary union variants) and
+* Error sets declare uppercase variants with optional union-style payloads
+  (`type Io = error { NotFound, Denied(path: String), };`): empty payloads,
+  trailing payload commas, and `void` payloads are one `E104`/`E100` each,
+  duplicates are one `E200`.
+  Values construct as paths (`Io.NotFound`, like nullary union variants) or
+  calls (`Io.Denied(path)` with arity/typen checked like union variants) and
   flow through fallible types (`Io!u64`, `!u64`), `try`, and `catch`.
+  `match` reads error values back: `match (e) { Io.Denied(p) { ... } else { ... } }`
+  over a plain error set, or over a fallible (`Io!u64`) where listed arms bind
+  error payloads and `else` covers the ok value plus unlisted variants.
   A fallible payload can never itself be fallible, and only error sets take
   `!` (anything else is one `E104`).
 * `catch` binds tighter than `||` (`a || b catch c` is `a || (b catch c)`)
@@ -176,7 +180,7 @@ Item ::= Use { path, names, span }
        | Union { name, name_span, type_params: Vec<TypeParam>, variants: Vec<UnionVariant>, span }
        | Error { name, name_span, variants: Vec<ErrorVariant>, span }
 UnionVariant ::= { name, name_span, payload: Vec<(VlType, Span)> }
-ErrorVariant ::= { name, name_span, payload: Vec<(VlType, Span)> }   ; always empty for now
+ErrorVariant ::= { name, name_span, payload: Vec<(VlType, Span)> }
 AssociatedFn ::= { name, name_span, type_params: Vec<TypeParam>, params: Vec<Param>, ret: Option<VlType>, ret_span, body: Vec<Stmt>, span }
        ; same shape as Function; the owner lives on the enclosing Object
 TypeParam ::= { name, span, bound: Option<GenericBound> }

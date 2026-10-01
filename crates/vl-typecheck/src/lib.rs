@@ -451,12 +451,18 @@ pub struct UnionSigTy {
     pub variants: Vec<UnionVariantSigTy>,
 }
 
-/// Declaration-only metadata for one nominal error set: variant names in
-/// declaration order. Variants carry no data in this milestone (plain
-/// names only); the shape already mirrors unions for future payloads.
+/// Declaration-only metadata for one nominal error set: variants in
+/// declaration order, each with its payload types (like unions; error sets
+/// declare no type parameters so payloads are always concrete).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorSigTy {
-    pub variants: Vec<String>,
+    pub variants: Vec<ErrorVariantSigTy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorVariantSigTy {
+    pub name: String,
+    pub payload: Vec<Ty>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -886,7 +892,11 @@ fn template_expr_ids(e: &HirExpr, out: &mut HashSet<u32>) {
             template_expr_ids(lhs, out);
             template_expr_ids(fallback, out);
         }
-        HirExpr::ErrorValue { .. } => {}
+        HirExpr::ErrorValue { args, .. } => {
+            for a in args {
+                template_expr_ids(a, out);
+            }
+        }
         HirExpr::Cast { inner, .. } => template_expr_ids(inner, out),
         HirExpr::Literal { .. }
         | HirExpr::String { .. }
@@ -1474,8 +1484,12 @@ fn validate_qualified_types(
             HirExpr::Literal { .. }
             | HirExpr::String { .. }
             | HirExpr::Null { .. }
-            | HirExpr::ErrorValue { .. }
             | HirExpr::Var { .. } => {}
+            HirExpr::ErrorValue { args, .. } => {
+                for arg in args {
+                    check_expr(arg, objects, unions, errors, diags);
+                }
+            }
         }
     }
     fn check_stmts(
@@ -1738,7 +1752,18 @@ pub fn check_with_modules(
             cx.typed.errors.insert(
                 export.qualified.clone(),
                 ErrorSigTy {
-                    variants: export.variants.clone(),
+                    variants: export
+                        .variants
+                        .iter()
+                        .map(|variant| ErrorVariantSigTy {
+                            name: variant.name.clone(),
+                            payload: variant
+                                .payload
+                                .iter()
+                                .map(|ty| Ty::from_vl_in(ty, &HashMap::new()))
+                                .collect(),
+                        })
+                        .collect(),
                 },
             );
         }
@@ -1773,9 +1798,15 @@ pub fn check_with_modules(
             }
             HirItem::Error { name, variants, .. } => {
                 // First declaration wins (semantic reported the E200);
-                // keyed bare and qualified like unions.
+                // keyed bare and qualified like unions. Payloads fill in
+                // below (mirroring the union pass); the empty predeclare
+                // keeps forward references known.
+                let variant_names = variants.iter().map(|v| ErrorVariantSigTy {
+                    name: v.name.clone(),
+                    payload: Vec::new(),
+                });
                 let sig = ErrorSigTy {
-                    variants: variants.iter().map(|v| v.name.clone()).collect(),
+                    variants: variant_names.collect(),
                 };
                 cx.typed.errors.entry(name.clone()).or_insert(sig.clone());
                 cx.typed
@@ -1841,6 +1872,54 @@ pub fn check_with_modules(
         cx.typed.unions.insert(name.clone(), sig.clone());
         cx.typed
             .unions
+            .insert(format!("{}.{}", prog.module, name), sig);
+    }
+    // Error payload pass: fill the predeclared variant payloads (error sets
+    // declare no type parameters, so the environment is always empty).
+    // Mirrors the union pass above, including its quiet-poison rules.
+    for item in &prog.items {
+        let HirItem::Error { name, variants, .. } = item else {
+            continue;
+        };
+        let out_variants = variants
+            .iter()
+            .map(|variant| ErrorVariantSigTy {
+                name: variant.name.clone(),
+                payload: variant
+                    .payload
+                    .iter()
+                    .map(|(ty, span)| {
+                        let mut payload_ty = Checker::vl_to_ty_in(
+                            &mut cx.diags,
+                            &cx.typed.unions,
+                            &cx.typed.objects,
+                            &cx.typed.errors,
+                            ty,
+                            &HashMap::new(),
+                            *span,
+                        );
+                        if ty_has_error(&payload_ty)
+                            || payload_ty.is_void()
+                            || ty_has_unknown_qualified(
+                                &payload_ty,
+                                &cx.typed.objects,
+                                &cx.typed.unions,
+                            )
+                            || !validate_capability(&payload_ty, *span, &mut cx.diags)
+                        {
+                            payload_ty = Ty::Error;
+                        }
+                        payload_ty
+                    })
+                    .collect(),
+            })
+            .collect();
+        let sig = ErrorSigTy {
+            variants: out_variants,
+        };
+        cx.typed.errors.insert(name.clone(), sig.clone());
+        cx.typed
+            .errors
             .insert(format!("{}.{}", prog.module, name), sig);
     }
     // Pass 1: collect object layouts so field types and object literals can
@@ -3446,6 +3525,20 @@ impl Checker {
             }
             return;
         }
+        // Error-set scrutinee: `match (e) { E.V(binds) { ... } else { ... } }`.
+        if let Ty::ErrorSet(set) = &scrut_ty {
+            let set = set.clone();
+            self.check_error_match(scrutinee, &set, arms, else_body, span);
+            return;
+        }
+        // Fallible scrutinee: `match (r) { E.V(binds) { ... } else { ... } }`
+        // where listed arms bind error payloads and `else` covers the ok
+        // value plus unlisted variants (unwrap it there with `try`).
+        if let Ty::Fallible(f) = &scrut_ty {
+            let f = f.clone();
+            self.check_fallible_match(scrutinee, &f, arms, else_body, span);
+            return;
+        }
         let scrut_core: Option<(&String, &Vec<Ty>)> = match &scrut_ty {
             Ty::Union(u) => Some((&u.name, &u.args)),
             Ty::Mutable(inner) => match &**inner {
@@ -3456,9 +3549,14 @@ impl Checker {
         };
         let Some((scrut_name, scrut_args)) = scrut_core else {
             self.diags.push(
-                Diagnostic::error(format!("match scrutinee must be a union, got `{scrut_ty}`"))
-                    .with_label(scrutinee.span(), "expected a union value here")
-                    .with_code("E302"),
+                Diagnostic::error(format!(
+                    "match scrutinee must be a union, an error set, or a fallible, got `{scrut_ty}`"
+                ))
+                .with_label(
+                    scrutinee.span(),
+                    "expected a union, error, or fallible value here",
+                )
+                .with_code("E302"),
             );
             for arm in arms {
                 poison_arm(self, arm);
@@ -3609,6 +3707,335 @@ impl Checker {
                 );
             }
         }
+    }
+
+    /// Check `match` over a plain error set: every arm must name a variant
+    /// of `set` with exactly its payload arity (bindings are fresh `val`s,
+    /// capability-projected like field reads). Duplicate arms are one E200;
+    /// a missing `else` with uncovered variants is one E309. Bodies always
+    /// check so one root cause never hides inner errors.
+    fn check_error_match(
+        &mut self,
+        scrutinee: &HirExpr,
+        set: &str,
+        arms: &[vl_hir::HirMatchArm],
+        else_body: Option<&[HirStmt]>,
+        span: Span,
+    ) {
+        let poison_arm = |checker: &mut Self, arm: &vl_hir::HirMatchArm| {
+            for b in &arm.bindings {
+                if let Some(def) = &b.def {
+                    checker.bindings.insert(def.0, Ty::Error);
+                    checker.fixed_defs.insert(def.0);
+                }
+            }
+        };
+        let Some(sig) = self.error_sig(set) else {
+            self.diags.push(
+                Diagnostic::error(format!("cannot find error set `{set}`"))
+                    .with_label(span, "unknown error set")
+                    .with_code("E302"),
+            );
+            for arm in arms {
+                poison_arm(self, arm);
+                for stmt in &arm.body {
+                    self.check_stmt(stmt);
+                }
+            }
+            if let Some(body) = else_body {
+                for stmt in body {
+                    self.check_stmt(stmt);
+                }
+            }
+            return;
+        };
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for arm in arms {
+            if arm.union != set {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "pattern `{}.{}` does not match scrutinee type `{set}`",
+                        arm.union, arm.variant
+                    ))
+                    .with_label(arm.span, "this arm matches a different error set")
+                    .with_code("E302"),
+                );
+                poison_arm(self, arm);
+                for stmt in &arm.body {
+                    self.check_stmt(stmt);
+                }
+                continue;
+            }
+            let Some(payload) = sig
+                .variants
+                .iter()
+                .find(|v| v.name == arm.variant)
+                .map(|v| v.payload.clone())
+            else {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "error set `{set}` has no variant `{}`",
+                        arm.variant
+                    ))
+                    .with_label(arm.span, "unknown error variant")
+                    .with_code("E302"),
+                );
+                poison_arm(self, arm);
+                for stmt in &arm.body {
+                    self.check_stmt(stmt);
+                }
+                continue;
+            };
+            if !seen.insert(arm.variant.clone()) {
+                self.diags.push(
+                    Diagnostic::error(format!("duplicate arm for variant `{set}.{}`", arm.variant))
+                        .with_label(arm.span, "this variant is already matched above")
+                        .with_code("E200"),
+                );
+                poison_arm(self, arm);
+                for stmt in &arm.body {
+                    self.check_stmt(stmt);
+                }
+                continue;
+            }
+            covered.insert(arm.variant.clone());
+            if !payload.is_empty() && !arm.bindings.is_empty() {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "cannot bind payloads of `{set}.{}` from a plain error value",
+                        arm.variant
+                    ))
+                    .with_label(arm.span, "this value carries only the error code")
+                    .with_note(format!(
+                        "match on a fallible `{set}!T` value to bind payloads"
+                    ))
+                    .with_code("E303"),
+                );
+                poison_arm(self, arm);
+                for stmt in &arm.body {
+                    self.check_stmt(stmt);
+                }
+                continue;
+            }
+            if arm.bindings.len() != payload.len() && payload.is_empty() {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "variant `{set}.{}` has {} payload(s), pattern binds {}",
+                        arm.variant,
+                        payload.len(),
+                        arm.bindings.len()
+                    ))
+                    .with_label(arm.span, "arity mismatch in match pattern")
+                    .with_code("E303"),
+                );
+                poison_arm(self, arm);
+                for stmt in &arm.body {
+                    self.check_stmt(stmt);
+                }
+                continue;
+            }
+            for (binding, formal) in arm.bindings.iter().zip(payload.iter()) {
+                let bound = project_capability(&Ty::ErrorSet(set.to_string()), formal);
+                if let Some(def) = &binding.def {
+                    if ty_has_error(&bound) {
+                        self.bindings.insert(def.0, Ty::Error);
+                    } else {
+                        self.bindings.insert(def.0, bound);
+                    }
+                    self.fixed_defs.insert(def.0);
+                }
+            }
+            for stmt in &arm.body {
+                self.check_stmt(stmt);
+            }
+        }
+        if let Some(body) = else_body {
+            for stmt in body {
+                self.check_stmt(stmt);
+            }
+        } else {
+            let mut missing: Vec<&str> = sig
+                .variants
+                .iter()
+                .filter(|v| !covered.contains(&v.name))
+                .map(|v| v.name.as_str())
+                .collect();
+            missing.sort();
+            if !missing.is_empty() {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "match is not exhaustive: missing variant(s) {}",
+                        missing
+                            .iter()
+                            .map(|v| format!("`{set}.{v}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                    .with_label(span, "add an `else` arm for the remaining variants")
+                    .with_code("E309"),
+                );
+            }
+        }
+        let _ = scrutinee;
+    }
+
+    /// Check `match` over a fallible scrutinee (`E!T` or `!T`): listed arms
+    /// bind error payloads, `else` covers the ok value plus unlisted
+    /// variants (unwrap it there with `try`). `else` is always required
+    /// (one E309 without it); coverage of error variants is satisfied by
+    /// `else`, so no per-variant exhaustiveness check runs here.
+    fn check_fallible_match(
+        &mut self,
+        scrutinee: &HirExpr,
+        fall: &FallibleTy,
+        arms: &[vl_hir::HirMatchArm],
+        else_body: Option<&[HirStmt]>,
+        span: Span,
+    ) {
+        let poison_arm = |checker: &mut Self, arm: &vl_hir::HirMatchArm| {
+            for b in &arm.bindings {
+                if let Some(def) = &b.def {
+                    checker.bindings.insert(def.0, Ty::Error);
+                    checker.fixed_defs.insert(def.0);
+                }
+            }
+        };
+        let check_bodies = |checker: &mut Self| {
+            for arm in arms {
+                for stmt in &arm.body {
+                    checker.check_stmt(stmt);
+                }
+            }
+            if let Some(body) = else_body {
+                for stmt in body {
+                    checker.check_stmt(stmt);
+                }
+            }
+        };
+        if else_body.is_none() {
+            self.diags.push(
+                Diagnostic::error("match on a fallible needs an `else` arm".to_string())
+                    .with_label(span, "the ok value has nowhere to go")
+                    .with_note("unwrap the ok value inside `else` with `try`")
+                    .with_code("E309"),
+            );
+            for arm in arms {
+                poison_arm(self, arm);
+            }
+            check_bodies(self);
+            return;
+        }
+        for arm in arms {
+            // Named sets resolve directly; an inferred (`!T`) scrutinee
+            // lets each arm name a variant of any known set (codes are
+            // globally unique, so dispatch stays sound).
+            let (sig, set_display) = match &fall.err {
+                Some(set) => {
+                    if arm.union != *set {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "pattern `{}.{}` does not match scrutinee error set `{set}`",
+                                arm.union, arm.variant
+                            ))
+                            .with_label(arm.span, "this arm matches a different error set")
+                            .with_code("E302"),
+                        );
+                        poison_arm(self, arm);
+                        for stmt in &arm.body {
+                            self.check_stmt(stmt);
+                        }
+                        continue;
+                    }
+                    let Some(sig) = self.error_sig(set) else {
+                        self.diags.push(
+                            Diagnostic::error(format!("cannot find error set `{set}`"))
+                                .with_label(span, "unknown error set")
+                                .with_code("E302"),
+                        );
+                        poison_arm(self, arm);
+                        for stmt in &arm.body {
+                            self.check_stmt(stmt);
+                        }
+                        continue;
+                    };
+                    (sig, set.clone())
+                }
+                None => {
+                    let Some(sig) = self.error_sig(&arm.union) else {
+                        self.diags.push(
+                            Diagnostic::error(format!("cannot find error set `{}`", arm.union))
+                                .with_label(arm.span, "unknown error set in pattern")
+                                .with_code("E302"),
+                        );
+                        poison_arm(self, arm);
+                        for stmt in &arm.body {
+                            self.check_stmt(stmt);
+                        }
+                        continue;
+                    };
+                    let display = arm.union.clone();
+                    (sig, display)
+                }
+            };
+            let Some(payload) = sig
+                .variants
+                .iter()
+                .find(|v| v.name == arm.variant)
+                .map(|v| v.payload.clone())
+            else {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "error set `{set_display}` has no variant `{}`",
+                        arm.variant
+                    ))
+                    .with_label(arm.span, "unknown error variant")
+                    .with_code("E302"),
+                );
+                poison_arm(self, arm);
+                for stmt in &arm.body {
+                    self.check_stmt(stmt);
+                }
+                continue;
+            };
+            if arm.bindings.len() != payload.len() {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "variant `{set_display}.{}` has {} payload(s), pattern binds {}",
+                        arm.variant,
+                        payload.len(),
+                        arm.bindings.len()
+                    ))
+                    .with_label(arm.span, "arity mismatch in match pattern")
+                    .with_code("E303"),
+                );
+                poison_arm(self, arm);
+                for stmt in &arm.body {
+                    self.check_stmt(stmt);
+                }
+                continue;
+            }
+            for (binding, formal) in arm.bindings.iter().zip(payload.iter()) {
+                let bound = project_capability(&Ty::Fallible(Box::new(fall.clone())), formal);
+                if let Some(def) = &binding.def {
+                    if ty_has_error(&bound) {
+                        self.bindings.insert(def.0, Ty::Error);
+                    } else {
+                        self.bindings.insert(def.0, bound);
+                    }
+                    self.fixed_defs.insert(def.0);
+                }
+            }
+            for stmt in &arm.body {
+                self.check_stmt(stmt);
+            }
+        }
+        if let Some(body) = else_body {
+            for stmt in body {
+                self.check_stmt(stmt);
+            }
+        }
+        let _ = scrutinee;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4630,24 +5057,174 @@ impl Checker {
         self.typed.errors.get(name).cloned()
     }
 
-    /// Check an error value (`E.Variant`): the set must be declared and the
-    /// variant a member. Unreachable through the driver (semantic owns
-    /// unknown sets/variants and records no site), but poison loudly rather
-    /// than silently for hand-built HIR.
-    fn check_error_value(&mut self, id: vl_hir::HirId, set: &str, variant: &str, span: Span) -> Ty {
-        match self.error_sig(set) {
-            Some(sig) if sig.variants.iter().any(|v| v == variant) => {
-                self.record(id, Ty::ErrorSet(set.to_string()))
+    /// Check an error value (`E.Variant(args)`): the set must be declared,
+    /// the variant a member, and the arguments matching its payload arity
+    /// and types (like union variants; error sets have no type parameters
+    /// so no inference is needed). Payload constructions only carry data
+    /// through fallible wraps: in a plain (`ErrorSet`) position a payload
+    /// call is one E303 (the code alone cannot hold it). Unreachable
+    /// through the driver for unknown sets/variants (semantic owns those
+    /// and records no site), but poison loudly rather than silently for
+    /// hand-built HIR.
+    fn check_error_value(
+        &mut self,
+        id: vl_hir::HirId,
+        set: &str,
+        variant: &str,
+        args: &[HirExpr],
+        span: Span,
+        in_fallible: bool,
+    ) -> Ty {
+        let display = format!("{set}.{variant}");
+        let Some(sig) = self.error_sig(set) else {
+            self.diags.push(
+                Diagnostic::error(format!("cannot find error value `{display}`"))
+                    .with_label(span, "unknown error value")
+                    .with_code("E302"),
+            );
+            for arg in args {
+                let _ = self.infer_expr(arg);
             }
-            _ => {
+            return self.record(id, Ty::Error);
+        };
+        let Some(formals) = sig
+            .variants
+            .iter()
+            .find(|v| v.name == variant)
+            .map(|v| v.payload.clone())
+        else {
+            self.diags.push(
+                Diagnostic::error(format!("cannot find error value `{display}`"))
+                    .with_label(span, "unknown error value")
+                    .with_code("E302"),
+            );
+            for arg in args {
+                let _ = self.infer_expr(arg);
+            }
+            return self.record(id, Ty::Error);
+        };
+        // Payloads only survive inside fallible values: a plain error
+        // value is just the global code, so constructing with arguments
+        // here would silently drop them.
+        if !args.is_empty() && !in_fallible {
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "error variant `{display}` carries payload(s) but this position holds only the error code"
+                ))
+                .with_label(span, "payloads are lost here")
+                .with_note(format!(
+                    "construct it where `{set}!T` is expected (e.g. `val x: {set}!u64 = {display}(...)`) so the payload is kept"
+                ))
+                .with_code("E303"),
+            );
+            for arg in args {
+                let _ = self.infer_expr(arg);
+            }
+            return self.record(id, Ty::Error);
+        }
+        // Infer payload argument types first (inner errors surface here,
+        // like calls). Bare `Array.new(n)`, empty `[]`, and `null` defer
+        // to the formal, exactly like variant arguments.
+        let mut arg_tys = Vec::with_capacity(args.len());
+        let mut poisoned = false;
+        for arg in args {
+            if let HirExpr::Call {
+                name: inner,
+                type_args: inner_args,
+                args: inner_call_args,
+                ..
+            } = arg
+            {
+                if inner == "Array.new" && inner_args.is_empty() {
+                    for a in inner_call_args {
+                        let _ = self.infer_expr(a);
+                    }
+                    arg_tys.push(Ty::Error);
+                    continue;
+                }
+            }
+            if let HirExpr::ArrayLiteral { elems, .. } = arg {
+                if elems.is_empty() {
+                    arg_tys.push(Ty::Error);
+                    continue;
+                }
+            }
+            if matches!(arg, HirExpr::Null { .. }) {
+                arg_tys.push(Ty::Error);
+                continue;
+            }
+            let t = self.infer_expr(arg);
+            if ty_has_error(&t) {
+                poisoned = true;
+            }
+            arg_tys.push(t);
+        }
+        if args.len() != formals.len() {
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "error variant `{display}` expects {} argument(s), got {}",
+                    formals.len(),
+                    args.len()
+                ))
+                .with_label(span, "wrong number of error payload arguments")
+                .with_code("E303"),
+            );
+            return self.record(id, Ty::Error);
+        }
+        if poisoned {
+            return self.record(id, Ty::Error);
+        }
+        for (i, (arg, original_got)) in args.iter().zip(arg_tys.iter()).enumerate() {
+            let is_bare_new = matches!(arg, HirExpr::Call { name, type_args, .. } if name == "Array.new" && type_args.is_empty());
+            let is_empty_array =
+                matches!(arg, HirExpr::ArrayLiteral { elems, .. } if elems.is_empty());
+            let is_null = matches!(arg, HirExpr::Null { .. });
+            if ty_has_error(original_got) && !(is_bare_new || is_empty_array || is_null) {
+                continue;
+            }
+            let want = &formals[i];
+            if ty_has_error(want) {
+                continue;
+            }
+            let got = self.infer_expr_expected(arg, want);
+            if ty_has_error(&got) {
+                continue;
+            }
+            if got == Ty::Void || *want == Ty::Void {
                 self.diags.push(
-                    Diagnostic::error(format!("cannot find error value `{set}.{variant}`"))
-                        .with_label(span, "unknown error value")
-                        .with_code("E302"),
+                    Diagnostic::error(format!(
+                        "error variant `{display}` payload `{i}` cannot be `void`"
+                    ))
+                    .with_label(arg.span(), "unexpected `void` here")
+                    .with_code("E308"),
                 );
-                self.record(id, Ty::Error)
+                return self.record(id, Ty::Error);
+            }
+            if !can_coerce(&got, want) {
+                if got.readonly_view() == want.readonly_view()
+                    && got.is_mutable_view() != want.is_mutable_view()
+                {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "cannot pass read-only `{got}` to mutable error payload `{i}: {want}`"
+                        ))
+                        .with_label(arg.span(), "mutation authority is required here")
+                        .with_note(format!("a read-only view cannot be upgraded to `{want}`"))
+                        .with_code("E306"),
+                    );
+                } else {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "error variant `{display}` payload `{i}` expects `{want}`, got `{got}`"
+                        ))
+                        .with_label(arg.span(), format!("expected `{want}` here"))
+                        .with_code("E306"),
+                    );
+                }
+                return self.record(id, Ty::Error);
             }
         }
+        self.record(id, Ty::ErrorSet(set.to_string()))
     }
 
     /// Check `try expr`: the operand must be fallible `E!T` (result: `T`),
@@ -4879,8 +5456,11 @@ impl Checker {
             return None;
         }
         // Error value under a compatible set: record the node as the
-        // fallible itself; LIR emits `WrapErr` around the lowered code.
-        if let HirExpr::ErrorValue { set, variant, .. } = expr {
+        // fallible itself; LIR emits `WrapErr` around the lowered payloads.
+        if let HirExpr::ErrorValue {
+            set, variant, args, ..
+        } = expr
+        {
             let compat = match &err {
                 None => true,
                 Some(want) => want == set,
@@ -4890,7 +5470,7 @@ impl Checker {
                 // (one error at the boundary).
                 return None;
             }
-            let set_ty = self.check_error_value(expr.id(), set, variant, expr.span());
+            let set_ty = self.check_error_value(expr.id(), set, variant, args, expr.span(), true);
             if ty_has_error(&set_ty) {
                 return Some(self.record(expr.id(), Ty::Error));
             }
@@ -6150,9 +6730,10 @@ impl Checker {
                 id,
                 set,
                 variant,
+                args,
                 span,
                 ..
-            } => self.check_error_value(*id, set, variant, *span),
+            } => self.check_error_value(*id, set, variant, args, *span, false),
             HirExpr::Try { id, inner, span } => self.check_try(*id, inner, *span),
             HirExpr::Catch {
                 id,
@@ -8512,6 +9093,71 @@ mod tests {
             t,
             Ty::Fallible(f) if f.err.as_deref() == Some("E") && f.ok == Ty::U64
         )));
+    }
+
+    #[test]
+    fn error_payloads_check_arity_types_and_positions() {
+        let (typed, diags) = check_src(
+            "type Io = error { Missing(String), }; fun f(): Io!String { return Io.Missing(\"s\"); } fun main() { val v = f() catch \"d\"; v; }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(!typed.fallible_err_wraps.is_empty(), "{typed:?}");
+        for (src, code) in [
+            // Arity: one payload, zero given.
+            (
+                "type Io = error { Missing(String), }; fun main() { val x: Io!u64 = Io.Missing; x; }",
+                "E303",
+            ),
+            // Payload type: `u64` is not `String`.
+            (
+                "type Io = error { Missing(String), }; fun main() { val x: Io!u64 = Io.Missing(1u64); x; }",
+                "E306",
+            ),
+            // Plain position drops payloads.
+            (
+                "type Io = error { Missing(String), }; fun main() { val x: Io = Io.Missing(\"s\"); x; }",
+                "E303",
+            ),
+        ] {
+            let (_, diags) = check_src(src);
+            let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{src}: {diags:?}");
+            assert_eq!(errors[0].code.as_deref(), Some(code), "{src}: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn error_match_binds_payloads_and_needs_else_for_fallible() {
+        let (_, diags) = check_src(
+            "type Io = error { NotFound, Missing(String), }; fun main() { val e: Io = Io.NotFound; match (e) { Io.NotFound { } Io.Missing { } } }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let (_, diags) = check_src(
+            "type Io = error { Missing(String), }; fun main() { val r: Io!u64 = Io.Missing(\"s\"); match (r) { Io.Missing(p) { p; } else { } } }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        for (src, code) in [
+            // Binding payloads from a plain code.
+            (
+                "type Io = error { NotFound, Missing(String), }; fun main() { val e: Io = Io.NotFound; match (e) { Io.Missing(p) { p; } else { } } }",
+                "E303",
+            ),
+            // Fallible match without `else`.
+            (
+                "type Io = error { Missing(String), }; fun main() { val r: Io!u64 = Io.Missing(\"s\"); match (r) { Io.Missing(p) { p; } } }",
+                "E309",
+            ),
+            // Non-exhaustive plain match without `else`.
+            (
+                "type Io = error { A, B, }; fun main() { val e: Io = Io.A; match (e) { Io.A { } } }",
+                "E309",
+            ),
+        ] {
+            let (_, diags) = check_src(src);
+            let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{src}: {diags:?}");
+            assert_eq!(errors[0].code.as_deref(), Some(code), "{src}: {diags:?}");
+        }
     }
 
     #[test]

@@ -255,10 +255,14 @@ fn calls_in_template(prog: &HirProgram, typed: &TypedProgram, def: u32) -> Vec<N
                 walk_expr(prog, typed, fallback, out);
             }
             HirExpr::Cast { inner, .. } => walk_expr(prog, typed, inner, out),
+            HirExpr::ErrorValue { args, .. } => {
+                for a in args {
+                    walk_expr(prog, typed, a, out);
+                }
+            }
             HirExpr::Literal { .. }
             | HirExpr::String { .. }
             | HirExpr::Null { .. }
-            | HirExpr::ErrorValue { .. }
             | HirExpr::Var { .. } => {}
         }
     }
@@ -691,8 +695,12 @@ pub fn validate_plan(
                 HirExpr::Literal { .. }
                 | HirExpr::String { .. }
                 | HirExpr::Null { .. }
-                | HirExpr::ErrorValue { .. }
                 | HirExpr::Var { .. } => {}
+                HirExpr::ErrorValue { args, .. } => {
+                    for a in args {
+                        expr_ids(a, out);
+                    }
+                }
             }
         }
         fn stmt_ids(s: &HirStmt, out: &mut HashSet<u32>) {

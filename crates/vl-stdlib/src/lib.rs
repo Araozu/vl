@@ -158,8 +158,10 @@ fn hir_expr_has_generic_call(expr: &vl_hir::HirExpr, typed: &vl_typecheck::Typed
         vl_hir::HirExpr::Literal { .. }
         | vl_hir::HirExpr::String { .. }
         | vl_hir::HirExpr::Null { .. }
-        | vl_hir::HirExpr::ErrorValue { .. }
         | vl_hir::HirExpr::Var { .. } => false,
+        vl_hir::HirExpr::ErrorValue { args, .. } => {
+            args.iter().any(|a| hir_expr_has_generic_call(a, typed))
+        }
     }
 }
 

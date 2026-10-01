@@ -1,9 +1,9 @@
 // Every source file is a module named after its filename.
 use std.string;
-use std.fs.{open, read};
+use std.fs.{read_file};
 
 fun main() {
-    val f = open("data.txt");
-    val s = read(f);
+    val s = read_file("data.txt") catch "missing";
     val n = string.len(s);
+    n;
 }

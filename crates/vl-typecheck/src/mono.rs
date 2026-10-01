@@ -389,10 +389,14 @@ fn calls_in_item(
                 walk_expr(typed, fallback, out);
             }
             HirExpr::Cast { inner, .. } => walk_expr(typed, inner, out),
+            HirExpr::ErrorValue { args, .. } => {
+                for a in args {
+                    walk_expr(typed, a, out);
+                }
+            }
             HirExpr::Literal { .. }
             | HirExpr::String { .. }
             | HirExpr::Null { .. }
-            | HirExpr::ErrorValue { .. }
             | HirExpr::Var { .. } => {}
         }
     }

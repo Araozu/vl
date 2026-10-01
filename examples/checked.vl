@@ -1,0 +1,28 @@
+// Checked externs: VM natives that report failures through `rv10`.
+//
+// `std.string.byte_at` / `string.slice` return `StringError!T`
+// (`OutOfBounds`, `InvalidRange`) and `std.fs.read_file` returns
+// `FsError!String` (`IoError`). Handle them with `catch`, propagate with
+// `try`, or bind error payloads with `match` (payloads live in the
+// fallible channel; `else` covers the ok value).
+use std;
+use std.string;
+use std.fs;
+
+fun first_byte(s: String): std.string.StringError!u8 {
+    val b = try string.byte_at(s, 0u64);
+    return b;
+}
+
+fun main() {
+    std.print_u64((first_byte("hi") catch 0u8) as u64);
+    std.print_u64((string.byte_at("hi", 9u64) catch 255u8) as u64);
+    std.print(string.slice("hello", 1u64, 4u64) catch "fallback");
+    std.print("\n");
+    match (string.slice("hello", 9u64, 10u64)) {
+        std.string.StringError.OutOfBounds { std.print("oob\n"); }
+        std.string.StringError.InvalidRange { std.print("range\n"); }
+        else { std.print("ok\n"); }
+    }
+    std.print(fs.read_file("data.txt") catch "no-file");
+}

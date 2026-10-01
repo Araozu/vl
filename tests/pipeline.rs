@@ -253,8 +253,7 @@ fn module_imports_resolve_without_importing_descendants() {
     let lir = frontend(&src).expect("module imports must compile");
     let dump = lir.dump();
     assert!(dump.contains("call std.string::len"), "{dump}");
-    assert!(dump.contains("call std.fs::open"), "{dump}");
-    assert!(dump.contains("call std.fs::read"), "{dump}");
+    assert!(dump.contains("call std.fs::read_file"), "{dump}");
 }
 
 #[test]
@@ -1840,7 +1839,9 @@ fn errors_example_wraps_propagates_and_catches_to_naravm() {
     let src = std::fs::read_to_string("examples/errors.vl").unwrap();
     let lir = frontend(&src).expect("errors.vl must compile");
     let dump = lir.dump();
-    for op in ["wrap_ok", "wrap_err", "tag_of", "unwrap_ok", "unwrap_err"] {
+    // `try` forwards through `rewrap_err` (no bare `unwrap_err` remains
+    // outside `match` on fallibles).
+    for op in ["wrap_ok", "wrap_err", "rewrap_err", "tag_of", "unwrap_ok"] {
         assert!(dump.contains(op), "{op} missing in {dump}");
     }
     let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
@@ -1882,6 +1883,9 @@ fn err_error_examples_fail() {
     for (file, code) in [
         ("examples/err_try_type.vl", "E304"),
         ("examples/err_unhandled.vl", "E309"),
+        ("examples/err_error_arity.vl", "E303"),
+        ("examples/err_error_payload.vl", "E303"),
+        ("examples/err_error_match.vl", "E303"),
     ] {
         let src = std::fs::read_to_string(file).unwrap();
         let err = frontend(&src).expect_err("{file} must fail");
@@ -1970,5 +1974,144 @@ fn brace_imported_error_sets_construct() {
         programs[1].dump().contains("wrap_err"),
         "{}",
         programs[1].dump()
+    );
+}
+
+#[test]
+fn error_payloads_construct_propagate_and_match_to_naravm() {
+    use vl_codegen::Target;
+    let src = std::fs::read_to_string("examples/errors.vl").unwrap();
+    let lir = frontend(&src).expect("errors.vl must compile");
+    let dump = lir.dump();
+    // Payload construction wraps args; `try` forwards via `rewrap_err`;
+    // fallible `match` binds through `err_payload_get`.
+    for op in ["wrap_err", "rewrap_err", "err_payload_get"] {
+        assert!(dump.contains(op), "{op} missing in {dump}");
+    }
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+}
+
+#[test]
+fn error_payload_misuse_is_single_root_causes() {
+    for (src, code) in [
+        // Arity: `Missing` takes one `String`.
+        (
+            "type Io = error { Missing(String), }; fun main() { val x: Io!u64 = Io.Missing; x; }",
+            "E303",
+        ),
+        // Payload type: `u64` is not `String`.
+        (
+            "type Io = error { Missing(String), }; fun main() { val x: Io!u64 = Io.Missing(1u64); x; }",
+            "E306",
+        ),
+        // Plain position drops payloads: annotate a fallible instead.
+        (
+            "type Io = error { Missing(String), }; fun main() { val x: Io = Io.Missing(\"s\"); x; }",
+            "E303",
+        ),
+        // Plain match cannot bind payloads.
+        (
+            "type Io = error { NotFound, Missing(String), }; fun main() { val e: Io = Io.NotFound; match (e) { Io.Missing(p) { p; } else { } } }",
+            "E303",
+        ),
+        // Fallible match needs `else` for the ok value.
+        (
+            "type Io = error { Missing(String), }; fun main() { val r: Io!u64 = Io.Missing(\"s\"); match (r) { Io.Missing(p) { p; } } }",
+            "E309",
+        ),
+        // Unknown variant in a fallible match arm.
+        (
+            "type Io = error { Missing(String), }; fun main() { val r: Io!u64 = Io.Missing(\"s\"); match (r) { Io.Bogus { } else { } } }",
+            "E302",
+        ),
+    ] {
+        let err = frontend(src).expect_err("payload probe must fail");
+        let errors = err.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{src}: {err:?}");
+        assert_eq!(errors[0].code.as_deref(), Some(code), "{src}: {err:?}");
+    }
+}
+
+#[test]
+fn cross_module_error_payloads_compile_to_lir_and_naravm() {
+    use vl_codegen::Target;
+    let programs = frontend_project(&[
+        (
+            "vl.io",
+            "type Io = error { NotFound, Missing(String), }; fun read(ok: bool): Io!u64 { if (ok) { return 1u64; } return Io.Missing(\"gone\"); }",
+        ),
+        (
+            "vl.main",
+            "use std; use vl.io.{self, Io}; fun main() { match (io.read(false)) { Io.Missing(p) { std.print(p); } else { std.print(\"ok\\n\"); } } }",
+        ),
+    ])
+    .expect("cross-module payload errors must compile");
+    let importer_dump = programs[1].dump();
+    assert!(importer_dump.contains("err_payload_get"), "{importer_dump}");
+    for lir in &programs {
+        let (artifact, diags) = vl_codegen::NaraVmTarget.emit(lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+    }
+}
+
+#[test]
+fn checked_string_and_fs_calls_compile_to_naravm() {
+    use vl_codegen::Target;
+    let src = std::fs::read_to_string("examples/checked.vl").unwrap();
+    let lir = frontend(&src).expect("checked.vl must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("call std.string::byte_at"), "{dump}");
+    assert!(dump.contains("call std.string::slice"), "{dump}");
+    assert!(dump.contains("call std.fs::read_file"), "{dump}");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+    // Checked calls lower to `calli` plus an `rv10`-status split.
+    for op in [0x20u8, 0x24, 0x27, 0x2d] {
+        assert!(bytes.contains(&op), "expected opcode {op:#x}");
+    }
+    assert!(
+        bytes
+            .windows(b"std::string".len())
+            .any(|w| w == b"std::string"),
+        "string native module missing"
+    );
+    assert!(
+        bytes.windows(b"std::fs".len()).any(|w| w == b"std::fs"),
+        "fs native module missing"
+    );
+}
+
+#[test]
+fn checked_call_sets_are_typed() {
+    let catalog = vl_codegen::modules();
+    let string = catalog
+        .iter()
+        .find(|m| m.path.as_string() == "std.string")
+        .expect("std.string in modules()");
+    let set = string.lookup_error("StringError").expect("StringError set");
+    assert_eq!(set.qualified, vl_codegen::STRING_ERROR_SET);
+    assert_eq!(
+        set.variants
+            .iter()
+            .map(|v| v.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["OutOfBounds", "InvalidRange"]
+    );
+    let fs = catalog
+        .iter()
+        .find(|m| m.path.as_string() == "std.fs")
+        .expect("std.fs in modules()");
+    let fs_set = fs.lookup_error("FsError").expect("FsError set");
+    assert_eq!(fs_set.qualified, vl_codegen::FS_ERROR_SET);
+    // `std.fs` is emittable on naravm now (no filter).
+    let target = vl_codegen::modules_for_target("naravm");
+    assert!(
+        target.iter().any(|m| m.path.as_string() == "std.fs"),
+        "std.fs must be emittable on naravm"
     );
 }

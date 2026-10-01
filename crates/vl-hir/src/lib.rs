@@ -61,11 +61,13 @@ pub struct HirUnionVariant {
     pub payload: Vec<(VlType, Span)>,
 }
 
-/// One error-set variant: a plain name (no payloads in this milestone).
+/// One error-set variant: a name plus optional per-variant payload types,
+/// mirroring union variants.
 #[derive(Debug, Clone)]
 pub struct HirErrorVariant {
     pub name: String,
     pub name_span: Span,
+    pub payload: Vec<(VlType, Span)>,
 }
 
 /// One `match` arm binding: a fresh implicit-`val` local for one payload
@@ -259,16 +261,18 @@ pub enum HirExpr {
         args: Vec<HirExpr>,
         span: Span,
     },
-    /// Error value construction: `E.NotFound`. Lowered from `Field` sites
-    /// recorded by `vl-semantic` (`Resolution::error_uses`); `set` is the
-    /// canonical set name (bare local, qualified imported) and `code` the
-    /// global FNV-1a runtime value, so every module agrees on the bits.
-    /// Error variants take no arguments (a call tail is E303 upstream).
+    /// Error value construction: `E.NotFound` or `E.Denied(args)`. Lowered
+    /// from `Field`/`Call` sites recorded by `vl-semantic`
+    /// (`Resolution::error_uses`); `set` is the canonical set name (bare
+    /// local, qualified imported) and `code` the global FNV-1a runtime
+    /// value, so every module agrees on the bits. Arity and payload types
+    /// are validated by typechecking from the recorded site.
     ErrorValue {
         id: HirId,
         set: String,
         variant: String,
         code: u64,
+        args: Vec<HirExpr>,
         span: Span,
     },
     /// Fallible propagation (`try expr`): unwrap or return the error.
@@ -667,6 +671,11 @@ impl<'a> Lowerer<'a> {
                     .map(|v| HirErrorVariant {
                         name: v.name.clone(),
                         name_span: v.name_span,
+                        payload: v
+                            .payload
+                            .iter()
+                            .map(|(ty, span)| (self.canonical_ty(ty.clone()), *span))
+                            .collect(),
                     })
                     .collect(),
                 span: *span,
@@ -1041,6 +1050,7 @@ impl<'a> Lowerer<'a> {
                         set: use_.set,
                         variant: use_.variant.clone(),
                         code: error_code(&qualified, &use_.variant),
+                        args: Vec::new(),
                         span: *span,
                     };
                 }
@@ -1093,8 +1103,9 @@ impl<'a> Lowerer<'a> {
                 span,
                 ..
             } => {
-                // Error construction with a call tail (`E.V(args)`, already
-                // E303 upstream): lower the error value, drop the arguments.
+                // Error construction with a call tail (`E.V(args)`, like a
+                // union variant): lower the error value with its payload
+                // arguments (arity checked downstream).
                 if let Some(use_) = self
                     .res
                     .error_uses
@@ -1111,6 +1122,7 @@ impl<'a> Lowerer<'a> {
                         set: use_.set,
                         variant: use_.variant.clone(),
                         code: error_code(&qualified, &use_.variant),
+                        args: args.iter().map(|a| self.lower_expr(a)).collect(),
                         span: *span,
                     };
                 }
@@ -1360,6 +1372,42 @@ mod tests {
                     other => panic!("expected error value, got {other:?}"),
                 },
                 other => panic!("expected let, got {other:?}"),
+            },
+            other => panic!("expected fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_payload_construction_lowers_args() {
+        let src = "type E = error { A(String), }; fun f(): E!u64 { return E.A(\"s\"); }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        match &hir.items[0] {
+            HirItem::Error { variants, .. } => {
+                assert_eq!(variants.len(), 1);
+                assert_eq!(variants[0].payload.len(), 1);
+            }
+            other => panic!("expected error set, got {other:?}"),
+        }
+        match &hir.items[1] {
+            HirItem::Fn { body, .. } => match &body[0] {
+                HirStmt::Return {
+                    value: Some(value), ..
+                } => match value {
+                    HirExpr::ErrorValue {
+                        set, variant, args, ..
+                    } => {
+                        assert_eq!(set, "E");
+                        assert_eq!(variant, "A");
+                        assert_eq!(args.len(), 1, "{value:?}");
+                    }
+                    other => panic!("expected error value, got {other:?}"),
+                },
+                other => panic!("expected return, got {other:?}"),
             },
             other => panic!("expected fn, got {other:?}"),
         }

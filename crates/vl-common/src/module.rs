@@ -212,15 +212,23 @@ pub struct UnionExport {
     pub variants: Vec<UnionVariantSig>,
 }
 
+/// One declaration-only error variant exported through a module interface.
+/// Payloads retain their source-level nominal type spellings so importers can
+/// validate qualified references without inventing a runtime representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorVariantSig {
+    pub name: String,
+    pub payload: Vec<VlType>,
+}
+
 /// Exported nominal error set: its short name, its fully qualified identity
-/// (`<module>.<name>`), and its variant names in declaration order.
-/// Variants carry no data in this milestone (plain names only); the shape
-/// already mirrors unions so payloads can land here later.
+/// (`<module>.<name>`), and its variants in declaration order (each with its
+/// payload types, like unions).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorExport {
     pub name: String,
     pub qualified: String,
-    pub variants: Vec<String>,
+    pub variants: Vec<ErrorVariantSig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,7 +239,7 @@ pub struct ModuleSpec {
     pub objects: Vec<ObjectExport>,
     /// Exported nominal unions. Unions have no object layout or methods.
     pub unions: Vec<UnionExport>,
-    /// Exported nominal error sets (plain variants, no payloads yet).
+    /// Exported nominal error sets (variants may carry payloads, like unions).
     pub errors: Vec<ErrorExport>,
     /// The provider had lexer/parser errors, so recovered AST omissions are
     /// not reliable evidence that an export does not exist.
@@ -377,7 +385,10 @@ mod tests {
             errors: vec![ErrorExport {
                 name: "Trip".into(),
                 qualified: "vl.dog.Trip".into(),
-                variants: vec!["Fell".into()],
+                variants: vec![ErrorVariantSig {
+                    name: "Fell".into(),
+                    payload: vec![],
+                }],
             }],
             parse_poisoned: false,
             poisoned_exports: vec![],
@@ -463,7 +474,10 @@ mod tests {
             errors: vec![ErrorExport {
                 name: "Oops".into(),
                 qualified: "demo.types.Oops".into(),
-                variants: vec!["Bad".into()],
+                variants: vec![ErrorVariantSig {
+                    name: "Bad".into(),
+                    payload: vec![VlType::Param("T".into())],
+                }],
             }],
             parse_poisoned: false,
             poisoned_exports: Vec::new(),

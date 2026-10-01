@@ -177,7 +177,9 @@ pub enum Instr {
         tys: Vec<Ty>,
         span: Span,
     },
-    /// Read a union value's discriminant tag (a `u64` value).
+    /// Read a union value's discriminant tag (a `u64` value). Also reads
+    /// a fallible's tag: both keep their discriminator in value slot 0.
+    /// (Plain error values are bare `u64` codes, compared directly.)
     TagOf {
         dst: Reg,
         scrut: Reg,
@@ -193,12 +195,26 @@ pub enum Instr {
         ok: Ty,
         span: Span,
     },
-    /// Build an `E!T` error value from a `u64` error code. `ok` sizes the
-    /// container for the `ok` payload the error displaces. Emitted for
-    /// implicit `E.V` -> `E!T` wraps and `try` error-path rebuilds.
+    /// Build an `E!T` error value from a `u64` error code plus its payload
+    /// registers. `ok` sizes the `ok` payload region; the error region
+    /// always spans the program's maximum lanes ([`LirProgram::err_lanes`]).
+    /// `args` / `tys` are this site's payload values in order. Emitted for
+    /// implicit `E.V` -> `E!T` wraps and `try` error-path rebuilds (via
+    /// [`Instr::RewrapErr`]).
     WrapErr {
         dst: Reg,
         code: Reg,
+        ok: Ty,
+        args: Vec<Reg>,
+        tys: Vec<Ty>,
+        span: Span,
+    },
+    /// Rebuild an `E!T` error value from another one with a different `ok`
+    /// payload type (`try` propagation): copies the code plus the whole
+    /// error payload region ([`LirProgram::err_lanes`] lanes).
+    RewrapErr {
+        dst: Reg,
+        scrut: Reg,
         ok: Ty,
         span: Span,
     },
@@ -222,6 +238,17 @@ pub enum Instr {
     /// matched variant's erased payload types (slot mapping mirrors
     /// [`Instr::NewVariant`]).
     PayloadGet {
+        dst: Reg,
+        scrut: Reg,
+        index: usize,
+        tys: Vec<Ty>,
+        span: Span,
+    },
+    /// Read payload position `index` of an error variant out of an `E!T`
+    /// container (valid on the err path, after a tag + code check). `tys`
+    /// is the matched variant's erased payload types; value payloads sit
+    /// two slots past the tag and code, reference payloads from slot 0.
+    ErrPayloadGet {
         dst: Reg,
         scrut: Reg,
         index: usize,
@@ -345,6 +372,11 @@ pub struct LirProgram {
     pub globals: Vec<Global>,
     pub functions: Vec<Function>,
     pub imports: Vec<FunctionImport>,
+    /// Maximum error-payload lanes (value slots, reference slots) over every
+    /// error set in scope. Sizes every fallible container's error region so
+    /// `try` forwards any variant blindly. `(0, 0)` keeps legacy containers
+    /// bit-identical.
+    pub err_lanes: (usize, usize),
 }
 
 impl LirProgram {
@@ -504,13 +536,14 @@ fn instr_ty(ins: &Instr) -> Option<&Ty> {
             Some(ok)
         }
         Instr::Cast { target, .. } => Some(target),
-        // Tuples and variants carry a `Vec<Ty>`; validated element-wise in
-        // `validate_runtime`.
+        // Tuples, variants, and errors carry a `Vec<Ty>`; validated
+        // element-wise in `validate_runtime`.
         Instr::TupleLit { .. }
         | Instr::TupleGet { .. }
         | Instr::TupleSet { .. }
         | Instr::NewVariant { .. }
-        | Instr::PayloadGet { .. } => None,
+        | Instr::PayloadGet { .. }
+        | Instr::ErrPayloadGet { .. } => None,
         _ => None,
     }
 }
@@ -528,7 +561,10 @@ fn instr_tuple_tys(ins: &Instr) -> Option<&Vec<Ty>> {
 /// Payload types carried by variant instructions, if any.
 fn instr_variant_tys(ins: &Instr) -> Option<&Vec<Ty>> {
     match ins {
-        Instr::NewVariant { tys, .. } | Instr::PayloadGet { tys, .. } => Some(tys),
+        Instr::NewVariant { tys, .. }
+        | Instr::WrapErr { tys, .. }
+        | Instr::PayloadGet { tys, .. }
+        | Instr::ErrPayloadGet { tys, .. } => Some(tys),
         _ => None,
     }
 }
@@ -690,8 +726,28 @@ fn fmt_instr(ins: &Instr) -> String {
         Instr::WrapOk { dst, value, ok, .. } => {
             format!("%{} = wrap_ok %{} : {ok}", dst.0, value.0)
         }
-        Instr::WrapErr { dst, code, ok, .. } => {
-            format!("%{} = wrap_err %{} : {ok}", dst.0, code.0)
+        Instr::WrapErr {
+            dst,
+            code,
+            ok,
+            args,
+            tys,
+            ..
+        } => {
+            let args = std::iter::once(code)
+                .chain(args.iter())
+                .map(|a| format!("%{}", a.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let tys = tys
+                .iter()
+                .map(|t| format!("{t}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("%{} = wrap_err [{args}] : {ok} : ({tys})", dst.0)
+        }
+        Instr::RewrapErr { dst, scrut, ok, .. } => {
+            format!("%{} = rewrap_err %{} : {ok}", dst.0, scrut.0)
         }
         Instr::UnwrapOk { dst, scrut, ok, .. } => {
             format!("%{} = unwrap_ok %{} : {ok}", dst.0, scrut.0)
@@ -712,6 +768,23 @@ fn fmt_instr(ins: &Instr) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("%{} = payload_get %{}[{index}] : ({tys})", dst.0, scrut.0)
+        }
+        Instr::ErrPayloadGet {
+            dst,
+            scrut,
+            index,
+            tys,
+            ..
+        } => {
+            let tys = tys
+                .iter()
+                .map(|t| format!("{t}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "%{} = err_payload_get %{}[{index}] : ({tys})",
+                dst.0, scrut.0
+            )
         }
         Instr::Cast {
             dst, src, target, ..
@@ -781,6 +854,31 @@ struct Lowerer<'t> {
 /// LIR and backends never see `*`.
 fn rt(ty: &Ty) -> Ty {
     ty.erase_capability()
+}
+
+/// Maximum error-payload lanes over every error set in scope: value slots
+/// and reference slots. Sizes every fallible container's error region so any
+/// variant (including `try`-forwarded ones from inferred `!T` values) fits
+/// the same container shape. `(0, 0)` when no variant carries a payload,
+/// which keeps existing containers bit-identical.
+fn max_error_lanes(errors: &HashMap<String, vl_typecheck::ErrorSigTy>) -> (usize, usize) {
+    let mut values = 0usize;
+    let mut refs = 0usize;
+    for sig in errors.values() {
+        for variant in &sig.variants {
+            let (mut v, mut r) = (0usize, 0usize);
+            for ty in &variant.payload {
+                if rt(ty).is_reference_type() {
+                    r += 1;
+                } else {
+                    v += 1;
+                }
+            }
+            values = values.max(v);
+            refs = refs.max(r);
+        }
+    }
+    (values, refs)
 }
 
 fn collect_import_expr(
@@ -867,8 +965,12 @@ fn collect_import_expr(
                 collect_import_expr(a, typed, out)
             }
         }
-        // Error values hold no calls; `try`/`catch` may hide them inside.
-        HirExpr::ErrorValue { .. } => {}
+        // Error payloads may hide calls; `try`/`catch` may hide them inside.
+        HirExpr::ErrorValue { args, .. } => {
+            for a in args {
+                collect_import_expr(a, typed, out)
+            }
+        }
         HirExpr::Try { inner, .. } => collect_import_expr(inner, typed, out),
         HirExpr::Catch { lhs, fallback, .. } => {
             collect_import_expr(lhs, typed, out);
@@ -1345,6 +1447,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
         globals: Vec::new(),
         functions: Vec::new(),
         imports: collect_imports(prog, typed),
+        err_lanes: max_error_lanes(&typed.errors),
     };
 
     // Globals first (source order): initializers may read earlier globals via
@@ -1821,6 +1924,7 @@ pub fn lower_project(
         globals: Vec::new(),
         functions: Vec::new(),
         imports: Vec::new(),
+        err_lanes: max_error_lanes(&typed.errors),
     };
 
     for (idx, (_def, name, id, value, span)) in global_items.iter().enumerate() {
@@ -2277,7 +2381,11 @@ fn collect_project_imports(
                 walk_expr(prog, typed, plan, outer, lhs, by_symbol);
                 walk_expr(prog, typed, plan, outer, fallback, by_symbol);
             }
-            HirExpr::ErrorValue { .. } => {}
+            HirExpr::ErrorValue { args, .. } => {
+                for a in args {
+                    walk_expr(prog, typed, plan, outer, a, by_symbol)
+                }
+            }
             HirExpr::Binary { lhs, rhs, .. } => {
                 walk_expr(prog, typed, plan, outer, lhs, by_symbol);
                 walk_expr(prog, typed, plan, outer, rhs, by_symbol);
@@ -2461,9 +2569,11 @@ impl Lowerer<'_> {
         Some(dst)
     }
 
-    /// Emit `WrapErr(code)` for an auto-wrapped `E!T` error. The node's
-    /// recorded type is the fallible itself (carries the `ok` layout); the
-    /// code comes from lowering the inner error value.
+    /// Emit `WrapErr` for an auto-wrapped `E!T` error. The node's recorded
+    /// type is the fallible itself (carries the `ok` layout); the code plus
+    /// payload registers come from lowering the inner error construction
+    /// (a bare error-typed value wraps with no payload: plain codes carry
+    /// none). The error region always spans the program's maximum lanes.
     fn lower_fallible_err_wrap(
         &mut self,
         expr: &HirExpr,
@@ -2474,12 +2584,40 @@ impl Lowerer<'_> {
             Ty::Fallible(f) => rt(&f.ok),
             _ => return None,
         };
-        let code = self.lower_expr_inner(expr, typed)?;
+        // Direct construction carries this site's payload registers;
+        // anything else (a variable holding a code, ...) wraps payloadless.
+        let (code, args, tys) = match expr {
+            HirExpr::ErrorValue {
+                code, args, span, ..
+            } => {
+                let mut lowered = Vec::with_capacity(args.len());
+                let mut tys = Vec::with_capacity(args.len());
+                for arg in args {
+                    let reg = self.lower_expr(arg, typed)?;
+                    let ty = self.resolved_ty(arg.id())?;
+                    lowered.push(reg);
+                    tys.push(rt(&ty));
+                }
+                let code_reg = self.reg();
+                self.instrs.push(Instr::Const {
+                    dst: code_reg,
+                    value: Scalar::U64(*code),
+                    span: *span,
+                });
+                (code_reg, lowered, tys)
+            }
+            _ => {
+                let code = self.lower_expr_inner(expr, typed)?;
+                (code, Vec::new(), Vec::new())
+            }
+        };
         let dst = self.reg();
         self.instrs.push(Instr::WrapErr {
             dst,
             code,
             ok,
+            args,
+            tys,
             span: expr.span(),
         });
         Some(dst)
@@ -3077,10 +3215,16 @@ impl Lowerer<'_> {
                     Some(dst)
                 }
             },
-            HirExpr::ErrorValue { code, span, .. } => {
-                // Error values are global `u64` codes (set membership was
-                // validated by typechecking); fallible wraps lift them into
-                // containers.
+            HirExpr::ErrorValue {
+                code, args, span, ..
+            } => {
+                // Plain error values are global `u64` codes (set membership
+                // was validated by typechecking); payload constructions only
+                // carry data through fallible wraps. Recovery still lowers
+                // stray arguments for their side effects.
+                for arg in args {
+                    let _ = self.lower_expr(arg, typed);
+                }
                 let dst = self.reg();
                 self.instrs.push(Instr::Const {
                     dst,
@@ -3554,8 +3698,9 @@ impl Lowerer<'_> {
     }
 
     /// `try expr`: unwrap the ok payload inline; on error, rebuild the
-    /// enclosing function's `ok` shape around the code and return it. The
-    /// error path diverges, so the ok value needs no join register.
+    /// enclosing function's `ok` shape around the code plus the whole
+    /// error payload region and return it. The error path diverges, so the
+    /// ok value needs no join register.
     fn lower_try(
         &mut self,
         id: vl_hir::HirId,
@@ -3597,16 +3742,10 @@ impl Lowerer<'_> {
             id: err_label,
             span,
         });
-        let code = self.reg();
-        self.instrs.push(Instr::UnwrapErr {
-            dst: code,
-            scrut,
-            span,
-        });
         let errv = self.reg();
-        self.instrs.push(Instr::WrapErr {
+        self.instrs.push(Instr::RewrapErr {
             dst: errv,
-            code,
+            scrut,
             ok: rebuild,
             span,
         });
@@ -3940,6 +4079,28 @@ impl Lowerer<'_> {
         });
     }
 
+    /// Declared code + erased payload types for `set.variant`. `None`
+    /// when unknown (typechecking already reported; lowering stands down).
+    /// Codes hash the fully qualified set identity so every module agrees
+    /// on the bits (mirroring HIR construction).
+    fn error_layout(&self, set: &str, variant: &str) -> Option<(u64, Vec<Ty>)> {
+        let sig = self.typed.errors.get(set)?;
+        let payload = sig
+            .variants
+            .iter()
+            .find(|v| v.name == variant)
+            .map(|v| &v.payload)?;
+        let qualified = if set.contains('.') {
+            set.to_string()
+        } else {
+            format!("{}.{}", self.module, set)
+        };
+        Some((
+            vl_hir::error_code(&qualified, variant),
+            payload.iter().map(rt).collect(),
+        ))
+    }
+
     /// Declared tag + erased payload types for `union.variant` under concrete
     /// union arguments. `None` when unknown (typechecking already reported;
     /// lowering stands down).
@@ -3978,6 +4139,9 @@ impl Lowerer<'_> {
     /// Lower `match`: read the discriminant once, then chain one tag
     /// comparison per arm (typechecking validated coverage and payload
     /// arity, so every arm binds exactly its variant's payloads).
+    /// Dispatches on the scrutinee type: unions compare tags, plain error
+    /// sets compare codes, fallibles check the tag first (ok goes to
+    /// `else`) then compare codes on the error path.
     fn lower_match(
         &mut self,
         scrutinee: &HirExpr,
@@ -3989,6 +4153,237 @@ impl Lowerer<'_> {
         let Some(scrut) = self.lower_expr(scrutinee, typed) else {
             return;
         };
+        match self.resolved_ty(scrutinee.id()) {
+            Some(Ty::ErrorSet(_)) => {
+                self.lower_error_match(scrut, arms, else_body, typed, span);
+                return;
+            }
+            Some(Ty::Fallible(_)) => {
+                self.lower_fallible_match(scrut, arms, else_body, typed, span);
+                return;
+            }
+            _ => {}
+        }
+        self.lower_union_match(scrutinee, scrut, arms, else_body, typed, span);
+    }
+
+    /// Lower `match` over a plain error set: chain one code comparison per
+    /// arm (codes are the scrutinee itself; payload-carrying patterns were
+    /// rejected upstream so no bindings run here).
+    fn lower_error_match(
+        &mut self,
+        scrut: Reg,
+        arms: &[vl_hir::HirMatchArm],
+        else_body: Option<&[HirStmt]>,
+        typed: &vl_typecheck::TypedProgram,
+        span: Span,
+    ) {
+        let mut layouts = Vec::with_capacity(arms.len());
+        for arm in arms {
+            let Some(layout) = self.error_layout(&arm.union, &arm.variant) else {
+                return;
+            };
+            layouts.push(layout);
+        }
+        let incoming = self.bindings.clone();
+        let end_label = self.label();
+        let mut next_labels = Vec::with_capacity(arms.len());
+        for _ in arms {
+            next_labels.push(self.label());
+        }
+        for ((arm, (code, _)), next) in arms.iter().zip(layouts.iter()).zip(next_labels.iter()) {
+            // `code == <arm code>`, else fall to the next arm.
+            let arm_code = self.reg();
+            self.instrs.push(Instr::Const {
+                dst: arm_code,
+                value: Scalar::U64(*code),
+                span,
+            });
+            let cond = self.reg();
+            self.instrs.push(Instr::BinOp {
+                dst: cond,
+                op: LirOp::Eq,
+                lhs: scrut,
+                rhs: arm_code,
+                span,
+            });
+            self.instrs.push(Instr::BranchIfFalse {
+                cond,
+                target: *next,
+                span,
+            });
+            self.bindings = incoming.clone();
+            for stmt in &arm.body {
+                self.lower_stmt(stmt, typed);
+            }
+            self.instrs.push(Instr::Jump {
+                target: end_label,
+                span,
+            });
+            self.instrs.push(Instr::Label { id: *next, span });
+        }
+        self.bindings = incoming.clone();
+        if let Some(body) = else_body {
+            for stmt in body {
+                self.lower_stmt(stmt, typed);
+            }
+        }
+        self.bindings = incoming;
+        self.instrs.push(Instr::Label {
+            id: end_label,
+            span,
+        });
+    }
+
+    /// Lower `match` over a fallible: ok values jump straight to `else`,
+    /// then the error path chains one code comparison per arm with payload
+    /// bindings. Typechecking requires `else` here, so a missing body
+    /// means prior errors (lowering stands down).
+    fn lower_fallible_match(
+        &mut self,
+        scrut: Reg,
+        arms: &[vl_hir::HirMatchArm],
+        else_body: Option<&[HirStmt]>,
+        typed: &vl_typecheck::TypedProgram,
+        span: Span,
+    ) {
+        let Some(else_body) = else_body else {
+            return;
+        };
+        let mut layouts = Vec::with_capacity(arms.len());
+        for arm in arms {
+            let Some(layout) = self.error_layout(&arm.union, &arm.variant) else {
+                return;
+            };
+            layouts.push(layout);
+        }
+        let incoming = self.bindings.clone();
+        let end_label = self.label();
+        let else_label = self.label();
+        let err_label = self.label();
+        // `is_ok` is true for tag 0: errors jump into the dispatch, ok
+        // values skip it for `else`.
+        let Some(is_ok) = self.lower_fallible_tag(scrut, span) else {
+            return;
+        };
+        self.instrs.push(Instr::BranchIfFalse {
+            cond: is_ok,
+            target: err_label,
+            span,
+        });
+        self.instrs.push(Instr::Jump {
+            target: else_label,
+            span,
+        });
+        self.instrs.push(Instr::Label {
+            id: err_label,
+            span,
+        });
+        let code = self.reg();
+        self.instrs.push(Instr::UnwrapErr {
+            dst: code,
+            scrut,
+            span,
+        });
+        let mut next_labels = Vec::with_capacity(arms.len());
+        for _ in arms {
+            next_labels.push(self.label());
+        }
+        for ((arm, (arm_code_value, tys)), next) in
+            arms.iter().zip(layouts.iter()).zip(next_labels.iter())
+        {
+            let arm_code = self.reg();
+            self.instrs.push(Instr::Const {
+                dst: arm_code,
+                value: Scalar::U64(*arm_code_value),
+                span,
+            });
+            let cond = self.reg();
+            self.instrs.push(Instr::BinOp {
+                dst: cond,
+                op: LirOp::Eq,
+                lhs: code,
+                rhs: arm_code,
+                span,
+            });
+            self.instrs.push(Instr::BranchIfFalse {
+                cond,
+                target: *next,
+                span,
+            });
+            // Bind this variant's error payloads, then run the arm.
+            self.bindings = incoming.clone();
+            for (i, b) in arm.bindings.iter().enumerate() {
+                if i >= tys.len() {
+                    break;
+                }
+                let dst = self.reg();
+                self.instrs.push(Instr::ErrPayloadGet {
+                    dst,
+                    scrut,
+                    index: i,
+                    tys: tys.clone(),
+                    span,
+                });
+                if let Some(def) = &b.def {
+                    if let Some(gid) = self.globals.get(&def.0).copied() {
+                        self.instrs.push(Instr::GlobalStore {
+                            global: gid,
+                            src: dst,
+                            span,
+                        });
+                    } else {
+                        let home = self.reg();
+                        self.instrs.push(Instr::Copy {
+                            dst: home,
+                            src: dst,
+                            span,
+                        });
+                        self.bindings.insert(def.0, home);
+                    }
+                }
+            }
+            for stmt in &arm.body {
+                self.lower_stmt(stmt, typed);
+            }
+            self.instrs.push(Instr::Jump {
+                target: end_label,
+                span,
+            });
+            self.instrs.push(Instr::Label { id: *next, span });
+        }
+        // No arm matched: an unlisted error still lands in `else`.
+        self.instrs.push(Instr::Jump {
+            target: else_label,
+            span,
+        });
+        self.instrs.push(Instr::Label {
+            id: else_label,
+            span,
+        });
+        self.bindings = incoming.clone();
+        for stmt in else_body {
+            self.lower_stmt(stmt, typed);
+        }
+        self.bindings = incoming;
+        self.instrs.push(Instr::Label {
+            id: end_label,
+            span,
+        });
+    }
+
+    /// Lower `match` over a union: read the discriminant once, then chain
+    /// one tag comparison per arm (typechecking validated coverage and
+    /// payload arity, so every arm binds exactly its variant's payloads).
+    fn lower_union_match(
+        &mut self,
+        scrutinee: &HirExpr,
+        scrut: Reg,
+        arms: &[vl_hir::HirMatchArm],
+        else_body: Option<&[HirStmt]>,
+        typed: &vl_typecheck::TypedProgram,
+        span: Span,
+    ) {
         // Resolve the union identity and every arm's layout before emitting:
         // anything unknown was already reported upstream.
         let union_ty = match self.resolved_ty(scrutinee.id()) {
@@ -4134,8 +4529,27 @@ mod tests {
         assert!(dump.contains("wrap_ok"), "{dump}");
         assert!(dump.contains("tag_of"), "{dump}");
         assert!(dump.contains("unwrap_ok"), "{dump}");
-        assert!(dump.contains("unwrap_err"), "{dump}");
+        assert!(dump.contains("rewrap_err"), "{dump}");
         assert!(dump.contains("branch_if_false"), "{dump}");
+    }
+
+    #[test]
+    fn error_payloads_lower_to_wrap_args_and_err_payload_get() {
+        let src = "type E = error { A(String), }; fun f(): E!u64 { return E.A(\"s\"); } fun main() { match (f()) { E.A(p) { p; } else { } } }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, _) = vl_semantic::resolve(&prog);
+        let hir = vl_hir::lower(&prog, &res);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let lir = lower(&hir, &typed);
+        // One String payload lane program-wide.
+        assert_eq!(lir.err_lanes, (0, 1), "{:?}", lir.err_lanes);
+        let dump = lir.dump();
+        assert!(dump.contains("wrap_err"), "{dump}");
+        assert!(dump.contains("err_payload_get"), "{dump}");
+        assert!(dump.contains("unwrap_err"), "{dump}");
     }
 
     #[test]

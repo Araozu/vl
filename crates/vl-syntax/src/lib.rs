@@ -180,9 +180,8 @@ pub struct UnionVariant {
     pub payload: Vec<(VlType, Span)>,
 }
 
-/// One error-set variant: a plain name for now (`NotFound`).
-/// `payload` is reserved for future per-variant data (like unions) and is
-/// always empty in this milestone; the parser rejects `(...)` tails.
+/// One error-set variant: a name plus optional per-variant payload types
+/// (`NotFound(path: String)`), mirroring union variants.
 #[derive(Debug, Clone)]
 pub struct ErrorVariant {
     pub name: String,
@@ -993,10 +992,10 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parse `type E = error { A, B, };`: plain uppercase variants, comma
-    /// separated, optional trailing comma (empty sets allowed). Payload
-    /// tails (`A(u64)`) are rejected: variants carry no data in this
-    /// milestone, but the AST already reserves the shape for later.
+    /// Parse `type E = error { A, B(c: u64), };`: uppercase variants with
+    /// optional union-style payloads, comma separated, optional trailing
+    /// comma (empty sets allowed). Payload rules mirror unions: non-empty,
+    /// no trailing payload comma, no `void`.
     fn parse_error_item(&mut self, start: Span, name: String, name_span: Span) -> Option<Item> {
         self.bump(); // error
         self.expect(&TokenKind::LBrace, "`{` after `error`")?;
@@ -1022,40 +1021,62 @@ impl<'a> Parser<'a> {
                     .with_code("E200"),
                 );
             }
+            let mut payload = Vec::new();
             if matches!(self.peek().kind, TokenKind::LParen) {
-                let paren = self.bump();
-                // Consume the balanced tail for recovery so one bad variant
-                // hides no later items.
-                let mut depth = 1usize;
-                while !self.at_eof() && depth > 0 {
-                    match self.peek().kind {
-                        TokenKind::LParen => {
-                            depth += 1;
-                            self.bump();
-                        }
-                        TokenKind::RParen => {
-                            depth -= 1;
-                            self.bump();
-                        }
-                        TokenKind::Semi | TokenKind::Eof => break,
-                        _ => {
-                            self.bump();
-                        }
+                self.bump();
+                if matches!(self.peek().kind, TokenKind::RParen) {
+                    let t = self.bump();
+                    self.diags.push(
+                        Diagnostic::error("an error payload cannot be empty")
+                            .with_label(t.span, "write `A` for a payload-free variant")
+                            .with_code("E104"),
+                    );
+                    self.recover_braced_type_item();
+                    return None;
+                }
+                loop {
+                    // Error sets declare no type parameters, so no names are
+                    // in scope for payload types.
+                    let parsed = self.parse_type(&[], true);
+                    let Some((ty, span)) = parsed else {
+                        self.recover_braced_type_item();
+                        return None;
+                    };
+                    if ty.is_void() {
+                        self.diags.push(
+                            Diagnostic::error("an error payload cannot be `void`")
+                                .with_label(span, "`void` is not a value type")
+                                .with_code("E104"),
+                        );
+                    }
+                    payload.push((ty, span));
+                    if !matches!(self.peek().kind, TokenKind::Comma) {
+                        break;
+                    }
+                    let comma = self.bump();
+                    if matches!(self.peek().kind, TokenKind::RParen) {
+                        self.bump();
+                        self.diags.push(
+                            Diagnostic::error("trailing commas are not allowed in error payloads")
+                                .with_label(comma.span, "remove this comma")
+                                .with_code("E100"),
+                        );
+                        self.recover_braced_type_item();
+                        return None;
                     }
                 }
-                self.diags.push(
-                    Diagnostic::error("error payloads are not supported yet")
-                        .with_label(paren.span, "write a plain name here, e.g. `NotFound`")
-                        .with_note("error variants carry no data in this milestone")
-                        .with_code("E104"),
-                );
-                self.recover_braced_type_item();
-                return None;
+                if self
+                    .expect(&TokenKind::RParen, "`)` after error payload")
+                    .is_none()
+                {
+                    self.recover_braced_type_item();
+                    return None;
+                }
             }
             variants.push(ErrorVariant {
                 name: variant,
                 name_span: variant_span,
-                payload: Vec::new(),
+                payload,
             });
             if matches!(self.peek().kind, TokenKind::Comma) {
                 self.bump();
@@ -3639,6 +3660,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_error_set_with_payload_variants() {
+        let (prog, diags) = parse_src("type Io = error { NotFound, Denied(String, u64), };");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Error { name, variants, .. } => {
+                assert_eq!(name, "Io");
+                assert!(variants[0].payload.is_empty());
+                assert_eq!(
+                    variants[1]
+                        .payload
+                        .iter()
+                        .map(|(t, _)| t.clone())
+                        .collect::<Vec<_>>(),
+                    vec![VlType::String, VlType::U64]
+                );
+            }
+            other => panic!("expected error set, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn error_declaration_validation_is_single_root_errors() {
         for (src, code, message) in [
             (
@@ -3647,11 +3689,9 @@ mod tests {
                 "duplicate error variant",
             ),
             ("type E = error { oops, };", "E200", "uppercase"),
-            (
-                "type E = error { A(u64), };",
-                "E104",
-                "payloads are not supported",
-            ),
+            ("type E = error { A(), };", "E104", "cannot be empty"),
+            ("type E = error { A(u64,) };", "E100", "trailing commas"),
+            ("type E = error { A(void), };", "E104", "cannot be `void`"),
             ("type E = error { A B, };", "E100", "expected `,`"),
             ("type E[T] = error { A, };", "E104", "type parameters"),
         ] {

@@ -52,13 +52,14 @@ pub enum VlType {
     Nullable(Box<VlType>),
     /// A nominal error set (`type MyError = error { ... };`). Values are
     /// global `u64` codes; the set is a static membership constraint.
-    /// Variants carry no data in this milestone (plain names only); the
-    /// declaration shape already reserves room for payloads (like unions).
+    /// Variants may declare union-style payloads, which only travel inside
+    /// fallible (`E!T`) values — a plain `ErrorSet` value is just the code.
     ErrorSet(String),
     /// A fallible value (`MyError!u64`, or `!u64` for the inferred set).
     /// `err` is `Some(set)` for a named set, `None` for `!T` (any error).
     /// Runtime representation is a heap tag+payload container (like unions):
-    /// tag 0 holds an `ok` payload, tag 1 holds the error code.
+    /// tag 0 holds an `ok` payload, tag 1 holds the error code plus the
+    /// error payload region (variant payloads, if any).
     Fallible {
         err: Option<String>,
         ok: Box<VlType>,

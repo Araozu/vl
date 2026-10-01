@@ -272,7 +272,17 @@ fn collect_interface_impl(
         errors.push(vl_common::ErrorExport {
             name: name.clone(),
             qualified: format!("{}.{}", prog.module, name),
-            variants: variants.iter().map(|v| v.name.clone()).collect(),
+            variants: variants
+                .iter()
+                .map(|variant| vl_common::ErrorVariantSig {
+                    name: variant.name.clone(),
+                    payload: variant
+                        .payload
+                        .iter()
+                        .map(|(ty, _)| qualify_export_ty(ty, &prog.module, &local_types))
+                        .collect(),
+                })
+                .collect(),
         });
     }
     // Union declarations export nominal identity and payload metadata, but
@@ -1434,6 +1444,16 @@ impl Resolver {
                                     .match_patterns
                                     .insert((arm.path_span.start, arm.path_span.end), canonical);
                             }
+                        } else if let Some((canonical, _)) = self.canonical_error_head(head) {
+                            // Error patterns (`E.Variant`) canonicalize the
+                            // same way so HIR and typechecking see one
+                            // spelling for imported sets.
+                            let head_joined = head.join(".");
+                            if canonical != head_joined {
+                                self.out
+                                    .match_patterns
+                                    .insert((arm.path_span.start, arm.path_span.end), canonical);
+                            }
                         }
                     }
                     self.scopes.push(HashMap::new());
@@ -1625,30 +1645,21 @@ impl Resolver {
                     }
                     return;
                 }
-                // Error variants take no arguments: `E.V(args)` is one E303
-                // here, and the site still records so HIR lowers the error
-                // value (lowering is blocked on this error anyway).
+                // Error variant construction (`E.V(args)`, like union
+                // variants): the head names an error set. Unknown variants
+                // are one E302 here; arity and payload types are validated
+                // by typechecking from the recorded site.
                 if callee.len() >= 2 {
                     let (head, variant) = callee.split_at(callee.len() - 1);
                     if let Some((canonical, variants)) = self.canonical_error_head(head) {
                         let display = head.join(".");
-                        if self.record_error_use(
+                        self.record_error_use(
                             *callee_span,
                             canonical,
                             &variants,
                             &variant[0],
                             &display,
-                        ) {
-                            self.diags.push(
-                                Diagnostic::error(format!(
-                                    "error variant `{display}.{}` takes no arguments",
-                                    variant[0]
-                                ))
-                                .with_label(*callee_span, "remove the `(...)` arguments")
-                                .with_note("error variants carry no data in this milestone")
-                                .with_code("E303"),
-                            );
-                        }
+                        );
                         for arg in args {
                             self.resolve_expr(arg);
                         }
@@ -2212,7 +2223,10 @@ impl Resolver {
             if let Some(qualified) = self.imported_types.get(&parts[0]) {
                 for spec in &self.modules {
                     if let Some(found) = spec.errors.iter().find(|e| e.qualified == *qualified) {
-                        return Some((found.qualified.clone(), found.variants.clone()));
+                        return Some((
+                            found.qualified.clone(),
+                            found.variants.iter().map(|v| v.name.clone()).collect(),
+                        ));
                     }
                 }
             }
@@ -2222,7 +2236,10 @@ impl Resolver {
         if parts.len() == 2 && self.imports.contains_key(&parts[0]) {
             let spec = self.imports.get(&parts[0]).cloned()?;
             let found = spec.errors.iter().find(|e| e.name == parts[1])?;
-            return Some((found.qualified.clone(), found.variants.clone()));
+            return Some((
+                found.qualified.clone(),
+                found.variants.iter().map(|v| v.name.clone()).collect(),
+            ));
         }
         let joined = parts.join(".");
         // Own-module qualified: fold to the bare local spelling.
@@ -2234,7 +2251,10 @@ impl Resolver {
         // Fully qualified without an import.
         for spec in &self.modules {
             if let Some(found) = spec.errors.iter().find(|e| e.qualified == joined) {
-                return Some((joined.clone(), found.variants.clone()));
+                return Some((
+                    joined.clone(),
+                    found.variants.iter().map(|v| v.name.clone()).collect(),
+                ));
             }
         }
         None
@@ -2851,7 +2871,13 @@ mod tests {
         let spec = provider_spec("type E = error { A, B, };", "vl.io");
         let err = spec.lookup_error("E").expect("error export");
         assert_eq!(err.qualified, "vl.io.E");
-        assert_eq!(err.variants, vec!["A", "B"]);
+        assert_eq!(
+            err.variants
+                .iter()
+                .map(|v| v.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["A", "B"]
+        );
         assert_eq!(spec.lookup_type_qualified("E"), Some("vl.io.E"));
     }
 
@@ -2878,13 +2904,12 @@ mod tests {
     }
 
     #[test]
-    fn error_variant_call_tail_is_one_e303() {
+    fn error_variant_call_tail_records_for_typechecking() {
+        // Arity moved to typechecking (like union variants): resolution
+        // records the site with no diagnostic either way.
         let (res, diags) =
             resolve_src("type E = error { A, }; fun main() { val x = E.A(1u64); x; }");
-        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
-        assert_eq!(errors.len(), 1, "{diags:?}");
-        assert_eq!(errors[0].code.as_deref(), Some("E303"));
-        // The site still records so lowering proceeds behind the error.
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
         assert_eq!(res.error_uses.len(), 1, "{res:?}");
     }
 

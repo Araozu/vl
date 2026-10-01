@@ -7,9 +7,11 @@
 //!   wrapper. Integer/float arithmetic, comparisons, and control flow
 //!   plus `std.print` / `std.println` / `std.print_u64`, the `std.string`
 //!   natives (`len`, `concat`, `eq`, `to_u64`, `hex_to_u64`), `std.math.mod_u64`,
-//!   `std.fmt.u64_to_s`, the checked `std.net.tcp` natives (each `rv10`
-//!   status becomes a `TcpError!T` value), and user-function calls lower to
-//!   `calli`.
+//!   `std.fmt.u64_to_s`, and the checked fallible natives (`std.string`
+//!   `byte_at`/`slice` as `StringError!T`, `std.fs.read_file` as
+//!   `FsError!String`, each `std.net.tcp` native as `TcpError!T`: every
+//!   `rv10` status becomes a typed error value), and user-function calls
+//!   lower to `calli`.
 //!
 //! Rule: new targets = new types implementing [`Target`]. Never branch
 //! the LIR or the driver on target names.
@@ -51,11 +53,50 @@ pub const TCP_STATUS_VARIANTS: [(u64, &str); 7] = [
     (7, "CapabilityUnavailable"),
 ];
 
+/// Qualified identity of the string error set (`<module>.<name>`), matching
+/// the resolver's canonicalization for `use std.string.{StringError}`.
+/// Extern signatures spell the set qualified so `try` compatibility compares
+/// the same string the importer-side `StringError!T` normalizes to.
+pub const STRING_ERROR_SET: &str = "std.string.StringError";
+
+/// `std::string` status codes with their `StringError` variants. Status 0
+/// is success (never wrapped); anything else the VM may report in the
+/// future surfaces as `OutOfBounds`.
+pub const STRING_STATUS_VARIANTS: [(u64, &str); 3] =
+    [(1, "OutOfBounds"), (2, "OutOfBounds"), (3, "InvalidRange")];
+
+/// Qualified identity of the filesystem error set (`<module>.<name>`).
+/// The VM reports a single failure code today, so every nonzero status
+/// maps to `IoError` (finer codes are a VM follow-up).
+pub const FS_ERROR_SET: &str = "std.fs.FsError";
+
+/// `std::fs` status codes with their `FsError` variants. Status 0 is
+/// success (never wrapped).
+pub const FS_STATUS_VARIANTS: [(u64, &str); 1] = [(1, "IoError")];
+
 /// Wrap an `ok` payload type in the named `TcpError` fallible shared by the
 /// `std.net.tcp` externs.
 fn tcp_fallible(ok: vl_common::VlType) -> vl_common::VlType {
     vl_common::VlType::Fallible {
         err: Some(TCP_ERROR_SET.into()),
+        ok: Box::new(ok),
+    }
+}
+
+/// Wrap an `ok` payload type in the named `StringError` fallible shared by
+/// the checked `std.string` externs.
+fn string_fallible(ok: vl_common::VlType) -> vl_common::VlType {
+    vl_common::VlType::Fallible {
+        err: Some(STRING_ERROR_SET.into()),
+        ok: Box::new(ok),
+    }
+}
+
+/// Wrap an `ok` payload type in the named `FsError` fallible shared by the
+/// checked `std.fs` externs.
+fn fs_fallible(ok: vl_common::VlType) -> vl_common::VlType {
+    vl_common::VlType::Fallible {
+        err: Some(FS_ERROR_SET.into()),
         ok: Box::new(ok),
     }
 }
@@ -67,15 +108,17 @@ fn tcp_fallible(ok: vl_common::VlType) -> vl_common::VlType {
 /// export carries VL-level param names/types and a return type. Backends map
 /// these VL types to target concepts (e.g. VL `String` -> Naravm blob).
 ///
-/// The `std.string` / `std.math` / `std.fmt` entries below cover only the
-/// infallible-or-trapping VM natives (e.g. `byte_count`, `concat`, `mod_u64`).
-/// `std.net.tcp` is the first fallible surface: every native reports a
-/// `std::net::tcp` status code in `rv10`, which the Naravm backend checks and
-/// wraps into a `TcpError!T` container (see `nara_tcp_call`). Natives that
-/// report errors through `rv10` without a typed wrapper yet (`byte_at`,
-/// `slice`) and the container bridges (`bytes`, `from_container`) stay out
-/// until they get the same treatment; likewise `std.fs` / `std.process` stay
-/// broad-catalog-only.
+/// The `std.math` / `std.fmt` entries below cover only the
+/// infallible-or-trapping VM natives (e.g. `mod_u64`, `to_u64`).
+/// `std.string` mixes both: `len`/`concat`/`eq` stay infallible while
+/// `byte_at`/`slice` are checked (`rv10` statuses become `StringError!T`,
+/// like TCP). `std.net.tcp` is fully fallible, and `std.fs.read_file` is
+/// checked too (`rv10` becomes `FsError!String`). Natives that report
+/// errors through `rv10` without a typed wrapper yet (`to_u64`,
+/// `hex_to_u64` trap instead of reporting) and the container bridges
+/// (`bytes`, `from_container`) stay out until they get the same treatment;
+/// likewise `std.fs` file handles (`get_stdout`, `write`) stay out until
+/// `File` values have a checked story.
 pub fn modules() -> Vec<vl_common::ModuleSpec> {
     use vl_common::VlType as T;
     let mut catalog = vec![
@@ -89,10 +132,7 @@ pub fn modules() -> Vec<vl_common::ModuleSpec> {
         ),
         vl_common::ModuleSpec::new(
             &["std", "fs"],
-            &[
-                ("open", &[("path", T::String)], T::File),
-                ("read", &[("file", T::File)], T::String),
-            ],
+            &[("read_file", &[("path", T::String)], fs_fallible(T::String))],
         ),
         vl_common::ModuleSpec::new(
             &["std", "string"],
@@ -102,6 +142,16 @@ pub fn modules() -> Vec<vl_common::ModuleSpec> {
                 ("eq", &[("a", T::String), ("b", T::String)], T::Bool),
                 ("to_u64", &[("value", T::String)], T::U64),
                 ("hex_to_u64", &[("value", T::String)], T::U64),
+                (
+                    "byte_at",
+                    &[("value", T::String), ("index", T::U64)],
+                    string_fallible(T::U8),
+                ),
+                (
+                    "slice",
+                    &[("value", T::String), ("start", T::U64), ("end", T::U64)],
+                    string_fallible(T::String),
+                ),
             ],
         ),
         vl_common::ModuleSpec::new(
@@ -175,7 +225,46 @@ pub fn modules() -> Vec<vl_common::ModuleSpec> {
             qualified: TCP_ERROR_SET.into(),
             variants: TCP_STATUS_VARIANTS
                 .iter()
-                .map(|(_, variant)| (*variant).into())
+                .map(|(_, variant)| vl_common::ErrorVariantSig {
+                    name: (*variant).into(),
+                    payload: Vec::new(),
+                })
+                .collect(),
+        });
+    // `StringError` mirrors the `std::string` fallible natives (`byte_at`,
+    // `slice`); several statuses share `OutOfBounds`, so the table is not
+    // one-to-one (see `STRING_STATUS_VARIANTS`).
+    catalog
+        .iter_mut()
+        .find(|m| m.path.as_string() == "std.string")
+        .expect("std.string declared above")
+        .errors
+        .push(vl_common::ErrorExport {
+            name: "StringError".into(),
+            qualified: STRING_ERROR_SET.into(),
+            variants: ["OutOfBounds", "InvalidRange"]
+                .iter()
+                .map(|variant| vl_common::ErrorVariantSig {
+                    name: (*variant).into(),
+                    payload: Vec::new(),
+                })
+                .collect(),
+        });
+    // `FsError` mirrors `std::fs.read_file` (one failure code today).
+    catalog
+        .iter_mut()
+        .find(|m| m.path.as_string() == "std.fs")
+        .expect("std.fs declared above")
+        .errors
+        .push(vl_common::ErrorExport {
+            name: "FsError".into(),
+            qualified: FS_ERROR_SET.into(),
+            variants: ["IoError"]
+                .iter()
+                .map(|variant| vl_common::ErrorVariantSig {
+                    name: (*variant).into(),
+                    payload: Vec::new(),
+                })
                 .collect(),
         });
     catalog
@@ -185,18 +274,14 @@ pub fn modules() -> Vec<vl_common::ModuleSpec> {
 /// catalog remains useful to frontend/library tests; drivers should resolve
 /// against this target-specific view so accepted calls are actually emit-able.
 ///
-/// Only `std.fs` is filtered for Naravm: its host file natives predate the
-/// fallible-call machinery. `std.net.tcp` stays in: its `rv10` statuses lower
-/// to typed `TcpError!T` values on native runs. Freestanding WASM hosts do
-/// not register `std::net::tcp`, so linked TCP programs need a native host.
+/// Every catalog module is emittable on Naravm: `std.fs.read_file` and the
+/// checked `std.string` natives lower through the same `rv10`-status
+/// machinery as `std.net.tcp`. Freestanding WASM hosts do not register
+/// `std::net::tcp` (nor `std::fs`), so linked TCP/file programs need a
+/// native host.
 pub fn modules_for_target(target: &str) -> Vec<vl_common::ModuleSpec> {
     match target {
-        "naravm" => {
-            let all = modules();
-            all.into_iter()
-                .filter(|m| m.path.as_string() != "std.fs")
-                .collect()
-        }
+        "naravm" => modules(),
         _ => modules(),
     }
 }
@@ -276,6 +361,9 @@ fn nara_extern_target(module: &str, function: &str) -> Option<(&'static str, &'s
         ("std.string", "eq") => Some(("std::string", "eq")),
         ("std.string", "to_u64") => Some(("std::string", "to_u64")),
         ("std.string", "hex_to_u64") => Some(("std::string", "hex_to_u64")),
+        ("std.string", "byte_at") => Some(("std::string", "byte_at")),
+        ("std.string", "slice") => Some(("std::string", "slice")),
+        ("std.fs", "read_file") => Some(("std::fs", "read_file")),
         ("std.math", "mod_u64") => Some(("std::math", "mod_u64")),
         ("std.fmt", "u64_to_s") => Some(("std::fmt", "u64_to_s")),
         ("std.net.tcp", "connect") => Some(("std::net::tcp", "connect")),
@@ -310,7 +398,9 @@ enum NaraKind {
     /// tag (0 = ok, 1 = error), value slot 1 holds the error code on the
     /// err path or the first value-kind payload slot on the ok path, and
     /// the remaining slots hold the `ok` payload's own value/reference
-    /// slots in order. The payload is `Void` for `E!void` (tag-only).
+    /// slots in order. Error payloads share the tail past the code (value
+    /// slots from 2, reference slots from 0) in a region spanning the
+    /// program's maximum lanes. The payload is `Void` for `E!void` (tag-only).
     Fallible(Box<NaraKind>),
     /// Union value (a memory container): value slot 0 holds the `u64`
     /// discriminant tag, remaining value slots hold value-kind payloads in
@@ -664,21 +754,43 @@ fn nara_tuple_copy_into(
 /// Container lane sizes for a fallible value: `(values, refs)`. Value
 /// slot 0 is the tag (0 = ok, 1 = error); value slot 1 is the error code
 /// on the err path or the first value-kind payload slot on the ok path.
-fn nara_fallible_lanes(ok: &NaraKind) -> (usize, usize) {
+/// Error payloads live past the code (value slots from 2, reference slots
+/// from 0) in a region spanning the program's maximum lanes, so `try`
+/// forwards any variant blindly.
+fn nara_fallible_lanes(ok: &NaraKind, err_lanes: (usize, usize)) -> (usize, usize) {
     let (v, r) = match ok {
         NaraKind::Tuple(kinds) => tuple_lanes(kinds),
         kind if kind.is_ref() => (0, 1),
         _ => (1, 0),
     };
-    (1 + v.max(1), r)
+    (1 + v.max(1).max(err_lanes.0), r.max(err_lanes.1))
+}
+
+/// Payload position -> (uses-reference-lane, lane-local slot) for a
+/// fallible error region. Value slot 0 holds the tag and slot 1 the code,
+/// so value-kind payloads start at slot 2; reference-kind payloads start
+/// at slot 0.
+fn fallible_err_slot(kinds: &[NaraKind], index: usize) -> Option<(bool, usize)> {
+    let (is_ref, lane_slot) = tuple_slot(kinds, index)?;
+    Some(if is_ref {
+        (true, lane_slot)
+    } else {
+        (false, lane_slot + 2)
+    })
 }
 
 /// Allocate a fallible container (`createi`) sized for an `ok` payload
 /// kind into an already-reserved register. E404 when a lane exceeds 255
 /// slots. Both arms of a checked call build into the same register so the
 /// join sees one value.
-fn nara_fallible_create_into(e: &mut NaraEmit, into: u8, ok: &NaraKind, span: Span) -> bool {
-    let (values, refs) = nara_fallible_lanes(ok);
+fn nara_fallible_create_into(
+    e: &mut NaraEmit,
+    into: u8,
+    ok: &NaraKind,
+    err_lanes: (usize, usize),
+    span: Span,
+) -> bool {
+    let (values, refs) = nara_fallible_lanes(ok, err_lanes);
     if values > u8::MAX as usize || refs > u8::MAX as usize {
         e.diags.push(
             Diagnostic::error("Naravm fallible value has more than 255 slots in one register lane")
@@ -695,8 +807,13 @@ fn nara_fallible_create_into(e: &mut NaraEmit, into: u8, ok: &NaraKind, span: Sp
 
 /// Allocate a fallible container (`createi`) sized for an `ok` payload
 /// kind. E404 when a lane exceeds 255 slots.
-fn nara_fallible_create(e: &mut NaraEmit, ok: &NaraKind, span: Span) -> Option<u8> {
-    let (values, refs) = nara_fallible_lanes(ok);
+fn nara_fallible_create(
+    e: &mut NaraEmit,
+    ok: &NaraKind,
+    err_lanes: (usize, usize),
+    span: Span,
+) -> Option<u8> {
+    let (values, refs) = nara_fallible_lanes(ok, err_lanes);
     if values > u8::MAX as usize || refs > u8::MAX as usize {
         e.diags.push(
             Diagnostic::error("Naravm fallible value has more than 255 slots in one register lane")
@@ -832,6 +949,70 @@ fn nara_fallible_store(e: &mut NaraEmit, dst: u8, payload: u8, ok: &NaraKind, sp
         e.bytecode.extend_from_slice(&[0x2f, dst, 0, payload]); // setrfati
     } else {
         e.bytecode.extend_from_slice(&[0x2d, dst, 1, payload]); // setvati
+    }
+    true
+}
+
+/// Store error payload registers into a fallible container's error region
+/// (err path): value payloads land in value slots from 2 (slots 0-1 are
+/// the tag and code), reference payloads in reference slots from 0.
+/// `kinds` are the erased payload kinds in order (from the instruction's
+/// `tys`). Nested tuples duplicate so the container owns every level.
+fn nara_fallible_store_err(
+    e: &mut NaraEmit,
+    dst: u8,
+    args: &[vl_lir::Reg],
+    kinds: &[NaraKind],
+    span: Span,
+) -> bool {
+    for (i, arg) in args.iter().enumerate() {
+        let Some(kind) = kinds.get(i).cloned() else {
+            e.diags.push(
+                Diagnostic::error("Naravm error payload index out of range (compiler bug)")
+                    .with_label(span, "error wrapped here")
+                    .with_code("E500"),
+            );
+            return false;
+        };
+        let Some((is_ref, slot)) = fallible_err_slot(kinds, i) else {
+            e.diags.push(
+                Diagnostic::error("Naravm error payload index out of range (compiler bug)")
+                    .with_label(span, "error wrapped here")
+                    .with_code("E500"),
+            );
+            return false;
+        };
+        let Ok(slot) = u8::try_from(slot) else {
+            e.diags.push(
+                Diagnostic::error("Naravm error payload slot is out of range (compiler bug)")
+                    .with_label(span, "error wrapped here")
+                    .with_code("E500"),
+            );
+            return false;
+        };
+        if is_ref {
+            let Some(v) = e.ref_reg(*arg, span) else {
+                return false;
+            };
+            if let NaraKind::Tuple(nested) = kind {
+                let Some(tmp) = e.fresh_rf(span) else {
+                    return false;
+                };
+                if !nara_tuple_copy_into(e, tmp, v, &nested, span) {
+                    e.free_rf.push(tmp);
+                    return false;
+                }
+                e.bytecode.extend_from_slice(&[0x2f, dst, slot, tmp]); // setrfati
+                e.free_rf.push(tmp);
+            } else {
+                e.bytecode.extend_from_slice(&[0x2f, dst, slot, v]); // setrfati
+            }
+        } else {
+            let Some(v) = e.value_reg(*arg, span) else {
+                return false;
+            };
+            e.bytecode.extend_from_slice(&[0x2d, dst, slot, v]); // setvati
+        }
     }
     true
 }
@@ -1201,6 +1382,9 @@ struct NaraFnCtx<'a> {
     global_slots: &'a std::collections::HashMap<u32, (bool, u8)>,
     /// Stable global ID -> runtime-erased global type (for dst kinds).
     global_tys: &'a std::collections::HashMap<u32, vl_typecheck::Ty>,
+    /// Program-wide maximum error-payload lanes (value slots, reference
+    /// slots): sizes every fallible container's error region.
+    err_lanes: (usize, usize),
 }
 
 /// Last-use map for one initializer fragment (straight-line temps die at
@@ -1244,8 +1428,14 @@ fn nara_last_use_fragment(
             I::WrapOk { value, .. } => {
                 touch(*value, idx);
             }
-            I::WrapErr { code, .. } => {
+            I::WrapErr { code, args, .. } => {
                 touch(*code, idx);
+                for arg in args {
+                    touch(*arg, idx);
+                }
+            }
+            I::RewrapErr { scrut, .. } => {
+                touch(*scrut, idx);
             }
             I::UnwrapOk { scrut, .. } | I::UnwrapErr { scrut, .. } => {
                 touch(*scrut, idx);
@@ -1253,7 +1443,7 @@ fn nara_last_use_fragment(
             I::TagOf { scrut, .. } => {
                 touch(*scrut, idx);
             }
-            I::PayloadGet { scrut, .. } => {
+            I::PayloadGet { scrut, .. } | I::ErrPayloadGet { scrut, .. } => {
                 touch(*scrut, idx);
             }
             I::TupleLit { elems, .. } => {
@@ -1363,10 +1553,12 @@ fn free_fragment_regs(e: &mut NaraEmit, instrs: &[Instr], result: &vl_lir::Reg) 
             | I::NewVariant { dst, .. }
             | I::WrapOk { dst, .. }
             | I::WrapErr { dst, .. }
+            | I::RewrapErr { dst, .. }
             | I::UnwrapOk { dst, .. }
             | I::UnwrapErr { dst, .. }
             | I::TagOf { dst, .. }
             | I::PayloadGet { dst, .. }
+            | I::ErrPayloadGet { dst, .. }
             | I::GlobalLoad { dst, .. }
             | I::Cast { dst, .. } => {
                 lir_regs.insert(*dst);
@@ -1608,6 +1800,7 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
             print_u64_fn_idx,
             global_slots: &global_slots,
             global_tys: &global_tys,
+            err_lanes: prog.err_lanes,
         };
         if is_main {
             // Allocate the module-state container first (exact sizes).
@@ -1721,6 +1914,7 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
                 print_u64_fn_idx,
                 global_slots: &global_slots,
                 global_tys: &global_tys,
+                err_lanes: prog.err_lanes,
             };
             for (idx, ins) in f.instrs.iter().enumerate() {
                 nara_instr(&mut e, ins, &ctx);
@@ -1793,6 +1987,7 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
                 print_u64_fn_idx,
                 global_slots: &global_slots,
                 global_tys: &global_tys,
+                err_lanes: prog.err_lanes,
             };
             e.bytecode
                 .extend_from_slice(&[0x27, MODULE_STATE_RF, value_count, ref_count]);
@@ -1986,10 +2181,16 @@ fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::R
                 }
             }
             I::WrapOk { value, .. } => touch(*value, idx),
-            I::WrapErr { code, .. } => touch(*code, idx),
+            I::WrapErr { code, args, .. } => {
+                touch(*code, idx);
+                for arg in args {
+                    touch(*arg, idx);
+                }
+            }
+            I::RewrapErr { scrut, .. } => touch(*scrut, idx),
             I::UnwrapOk { scrut, .. } | I::UnwrapErr { scrut, .. } => touch(*scrut, idx),
             I::TagOf { scrut, .. } => touch(*scrut, idx),
-            I::PayloadGet { scrut, .. } => touch(*scrut, idx),
+            I::PayloadGet { scrut, .. } | I::ErrPayloadGet { scrut, .. } => touch(*scrut, idx),
             I::ObjectGet { object, .. } => touch(*object, idx),
             I::ObjectSet { object, value, .. } => {
                 touch(*object, idx);
@@ -2109,8 +2310,12 @@ fn nara_free_dead(e: &mut NaraEmit, ins: &Instr, idx: usize) {
         I::WrapOk { value, .. } => {
             dead.push(*value);
         }
-        I::WrapErr { code, .. } => {
+        I::WrapErr { code, args, .. } => {
             dead.push(*code);
+            dead.extend(args.iter().copied());
+        }
+        I::RewrapErr { scrut, .. } => {
+            dead.push(*scrut);
         }
         I::UnwrapOk { scrut, .. } | I::UnwrapErr { scrut, .. } => {
             dead.push(*scrut);
@@ -2118,7 +2323,7 @@ fn nara_free_dead(e: &mut NaraEmit, ins: &Instr, idx: usize) {
         I::TagOf { scrut, .. } => {
             dead.push(*scrut);
         }
-        I::PayloadGet { scrut, .. } => {
+        I::PayloadGet { scrut, .. } | I::ErrPayloadGet { scrut, .. } => {
             dead.push(*scrut);
         }
         I::BranchIfFalse { cond, .. } => {
@@ -2377,6 +2582,16 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 nara_tcp_call(e, ctx, *dst, callee, args, *span);
                 return;
             }
+            // Checked single-result natives (`std.string` bounds-checked
+            // reads, `std.fs` file reads): same `rv10` treatment through
+            // the shared emitter.
+            if (callee.module == "std.string"
+                && matches!(callee.function.as_str(), "byte_at" | "slice"))
+                || (callee.module == "std.fs" && callee.function.as_str() == "read_file")
+            {
+                nara_checked_call(e, ctx, *dst, callee, args, *span);
+                return;
+            }
             // User functions first: a user function may share a bare name
             // with a std export, and the LIR callee spelling alone cannot
             // tell them apart (imports are resolved away before lowering).
@@ -2485,7 +2700,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                     ))
                     .with_label(*span, "unsupported call")
                     .with_note(
-                        "only `std.print`, `std.println`, `std.print_u64`, the `std.string`/`std.math`/`std.fmt`/`std.net.tcp` natives, and user functions lower to Naravm calls",
+                        "only `std.print`, `std.println`, `std.print_u64`, the `std.string`/`std.math`/`std.fmt`/`std.fs`/`std.net.tcp` natives, and user functions lower to Naravm calls",
                     )
                     .with_code("E404"),
                 );
@@ -3445,7 +3660,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                     }
                 }
             };
-            let Some(rf) = nara_fallible_create(e, &ok_kind, *span) else {
+            let Some(rf) = nara_fallible_create(e, &ok_kind, ctx.err_lanes, *span) else {
                 e.invalid.insert(*dst);
                 return;
             };
@@ -3462,6 +3677,8 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             dst,
             code,
             ok,
+            args,
+            tys,
             span,
         } => {
             let Some(ok_kind) = NaraKind::of_ok(ok) else {
@@ -3481,6 +3698,25 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 e.invalid.insert(*dst);
                 return;
             }
+            for arg in args {
+                if e.invalid.contains(arg) {
+                    e.invalid.insert(*dst);
+                    return;
+                }
+            }
+            let Some(kinds) = nara_variant_kinds(tys, *span, e) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            if kinds.len() != args.len() {
+                e.diags.push(
+                    Diagnostic::error("Naravm error payload arity drifted (compiler bug)")
+                        .with_label(*span, "error wrapped here")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            }
             let Some(code_rv) = e.rv_map.get(code).copied() else {
                 e.diags.push(
                     Diagnostic::error("Naravm backend could not resolve an error code register")
@@ -3490,7 +3726,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 e.invalid.insert(*dst);
                 return;
             };
-            let Some(rf) = nara_fallible_create(e, &ok_kind, *span) else {
+            let Some(rf) = nara_fallible_create(e, &ok_kind, ctx.err_lanes, *span) else {
                 e.invalid.insert(*dst);
                 return;
             };
@@ -3499,8 +3735,161 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 return;
             }
             e.bytecode.extend_from_slice(&[0x2d, rf, 1, code_rv]); // setvati (code slot)
+            if !nara_fallible_store_err(e, rf, args, &kinds, *span) {
+                e.invalid.insert(*dst);
+                return;
+            }
             e.rf_map.insert(*dst, rf);
             e.kinds.insert(*dst, NaraKind::Fallible(Box::new(ok_kind)));
+        }
+        Instr::RewrapErr {
+            dst,
+            scrut,
+            ok,
+            span,
+        } => {
+            let Some(ok_kind) = NaraKind::of_ok(ok) else {
+                e.diags.push(
+                    Diagnostic::error("Naravm backend found a non-runtime fallible payload")
+                        .with_label(*span, "error forwarded here")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            };
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, NaraKind::Fallible(Box::new(ok_kind)));
+                return;
+            }
+            let Some(obj) = e.rf_map.get(scrut).copied() else {
+                if !e.invalid.contains(scrut) {
+                    e.diags.push(
+                        Diagnostic::error("Naravm backend expected a fallible reference")
+                            .with_label(*span, "error forwarded here")
+                            .with_code("E500"),
+                    );
+                }
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(rf) = nara_fallible_create(e, &ok_kind, ctx.err_lanes, *span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            if !nara_fallible_tag(e, rf, 1, *span) {
+                e.invalid.insert(*dst);
+                return;
+            }
+            // Copy the code plus the whole error region (value slots from
+            // 2, reference slots from 0): every container shares the
+            // program-wide error lanes, so the copy is always in range.
+            let Some(tmp) = e.fresh_rv(*span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            e.bytecode.extend_from_slice(&[0x2c, tmp, obj, 1]); // getvati (code slot)
+            e.bytecode.extend_from_slice(&[0x2d, rf, 1, tmp]); // setvati (code slot)
+            let mut failed = false;
+            for slot in 0..ctx.err_lanes.0 {
+                let (Ok(src), Ok(dst_slot)) = (u8::try_from(slot + 2), u8::try_from(slot + 2))
+                else {
+                    failed = true;
+                    break;
+                };
+                e.bytecode.extend_from_slice(&[0x2c, tmp, obj, src]); // getvati
+                e.bytecode.extend_from_slice(&[0x2d, rf, dst_slot, tmp]); // setvati
+            }
+            e.free_rv.push(tmp);
+            if failed {
+                e.invalid.insert(*dst);
+                return;
+            }
+            if ctx.err_lanes.1 > 0 {
+                let Some(rtmp) = e.fresh_rf(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                for slot in 0..ctx.err_lanes.1 {
+                    let (Ok(s), Ok(d)) = (u8::try_from(slot), u8::try_from(slot)) else {
+                        failed = true;
+                        break;
+                    };
+                    e.bytecode.extend_from_slice(&[0x2e, rtmp, obj, s]); // getrfati
+                    e.bytecode.extend_from_slice(&[0x2f, rf, d, rtmp]); // setrfati
+                }
+                e.free_rf.push(rtmp);
+                if failed {
+                    e.invalid.insert(*dst);
+                    return;
+                }
+            }
+            e.rf_map.insert(*dst, rf);
+            e.kinds.insert(*dst, NaraKind::Fallible(Box::new(ok_kind)));
+        }
+        Instr::ErrPayloadGet {
+            dst,
+            scrut,
+            index,
+            tys,
+            span,
+        } => {
+            let Some(kinds) = nara_variant_kinds(tys, *span, e) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some((is_ref, slot)) = fallible_err_slot(&kinds, *index) else {
+                e.diags.push(
+                    Diagnostic::error("Naravm error payload index out of range (compiler bug)")
+                        .with_label(*span, "payload read emitted here")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Some(elem_kind) = kinds.get(*index).cloned() else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            let Ok(slot) = u8::try_from(slot) else {
+                e.diags.push(
+                    Diagnostic::error("Naravm error payload slot is out of range (compiler bug)")
+                        .with_label(*span, "payload read emitted here")
+                        .with_code("E500"),
+                );
+                e.invalid.insert(*dst);
+                return;
+            };
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, elem_kind);
+                return;
+            }
+            let Some(obj) = e.rf_map.get(scrut).copied() else {
+                if !e.invalid.contains(scrut) {
+                    e.diags.push(
+                        Diagnostic::error("Naravm backend expected a fallible reference")
+                            .with_label(*span, "payload read emitted here")
+                            .with_code("E500"),
+                    );
+                }
+                e.invalid.insert(*dst);
+                return;
+            };
+            if is_ref {
+                let Some(d) = e.fresh_rf(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x2e, d, obj, slot]); // getrfati
+                e.rf_map.insert(*dst, d);
+            } else {
+                let Some(d) = e.fresh_rv(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x2c, d, obj, slot]); // getvati
+                e.rv_map.insert(*dst, d);
+            }
+            e.kinds.insert(*dst, elem_kind);
         }
         Instr::UnwrapOk {
             dst,
@@ -4067,7 +4456,7 @@ fn nara_tcp_call(
         e.invalid.insert(dst);
         return;
     };
-    if !nara_fallible_create_into(e, cont, &ok_kind, span) {
+    if !nara_fallible_create_into(e, cont, &ok_kind, ctx.err_lanes, span) {
         e.invalid.insert(dst);
         return;
     }
@@ -4106,7 +4495,7 @@ fn nara_tcp_call(
             };
             e.bytecode.extend_from_slice(&[0x04, payload, 0x11]); // cpv
             temps_rv.push(payload);
-            nara_tcp_wrap_ok(e, dst, cont, payload, &ok_kind, span)
+            nara_tcp_wrap_ok(e, dst, cont, payload, &ok_kind, ctx.err_lanes, span)
         }
         // No result (`E!void` keeps its dummy value lane).
         "close" => {
@@ -4125,7 +4514,7 @@ fn nara_tcp_call(
                 e.invalid.insert(dst);
                 return;
             };
-            nara_tcp_wrap_ok(e, dst, cont, zero, &ok_kind, span)
+            nara_tcp_wrap_ok(e, dst, cont, zero, &ok_kind, ctx.err_lanes, span)
         }
         // `(listener, port)` in `rv11`/`rv12`.
         "listen" => nara_tcp_wrap_tuple(
@@ -4137,6 +4526,7 @@ fn nara_tcp_call(
             &[(false, 0x11), (false, 0x12)],
             &ok_ty,
             &ok_kind,
+            ctx.err_lanes,
             &mut temps_rv,
             &mut temps_rf,
         ),
@@ -4150,6 +4540,7 @@ fn nara_tcp_call(
             &[(true, 0x31), (false, 0x12)],
             &ok_ty,
             &ok_kind,
+            ctx.err_lanes,
             &mut temps_rv,
             &mut temps_rf,
         ),
@@ -4190,9 +4581,10 @@ fn nara_tcp_wrap_ok(
     cont: u8,
     payload: u8,
     ok_kind: &NaraKind,
+    err_lanes: (usize, usize),
     span: Span,
 ) -> bool {
-    if !(nara_fallible_create_into(e, cont, ok_kind, span)
+    if !(nara_fallible_create_into(e, cont, ok_kind, err_lanes, span)
         && nara_fallible_tag(e, cont, 0, span)
         && nara_fallible_store(e, cont, payload, ok_kind, span))
     {
@@ -4220,6 +4612,7 @@ fn nara_tcp_wrap_tuple(
     elems: &[(bool, u8)],
     ok_ty: &vl_typecheck::Ty,
     ok_kind: &NaraKind,
+    err_lanes: (usize, usize),
     temps_rv: &mut Vec<u8>,
     temps_rf: &mut Vec<u8>,
 ) -> bool {
@@ -4312,7 +4705,334 @@ fn nara_tcp_wrap_tuple(
         );
         return false;
     }
-    nara_tcp_wrap_ok(e, dst, cont, tup, ok_kind, span)
+    nara_tcp_wrap_ok(e, dst, cont, tup, ok_kind, err_lanes, span)
+}
+
+/// Call a single-result `rv10`-status native: move actuals into the native
+/// slots (`rv11+` for values, `rf31+` for references — the same convention
+/// as `nara_user_call`, minus spills since natives are leaves), `calli`,
+/// then check the `rv10` status: 0 builds the ok container from the result
+/// register, nonzero maps through `statuses` to the matching error variant
+/// code (unlisted statuses use `fallthrough`) and builds the error
+/// container. `dst` always names the container.
+///
+/// Result registers per native: `std.string.byte_at` returns the byte in
+/// `rv11`; `std.string.slice` and `std.fs.read_file` return the string in
+/// `rf31`. Covered callees: `std.string::{byte_at, slice}`,
+/// `std.fs::read_file`.
+fn nara_checked_call(
+    e: &mut NaraEmit,
+    ctx: &NaraFnCtx,
+    dst: vl_lir::Reg,
+    callee: &vl_lir::FunctionRef,
+    args: &[vl_lir::Reg],
+    span: Span,
+) {
+    struct Spec {
+        set: &'static str,
+        statuses: &'static [(u64, &'static str)],
+        fallthrough: &'static str,
+        /// (is_ref, machine reg) holding the ok payload on success.
+        result: (bool, u8),
+    }
+    let spec = match (callee.module.as_str(), callee.function.as_str()) {
+        ("std.string", "byte_at") => Spec {
+            set: STRING_ERROR_SET,
+            statuses: &STRING_STATUS_VARIANTS,
+            fallthrough: "OutOfBounds",
+            result: (false, 0x11),
+        },
+        ("std.string", "slice") => Spec {
+            set: STRING_ERROR_SET,
+            statuses: &STRING_STATUS_VARIANTS,
+            fallthrough: "OutOfBounds",
+            result: (true, 0x31),
+        },
+        ("std.fs", "read_file") => Spec {
+            set: FS_ERROR_SET,
+            statuses: &FS_STATUS_VARIANTS,
+            fallthrough: "IoError",
+            result: (true, 0x31),
+        },
+        _ => {
+            e.diags.push(
+                Diagnostic::error(format!(
+                    "Naravm backend does not support checked call `{callee}` yet"
+                ))
+                .with_label(span, "unsupported call")
+                .with_code("E404"),
+            );
+            e.invalid.insert(dst);
+            return;
+        }
+    };
+    let Some(import) = ctx.imports.get(callee) else {
+        e.diags.push(
+            Diagnostic::error(format!(
+                "codegen: missing import for `{callee}` (compiler bug)"
+            ))
+            .with_label(span, "call emitted here")
+            .with_code("E500"),
+        );
+        e.invalid.insert(dst);
+        return;
+    };
+    let (param_tys, ret) = (import.param_tys.clone(), import.ret.clone());
+    for arg in args {
+        if e.invalid.contains(arg) {
+            e.invalid.insert(dst);
+            return;
+        }
+    }
+    if args.len() != param_tys.len() {
+        e.diags.push(
+            Diagnostic::error(format!(
+                "codegen: arity mismatch calling `{callee}` (compiler bug)"
+            ))
+            .with_label(span, "call emitted here")
+            .with_code("E500"),
+        );
+        e.invalid.insert(dst);
+        return;
+    }
+    // The import must be the declared fallible shape (`Set!T`); anything
+    // else means `modules()` drifted from this emitter.
+    let ok_ty = match &ret {
+        vl_typecheck::Ty::Fallible(f) if f.err.as_deref() == Some(spec.set) => f.ok.clone(),
+        _ => {
+            e.diags.push(
+                Diagnostic::error(format!(
+                    "codegen: `{callee}` is not a `{}!T` import (compiler bug)",
+                    spec.set
+                ))
+                .with_label(span, "call emitted here")
+                .with_code("E500"),
+            );
+            e.invalid.insert(dst);
+            return;
+        }
+    };
+    let Some(ok_kind) = NaraKind::of_ok(&ok_ty) else {
+        e.diags.push(
+            Diagnostic::error("Naravm backend found a non-runtime checked payload type")
+                .with_label(span, "call emitted here")
+                .with_code("E500"),
+        );
+        e.invalid.insert(dst);
+        return;
+    };
+    // Move actuals into the native slots, checking lanes against the import.
+    // All checked natives take `String` references plus `u64` values today.
+    let mut vi = 0u8;
+    let mut ri = 0u8;
+    for (ty, arg) in param_tys.iter().zip(args.iter()) {
+        let Some(kind) = NaraKind::of_ty(ty) else {
+            e.diags.push(
+                Diagnostic::error("Naravm backend found a non-runtime checked argument type")
+                    .with_label(span, "call emitted here")
+                    .with_code("E500"),
+            );
+            e.invalid.insert(dst);
+            return;
+        };
+        if kind.is_ref() {
+            if kind != NaraKind::String {
+                e.diags.push(
+                    Diagnostic::error(
+                        "Naravm backend requires a String argument to a checked call",
+                    )
+                    .with_label(span, "unsupported argument")
+                    .with_code("E402"),
+                );
+                e.invalid.insert(dst);
+                return;
+            }
+            let Some(src) = e.rf_map.get(arg).copied() else {
+                e.diags.push(
+                    Diagnostic::error(
+                        "Naravm backend could not resolve a checked call argument (compiler bug)",
+                    )
+                    .with_label(span, "call emitted here")
+                    .with_code("E500"),
+                );
+                e.invalid.insert(dst);
+                return;
+            };
+            e.bytecode.extend_from_slice(&[0x05, 0x31 + ri, src]); // cprf
+            ri += 1;
+        } else {
+            let Some(src) = e.rv_map.get(arg).copied() else {
+                e.diags.push(
+                    Diagnostic::error(
+                        "Naravm backend could not resolve a checked call argument (compiler bug)",
+                    )
+                    .with_label(span, "call emitted here")
+                    .with_code("E500"),
+                );
+                e.invalid.insert(dst);
+                return;
+            };
+            e.bytecode.extend_from_slice(&[0x04, 0x11 + vi, src]); // cpv
+            vi += 1;
+        }
+    }
+    let Some(fn_idx) = ctx.imported_fn_consts.get(callee).copied() else {
+        e.diags.push(
+            Diagnostic::error(format!(
+                "codegen: missing function constant for `{callee}` (compiler bug)"
+            ))
+            .with_label(span, "call emitted here")
+            .with_code("E500"),
+        );
+        e.invalid.insert(dst);
+        return;
+    };
+    nara_calli(e, fn_idx, span);
+    if !e.last_use.contains_key(&dst) {
+        // Dead result: the call's side effects stand, but no container is built.
+        e.kinds.insert(dst, NaraKind::Fallible(Box::new(ok_kind)));
+        return;
+    }
+    // Copy the status out of the reserved channel, then split ok/err.
+    let Some(status) = e.fresh_rv(span) else {
+        e.invalid.insert(dst);
+        return;
+    };
+    e.bytecode.extend_from_slice(&[0x04, status, 0x10]); // cpv status, rv10
+    let to_ok = nara_emit_jz(e, status);
+    // Err path: select the variant code per status; unlisted statuses use
+    // the fallthrough variant.
+    let (Some(code), Some(sc), Some(tt)) = (e.fresh_rv(span), e.fresh_rv(span), e.fresh_rv(span))
+    else {
+        e.invalid.insert(dst);
+        return;
+    };
+    let mut to_have_code = Vec::with_capacity(spec.statuses.len());
+    for (status_value, variant) in spec.statuses {
+        let (Some(status_idx), Some(code_idx)) = (
+            e.add_value(*status_value, span),
+            e.add_value(vl_hir::error_code(spec.set, variant), span),
+        ) else {
+            e.invalid.insert(dst);
+            return;
+        };
+        let (Ok(status_idx), Ok(code_idx)) = (u8::try_from(status_idx), u8::try_from(code_idx))
+        else {
+            e.diags.push(
+                Diagnostic::error("Naravm constant pool exhausted (compiler bug)")
+                    .with_label(span, "call emitted here")
+                    .with_code("E500"),
+            );
+            e.invalid.insert(dst);
+            return;
+        };
+        e.bytecode.extend_from_slice(&[0x02, sc, status_idx]); // lv
+        e.bytecode.extend_from_slice(&[0x0a, tt, status, sc]); // eq
+        let to_next = nara_emit_jz(e, tt);
+        e.bytecode.extend_from_slice(&[0x02, code, code_idx]); // lv
+        to_have_code.push(nara_emit_jmp(e));
+        if !nara_patch_jump(e, to_next, 4, e.bytecode.len(), span) {
+            e.invalid.insert(dst);
+            return;
+        }
+    }
+    let Some(fallthrough_idx) = e.add_value(vl_hir::error_code(spec.set, spec.fallthrough), span)
+    else {
+        e.invalid.insert(dst);
+        return;
+    };
+    let Ok(fallthrough_idx) = u8::try_from(fallthrough_idx) else {
+        e.diags.push(
+            Diagnostic::error("Naravm constant pool exhausted (compiler bug)")
+                .with_label(span, "call emitted here")
+                .with_code("E500"),
+        );
+        e.invalid.insert(dst);
+        return;
+    };
+    e.bytecode.extend_from_slice(&[0x02, code, fallthrough_idx]); // lv
+    let have_code = e.bytecode.len();
+    for jmp in to_have_code {
+        if !nara_patch_jump(e, jmp, 3, have_code, span) {
+            e.invalid.insert(dst);
+            return;
+        }
+    }
+    // One container register for both arms: only the taken arm's `createi`
+    // executes, and the join below (plus all later uses of `dst`) sees it.
+    let Some(cont) = e.fresh_rf(span) else {
+        e.invalid.insert(dst);
+        return;
+    };
+    if !nara_fallible_create_into(e, cont, &ok_kind, ctx.err_lanes, span) {
+        e.invalid.insert(dst);
+        return;
+    }
+    if !nara_fallible_tag(e, cont, 1, span) {
+        e.invalid.insert(dst);
+        return;
+    }
+    e.bytecode.extend_from_slice(&[0x2d, cont, 1, code]); // setvati (code slot)
+    let to_end_err = nara_emit_jmp(e);
+    // Ok path: collect the result register into the payload, then wrap.
+    let ok_pos = e.bytecode.len();
+    if !nara_patch_jump(e, to_ok, 4, ok_pos, span) {
+        e.invalid.insert(dst);
+        return;
+    }
+    let mut temps_rv: Vec<u8> = vec![status, code, sc, tt];
+    let mut temps_rf: Vec<u8> = Vec::new();
+    let (result_ref, result_reg) = spec.result;
+    // The checked natives declare single-lane payloads; anything else means
+    // `modules()` drifted from this emitter.
+    let lane_ok = if result_ref {
+        ok_kind.is_ref() && !matches!(ok_kind, NaraKind::Tuple(_))
+    } else {
+        !ok_kind.is_ref() && !matches!(ok_kind, NaraKind::Tuple(_))
+    };
+    if !lane_ok {
+        e.diags.push(
+            Diagnostic::error(format!(
+                "codegen: `{callee}` payload drifted from its result lane (compiler bug)"
+            ))
+            .with_label(span, "call emitted here")
+            .with_code("E500"),
+        );
+        e.invalid.insert(dst);
+        return;
+    }
+    let ok_built = if result_ref {
+        let Some(tmp) = e.fresh_rf(span) else {
+            e.invalid.insert(dst);
+            return;
+        };
+        e.bytecode.extend_from_slice(&[0x05, tmp, result_reg]); // cprf
+        temps_rf.push(tmp);
+        nara_tcp_wrap_ok(e, dst, cont, tmp, &ok_kind, ctx.err_lanes, span)
+    } else {
+        let Some(tmp) = e.fresh_rv(span) else {
+            e.invalid.insert(dst);
+            return;
+        };
+        e.bytecode.extend_from_slice(&[0x04, tmp, result_reg]); // cpv
+        temps_rv.push(tmp);
+        nara_tcp_wrap_ok(e, dst, cont, tmp, &ok_kind, ctx.err_lanes, span)
+    };
+    if !ok_built {
+        e.invalid.insert(dst);
+        return;
+    }
+    let end_pos = e.bytecode.len();
+    if !nara_patch_jump(e, to_end_err, 3, end_pos, span) {
+        e.invalid.insert(dst);
+        return;
+    }
+    for rv in temps_rv {
+        e.free_rv.push(rv);
+    }
+    for rf in temps_rf {
+        e.free_rf.push(rf);
+    }
 }
 
 /// Call a user function: spill live caller registers (the register file is
@@ -5095,6 +5815,7 @@ mod tests {
             }],
             globals: vec![],
             imports: vec![],
+            err_lanes: (0, 0),
             functions: vec![
                 vl_lir::Function {
                     name: "read".into(),
@@ -5229,6 +5950,7 @@ fun main() {
             objects: vec![],
             globals: vec![],
             imports: vec![],
+            err_lanes: (0, 0),
             functions: vec![Function {
                 name: "main".into(),
                 param_tys: vec![],
@@ -5266,6 +5988,65 @@ fun main() {
     #[test]
     fn unknown_target_is_none() {
         assert!(lookup("x86-64").is_none());
+    }
+
+    #[test]
+    fn naravm_emits_checked_string_and_fs_calls_with_status_dispatch() {
+        // `byte_at` exercises the value-result arm, `slice`/`read_file`
+        // the reference-result arm. Lower against the authoritative
+        // catalog (the semantic default is a minimal unit-test surface).
+        fn lir_of_checked(src: &str) -> LirProgram {
+            let catalog = modules();
+            let (toks, _) = vl_lex::lex(src);
+            let (prog, _) = vl_syntax::parse(&toks, src);
+            let (res, _) = vl_semantic::resolve_with_modules(&prog, &catalog);
+            let hir = vl_hir::lower(&prog, &res);
+            let (typed, _) = vl_typecheck::check_with_modules(&hir, &catalog);
+            vl_lir::lower(&hir, &typed)
+        }
+        // `byte_at` exercises the value-result arm, `slice`/`read_file`
+        // the reference-result arm.
+        for src in [
+            "use std.string; fun main() { val b = string.byte_at(\"hi\", 0u64) catch 0u8; b; }",
+            "use std.string; fun main() { val s = string.slice(\"hi\", 0u64, 1u64) catch \"x\"; s; }",
+            "use std.fs; fun main() { val s = fs.read_file(\"hi\") catch \"x\"; s; }",
+        ] {
+            let lir = lir_of_checked(src);
+            let (artifact, diags) = NaraVmTarget.emit(&lir);
+            assert!(diags.is_empty(), "{src}: {diags:?}");
+            let bytes = artifact.unwrap().bytes.unwrap();
+            assert_eq!(&bytes[..4], b"nara");
+            // calli, status-branch (jz), containers (createi/setvati).
+            for op in [0x20u8, 0x24, 0x27, 0x2d] {
+                assert!(bytes.contains(&op), "{src}: no {op:#x}");
+            }
+        }
+        let bytes = NaraVmTarget
+            .emit(&lir_of_checked(
+                "use std.string; fun main() { val b = string.byte_at(\"hi\", 0u64) catch 0u8; b; }",
+            ))
+            .0
+            .unwrap()
+            .bytes
+            .unwrap();
+        assert!(
+            bytes
+                .windows(b"std::string".len())
+                .any(|w| w == b"std::string"),
+            "string native module missing"
+        );
+        let bytes = NaraVmTarget
+            .emit(&lir_of_checked(
+                "use std.fs; fun main() { val s = fs.read_file(\"hi\") catch \"x\"; s; }",
+            ))
+            .0
+            .unwrap()
+            .bytes
+            .unwrap();
+        assert!(
+            bytes.windows(b"std::fs".len()).any(|w| w == b"std::fs"),
+            "fs native module missing"
+        );
     }
 
     #[test]
@@ -5336,7 +6117,8 @@ fun main() {
         assert!(modules_for_target("naravm")
             .iter()
             .any(|m| m.path.as_string() == "std"));
-        assert!(!modules_for_target("naravm")
+        // `std.fs.read_file` is checked like TCP, so it stays emittable.
+        assert!(modules_for_target("naravm")
             .iter()
             .any(|m| m.path.as_string() == "std.fs"));
         assert!(modules_for_target("unknown")
@@ -5488,6 +6270,7 @@ fun main() {
                 span: Span::empty(0),
             }],
             imports: vec![],
+            err_lanes: (0, 0),
             functions: vec![Function {
                 name: "main".into(),
                 param_tys: vec![],
@@ -5516,12 +6299,16 @@ fun main() {
         let set = tcp.lookup_error("TcpError").expect("TcpError set");
         assert_eq!(set.qualified, TCP_ERROR_SET);
         assert_eq!(
-            set.variants,
+            set.variants
+                .iter()
+                .map(|v| v.name.clone())
+                .collect::<Vec<_>>(),
             TCP_STATUS_VARIANTS
                 .iter()
                 .map(|(_, v)| (*v).to_string())
                 .collect::<Vec<_>>(),
         );
+        assert!(set.variants.iter().all(|v| v.payload.is_empty()));
         // Every export returns the named fallible (never a bare status).
         for export in &tcp.exports {
             match &export.sig.ret {
@@ -5618,6 +6405,7 @@ fun main() {
                 ret: vl_typecheck::Ty::Void,
                 instrs,
             }],
+            err_lanes: (0, 0),
         }
     }
 

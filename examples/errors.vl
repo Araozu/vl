@@ -1,13 +1,17 @@
 // Error sets and fallible values (`E!T`), Zig-style.
 //
-// `type Io = error { ... };` declares plain-named variants (no payloads
-// yet). `Io.NotFound` is an error value; `Io!u64` is a fallible `u64`
-// (or `!u64` for the inferred set). `try expr` unwraps or returns the
-// error from the enclosing fallible function; `expr catch fallback`
-// handles it inline. `E!void` marks fallible side effects.
+// `type Io = error { ... };` declares variants with optional union-style
+// payloads (`Missing(String)`). `Io.NotFound` is a plain error value
+// (a global code); `Io.Missing(p)` carries data but only flows through
+// fallible values (`Io!u64`, or `!u64` for the inferred set). `try expr`
+// unwraps or returns the error (payloads forward untouched) from the
+// enclosing fallible function; `expr catch fallback` handles it inline.
+// `match` reads payloads back: over a plain set for codes, or over a
+// fallible where listed arms bind error payloads and `else` covers the ok
+// value plus unlisted variants. `E!void` marks fallible side effects.
 use std;
 
-type Io = error { NotFound, Denied, };
+type Io = error { NotFound, Denied, Missing(String), };
 
 fun read_byte(ok: bool): Io!u64 {
     if (ok) {
@@ -26,6 +30,13 @@ fun deny(): Io!void {
     return Io.Denied;
 }
 
+fun load(missing: bool): Io!String {
+    if (missing) {
+        return Io.Missing("gone");
+    }
+    return "data";
+}
+
 fun main() {
     std.print_u64(read_byte(true) catch 0u64);
     std.print_u64(read_byte(false) catch 7u64);
@@ -33,5 +44,14 @@ fun main() {
     std.print_u64(read_two(true, false) catch 9u64);
     deny() catch std.print("denied\n");
     val e: Io = Io.NotFound;
-    e;
+    match (e) {
+        Io.NotFound { std.print("not-found\n"); }
+        Io.Denied { std.print("denied\n"); }
+        Io.Missing { std.print("missing\n"); }
+    }
+    match (load(true)) {
+        Io.Missing(path) { std.print(path); }
+        else { std.print("loaded\n"); }
+    }
+    std.print(load(false) catch "fallback");
 }

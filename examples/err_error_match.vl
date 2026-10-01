@@ -1,0 +1,11 @@
+// A plain error value carries only the code: binding payloads from it is
+// one E303 (match on the fallible `Io!T` value to bind payloads).
+type Io = error { NotFound, Missing(String), };
+
+fun main() {
+    val e: Io = Io.NotFound;
+    match (e) {
+        Io.Missing(path) { path; }
+        else { }
+    }
+}

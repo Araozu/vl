@@ -74,6 +74,8 @@ The most useful helpers are:
 | `string.is_empty(s)` | `true` when `s` has zero bytes |
 | `string.concat(a, b)` | `a` followed by `b` |
 | `string.eq(a, b)` | `true` when `a` and `b` hold the same bytes |
+| `string.byte_at(s, i)` | `StringError!u8`: the byte at index `i` |
+| `string.slice(s, lo, hi)` | `StringError!String`: bytes `lo..hi` |
 
 ```vl
 use std.string;
@@ -83,6 +85,28 @@ fun main() {
     val same = string.eq("VL", "VL");
 }
 ```
+
+Bounds-checked reads are fallible: out-of-range indices are typed errors,
+not traps. Handle them with `catch`, propagate with `try`, or match on
+the set:
+
+```vl
+use std;
+use std.string;
+
+fun main() {
+    val byte = string.byte_at("hi", 9u64) catch 0u8;
+    byte;
+    match (string.slice("hello", 9u64, 10u64)) {
+        std.string.StringError.OutOfBounds { std.print("too far\n"); }
+        std.string.StringError.InvalidRange { std.print("backwards\n"); }
+        else { std.print("ok\n"); }
+    }
+}
+```
+
+`string.to_u64` / `string.hex_to_u64` still trap on bad input (their VM
+natives report no status yet); fallible parsing is a follow-up.
 
 Numbers and strings are different types. To turn a number into text, use
 `std.fmt`:

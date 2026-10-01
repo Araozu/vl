@@ -13,10 +13,10 @@ outside world. VL models failure with error sets, in the style of Zig.
 
 Declare a set with `type` and `error`, listing the ways it can fail. Variant
 names start with an uppercase letter, and the declaration ends with a
-semicolon. Variants carry no data in this milestone:
+semicolon. Variants take optional union-style payloads:
 
 ```vl
-type Io = error { NotFound, Denied, };
+type Io = error { NotFound, Denied, Missing(String), };
 ```
 
 An error value names the set and the variant together:
@@ -28,6 +28,10 @@ fun missing(): Io {
     return Io.NotFound;
 }
 ```
+
+Payload constructions (`Io.Missing(path)`) only carry data through fallible
+values (below): a plain `Io` holds just the error code, so building one
+with arguments is an error.
 
 ## Fallible functions
 
@@ -80,6 +84,29 @@ fun main() {
 Using a fallible value without `try` or `catch` — passing it on, dropping
 it, or branching on it — is an error. The entrypoint itself stays
 infallible: handle errors inside `main` with `catch`.
+
+## Match: read payloads
+
+`match` reads error values back. Over a plain set it dispatches on the
+code (payload patterns bind nothing there — a bare pattern matches the
+code). Over a fallible, listed arms bind error payloads while `else`
+covers the ok value plus unlisted variants:
+
+```vl
+type Io = error { NotFound, Missing(String), };
+
+fun report(r: Io!u64) {
+    match (r) {
+        Io.Missing(path) { std.print(path); }
+        Io.NotFound { std.print("gone\n"); }
+        else { std.print("ok\n"); }
+    }
+}
+```
+
+`try` forwards error payloads untouched, so a helper can propagate and its
+caller still match on the data. `catch` discards the error (payloads
+included) and evaluates its fallback.
 
 ## Importing error sets
 
