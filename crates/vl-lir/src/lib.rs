@@ -2474,24 +2474,67 @@ pub fn lower_project(
     }
     objects.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let global_items: Vec<(u32, String, vl_hir::HirId, HirExpr, Span)> = prog
-        .items
-        .iter()
-        .filter_map(|item| match item {
+    type ProjectGlobalEntry = (
+        Option<u32>,
+        String,
+        vl_hir::HirId,
+        HirExpr,
+        Span,
+        Option<(vl_hir::HirDestructureBinding, u32)>,
+    );
+    let mut global_items: Vec<ProjectGlobalEntry> = Vec::new();
+    for item in &prog.items {
+        match item {
             HirItem::Let {
                 def: Some(def),
                 value,
                 id,
                 span,
                 ..
-            } => Some((def.0, format!("g{}", def.0), *id, value.clone(), *span)),
-            _ => None,
-        })
-        .collect();
+            } => global_items.push((
+                Some(def.0),
+                format!("g{}", def.0),
+                *id,
+                value.clone(),
+                *span,
+                None,
+            )),
+            HirItem::Destructure {
+                bindings,
+                value,
+                id,
+                span,
+                ..
+            } => {
+                let hidden_gid = global_items.len() as u32;
+                global_items.push((
+                    None,
+                    format!("g{hidden_gid}_tuplebase"),
+                    *id,
+                    value.clone(),
+                    *span,
+                    None,
+                ));
+                for binding in bindings {
+                    if let Some(def) = &binding.def {
+                        global_items.push((
+                            Some(def.0),
+                            format!("g{}", def.0),
+                            *id,
+                            value.clone(),
+                            *span,
+                            Some((binding.clone(), hidden_gid)),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     let global_map: HashMap<u32, u32> = global_items
         .iter()
         .enumerate()
-        .map(|(idx, (def, _, _, _, _))| (*def, idx as u32))
+        .filter_map(|(idx, (def, _, _, _, _, _))| def.map(|def| (def, idx as u32)))
         .collect();
 
     let mut out = LirProgram {
@@ -2505,8 +2548,97 @@ pub fn lower_project(
         err_lanes: max_error_lanes(&typed.errors),
     };
 
-    for (idx, (_def, name, id, value, span)) in global_items.iter().enumerate() {
+    for (idx, (_def, name, id, value, span, binding)) in global_items.iter().enumerate() {
         let gid = idx as u32;
+        if let Some((binding, hidden)) = binding {
+            let base_ty = typed
+                .type_of_id(*id)
+                .or_else(|| typed.type_of_id(value.id()))
+                .unwrap_or(Ty::Error);
+            let Some(position) = destructure_position(&base_ty, binding) else {
+                out.globals.push(Global {
+                    id: gid,
+                    name: name.clone(),
+                    ty: Ty::Error,
+                    init: Vec::new(),
+                    result: Reg(u32::MAX),
+                    span: *span,
+                });
+                continue;
+            };
+            let Some(elements) = base_ty.tuple_elems() else {
+                out.globals.push(Global {
+                    id: gid,
+                    name: name.clone(),
+                    ty: Ty::Error,
+                    init: Vec::new(),
+                    result: Reg(u32::MAX),
+                    span: *span,
+                });
+                continue;
+            };
+            let Some((_, element_ty)) = elements.get(position).cloned() else {
+                out.globals.push(Global {
+                    id: gid,
+                    name: name.clone(),
+                    ty: Ty::Error,
+                    init: Vec::new(),
+                    result: Reg(u32::MAX),
+                    span: *span,
+                });
+                continue;
+            };
+            if element_ty == Ty::Error || !element_ty.is_concrete() {
+                out.globals.push(Global {
+                    id: gid,
+                    name: name.clone(),
+                    ty: Ty::Error,
+                    init: Vec::new(),
+                    result: Reg(u32::MAX),
+                    span: *span,
+                });
+                continue;
+            }
+            let mut lowerer = Lowerer {
+                next: 0,
+                instrs: Vec::new(),
+                bindings: HashMap::new(),
+                globals: global_map.clone(),
+                next_label: 0,
+                loop_stack: Vec::new(),
+                cleanup: Vec::new(),
+                env: HashMap::new(),
+                outer: None,
+                plan: Some(plan),
+                outer_key: None,
+                typed,
+                module: prog.module.as_str(),
+                fn_ret: Ty::Void,
+            };
+            let tuple = lowerer.reg();
+            lowerer.instrs.push(Instr::GlobalLoad {
+                dst: tuple,
+                global: *hidden,
+                span: *span,
+            });
+            let dst = lowerer.reg();
+            lowerer.instrs.push(Instr::TupleGet {
+                dst,
+                tuple,
+                index: position,
+                tys: elements.into_iter().map(|(_, ty)| rt(&ty)).collect(),
+                span: *span,
+            });
+            out.globals.push(Global {
+                id: gid,
+                name: name.clone(),
+                ty: rt(&element_ty),
+                init: lowerer.instrs,
+                result: dst,
+                span: *span,
+            });
+            continue;
+        }
         let ty = typed
             .type_of_id(*id)
             .or_else(|| typed.type_of_id(value.id()))
@@ -3080,6 +3212,9 @@ fn collect_project_imports(
             HirItem::Let { value, .. } => {
                 walk_expr(prog, typed, plan, None, value, &mut by_symbol);
             }
+            HirItem::Destructure { value, .. } => {
+                walk_expr(prog, typed, plan, None, value, &mut by_symbol);
+            }
             _ => {}
         }
     }
@@ -3116,6 +3251,11 @@ impl Lowerer<'_> {
         // Poisoned nodes (and, defensively, types that stayed generic) lower
         // to nothing — the error was already reported.
         self.resolved_ty(expr.id())?;
+        if typed.nullable_wraps.contains(&expr.id().0)
+            && typed.fallible_ok_wraps.contains(&expr.id().0)
+        {
+            return self.lower_composed_nullable_fallible_wrap(expr, typed);
+        }
         // Implicit `T` -> `?T` (auto-`Some`): the node's recorded type is
         // the inner `T`; emit the inner value then wrap as `Option.Some`.
         if typed.nullable_wraps.contains(&expr.id().0) {
@@ -3132,6 +3272,29 @@ impl Lowerer<'_> {
             return self.lower_fallible_err_wrap(expr, typed);
         }
         self.lower_expr_inner(expr, typed)
+    }
+
+    /// Compose `T -> ?T -> E!?T`: emit the nullable value first, then make
+    /// that `Option[T]` the `ok` payload of the fallible container.
+    fn lower_composed_nullable_fallible_wrap(
+        &mut self,
+        expr: &HirExpr,
+        typed: &vl_typecheck::TypedProgram,
+    ) -> Option<Reg> {
+        let inner_ty = self.resolved_ty(expr.id())?;
+        let nullable = self.lower_nullable_wrap(expr, typed)?;
+        let option_ty = Ty::Union(Box::new(vl_typecheck::UnionTy {
+            name: "Option".to_string(),
+            args: vec![rt(&inner_ty)],
+        }));
+        let dst = self.reg();
+        self.instrs.push(Instr::WrapOk {
+            dst,
+            value: nullable,
+            ok: rt(&option_ty),
+            span: expr.span(),
+        });
+        Some(dst)
     }
 
     /// Emit `WrapOk(inner)` for an auto-wrapped `E!T` value. The node's
@@ -3865,6 +4028,42 @@ impl Lowerer<'_> {
                     self.instrs.push(Instr::Not {
                         dst,
                         src,
+                        span: *span,
+                    });
+                    Some(dst)
+                }
+                HirUnOp::Neg => {
+                    let ty = self.resolved_ty(inner.id())?;
+                    let (op, lhs) = if ty == Ty::F64 {
+                        let minus_one = self.reg();
+                        self.instrs.push(Instr::Const {
+                            dst: minus_one,
+                            value: Scalar::F64((-1.0f64).to_bits()),
+                            span: *span,
+                        });
+                        (LirOp::Mul, minus_one)
+                    } else {
+                        let zero = self.reg();
+                        let value = match ty {
+                            Ty::U64 => Scalar::U64(0),
+                            Ty::I64 => Scalar::I64(0),
+                            Ty::U8 => Scalar::U8(0),
+                            _ => return None,
+                        };
+                        self.instrs.push(Instr::Const {
+                            dst: zero,
+                            value,
+                            span: *span,
+                        });
+                        (LirOp::Sub, zero)
+                    };
+                    let src = self.lower_expr(inner, typed)?;
+                    let dst = self.reg();
+                    self.instrs.push(Instr::BinOp {
+                        dst,
+                        op,
+                        lhs,
+                        rhs: src,
                         span: *span,
                     });
                     Some(dst)
@@ -5843,5 +6042,132 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn project_global_destructure_evaluates_and_imports_its_initializer_once() {
+        let ((hir_lib, typed_lib, _), (hir_main, typed_main, _), _) = check_two(
+            "fun make(): #(u64, u64) { return #(11u64, 22u64); }",
+            "demo.lib",
+            "use demo.lib.make; val #(a, b) = make(); fun main() { a; b; }",
+            "demo.main",
+        );
+        let refs = vec![(&hir_lib, &typed_lib), (&hir_main, &typed_main)];
+        let (plan, diags) = vl_typecheck::world::plan_world(&refs);
+        assert!(diags.is_empty(), "{diags:?}");
+        let lir = lower_project(&hir_main, &typed_main, &plan);
+        assert_eq!(lir.globals.len(), 3, "{}", lir.dump());
+        assert!(lir
+            .imports
+            .iter()
+            .any(|import| import.symbol.module == "demo.lib" && import.symbol.function == "make"));
+        let calls = lir
+            .globals
+            .iter()
+            .flat_map(|global| global.init.iter())
+            .filter(|instruction| matches!(instruction, Instr::Call { .. }))
+            .count();
+        assert_eq!(
+            calls,
+            1,
+            "destructure initializer must run once: {}",
+            lir.dump()
+        );
+        assert!(
+            lir.functions[0]
+                .instrs
+                .iter()
+                .filter(|instruction| matches!(instruction, Instr::GlobalLoad { .. }))
+                .count()
+                >= 2
+        );
+    }
+
+    #[test]
+    fn nullable_then_fallible_conversion_wraps_the_option_as_ok_payload() {
+        let source = "type E = error { Bad, }; fun make(): E!?u64 { return 7u64; } fun take(x: E!?u64): E!?u64 { return x; } fun main() { val local: E!?u64 = 8u64; val passed = take(9u64); }";
+        let (tokens, lex_diags) = vl_lex::lex(source);
+        assert!(lex_diags.is_empty(), "{lex_diags:?}");
+        let (ast, parse_diags) = vl_syntax::parse(&tokens, source);
+        assert!(parse_diags.is_empty(), "{parse_diags:?}");
+        let (resolved, resolve_diags) = vl_semantic::resolve(&ast);
+        assert!(
+            resolve_diags.iter().all(|d| !d.is_error()),
+            "{resolve_diags:?}"
+        );
+        let hir = vl_hir::lower(&ast, &resolved);
+        let (typed, type_diags) = vl_typecheck::check(&hir);
+        assert!(type_diags.iter().all(|d| !d.is_error()), "{type_diags:?}");
+        let lir = lower(&hir, &typed);
+        let makes = lir
+            .functions
+            .iter()
+            .filter(|f| f.name == "make")
+            .collect::<Vec<_>>();
+        assert_eq!(makes.len(), 1);
+        let make = makes[0];
+        let some = make.instrs.iter().position(|instruction| matches!(
+            instruction,
+            Instr::NewVariant { union, variant, .. } if union == "Option" && variant == "Some"
+        )).expect("nullable Some wrapper");
+        let wrap = make
+            .instrs
+            .iter()
+            .position(|instruction| matches!(instruction, Instr::WrapOk { .. }))
+            .expect("outer fallible ok wrapper");
+        assert!(
+            some < wrap,
+            "inner nullable wrapper must be emitted first: {}",
+            lir.dump()
+        );
+        let Instr::WrapOk { ok, .. } = &make.instrs[wrap] else {
+            unreachable!()
+        };
+        assert!(
+            matches!(ok, Ty::Union(union) if union.name == "Option" && union.args == vec![Ty::U64]),
+            "wrong wrapped payload type: {ok:?}"
+        );
+        let wrapped_options = lir.functions.iter().flat_map(|function| function.instrs.iter())
+            .filter(|instruction| matches!(instruction, Instr::WrapOk { ok: Ty::Union(union), .. } if union.name == "Option" && union.args == vec![Ty::U64]))
+            .count();
+        assert!(
+            wrapped_options >= 3,
+            "expected return, binding, and argument wrappers: {}",
+            lir.dump()
+        );
+    }
+
+    #[test]
+    fn unary_negation_uses_typed_zero_and_float_sign_multiplier() {
+        let source = "fun main() { val i = -7i64; val f = -0.0f64; }";
+        let (tokens, _) = vl_lex::lex(source);
+        let (ast, _) = vl_syntax::parse(&tokens, source);
+        let (resolved, _) = vl_semantic::resolve(&ast);
+        let hir = vl_hir::lower(&ast, &resolved);
+        let (typed, diags) = vl_typecheck::check(&hir);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let lir = lower(&hir, &typed);
+        let main = lir.functions.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            main.instrs.iter().any(|instruction| matches!(
+                instruction,
+                Instr::BinOp { op: LirOp::Sub, lhs, .. }
+                    if main.instrs.iter().any(|candidate| matches!(candidate,
+                        Instr::Const { dst, value: Scalar::I64(0), .. } if dst == lhs))
+            )),
+            "integer negation must subtract from a typed zero: {}",
+            lir.dump()
+        );
+        assert!(
+            main.instrs.iter().any(|instruction| matches!(
+                instruction,
+                Instr::BinOp { op: LirOp::Mul, lhs, .. }
+                    if main.instrs.iter().any(|candidate| matches!(candidate,
+                        Instr::Const { dst, value: Scalar::F64(bits), .. }
+                            if dst == lhs && *bits == (-1.0f64).to_bits()))
+            )),
+            "float negation must multiply by negative one: {}",
+            lir.dump()
+        );
     }
 }

@@ -396,6 +396,7 @@ pub enum HirExpr {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HirUnOp {
+    Neg,
     Not,
 }
 
@@ -1303,33 +1304,14 @@ impl<'a> Lowerer<'a> {
                     span: *span,
                 }
             }
-            AstExpr::Unary { op, rhs, span } => match op {
-                // Desugar `-x` into `0 - x`.
-                AstUnOp::Neg => {
-                    let rhs = self.lower_expr(rhs);
-                    let zero = match &rhs {
-                        HirExpr::Literal { value, .. } => scalar_zero(*value),
-                        _ => Scalar::Int(0),
-                    };
-                    let zero_span = Span::empty(span.start);
-                    HirExpr::Binary {
-                        id: self.id(),
-                        op: HirBinOp::Sub,
-                        lhs: Box::new(HirExpr::Literal {
-                            id: self.id(),
-                            value: zero,
-                            span: zero_span,
-                        }),
-                        rhs: Box::new(rhs),
-                        span: *span,
-                    }
-                }
-                AstUnOp::Not => HirExpr::Unary {
-                    id: self.id(),
-                    op: HirUnOp::Not,
-                    inner: Box::new(self.lower_expr(rhs)),
-                    span: *span,
+            AstExpr::Unary { op, rhs, span } => HirExpr::Unary {
+                id: self.id(),
+                op: match op {
+                    AstUnOp::Neg => HirUnOp::Neg,
+                    AstUnOp::Not => HirUnOp::Not,
                 },
+                inner: Box::new(self.lower_expr(rhs)),
+                span: *span,
             },
             AstExpr::Binary { op, lhs, rhs, span } => {
                 let op = match op {
@@ -1382,17 +1364,6 @@ impl<'a> Lowerer<'a> {
                 span: *span,
             },
         }
-    }
-}
-
-fn scalar_zero(value: Scalar) -> Scalar {
-    match value {
-        Scalar::Int(_) => Scalar::Int(0),
-        Scalar::U64(_) => Scalar::U64(0),
-        Scalar::I64(_) => Scalar::I64(0),
-        Scalar::F64(_) => Scalar::F64(0.0f64.to_bits()),
-        Scalar::Bool(_) => Scalar::Bool(false),
-        Scalar::U8(_) => Scalar::U8(0),
     }
 }
 
@@ -1535,6 +1506,30 @@ mod tests {
     }
 
     #[test]
+    fn negated_literal_remains_unary() {
+        let src = "fun main() { val x = -0.0f64; }";
+        let (toks, _) = vl_lex::lex(src);
+        let (prog, pdiags) = vl_syntax::parse(&toks, src);
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, rdiags) = vl_semantic::resolve(&prog);
+        assert!(rdiags.iter().all(|d| !d.is_error()), "{rdiags:?}");
+        let hir = lower(&prog, &res);
+        let HirItem::Fn { body, .. } = &hir.items[0] else {
+            panic!("expected function")
+        };
+        let HirStmt::Let { value, .. } = &body[0] else {
+            panic!("expected let")
+        };
+        assert!(matches!(
+            value,
+            HirExpr::Unary {
+                op: HirUnOp::Neg,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn arrays_lower() {
         let src = "fun main() { var a = [1u64, 2u64]; a[0u64] = 3u64; val x = a[1u64]; }";
         let (toks, _) = vl_lex::lex(src);
@@ -1662,13 +1657,22 @@ mod tests {
     }
 
     #[test]
-    fn neg_desugars_to_sub() {
+    fn negation_lowers_to_explicit_unary() {
         let (toks, _) = vl_lex::lex("val x = -1;");
         let (prog, _) = vl_syntax::parse(&toks, "val x = -1;");
         let (res, _) = vl_semantic::resolve(&prog);
         let hir = lower(&prog, &res);
         assert_eq!(hir.items.len(), 1);
-        assert!(matches!(hir.items[0], HirItem::Let { .. }));
+        assert!(matches!(
+            &hir.items[0],
+            HirItem::Let {
+                value: HirExpr::Unary {
+                    op: HirUnOp::Neg,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]

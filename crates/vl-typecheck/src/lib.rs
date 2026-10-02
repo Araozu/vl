@@ -6234,6 +6234,13 @@ impl Checker {
     /// adding conversion instructions.
     fn coerce_expr_literals(&mut self, expr: &HirExpr, expected: &Ty) {
         match expr {
+            HirExpr::Unary {
+                op: HirUnOp::Neg,
+                inner,
+                ..
+            } if is_integer(expected) => {
+                self.coerce_expr_literals(inner, expected);
+            }
             HirExpr::Literal { id, value, span }
                 if matches!(value, Scalar::Int(_)) && is_integer(expected) =>
             {
@@ -7471,6 +7478,19 @@ impl Checker {
                     return self.record(*id, Ty::Error);
                 }
                 match op {
+                    HirUnOp::Neg => {
+                        if !self.is_numeric_in_scope(&inner_ty) {
+                            self.diags.push(
+                                Diagnostic::error(format!(
+                                    "negation requires a Numeric operand, got {inner_ty}"
+                                ))
+                                .with_label(*span, "use a numeric value or a Numeric bound")
+                                .with_code("E302"),
+                            );
+                            return self.record(*id, Ty::Error);
+                        }
+                        self.record(*id, inner_ty)
+                    }
                     HirUnOp::Not => {
                         if inner_ty != Ty::Bool {
                             self.diags.push(
