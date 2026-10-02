@@ -40,8 +40,11 @@ pub enum Ty {
     U8,
     String,
     File,
-    /// User-defined nominal object (reference semantics).
-    Object(String),
+    /// User-defined nominal object, possibly generic (`Counter`, `List[u64]`).
+    /// Reference semantics (heap-allocated layout). Generic arguments align
+    /// positionally with the declared type parameters. Boxed like unions to
+    /// keep [`Ty`] small: generic-instance checking nests types dozens deep.
+    Object(Box<ObjectTy>),
     /// Nominal union instantiation (`Option`, `Option[u64]`). Reference
     /// semantics (heap tag + payload); constructed via variants, read via
     /// `match`. Boxed to keep [`Ty`] small on the stack: generic-instance
@@ -81,6 +84,15 @@ pub struct UnionTy {
     pub args: Vec<Ty>,
 }
 
+/// Nominal object instantiation: `name` plus one argument per declared type
+/// parameter (`args` aligns positionally; empty for monomorphic objects).
+/// Boxed inside [`Ty::Object`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObjectTy {
+    pub name: String,
+    pub args: Vec<Ty>,
+}
+
 /// Fallible instantiation: an optional error-set constraint plus the `ok`
 /// payload type. Boxed inside [`Ty::Fallible`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -100,7 +112,20 @@ impl std::fmt::Display for Ty {
             Ty::U8 => write!(f, "u8"),
             Ty::String => write!(f, "String"),
             Ty::File => write!(f, "File"),
-            Ty::Object(name) => write!(f, "{name}"),
+            Ty::Object(o) => {
+                write!(f, "{}", o.name)?;
+                if !o.args.is_empty() {
+                    write!(f, "[")?;
+                    for (i, arg) in o.args.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{arg}")?;
+                    }
+                    write!(f, "]")?;
+                }
+                Ok(())
+            }
             Ty::Union(u) => {
                 // The builtin nullable (`?T` sugar over `Option[T]`) keeps
                 // its surface spelling in diagnostics and dumps; every other
@@ -167,7 +192,10 @@ impl Ty {
             VlType::U8 => Ty::U8,
             VlType::String => Ty::String,
             VlType::File => Ty::File,
-            VlType::Object(name) => Ty::Object(name.clone()),
+            VlType::Object { name, args } => Ty::Object(Box::new(ObjectTy {
+                name: name.clone(),
+                args: args.iter().map(|a| Self::from_vl_in(a, env)).collect(),
+            })),
             VlType::Union { name, args } => Ty::Union(Box::new(UnionTy {
                 name: name.clone(),
                 args: args.iter().map(|a| Self::from_vl_in(a, env)).collect(),
@@ -218,6 +246,7 @@ impl Ty {
             Ty::Array(elem) => elem.is_concrete(),
             Ty::Tuple(fields) => fields.iter().all(|(_, ty)| ty.is_concrete()),
             Ty::Union(u) => u.args.iter().all(|a| a.is_concrete()),
+            Ty::Object(o) => o.args.iter().all(|a| a.is_concrete()),
             Ty::Fallible(f) => f.ok.is_concrete(),
             Ty::Mutable(inner) => inner.is_concrete(),
             Ty::Param(_) | Ty::Error | Ty::Int => false,
@@ -275,6 +304,10 @@ impl Ty {
                 name: u.name.clone(),
                 args: u.args.iter().map(|a| a.erase_capability()).collect(),
             })),
+            Ty::Object(o) => Ty::Object(Box::new(ObjectTy {
+                name: o.name.clone(),
+                args: o.args.iter().map(|a| a.erase_capability()).collect(),
+            })),
             Ty::Fallible(f) => Ty::Fallible(Box::new(FallibleTy {
                 err: f.err.clone(),
                 ok: f.ok.erase_capability(),
@@ -321,6 +354,7 @@ impl Ty {
             Ty::Mutable(inner) => inner.is_void(),
             Ty::Array(elem) => elem.is_void(),
             Ty::Union(u) => u.args.iter().any(|a| a.is_void()),
+            Ty::Object(o) => o.args.iter().any(|a| a.is_void()),
             // `E!void` is void (return position only); a bare set never is.
             Ty::Fallible(f) => f.ok.is_void(),
             Ty::Tuple(fields) => fields.iter().any(|(_, ty)| ty.is_void()),
@@ -338,6 +372,10 @@ pub fn subst_ty(ty: &Ty, env: &HashMap<String, Ty>) -> Ty {
         Ty::Union(u) => Ty::Union(Box::new(UnionTy {
             name: u.name.clone(),
             args: u.args.iter().map(|a| subst_ty(a, env)).collect(),
+        })),
+        Ty::Object(o) => Ty::Object(Box::new(ObjectTy {
+            name: o.name.clone(),
+            args: o.args.iter().map(|a| subst_ty(a, env)).collect(),
         })),
         Ty::Tuple(fields) => Ty::Tuple(
             fields
@@ -393,7 +431,14 @@ fn mangle_ty(ty: &Ty) -> String {
         Ty::U8 => "u8".into(),
         Ty::String => "String".into(),
         Ty::File => "File".into(),
-        Ty::Object(name) => format!("Object_{}", sanitize_object_name(name)),
+        Ty::Object(o) => {
+            let mut out = format!("Object_{}", sanitize_object_name(&o.name));
+            for arg in &o.args {
+                out.push('_');
+                out.push_str(&mangle_ty(arg));
+            }
+            out
+        }
         Ty::Union(u) => {
             // `Option[u64]` -> `Union_Option_u64`; bare `Option` ->
             // `Union_Option`. `$` never appears inside an encoded argument,
@@ -437,18 +482,25 @@ fn mangle_ty(ty: &Ty) -> String {
     }
 }
 
-/// Statically known layout of one user-defined object.
+/// Statically known layout of one user-defined object, possibly generic.
+/// `type_params` holds the declared parameters (`[]` for monomorphic);
+/// `fields` may mention those parameters as `Param` (e.g. `Array[T]`).
+/// Each concrete instantiation substitutes its own arguments. `bounds`
+/// maps parameter names to their `extends` constraints for instantiation
+/// checking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectSigTy {
+    pub type_params: Vec<String>,
+    pub bounds: HashMap<String, GenericBound>,
     pub fields: Vec<(String, Ty)>,
 }
 
-/// Declaration-only metadata for one nominal union. It is intentionally
-/// separate from [`ObjectSigTy`]: unions have no fields, methods, or runtime
-/// layout in this milestone.
+/// Declaration-only metadata for one nominal union, possibly with methods.
+/// `bounds` mirrors objects for instantiation checking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnionSigTy {
     pub type_params: Vec<String>,
+    pub bounds: HashMap<String, GenericBound>,
     pub variants: Vec<UnionVariantSigTy>,
 }
 
@@ -478,6 +530,7 @@ pub struct UnionVariantSigTy {
 pub fn builtin_option_sig() -> UnionSigTy {
     UnionSigTy {
         type_params: vec!["T".to_string()],
+        bounds: HashMap::new(),
         variants: vec![
             UnionVariantSigTy {
                 name: "None".to_string(),
@@ -1053,8 +1106,13 @@ fn ty_has_unknown_qualified(
     unions: &HashMap<String, UnionSigTy>,
 ) -> bool {
     match ty {
-        Ty::Object(name) => {
-            name.contains('.') && !objects.contains_key(name) && !unions.contains_key(name)
+        Ty::Object(o) => {
+            (o.name.contains('.')
+                && !objects.contains_key(&o.name)
+                && !unions.contains_key(&o.name))
+                || o.args
+                    .iter()
+                    .any(|a| ty_has_unknown_qualified(a, objects, unions))
         }
         Ty::Array(elem) => ty_has_unknown_qualified(elem, objects, unions),
         Ty::Union(u) => u
@@ -1176,6 +1234,66 @@ fn normalize_union_ty(
             if args.iter().any(ty_has_error) {
                 return Ty::Error;
             }
+            // A qualified generic-object spelling (`m.List[u64]`) parses as a
+            // union; reinterpret it as an object when the name resolves to a
+            // generic object and not to a union.
+            if !unions.contains_key(&name) && name != "Option" {
+                if let Some(osig) = objects.get(&name) {
+                    if args.len() != osig.type_params.len() {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "object `{name}` expects {} type argument(s), got {}",
+                                osig.type_params.len(),
+                                args.len()
+                            ))
+                            .with_label(
+                                span,
+                                format!(
+                                    "write `{name}[...]` with {} argument(s)",
+                                    osig.type_params.len()
+                                ),
+                            )
+                            .with_code("E302"),
+                        );
+                        return Ty::Error;
+                    }
+                    if args.iter().any(ty_contains_mutable) {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "object `{name}` cannot take a mutable view as a type argument"
+                            ))
+                            .with_label(
+                                span,
+                                "mutation authority cannot flow through generic arguments",
+                            )
+                            .with_note(
+                                "use a read-only type here and supply `*T` as a function argument instead",
+                            )
+                            .with_code("E106"),
+                        );
+                        return Ty::Error;
+                    }
+                    for (param, arg) in osig.type_params.iter().zip(args.iter()) {
+                        if let Some(bound) = osig.bounds.get(param) {
+                            if matches!(arg, Ty::Param(_)) {
+                                continue;
+                            }
+                            if !bound_satisfied(*bound, arg) {
+                                diags.push(
+                                    Diagnostic::error(format!(
+                                        "`{arg}` does not satisfy bound `{bound}` for `{name}` parameter `{param}`"
+                                    ))
+                                    .with_label(span, format!("expected `{bound}` here"))
+                                    .with_code("E302"),
+                                );
+                                return Ty::Error;
+                            }
+                        }
+                    }
+                    return Ty::Object(Box::new(ObjectTy { name, args }));
+                }
+            }
+            // Builtin `Option` backs `?T` / `null` without a declaration;
             // Builtin `Option` backs `?T` / `null` without a declaration;
             // a local `type Option` shadows it (checked first).
             let builtin =
@@ -1256,9 +1374,54 @@ fn normalize_union_ty(
                 );
                 return Ty::Error;
             }
+            if args.iter().any(ty_contains_mutable) {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "union `{name}` cannot take a mutable view as a type argument"
+                    ))
+                    .with_label(
+                        span,
+                        "mutation authority cannot flow through generic arguments",
+                    )
+                    .with_note(
+                        "use a read-only type here and supply `*T` as a function argument instead",
+                    )
+                    .with_code("E106"),
+                );
+                return Ty::Error;
+            }
+            // Bound enforcement for concrete arguments (`T extends Numeric`).
+            if let Some(sig) = unions.get(&name) {
+                for (param, arg) in sig.type_params.iter().zip(args.iter()) {
+                    if let Some(bound) = sig.bounds.get(param) {
+                        if matches!(arg, Ty::Param(_)) {
+                            continue;
+                        }
+                        if !bound_satisfied(*bound, arg) {
+                            diags.push(
+                                Diagnostic::error(format!(
+                                    "`{arg}` does not satisfy bound `{bound}` for `{name}` parameter `{param}`"
+                                ))
+                                .with_label(span, format!("expected `{bound}` here"))
+                                .with_code("E302"),
+                            );
+                            return Ty::Error;
+                        }
+                    }
+                }
+            }
             Ty::Union(Box::new(UnionTy { name, args }))
         }
-        Ty::Object(name) => {
+        Ty::Object(o) => {
+            let name = o.name.clone();
+            let args = o
+                .args
+                .into_iter()
+                .map(|a| normalize_union_ty(diags, unions, objects, errors, a, span))
+                .collect::<Vec<_>>();
+            if args.iter().any(ty_has_error) {
+                return Ty::Error;
+            }
             // A bare object spelling naming a union: the parser resolves
             // file-local bare unions itself, so only qualified spellings
             // (`m.Option`), the builtin `Option` (bare `Option` without
@@ -1267,36 +1430,139 @@ fn normalize_union_ty(
                 (name == "Option" && !unions.contains_key(&name)).then(builtin_option_sig);
             let sig_opt: Option<&UnionSigTy> = unions.get(&name).or(builtin.as_ref());
             if let Some(sig) = sig_opt {
-                if sig.type_params.is_empty() {
+                if args.is_empty() && sig.type_params.is_empty() {
                     return Ty::Union(Box::new(UnionTy {
                         name,
                         args: Vec::new(),
                     }));
                 }
-                diags.push(
-                    Diagnostic::error(format!(
-                        "union `{name}` expects {} type argument(s), got 0",
-                        sig.type_params.len()
-                    ))
-                    .with_label(
-                        span,
-                        format!(
-                            "write `{name}[...]` with {} argument(s)",
+                if args.is_empty() {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "union `{name}` expects {} type argument(s), got 0",
                             sig.type_params.len()
-                        ),
-                    )
-                    .with_code("E302"),
-                );
-                return Ty::Error;
+                        ))
+                        .with_label(
+                            span,
+                            format!(
+                                "write `{name}[...]` with {} argument(s)",
+                                sig.type_params.len()
+                            ),
+                        )
+                        .with_code("E302"),
+                    );
+                    return Ty::Error;
+                }
+                // An object spelling carrying arguments that names a union
+                // (e.g. a qualified `m.Option[u64]` that parsed as an object
+                // in an older spelling): reinterpret as the union.
+                if args.len() != sig.type_params.len() {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "union `{name}` expects {} type argument(s), got {}",
+                            sig.type_params.len(),
+                            args.len()
+                        ))
+                        .with_label(
+                            span,
+                            format!(
+                                "write `{name}[...]` with {} argument(s)",
+                                sig.type_params.len()
+                            ),
+                        )
+                        .with_code("E302"),
+                    );
+                    return Ty::Error;
+                }
+                return Ty::Union(Box::new(UnionTy { name, args }));
             }
             // An object spelling naming an error set: qualified spellings
             // (`m.E`, which the parser cannot resolve) and bare imported
             // shorts the HIR did not qualify land here. Objects win ties
-            // (same-module duplicates are E200 upstream).
+            // (same-module duplicates are E200 upstream). Error sets take no
+            // arguments.
             if !objects.contains_key(&name) && errors.contains_key(&name) {
+                if !args.is_empty() {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "error set `{name}` takes no type arguments, got {}",
+                            args.len()
+                        ))
+                        .with_label(span, "remove the `[...]` arguments")
+                        .with_code("E302"),
+                    );
+                    return Ty::Error;
+                }
                 return Ty::ErrorSet(name);
             }
-            Ty::Object(name)
+            // Nominal object validation, including generic arity.
+            if let Some(osig) = objects.get(&name) {
+                if args.len() != osig.type_params.len() {
+                    if osig.type_params.is_empty() {
+                        diags.push(
+                            Diagnostic::error(format!("unknown type `{name}` with type arguments"))
+                                .with_label(
+                                    span,
+                                    format!("`{name}` is an object and takes no `[...]` arguments"),
+                                )
+                                .with_note("only generic types take `[...]` type arguments")
+                                .with_code("E105"),
+                        );
+                    } else {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "object `{name}` expects {} type argument(s), got {}",
+                                osig.type_params.len(),
+                                args.len()
+                            ))
+                            .with_label(
+                                span,
+                                format!(
+                                    "write `{name}[...]` with {} argument(s)",
+                                    osig.type_params.len()
+                                ),
+                            )
+                            .with_code("E302"),
+                        );
+                    }
+                    return Ty::Error;
+                }
+                if args.iter().any(ty_contains_mutable) {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "object `{name}` cannot take a mutable view as a type argument"
+                        ))
+                        .with_label(
+                            span,
+                            "mutation authority cannot flow through generic arguments",
+                        )
+                        .with_note(
+                            "use a read-only type here and supply `*T` as a function argument instead",
+                        )
+                        .with_code("E106"),
+                    );
+                    return Ty::Error;
+                }
+                for (param, arg) in osig.type_params.iter().zip(args.iter()) {
+                    if let Some(bound) = osig.bounds.get(param) {
+                        if matches!(arg, Ty::Param(_)) {
+                            continue;
+                        }
+                        if !bound_satisfied(*bound, arg) {
+                            diags.push(
+                                Diagnostic::error(format!(
+                                    "`{arg}` does not satisfy bound `{bound}` for `{name}` parameter `{param}`"
+                                ))
+                                .with_label(span, format!("expected `{bound}` here"))
+                                .with_code("E302"),
+                            );
+                            return Ty::Error;
+                        }
+                    }
+                }
+                return Ty::Object(Box::new(ObjectTy { name, args }));
+            }
+            Ty::Object(Box::new(ObjectTy { name, args }))
         }
         Ty::Array(elem) => {
             let elem = normalize_union_ty(diags, unions, objects, errors, *elem, span);
@@ -1360,7 +1626,7 @@ fn validate_qualified_types(
         diags: &mut Vec<Diagnostic>,
     ) {
         match ty {
-            VlType::Object(name)
+            VlType::Object { name, args }
                 if name.contains('.')
                     && !objects.contains_key(name)
                     && !unions.contains_key(name)
@@ -1374,6 +1640,11 @@ fn validate_qualified_types(
             }
             VlType::Array(elem) => check_ty(elem, span, objects, unions, errors, diags),
             VlType::Nullable(inner) => check_ty(inner, span, objects, unions, errors, diags),
+            VlType::Object { args, .. } => {
+                for arg in args {
+                    check_ty(arg, span, objects, unions, errors, diags);
+                }
+            }
             VlType::Union { args, .. } => {
                 // Union heads are validated during conversion
                 // (`normalize_union_ty` owns E105/E302); only dotted names
@@ -1681,16 +1952,27 @@ pub fn check_with_modules(
             if cx.typed.objects.contains_key(&export.qualified) {
                 continue;
             }
+            let env: HashMap<String, Ty> = export
+                .type_params
+                .iter()
+                .map(|p| (p.name.clone(), Ty::Param(p.name.clone())))
+                .collect();
             let mut out_fields = Vec::with_capacity(export.fields.len());
             for field in &export.fields {
-                out_fields.push((
-                    field.name.clone(),
-                    Ty::from_vl_in(&field.ty, &HashMap::new()),
-                ));
+                out_fields.push((field.name.clone(), Ty::from_vl_in(&field.ty, &env)));
             }
-            cx.typed
-                .objects
-                .insert(export.qualified.clone(), ObjectSigTy { fields: out_fields });
+            cx.typed.objects.insert(
+                export.qualified.clone(),
+                ObjectSigTy {
+                    type_params: export.type_params.iter().map(|p| p.name.clone()).collect(),
+                    bounds: export
+                        .type_params
+                        .iter()
+                        .filter_map(|p| p.bound.map(|b| (p.name.clone(), b)))
+                        .collect(),
+                    fields: out_fields,
+                },
+            );
             // Associated functions join the foreign method table under their
             // qualified owner so instance sugar (`p.method()`) resolves
             // without an import, like object layouts. Poisoned and
@@ -1731,6 +2013,11 @@ pub fn check_with_modules(
                 export.qualified.clone(),
                 UnionSigTy {
                     type_params: export.type_params.iter().map(|p| p.name.clone()).collect(),
+                    bounds: export
+                        .type_params
+                        .iter()
+                        .filter_map(|p| p.bound.map(|b| (p.name.clone(), b)))
+                        .collect(),
                     variants: export
                         .variants
                         .iter()
@@ -1745,6 +2032,30 @@ pub fn check_with_modules(
                         .collect(),
                 },
             );
+            // Union associated functions join the foreign method table like
+            // objects, so `v.method()` sugar resolves without an import.
+            for method in &export.methods {
+                cx.assoc_foreign.insert(
+                    (export.qualified.clone(), method.name.clone()),
+                    ForeignMethod {
+                        owner_module: spec.path.as_string(),
+                        dotted: format!("{}.{}", export.name, method.name),
+                        sig: FuncSigTy::from_shared(&method.sig),
+                        global_dependent: spec
+                            .global_dependent_exports
+                            .iter()
+                            .any(|e| e == &format!("{}.{}", export.name, method.name)),
+                    },
+                );
+            }
+            for poisoned in &spec.poisoned_exports {
+                if let Some((owner, method)) = poisoned.split_once('.') {
+                    if owner == export.name {
+                        cx.assoc_poisoned
+                            .insert((export.qualified.clone(), method.to_string()));
+                    }
+                }
+            }
         }
         for export in &spec.errors {
             if cx.typed.errors.contains_key(&export.qualified) {
@@ -1779,6 +2090,10 @@ pub fn check_with_modules(
             } => {
                 let sig = UnionSigTy {
                     type_params: type_params.iter().map(|p| p.name.clone()).collect(),
+                    bounds: type_params
+                        .iter()
+                        .filter_map(|p| p.bound.map(|b| (p.name.clone(), b)))
+                        .collect(),
                     variants: Vec::new(),
                 };
                 cx.typed.unions.entry(name.clone()).or_insert(sig.clone());
@@ -1787,15 +2102,22 @@ pub fn check_with_modules(
                     .entry(format!("{}.{}", prog.module, name))
                     .or_insert(sig);
             }
-            HirItem::Object { name, .. } => {
-                cx.typed
-                    .objects
-                    .entry(name.clone())
-                    .or_insert_with(|| ObjectSigTy { fields: Vec::new() });
+            HirItem::Object {
+                name, type_params, ..
+            } => {
+                let sig = ObjectSigTy {
+                    type_params: type_params.iter().map(|p| p.name.clone()).collect(),
+                    bounds: type_params
+                        .iter()
+                        .filter_map(|p| p.bound.map(|b| (p.name.clone(), b)))
+                        .collect(),
+                    fields: Vec::new(),
+                };
+                cx.typed.objects.entry(name.clone()).or_insert(sig.clone());
                 cx.typed
                     .objects
                     .entry(format!("{}.{}", prog.module, name))
-                    .or_insert_with(|| ObjectSigTy { fields: Vec::new() });
+                    .or_insert(sig);
             }
             HirItem::Error { name, variants, .. } => {
                 // First declaration wins (semantic reported the E200);
@@ -1868,6 +2190,10 @@ pub fn check_with_modules(
             .collect();
         let sig = UnionSigTy {
             type_params: type_params.iter().map(|p| p.name.clone()).collect(),
+            bounds: type_params
+                .iter()
+                .filter_map(|p| p.bound.map(|b| (p.name.clone(), b)))
+                .collect(),
             variants: out_variants,
         };
         cx.typed.unions.insert(name.clone(), sig.clone());
@@ -1924,9 +2250,21 @@ pub fn check_with_modules(
             .insert(format!("{}.{}", prog.module, name), sig);
     }
     // Pass 1: collect object layouts so field types and object literals can
-    // refer to declarations in either order.
+    // refer to declarations in either order. Generic fields may mention the
+    // owner's parameters (`Array[T]`); they are stored generic (`Param`
+    // inside) and substituted per concrete instantiation.
     for item in &prog.items {
-        if let HirItem::Object { name, fields, .. } = item {
+        if let HirItem::Object {
+            name,
+            type_params,
+            fields,
+            ..
+        } = item
+        {
+            let env: HashMap<String, Ty> = type_params
+                .iter()
+                .map(|p| (p.name.clone(), Ty::Param(p.name.clone())))
+                .collect();
             let mut out_fields = Vec::with_capacity(fields.len());
             for (field, ty, span) in fields {
                 let mut field_ty = ty
@@ -1938,7 +2276,7 @@ pub fn check_with_modules(
                             &cx.typed.objects,
                             &cx.typed.errors,
                             v,
-                            &HashMap::new(),
+                            &env,
                             *span,
                         )
                     })
@@ -1961,7 +2299,14 @@ pub fn check_with_modules(
                 }
                 out_fields.push((field.clone(), field_ty));
             }
-            let sig = ObjectSigTy { fields: out_fields };
+            let sig = ObjectSigTy {
+                type_params: type_params.iter().map(|p| p.name.clone()).collect(),
+                bounds: type_params
+                    .iter()
+                    .filter_map(|p| p.bound.map(|b| (p.name.clone(), b)))
+                    .collect(),
+                fields: out_fields,
+            };
             cx.typed.objects.insert(name.clone(), sig.clone());
             // Qualified identity for cross-module references and
             // self-references spelled `vl.person.Person`.
@@ -2147,16 +2492,53 @@ pub(crate) fn canonicalize_for_key(
     objects: &HashMap<String, ObjectSigTy>,
 ) -> Ty {
     match ty {
-        Ty::Object(name) if !name.contains('.') => {
-            let qualified = format!("{caller}.{name}");
+        Ty::Object(o) if !o.name.contains('.') => {
+            let qualified = format!("{caller}.{}", o.name);
+            let args = o
+                .args
+                .iter()
+                .map(|a| canonicalize_for_key(a, caller, objects))
+                .collect();
             if objects.contains_key(&qualified) {
-                Ty::Object(qualified)
+                Ty::Object(Box::new(ObjectTy {
+                    name: qualified,
+                    args,
+                }))
             } else {
-                ty.clone()
+                Ty::Object(Box::new(ObjectTy {
+                    name: o.name.clone(),
+                    args,
+                }))
             }
         }
+        Ty::Object(o) => Ty::Object(Box::new(ObjectTy {
+            name: o.name.clone(),
+            args: o
+                .args
+                .iter()
+                .map(|a| canonicalize_for_key(a, caller, objects))
+                .collect(),
+        })),
+        Ty::Union(u) => Ty::Union(Box::new(UnionTy {
+            name: u.name.clone(),
+            args: u
+                .args
+                .iter()
+                .map(|a| canonicalize_for_key(a, caller, objects))
+                .collect(),
+        })),
         Ty::Array(elem) => Ty::Array(Box::new(canonicalize_for_key(elem, caller, objects))),
         Ty::Mutable(inner) => Ty::Mutable(Box::new(canonicalize_for_key(inner, caller, objects))),
+        Ty::Tuple(fields) => Ty::Tuple(
+            fields
+                .iter()
+                .map(|(n, t)| (n.clone(), canonicalize_for_key(t, caller, objects)))
+                .collect(),
+        ),
+        Ty::Fallible(f) => Ty::Fallible(Box::new(FallibleTy {
+            err: f.err.clone(),
+            ok: canonicalize_for_key(&f.ok, caller, objects),
+        })),
         _ => ty.clone(),
     }
 }
@@ -3304,7 +3686,22 @@ impl Checker {
                     self.record(*id, Ty::Error);
                     return;
                 };
-                let Some((_, want)) = sig.fields.iter().find(|(name, _)| name == field) else {
+                let object_args: Vec<Ty> = match &bt {
+                    Ty::Object(o) => o.args.clone(),
+                    Ty::Mutable(inner) => match &**inner {
+                        Ty::Object(o) => o.args.clone(),
+                        _ => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                };
+                let env: HashMap<String, Ty> = sig
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(object_args.iter().cloned())
+                    .collect();
+                let Some((_, want_generic)) = sig.fields.iter().find(|(name, _)| name == field)
+                else {
                     self.diags.push(
                         Diagnostic::error(format!("object `{object_name}` has no field `{field}`"))
                             .with_label(*span, "unknown object field")
@@ -3314,17 +3711,18 @@ impl Checker {
                     self.record(*id, Ty::Error);
                     return;
                 };
+                let want = subst_ty(want_generic, &env);
                 // Poisoned field declarations (E106 already reported) stay
                 // quiet here to keep one root cause.
-                if ty_has_error(want) {
+                if ty_has_error(&want) {
                     let _ = self.infer_expr(value);
                     self.record(*id, Ty::Error);
                     return;
                 }
                 // Check the stored declaration type, not the projected read
                 // type: a mutable receiver does not upgrade a read-only field.
-                let got = self.infer_expr_expected(value, want);
-                if ty_has_error(&got) || !can_coerce(&got, want) {
+                let got = self.infer_expr_expected(value, &want);
+                if ty_has_error(&got) || !can_coerce(&got, &want) {
                     if !ty_has_error(&got) {
                         // Focused capability message when shapes match except
                         // authority; generic mismatch stays E302.
@@ -4155,6 +4553,18 @@ impl Checker {
     /// `Counter` consults only the local table (foreign values are always
     /// qualified, so nominal identity cannot cross modules by accident).
     fn find_assoc_method(&self, obj: &str, method: &str) -> AssocLookup {
+        // `has_field` also covers union variants (same member namespace).
+        let has_field_here = |key: &str| {
+            self.typed
+                .objects
+                .get(key)
+                .is_some_and(|sig| sig.fields.iter().any(|(f, _)| f == method))
+                || self
+                    .typed
+                    .unions
+                    .get(key)
+                    .is_some_and(|sig| sig.variants.iter().any(|v| v.name == method))
+        };
         if let Some(short) = obj.strip_prefix(&format!("{}.", self.module)) {
             // Own-module qualification (`my.mod.Counter`): the local table,
             // keyed by the bare HIR spelling.
@@ -4171,12 +4581,17 @@ impl Checker {
                 }
             }
             return AssocLookup::Missing {
-                has_field: self
-                    .typed
-                    .objects
-                    .get(obj)
-                    .or_else(|| self.typed.objects.get(short))
-                    .is_some_and(|sig| sig.fields.iter().any(|(f, _)| f == method)),
+                has_field: has_field_here(obj)
+                    || self
+                        .typed
+                        .objects
+                        .get(short)
+                        .is_some_and(|sig| sig.fields.iter().any(|(f, _)| f == method))
+                    || self
+                        .typed
+                        .unions
+                        .get(short)
+                        .is_some_and(|sig| sig.variants.iter().any(|v| v.name == method)),
             };
         }
         if obj.contains('.') {
@@ -4195,11 +4610,7 @@ impl Checker {
                 return AssocLookup::Poisoned;
             }
             return AssocLookup::Missing {
-                has_field: self
-                    .typed
-                    .objects
-                    .get(obj)
-                    .is_some_and(|sig| sig.fields.iter().any(|(f, _)| f == method)),
+                has_field: has_field_here(obj),
             };
         }
         // Bare receivers are always local.
@@ -4213,11 +4624,7 @@ impl Checker {
             }
         }
         AssocLookup::Missing {
-            has_field: self
-                .typed
-                .objects
-                .get(obj)
-                .is_some_and(|sig| sig.fields.iter().any(|(f, _)| f == method)),
+            has_field: has_field_here(obj),
         }
     }
 
@@ -4277,11 +4684,11 @@ impl Checker {
         if ty_has_error(&r_ty) {
             return self.record(id, Ty::Error);
         }
-        let Some(obj_name) = object_base(&r_ty) else {
+        let Some((r_is_union, obj_name)) = nominal_base(&r_ty) else {
             if !ty_has_error(&r_ty) {
                 self.diags.push(
                     Diagnostic::error(format!("cannot call method `{method}` on `{r_ty}`"))
-                        .with_label(method_span, "expected an object value here")
+                        .with_label(method_span, "expected an object or union value here")
                         .with_code("E302"),
                 );
             }
@@ -4337,8 +4744,9 @@ impl Checker {
                 return self.record(id, Ty::Error);
             }
             AssocLookup::Missing { has_field } => {
+                let kind = if r_is_union { "union" } else { "object" };
                 let mut diag = Diagnostic::error(format!(
-                    "object `{obj_name}` has no associated function `{method}`"
+                    "{kind} `{obj_name}` has no associated function `{method}`"
                 ))
                 .with_label(method_span, "unknown associated function")
                 .with_code("E302");
@@ -4384,11 +4792,15 @@ impl Checker {
             return self.record(id, Ty::Error);
         }
         // The sugar gate: the first parameter must take the receiver's
-        // object. A different object is E303 (sugar does not apply); the same
-        // object with an unmet `*` capability is E306 like any other argument.
+        // nominal type (object or union). A different type is E303 (sugar
+        // does not apply); the same type with an unmet `*` capability is
+        // E306 like any other argument.
         let p0 = &param_tys[0];
-        match object_base(p0) {
-            Some(p0obj) if same_object_name(&p0obj, &obj_name, &self.module) => {
+        match nominal_base(p0) {
+            Some((p0_is_union, p0obj))
+                if p0_is_union == r_is_union
+                    && same_object_name(&p0obj, &obj_name, &self.module) =>
+            {
                 if !can_coerce(&r_ty, p0) {
                     if r_ty.readonly_view() == p0.readonly_view()
                         && r_ty.is_mutable_view() != p0.is_mutable_view()
@@ -5827,20 +6239,32 @@ impl Checker {
             }
             HirExpr::ObjectLiteral { id, fields, .. } => {
                 // `*Foo` in a fresh context coerces fields like `Foo`.
-                let obj_name: Option<&String> = match expected {
-                    Ty::Object(name) => Some(name),
+                // Generic `List[u64]` instantiates `Array[T]` to `Array[u64]`
+                // before recursing.
+                let expected_obj: Option<&ObjectTy> = match expected {
+                    Ty::Object(o) => Some(o),
                     Ty::Mutable(inner) => match &**inner {
-                        Ty::Object(name) => Some(name),
+                        Ty::Object(o) => Some(o),
                         _ => None,
                     },
                     _ => None,
                 };
-                if let Some(name) = obj_name {
-                    if let Some(sig) = self.typed.objects.get(name).cloned() {
-                        for (field, value) in fields {
-                            if let Some((_, field_ty)) = sig.fields.iter().find(|(n, _)| n == field)
-                            {
-                                self.coerce_expr_literals(value, field_ty);
+                if let Some(want_obj) = expected_obj {
+                    if let Some(sig) = self.typed.objects.get(&want_obj.name).cloned() {
+                        if sig.type_params.len() == want_obj.args.len() {
+                            let env: HashMap<String, Ty> = sig
+                                .type_params
+                                .iter()
+                                .cloned()
+                                .zip(want_obj.args.iter().cloned())
+                                .collect();
+                            for (field, value) in fields {
+                                if let Some((_, field_ty)) =
+                                    sig.fields.iter().find(|(n, _)| n == field)
+                                {
+                                    let inst = subst_ty(field_ty, &env);
+                                    self.coerce_expr_literals(value, &inst);
+                                }
                             }
                         }
                         if matches!(expected, Ty::Object(_)) {
@@ -6036,6 +6460,7 @@ impl Checker {
             HirExpr::ObjectLiteral {
                 id,
                 name,
+                type_args,
                 fields,
                 span,
             } => {
@@ -6082,6 +6507,219 @@ impl Checker {
                     }
                     return self.record(*id, Ty::Error);
                 }
+                // Resolve generic arguments for `List[T]`-style objects.
+                // Explicit `List::[u64] { ... }` wins; otherwise honor a
+                // previously coerced expected type (`var x: List[u64] = List
+                // { ... }`); otherwise require one (like `[]`).
+                let resolved_args: Option<Vec<Ty>> = if sig.type_params.is_empty() {
+                    if !type_args.is_empty() {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "object `{name}` takes no type arguments, got {}",
+                                type_args.len()
+                            ))
+                            .with_label(*span, "remove the `::[...]` arguments")
+                            .with_code("E302"),
+                        );
+                        for (_, value) in fields {
+                            self.infer_expr(value);
+                        }
+                        return self.record(*id, Ty::Error);
+                    }
+                    Some(Vec::new())
+                } else if !type_args.is_empty() {
+                    if type_args.len() != sig.type_params.len() {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "object `{name}` expects {} type argument(s), got {}",
+                                sig.type_params.len(),
+                                type_args.len()
+                            ))
+                            .with_label(
+                                *span,
+                                format!(
+                                    "write `{name}::[...] with {} argument(s)`",
+                                    sig.type_params.len()
+                                ),
+                            )
+                            .with_code("E302"),
+                        );
+                        for (_, value) in fields {
+                            self.infer_expr(value);
+                        }
+                        return self.record(*id, Ty::Error);
+                    }
+                    let mut out = Vec::with_capacity(type_args.len());
+                    let mut bad = false;
+                    for ta in type_args {
+                        let t = self.vl_to_ty(ta, *span);
+                        if ty_has_error(&t) {
+                            bad = true;
+                        }
+                        out.push(t);
+                    }
+                    if bad {
+                        for (_, value) in fields {
+                            self.infer_expr(value);
+                        }
+                        return self.record(*id, Ty::Error);
+                    }
+                    if out.iter().any(ty_contains_mutable) {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "object `{name}` cannot take a mutable view as a type argument"
+                            ))
+                            .with_label(
+                                *span,
+                                "mutation authority cannot flow through generic arguments",
+                            )
+                            .with_note(
+                                "use a read-only type here and supply `*T` as a function argument instead",
+                            )
+                            .with_code("E106"),
+                        );
+                        for (_, value) in fields {
+                            self.infer_expr(value);
+                        }
+                        return self.record(*id, Ty::Error);
+                    }
+                    for (param, arg) in sig.type_params.iter().zip(out.iter()) {
+                        if let Some(bound) = sig.bounds.get(param) {
+                            if matches!(arg, Ty::Param(_)) {
+                                continue;
+                            }
+                            if !bound_satisfied(*bound, arg) {
+                                self.diags.push(
+                                    Diagnostic::error(format!(
+                                        "`{arg}` does not satisfy bound `{bound}` for `{name}` parameter `{param}`"
+                                    ))
+                                    .with_label(*span, format!("expected `{bound}` here"))
+                                    .with_code("E302"),
+                                );
+                                for (_, value) in fields {
+                                    self.infer_expr(value);
+                                }
+                                return self.record(*id, Ty::Error);
+                            }
+                        }
+                    }
+                    Some(out)
+                } else {
+                    // Honor a previously coerced expected type (`var x:
+                    // List[u64] = List { ... }`, including `*List[u64]`).
+                    match self.typed.type_of_id(*id) {
+                        Some(Ty::Object(o))
+                            if same_object_name(&o.name, name, &self.module)
+                                && o.args.len() == sig.type_params.len()
+                                && !o.args.iter().any(ty_has_error) =>
+                        {
+                            Some(o.args)
+                        }
+                        Some(Ty::Mutable(inner)) => match *inner {
+                            Ty::Object(o)
+                                if same_object_name(&o.name, name, &self.module)
+                                    && o.args.len() == sig.type_params.len()
+                                    && !o.args.iter().any(ty_has_error) =>
+                            {
+                                Some(o.args)
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                };
+                // Fallback: infer from field values (e.g. `return List {
+                // items, len }` inside `init` where `T` is the enclosing
+                // method's parameter). Collects `want_generic vs got` per
+                // field and solves; `Param` solutions (outer generics) are
+                // allowed here and monomorphize per instance. Field errors
+                // already reported poison quietly (no second diagnostic).
+                let resolved_args: Option<Vec<Ty>> = match resolved_args {
+                    Some(a) => Some(a),
+                    None => {
+                        let mut cs = ConstraintSet::default();
+                        let mut poisoned = false;
+                        for (field, value) in fields.iter() {
+                            let Some((_, want_g)) = sig.fields.iter().find(|(n, _)| n == field)
+                            else {
+                                // Unknown field: infer now for inner errors;
+                                // the main loop below will report the unknown
+                                // field (single root cause there). Mark
+                                // poisoned to suppress our fallback message.
+                                let _ = self.infer_expr(value);
+                                poisoned = true;
+                                break;
+                            };
+                            let got = self.infer_expr(value);
+                            if ty_has_error(&got) || ty_has_error(want_g) {
+                                poisoned = true;
+                                break;
+                            }
+                            if !cs.collect(want_g, &got, name, value.span(), &mut self.diags) {
+                                poisoned = true;
+                                break;
+                            }
+                        }
+                        if poisoned {
+                            // Root cause already reported (field error or
+                            // E306 from collect); poison quietly. Fields were
+                            // already inferred above; skip the main loop's
+                            // re-inference by returning Error now.
+                            return self.record(*id, Ty::Error);
+                        }
+                        // Use ConstraintSet::solve with a synthetic
+                        // signature matching the object's params.
+                        let dummy = FuncSigTy {
+                            param_names: vec![],
+                            param_tys: vec![],
+                            ret: Ty::Void,
+                            type_params: sig.type_params.clone(),
+                            bounds: HashMap::new(),
+                        };
+                        let before = self.diags.len();
+                        let solved_args = cs.solve(name, *span, &dummy, &mut self.diags);
+                        if let Some(args) = solved_args {
+                            if args.iter().any(ty_has_error) {
+                                None
+                            } else {
+                                Some(args.into_iter().map(default_inferred_ty).collect())
+                            }
+                        } else {
+                            // Avoid double-report with our fallback below.
+                            self.diags.truncate(before);
+                            None
+                        }
+                    }
+                };
+                let Some(resolved_args) = resolved_args else {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "cannot infer type arguments for generic object `{name}`"
+                        ))
+                        .with_label(
+                            *span,
+                            format!(
+                                "annotate (`var x: {name}[...] = {name} {{ ... }}`) or write `{name}::[...] {{ ... }}`"
+                            ),
+                        )
+                        .with_code("E302"),
+                    );
+                    for (_, value) in fields {
+                        self.infer_expr(value);
+                    }
+                    return self.record(*id, Ty::Error);
+                };
+                let env: HashMap<String, Ty> = sig
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(resolved_args.iter().cloned())
+                    .collect();
+                let inst_fields: Vec<(String, Ty)> = sig
+                    .fields
+                    .iter()
+                    .map(|(n, t)| (n.clone(), subst_ty(t, &env)))
+                    .collect();
                 let mut poisoned = false;
                 let mut seen = HashSet::new();
                 for (field, value) in fields {
@@ -6094,7 +6732,7 @@ impl Checker {
                         poisoned = true;
                         continue;
                     }
-                    let Some((_, want)) = sig.fields.iter().find(|(name, _)| name == field) else {
+                    let Some((_, want)) = inst_fields.iter().find(|(n, _)| n == field) else {
                         self.diags.push(
                             Diagnostic::error(format!("object `{name}` has no field `{field}`"))
                                 .with_label(value.span(), "unknown object field")
@@ -6146,7 +6784,13 @@ impl Checker {
                 if poisoned {
                     self.record(*id, Ty::Error)
                 } else {
-                    self.record(*id, Ty::Object(name.clone()))
+                    self.record(
+                        *id,
+                        Ty::Object(Box::new(ObjectTy {
+                            name: name.clone(),
+                            args: resolved_args,
+                        })),
+                    )
                 }
             }
             HirExpr::Variant {
@@ -6336,9 +6980,25 @@ impl Checker {
                     }
                     return self.record(*id, Ty::Error);
                 };
-                let Some(sig) = self.typed.objects.get(&object_name) else {
+                let Some(sig) = self.typed.objects.get(&object_name).cloned() else {
                     return self.record(*id, Ty::Error);
                 };
+                // Generic instantiation: `List[u64].items` substitutes
+                // `T := u64` from the receiver's arguments.
+                let object_args: Vec<Ty> = match &bt {
+                    Ty::Object(o) => o.args.clone(),
+                    Ty::Mutable(inner) => match &**inner {
+                        Ty::Object(o) => o.args.clone(),
+                        _ => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                };
+                let env: HashMap<String, Ty> = sig
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(object_args.iter().cloned())
+                    .collect();
                 let Some((_, ty)) = sig.fields.iter().find(|(field, _)| field == name) else {
                     self.diags.push(
                         Diagnostic::error(format!("object `{object_name}` has no field `{name}`"))
@@ -6347,9 +7007,10 @@ impl Checker {
                     );
                     return self.record(*id, Ty::Error);
                 };
+                let inst = subst_ty(ty, &env);
                 // Transitive projection: `Parent.child` -> `Child`,
                 // `*Parent.child` -> `*Child`.
-                self.record(*id, project_capability(&bt, ty))
+                self.record(*id, project_capability(&bt, &inst))
             }
             HirExpr::Var { id, def, span, .. } => {
                 // Unresolved names were already reported by `vl-semantic`;
@@ -7124,8 +7785,10 @@ pub(crate) fn ty_has_error(ty: &Ty) -> bool {
         Ty::Error => true,
         Ty::Array(elem) => ty_has_error(elem),
         Ty::Union(u) => u.args.iter().any(ty_has_error),
+        Ty::Object(o) => o.args.iter().any(ty_has_error),
         Ty::Tuple(fields) => fields.iter().any(|(_, ty)| ty_has_error(ty)),
         Ty::Mutable(inner) => ty_has_error(inner),
+        Ty::Fallible(f) => ty_has_error(&f.ok),
         _ => false,
     }
 }
@@ -7137,8 +7800,28 @@ fn ty_contains_int(ty: &Ty) -> bool {
         Ty::Int => true,
         Ty::Array(elem) => ty_contains_int(elem),
         Ty::Union(u) => u.args.iter().any(ty_contains_int),
+        Ty::Object(o) => o.args.iter().any(ty_contains_int),
         Ty::Tuple(fields) => fields.iter().any(|(_, ty)| ty_contains_int(ty)),
         Ty::Mutable(inner) => ty_contains_int(inner),
+        Ty::Fallible(f) => ty_contains_int(&f.ok),
+        _ => false,
+    }
+}
+
+/// True when a type contains a mutable view (`*T`) anywhere inside (top
+/// level or nested in containers/generic arguments). Generic object and
+/// union arguments must not carry mutation authority: `Cell[*Child]` would
+/// let a read-only `Cell` hand out `*Child` through a `T` return, bypassing
+/// projection (see field-projection check). Containers like `Array[*Foo]`
+/// remain valid as field types; only generic *arguments* are restricted.
+fn ty_contains_mutable(ty: &Ty) -> bool {
+    match ty {
+        Ty::Mutable(_) => true,
+        Ty::Array(elem) => ty_contains_mutable(elem),
+        Ty::Union(u) => u.args.iter().any(ty_contains_mutable),
+        Ty::Object(o) => o.args.iter().any(ty_contains_mutable),
+        Ty::Tuple(fields) => fields.iter().any(|(_, t)| ty_contains_mutable(t)),
+        Ty::Fallible(f) => ty_contains_mutable(&f.ok),
         _ => false,
     }
 }
@@ -7209,6 +7892,10 @@ pub(crate) fn default_inferred_ty(ty: Ty) -> Ty {
             name: u.name.clone(),
             args: u.args.into_iter().map(default_inferred_ty).collect(),
         })),
+        Ty::Object(o) => Ty::Object(Box::new(ObjectTy {
+            name: o.name.clone(),
+            args: o.args.into_iter().map(default_inferred_ty).collect(),
+        })),
         Ty::Tuple(fields) => Ty::Tuple(
             fields
                 .into_iter()
@@ -7264,6 +7951,18 @@ impl ConstraintSet {
                 }
                 ok
             }
+            (Ty::Object(fo), Ty::Object(ao))
+                if fo.name == ao.name && fo.args.len() == ao.args.len() =>
+            {
+                let mut ok = true;
+                for (f, a) in fo.args.iter().zip(ao.args.iter()) {
+                    if !self.collect(f, a, name, span, diags) {
+                        ok = false;
+                        break;
+                    }
+                }
+                ok
+            }
             (Ty::Tuple(fs), Ty::Tuple(as_)) => {
                 if fs.len() != as_.len() {
                     diags.push(
@@ -7291,6 +7990,36 @@ impl ConstraintSet {
                 true
             }
             (Ty::Mutable(f), Ty::Mutable(a)) => self.collect(f, a, name, span, diags),
+            // Read-only object formal accepts a mutable actual via downgrade
+            // (`List[T]` with `*List[u64]` infers `T = u64`).
+            (Ty::Object(fo), Ty::Mutable(inner)) => match &**inner {
+                Ty::Object(ao) if fo.name == ao.name && fo.args.len() == ao.args.len() => {
+                    self.collect(formal, inner, name, span, diags)
+                }
+                _ => {
+                    diags.push(
+                        Diagnostic::error(format!("`{name}` expects `{formal}`, got `{actual}`"))
+                            .with_label(span, format!("expected `{formal}` here"))
+                            .with_code("E306"),
+                    );
+                    false
+                }
+            },
+            // Read-only union formal accepts a mutable actual via downgrade
+            // (`Box[T]` with `*Box[u64]` infers `T = u64`).
+            (Ty::Union(fu), Ty::Mutable(inner)) => match &**inner {
+                Ty::Union(au) if fu.name == au.name && fu.args.len() == au.args.len() => {
+                    self.collect(formal, inner, name, span, diags)
+                }
+                _ => {
+                    diags.push(
+                        Diagnostic::error(format!("`{name}` expects `{formal}`, got `{actual}`"))
+                            .with_label(span, format!("expected `{formal}` here"))
+                            .with_code("E306"),
+                    );
+                    false
+                }
+            },
             // Read-only array formal accepts a mutable array actual via
             // downgrade for inference (`Array[T]` with `*Array[u64]` infers
             // `T = u64`); the later per-argument check enforces downgrade.
@@ -7694,6 +8423,18 @@ fn common_type(a: &Ty, b: &Ty) -> Option<Ty> {
                 args: out,
             })))
         }
+        (Ty::Object(ao), Ty::Object(bo))
+            if ao.name == bo.name && ao.args.len() == bo.args.len() =>
+        {
+            let mut out = Vec::with_capacity(ao.args.len());
+            for (x, y) in ao.args.iter().zip(bo.args.iter()) {
+                out.push(common_type(x, y)?);
+            }
+            Some(Ty::Object(Box::new(ObjectTy {
+                name: ao.name.clone(),
+                args: out,
+            })))
+        }
         (Ty::Tuple(x), Ty::Tuple(y)) if x.len() == y.len() => {
             let mut out = Vec::with_capacity(x.len());
             for ((nx, tx), (ny, ty)) in x.iter().zip(y.iter()) {
@@ -7732,6 +8473,18 @@ fn invariant_common(a: &Ty, b: &Ty) -> Option<Ty> {
                 args: out,
             })))
         }
+        (Ty::Object(ao), Ty::Object(bo))
+            if ao.name == bo.name && ao.args.len() == bo.args.len() =>
+        {
+            let mut out = Vec::with_capacity(ao.args.len());
+            for (x, y) in ao.args.iter().zip(bo.args.iter()) {
+                out.push(invariant_common(x, y)?);
+            }
+            Some(Ty::Object(Box::new(ObjectTy {
+                name: ao.name.clone(),
+                args: out,
+            })))
+        }
         (Ty::Tuple(x), Ty::Tuple(y)) if x.len() == y.len() => {
             let mut out = Vec::with_capacity(x.len());
             for ((nx, tx), (ny, ty)) in x.iter().zip(y.iter()) {
@@ -7758,15 +8511,42 @@ fn project_capability(receiver: &Ty, member: &Ty) -> Ty {
 }
 
 /// Object name through an optional outer `*` (`Foo` or `*Foo` -> `Foo`).
+/// Generic arguments are ignored here; the sugar gate compares nominal
+/// identity only, while inference unifies the arguments.
 fn object_base(ty: &Ty) -> Option<String> {
     match ty {
-        Ty::Object(name) => Some(name.clone()),
+        Ty::Object(o) => Some(o.name.clone()),
         Ty::Mutable(inner) => match &**inner {
-            Ty::Object(name) => Some(name.clone()),
+            Ty::Object(o) => Some(o.name.clone()),
             _ => None,
         },
         _ => None,
     }
+}
+
+/// Union name through an optional outer `*` (`Option` or `*Option`).
+/// Mirrors [`object_base`] for union associated functions.
+fn union_base(ty: &Ty) -> Option<String> {
+    match ty {
+        Ty::Union(u) => Some(u.name.clone()),
+        Ty::Mutable(inner) => match &**inner {
+            Ty::Union(u) => Some(u.name.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Nominal (object or union) base name through an optional outer `*`.
+/// Returns `(is_union, name)` so the sugar gate requires the same kind.
+fn nominal_base(ty: &Ty) -> Option<(bool, String)> {
+    if let Some(n) = object_base(ty) {
+        return Some((false, n));
+    }
+    if let Some(n) = union_base(ty) {
+        return Some((true, n));
+    }
+    None
 }
 
 /// Nominal object identity tolerating bare/qualified spelling: `Counter` in
@@ -7884,6 +8664,14 @@ fn validate_capability(ty: &Ty, span: Span, diags: &mut Vec<Diagnostic>) -> bool
             }
             return true;
         }
+        Ty::Object(o) => {
+            for arg in &o.args {
+                if !validate_capability(arg, span, diags) {
+                    return false;
+                }
+            }
+            return true;
+        }
         Ty::Tuple(fields) => {
             for (_, ty) in fields {
                 if !validate_capability(ty, span, diags) {
@@ -7929,6 +8717,7 @@ pub(crate) fn is_capability_valid(ty: &Ty) -> bool {
         Ty::Array(elem) => return is_capability_valid(elem),
         Ty::Tuple(fields) => return fields.iter().all(|(_, ty)| is_capability_valid(ty)),
         Ty::Union(u) => return u.args.iter().all(is_capability_valid),
+        Ty::Object(o) => return o.args.iter().all(is_capability_valid),
         _ => {}
     }
     true
@@ -8042,6 +8831,7 @@ mod tests {
                 name: "A".into(),
                 payload: Vec::new(),
             }],
+            methods: vec![],
         });
         let (_, valid_foreign) = check_with_modules(&hir, &[foreign]);
         assert!(valid_foreign.is_empty(), "{valid_foreign:?}");
@@ -9511,7 +10301,10 @@ mod tests {
     #[test]
     fn mutable_ty_structural_ops() {
         use std::collections::HashMap;
-        let foo = Ty::Object("Foo".into());
+        let foo = Ty::Object(Box::new(ObjectTy {
+            name: "Foo".into(),
+            args: vec![],
+        }));
         let mfoo = Ty::Mutable(Box::new(foo.clone()));
         // Display round-trips the `*` spelling.
         assert_eq!(mfoo.to_string(), "*Foo");
@@ -9521,7 +10314,10 @@ mod tests {
         );
         // from_vl preserves capability recursively.
         let v = VlType::Mutable(Box::new(VlType::Array(Box::new(VlType::Mutable(
-            Box::new(VlType::Object("Foo".into())),
+            Box::new(VlType::Object {
+                name: "Foo".into(),
+                args: Vec::new(),
+            }),
         )))));
         assert_eq!(
             Ty::from_vl(&v),
@@ -9694,16 +10490,21 @@ mod tests {
             "type Foo = object { value: u64, }; fun main() { val v = Foo { value = 1u64 }; v; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
-        assert!(typed.types.values().any(|t| *t == Ty::Object("Foo".into())));
+        assert!(typed.types.values().any(|t| *t
+            == Ty::Object(Box::new(ObjectTy {
+                name: "Foo".into(),
+                args: vec![]
+            }))));
 
         let (typed, diags) = check_src(
             "type Foo = object { value: u64, }; fun main() { val e: *Foo = Foo { value = 1u64 }; e; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
-        assert!(typed
-            .types
-            .values()
-            .any(|t| *t == Ty::Mutable(Box::new(Ty::Object("Foo".into())))));
+        assert!(typed.types.values().any(|t| *t
+            == Ty::Mutable(Box::new(Ty::Object(Box::new(ObjectTy {
+                name: "Foo".into(),
+                args: vec![]
+            }))))));
 
         // Existing values never upgrade from context.
         let (_, diags) = check_src(
@@ -9718,22 +10519,31 @@ mod tests {
             "type Foo = object { value: u64, }; fun main() { var fresh = Foo { value = 1u64 }; fresh.value = 2u64; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
-        assert!(typed
-            .types
-            .values()
-            .any(|t| *t == Ty::Mutable(Box::new(Ty::Object("Foo".into())))));
+        assert!(typed.types.values().any(|t| *t
+            == Ty::Mutable(Box::new(Ty::Object(Box::new(ObjectTy {
+                name: "Foo".into(),
+                args: vec![]
+            }))))));
 
         let (typed, diags) = check_src(
             "type Foo = object { value: u64, }; fun main() { val view = Foo { value = 1u64 }; view; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
-        assert!(typed.types.values().any(|t| *t == Ty::Object("Foo".into())));
+        assert!(typed.types.values().any(|t| *t
+            == Ty::Object(Box::new(ObjectTy {
+                name: "Foo".into(),
+                args: vec![]
+            }))));
 
         let (typed, diags) = check_src(
             "type Foo = object { value: u64, }; fun main() { var view: Foo = Foo { value = 1u64 }; view; }",
         );
         assert!(diags.is_empty(), "{diags:?}");
-        assert!(typed.types.values().any(|t| *t == Ty::Object("Foo".into())));
+        assert!(typed.types.values().any(|t| *t
+            == Ty::Object(Box::new(ObjectTy {
+                name: "Foo".into(),
+                args: vec![]
+            }))));
 
         let (_, diags) = check_src(
             "type Foo = object { value: u64, }; fun read(): Foo { return Foo { value = 1u64 }; } fun main() { var bad = read(); }",
@@ -9895,8 +10705,14 @@ mod tests {
             mangle("f", std::slice::from_ref(&array_u64)),
             mangle("f", std::slice::from_ref(&mut_array))
         );
-        let a_person = Ty::Object("vl.a.Person".into());
-        let b_person = Ty::Object("vl.b.Person".into());
+        let a_person = Ty::Object(Box::new(ObjectTy {
+            name: "vl.a.Person".into(),
+            args: vec![],
+        }));
+        let b_person = Ty::Object(Box::new(ObjectTy {
+            name: "vl.b.Person".into(),
+            args: vec![],
+        }));
         assert_ne!(mangle("f", &[a_person]), mangle("f", &[b_person]));
         assert!(mangle("f", &[Ty::String]).contains("String"));
         let key = InstanceKey::new(TemplateKey::new("demo.lib", "id"), vec![Ty::U64]);

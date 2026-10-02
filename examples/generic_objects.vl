@@ -1,0 +1,36 @@
+// Reusable generic list backed by `Array[T]`.
+//
+// `type List[T] = object { ... };` declares one layout per instantiation
+// (`List[u64]`, `List[String]`, ...). Fields may mention `T` (`items:
+// *Array[T]`), and associated functions see the owner's `T` alongside their
+// own parameters.
+use std;
+
+type List[T] = object {
+    items: *Array[T],
+    len: u64,
+
+    fun init(n: u64): *List[T] {
+        var items: *Array[T] = Array.new(n);
+        return List { items = items, len = n };
+    },
+
+    fun get(self: List[T], i: u64): T {
+        return self.items[i];
+    },
+
+    fun set(self: *List[T], i: u64, v: T): void {
+        self.items[i] = v;
+    },
+};
+
+fun main() {
+    var nums: *List[u64] = List.init::[u64](3);
+    nums.set(0, 10);
+    nums.set(1, 20);
+    nums.set(2, 30);
+    std.print_u64(nums.get(0) + nums.get(1) + nums.len);
+    val words: *List[String] = List.init::[String](2);
+    words.set(0, "hi");
+    std.print(words.get(0));
+}

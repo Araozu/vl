@@ -416,6 +416,7 @@ impl LirProgram {
                 || match ty {
                     Ty::Array(elem) => bad(elem),
                     Ty::Union(u) => u.args.iter().any(bad),
+                    Ty::Object(o) => o.args.iter().any(bad),
                     Ty::Tuple(fields) => fields.iter().any(|(_, t)| bad(t)),
                     // Error sets are plain `u64` codes (always runtime);
                     // fallible containers recurse into the `ok` payload.
@@ -1353,14 +1354,245 @@ fn destructure_position(base: &Ty, b: &vl_hir::HirDestructureBinding) -> Option<
 /// table with explicit load/store operations run once before `main`.
 pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgram {
     // Runtime-erased object layouts (capabilities served their purpose).
-    let mut objects = typed
-        .objects
-        .iter()
-        .map(|(name, sig)| ObjectDef {
+    // Monomorphic objects emit directly; generic templates (`List[T]`) are
+    // skipped here — concrete instantiations (`List[u64]`) emit mangled
+    // layouts below (`List$u64`), one per distinct argument list.
+    use std::collections::{HashMap, HashSet};
+    use vl_typecheck::{mangle, subst_ty};
+    fn collect_object_insts(ty: &Ty, out: &mut Vec<Ty>) {
+        match ty {
+            Ty::Object(o) if !o.args.is_empty() => {
+                out.push(ty.clone());
+                for a in &o.args {
+                    collect_object_insts(a, out);
+                }
+            }
+            Ty::Object(_) => {}
+            Ty::Union(u) => {
+                for a in &u.args {
+                    collect_object_insts(a, out);
+                }
+            }
+            Ty::Array(e) => collect_object_insts(e, out),
+            Ty::Tuple(fs) => {
+                for (_, t) in fs {
+                    collect_object_insts(t, out);
+                }
+            }
+            Ty::Mutable(inner) => collect_object_insts(inner, out),
+            Ty::Fallible(f) => collect_object_insts(&f.ok, out),
+            _ => {}
+        }
+    }
+    let mut objects: Vec<ObjectDef> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (name, sig) in typed.objects.iter() {
+        if !sig.type_params.is_empty() {
+            continue;
+        }
+        objects.push(ObjectDef {
             name: name.clone(),
             fields: sig.fields.iter().map(|(n, t)| (n.clone(), rt(t))).collect(),
-        })
-        .collect::<Vec<_>>();
+        });
+        seen.insert(name.clone());
+    }
+    // Concrete generic instantiations discovered in checked types.
+    let mut insts: Vec<Ty> = Vec::new();
+    for ty in typed.types.values() {
+        collect_object_insts(ty, &mut insts);
+    }
+    // Generic object patterns with `Param` (e.g. `Cell[T]` inside `f[T]`)
+    // plus concrete function instances (`f$u64`) imply concrete layouts
+    // (`Cell$u64`). Substitute each instance's arguments into each pattern
+    // sharing parameter names.
+    {
+        use vl_hir::HirItem;
+        use vl_typecheck::subst_ty as subst;
+        // Collect generic patterns (containing Param) once.
+        let mut patterns: Vec<Ty> = Vec::new();
+        for ty in typed.types.values() {
+            // collect_object_insts only pushes non-empty Object; filter to
+            // those containing Param (generic templates).
+            fn has_param(t: &Ty) -> bool {
+                match t {
+                    Ty::Param(_) => true,
+                    Ty::Array(e) => has_param(e),
+                    Ty::Union(u) => u.args.iter().any(has_param),
+                    Ty::Object(o) => o.args.iter().any(has_param),
+                    Ty::Tuple(fs) => fs.iter().any(|(_, t)| has_param(t)),
+                    Ty::Mutable(inner) => has_param(inner),
+                    Ty::Fallible(f) => has_param(&f.ok),
+                    _ => false,
+                }
+            }
+            // Only Object roots (layouts); nested handled via recursion.
+            match ty {
+                Ty::Object(o) if !o.args.is_empty() && has_param(ty) => {
+                    patterns.push(ty.clone());
+                }
+                Ty::Mutable(inner) => match &**inner {
+                    Ty::Object(o) if !o.args.is_empty() && has_param(ty) => {
+                        patterns.push((**inner).clone());
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        // Map template DefId -> type param names.
+        let mut def_to_params: HashMap<u32, Vec<String>> = HashMap::new();
+        for item in &prog.items {
+            if let HirItem::Fn {
+                def: Some(d),
+                type_params,
+                ..
+            } = item
+            {
+                def_to_params.insert(d.0, type_params.iter().map(|p| p.name.clone()).collect());
+            }
+        }
+        for inst in typed.instances.values() {
+            let Some(param_names) = def_to_params.get(&inst.orig) else {
+                continue;
+            };
+            if param_names.is_empty() || inst.args.len() != param_names.len() {
+                continue;
+            }
+            if inst.args.iter().any(|a| !a.is_concrete()) {
+                continue;
+            }
+            let env: HashMap<String, Ty> = param_names
+                .iter()
+                .cloned()
+                .zip(inst.args.iter().cloned())
+                .collect();
+            for pat in &patterns {
+                let concrete = subst(pat, &env);
+                // Only concrete, non-mutable-arg layouts (rejected otherwise).
+                // `is_concrete` ensures no Param/Error/Int.
+                if concrete.is_concrete() {
+                    // Skip if still contains Param (unmapped names).
+                    insts.push(concrete);
+                }
+            }
+        }
+    }
+    // Associated-function instances imply their owner's instantiation:
+    // `List.init$u64` (combined `owner + own` params) needs `List$u64`.
+    // Map template DefId -> `Owner.method` name via HIR, then take the
+    // owner's prefix of the concrete instance arguments.
+    {
+        use vl_hir::HirItem;
+        let mut def_to_name: HashMap<u32, String> = HashMap::new();
+        for item in &prog.items {
+            if let HirItem::Fn {
+                def: Some(d), name, ..
+            } = item
+            {
+                def_to_name.insert(d.0, name.clone());
+            }
+        }
+        for inst in typed.instances.values() {
+            let Some(fname) = def_to_name.get(&inst.orig) else {
+                continue;
+            };
+            let Some((owner, _)) = fname.split_once('.') else {
+                continue;
+            };
+            // Owner template may be bare (`List`) while instance owner
+            // qualification differs; resolve via objects map below.
+            let owner_key = typed.objects.get(owner).map(|_| owner.to_string());
+            // Look up generic owner template (bare or qualified).
+            let tmpl_opt = owner_key
+                .as_deref()
+                .and_then(|k| typed.objects.get(k))
+                .or_else(|| typed.objects.get(owner));
+            let Some(tmpl) = tmpl_opt else {
+                continue;
+            };
+            if tmpl.type_params.is_empty() || inst.args.len() < tmpl.type_params.len() {
+                continue;
+            }
+            let oargs = inst.args[..tmpl.type_params.len()].to_vec();
+            if oargs.iter().any(|a| !a.is_concrete()) {
+                continue;
+            }
+            // Reconstruct qualified owner name for mangling: prefer the
+            // instance's module? Use template key as stored (bare local).
+            // `typed.objects` has both bare and qualified; `owner` here is
+            // the HIR spelling (bare local), which matches `typed.types`
+            // recordings, so mangle that.
+            insts.push(Ty::Object(Box::new(vl_typecheck::ObjectTy {
+                name: owner.to_string(),
+                args: oargs,
+            })));
+            // Also try qualified (`module.Owner`) so imported layouts emit.
+            // `typed.objects` keys include qualified; push both spellings —
+            // deduplication by mangled name keeps it safe.
+            // (Qualified instance owners arise in project builds; single-file
+            // `prog.module` is the owner module here.)
+            let qualified = format!("{}.{}", prog.module, owner);
+            if typed.objects.contains_key(&qualified) {
+                // Find qualified args via canonicalization? Instance args may
+                // be bare (`List`); qualify bare object args for the key.
+                // For now push same args under qualified name; normalization
+                // already qualified field types, and mangling escapes `.`.
+                insts.push(Ty::Object(Box::new(vl_typecheck::ObjectTy {
+                    name: qualified,
+                    args: inst.args[..tmpl.type_params.len()].to_vec(),
+                })));
+            }
+        }
+    }
+    let mut by_mangled: HashMap<String, (String, Vec<Ty>)> = HashMap::new();
+    for ty in insts {
+        let (oname, oargs) = match &ty {
+            Ty::Object(o) => (o.name.clone(), o.args.clone()),
+            Ty::Mutable(inner) => match &**inner {
+                Ty::Object(o) => (o.name.clone(), o.args.clone()),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if oargs.iter().any(|a| !a.is_concrete()) {
+            continue;
+        }
+        let mangled = mangle(&oname, &oargs);
+        if seen.contains(&mangled) || by_mangled.contains_key(&mangled) {
+            continue;
+        }
+        by_mangled.insert(mangled, (oname, oargs));
+    }
+    for (mangled, (oname, oargs)) in by_mangled {
+        // Find generic template by base name (bare or qualified).
+        let template = typed.objects.get(&oname).cloned().or_else(|| {
+            // Bare `List` vs qualified `m.List`: try short tail.
+            let short = oname.rsplit('.').next().unwrap_or(&oname);
+            typed.objects.get(short).cloned()
+        });
+        let Some(tmpl) = template else {
+            continue;
+        };
+        if tmpl.type_params.len() != oargs.len() {
+            continue;
+        }
+        let env: HashMap<String, Ty> = tmpl
+            .type_params
+            .iter()
+            .cloned()
+            .zip(oargs.iter().cloned())
+            .collect();
+        let fields = tmpl
+            .fields
+            .iter()
+            .map(|(n, t)| (n.clone(), rt(&subst_ty(t, &env))))
+            .collect();
+        objects.push(ObjectDef {
+            name: mangled.clone(),
+            fields,
+        });
+        seen.insert(mangled);
+    }
     objects.sort_by(|a, b| a.name.cmp(&b.name));
 
     // Stable global IDs in source order: top-level bindings with definitions.
@@ -1895,14 +2127,198 @@ pub fn lower_project(
     typed: &vl_typecheck::TypedProgram,
     plan: &vl_typecheck::world::MonomorphizationPlan,
 ) -> LirProgram {
-    let mut objects = typed
-        .objects
-        .iter()
-        .map(|(name, sig)| ObjectDef {
+    use std::collections::{HashMap, HashSet};
+    use vl_typecheck::{mangle, subst_ty};
+    fn collect_object_insts(ty: &Ty, out: &mut Vec<Ty>) {
+        match ty {
+            Ty::Object(o) if !o.args.is_empty() => {
+                out.push(ty.clone());
+                for a in &o.args {
+                    collect_object_insts(a, out);
+                }
+            }
+            Ty::Object(_) => {}
+            Ty::Union(u) => {
+                for a in &u.args {
+                    collect_object_insts(a, out);
+                }
+            }
+            Ty::Array(e) => collect_object_insts(e, out),
+            Ty::Tuple(fs) => {
+                for (_, t) in fs {
+                    collect_object_insts(t, out);
+                }
+            }
+            Ty::Mutable(inner) => collect_object_insts(inner, out),
+            Ty::Fallible(f) => collect_object_insts(&f.ok, out),
+            _ => {}
+        }
+    }
+    let mut objects: Vec<ObjectDef> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (name, sig) in typed.objects.iter() {
+        if !sig.type_params.is_empty() {
+            continue;
+        }
+        objects.push(ObjectDef {
             name: name.clone(),
             fields: sig.fields.iter().map(|(n, t)| (n.clone(), rt(t))).collect(),
-        })
-        .collect::<Vec<_>>();
+        });
+        seen.insert(name.clone());
+    }
+    let mut insts: Vec<Ty> = Vec::new();
+    for ty in typed.types.values() {
+        collect_object_insts(ty, &mut insts);
+    }
+    // Generic patterns (`Cell[T]`) plus concrete plan instances (`f$u64`)
+    // imply concrete layouts (`Cell$u64`), covering free generic functions.
+    {
+        use vl_hir::HirItem;
+        fn has_param(t: &Ty) -> bool {
+            match t {
+                Ty::Param(_) => true,
+                Ty::Array(e) => has_param(e),
+                Ty::Union(u) => u.args.iter().any(has_param),
+                Ty::Object(o) => o.args.iter().any(has_param),
+                Ty::Tuple(fs) => fs.iter().any(|(_, t)| has_param(t)),
+                Ty::Mutable(inner) => has_param(inner),
+                Ty::Fallible(f) => has_param(&f.ok),
+                _ => false,
+            }
+        }
+        let mut patterns: Vec<Ty> = Vec::new();
+        for ty in typed.types.values() {
+            match ty {
+                Ty::Object(o) if !o.args.is_empty() && has_param(ty) => {
+                    patterns.push(ty.clone());
+                }
+                Ty::Mutable(inner) => match &**inner {
+                    Ty::Object(o) if !o.args.is_empty() && has_param(ty) => {
+                        patterns.push((**inner).clone());
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        let mut name_to_params: HashMap<String, Vec<String>> = HashMap::new();
+        for item in &prog.items {
+            if let HirItem::Fn {
+                name, type_params, ..
+            } = item
+            {
+                name_to_params.insert(
+                    name.clone(),
+                    type_params.iter().map(|p| p.name.clone()).collect(),
+                );
+            }
+        }
+        if let Some(owned) = plan.instances_by_owner.get(&prog.module) {
+            for key in owned.keys() {
+                let param_names =
+                    name_to_params
+                        .get(&key.template.function)
+                        .cloned()
+                        .or_else(|| {
+                            let short = key.template.function.rsplit('.').next().unwrap_or("");
+                            name_to_params
+                                .iter()
+                                .find(|(n, _)| n.ends_with(&format!(".{short}")) || *n == short)
+                                .map(|(_, v)| v.clone())
+                        });
+                let Some(param_names) = param_names else {
+                    continue;
+                };
+                if param_names.is_empty() || key.args.len() != param_names.len() {
+                    continue;
+                }
+                if key.args.iter().any(|a| !a.is_concrete()) {
+                    continue;
+                }
+                let env: HashMap<String, Ty> = param_names
+                    .iter()
+                    .cloned()
+                    .zip(key.args.iter().cloned())
+                    .collect();
+                for pat in &patterns {
+                    let concrete = subst_ty(pat, &env);
+                    if concrete.is_concrete() {
+                        insts.push(concrete);
+                    }
+                }
+            }
+        }
+    }
+    // Project plan instances for this module imply owner layouts.
+    if let Some(owned) = plan.instances_by_owner.get(&prog.module) {
+        for key in owned.keys() {
+            // `Owner.method` templates: owner's prefix of args is the object.
+            if let Some((owner, _)) = key.template.function.split_once('.') {
+                if let Some(tmpl) = typed.objects.get(owner).or_else(|| {
+                    // Qualified fallback.
+                    let q = format!("{}.{}", key.template.module, owner);
+                    typed.objects.get(&q)
+                }) {
+                    if !tmpl.type_params.is_empty() && key.args.len() >= tmpl.type_params.len() {
+                        let oargs = key.args[..tmpl.type_params.len()].to_vec();
+                        if oargs.iter().all(|a| a.is_concrete()) {
+                            insts.push(Ty::Object(Box::new(vl_typecheck::ObjectTy {
+                                name: owner.to_string(),
+                                args: oargs,
+                            })));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut by_mangled: HashMap<String, (String, Vec<Ty>)> = HashMap::new();
+    for ty in insts {
+        let (oname, oargs) = match &ty {
+            Ty::Object(o) => (o.name.clone(), o.args.clone()),
+            Ty::Mutable(inner) => match &**inner {
+                Ty::Object(o) => (o.name.clone(), o.args.clone()),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if oargs.iter().any(|a| !a.is_concrete()) {
+            continue;
+        }
+        let mangled = mangle(&oname, &oargs);
+        if seen.contains(&mangled) || by_mangled.contains_key(&mangled) {
+            continue;
+        }
+        by_mangled.insert(mangled, (oname, oargs));
+    }
+    for (mangled, (oname, oargs)) in by_mangled {
+        let template = typed.objects.get(&oname).cloned().or_else(|| {
+            let short = oname.rsplit('.').next().unwrap_or(&oname);
+            typed.objects.get(short).cloned()
+        });
+        let Some(tmpl) = template else {
+            continue;
+        };
+        if tmpl.type_params.len() != oargs.len() {
+            continue;
+        }
+        let env: HashMap<String, Ty> = tmpl
+            .type_params
+            .iter()
+            .cloned()
+            .zip(oargs.iter().cloned())
+            .collect();
+        let fields = tmpl
+            .fields
+            .iter()
+            .map(|(n, t)| (n.clone(), rt(&subst_ty(t, &env))))
+            .collect();
+        objects.push(ObjectDef {
+            name: mangled.clone(),
+            fields,
+        });
+        seen.insert(mangled);
+    }
     objects.sort_by(|a, b| a.name.cmp(&b.name));
 
     let global_items: Vec<(u32, String, vl_hir::HirId, HirExpr, Span)> = prog
@@ -2760,16 +3176,36 @@ impl Lowerer<'_> {
                 Some(dst)
             }
             HirExpr::ObjectLiteral {
-                name, fields, span, ..
+                id,
+                name,
+                fields,
+                span,
+                ..
             } => {
                 let mut regs = Vec::with_capacity(fields.len());
                 for (_, value) in fields {
                     regs.push(self.lower_expr(value, typed)?);
                 }
+                // Generic instantiations (`List[u64]`) lower to their mangled
+                // layout (`List$u64`); monomorphic objects keep their name.
+                // The node's recorded type carries the instance-substituted
+                // arguments (capabilities erased here).
+                let layout: String = match self.resolved_ty(*id) {
+                    Some(Ty::Object(o)) if !o.args.is_empty() => {
+                        vl_typecheck::mangle(&o.name, &o.args)
+                    }
+                    Some(Ty::Mutable(inner)) => match *inner {
+                        Ty::Object(o) if !o.args.is_empty() => {
+                            vl_typecheck::mangle(&o.name, &o.args)
+                        }
+                        _ => name.clone(),
+                    },
+                    _ => name.clone(),
+                };
                 let dst = self.reg();
                 self.instrs.push(Instr::NewObject {
                     dst,
-                    name: name.clone(),
+                    name: layout,
                     fields: fields
                         .iter()
                         .zip(regs)

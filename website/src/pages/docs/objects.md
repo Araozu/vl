@@ -163,7 +163,10 @@ fun main() {
 ```
 
 Functions on objects may use their own type parameters, just like free
-generic functions. Across files, call them through the type
+generic functions. Generic objects declare their own parameters
+(`type List[T] = object { ... };`, see `examples/generic_objects.vl`):
+fields may mention `T`, and associated functions see the owner's `T`
+alongside their own parameters. Across files, call them through the type
 (`person.Person.birthday(rose)`), or import the type first and use the bare
 name (`use my_app.person.{Person}` then `Person.birthday(rose)`); the short
 receiver form (`rose.birthday()`) works from the value alone and needs no

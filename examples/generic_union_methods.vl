@@ -1,0 +1,34 @@
+// Generic unions with associated functions.
+//
+// Like objects, `union` bodies may declare `fun` members that see the
+// owner's type parameters (`T` below) alongside their own.
+use std;
+
+type Box[T] = union {
+    Empty,
+    Full(T),
+
+    fun wrap(v: T): Box[T] {
+        return Box.Full(v);
+    },
+
+    fun unwrap_or(self: Box[T], fallback: T): T {
+        match (self) {
+            Box.Full(x) {
+                return x;
+            }
+            Box.Empty {
+                return fallback;
+            }
+            else {
+                return fallback;
+            }
+        }
+    },
+};
+
+fun main() {
+    val b = Box.wrap(7u64);
+    std.print_u64(b.unwrap_or(0u64));
+    std.print_u64(Box.unwrap_or(Box.Full(3u64), 0u64));
+}

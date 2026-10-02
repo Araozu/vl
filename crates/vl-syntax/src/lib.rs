@@ -214,6 +214,9 @@ pub enum Item {
     Object {
         name: String,
         name_span: Span,
+        /// Declared type parameters (`[]` when monomorphic). Names are
+        /// validated by the parser (distinct, not primitives), like unions.
+        type_params: Vec<TypeParam>,
         fields: Vec<ObjectField>,
         /// Associated functions declared inside the object body. Fields and
         /// methods share one member namespace (duplicates are E200).
@@ -225,6 +228,12 @@ pub enum Item {
         name_span: Span,
         type_params: Vec<TypeParam>,
         variants: Vec<UnionVariant>,
+        /// Associated functions declared inside the union body (`fun is_some
+        /// ...` in `type Option[T] = union { ..., fun ... };`). Variants and
+        /// methods share one member namespace (duplicates are E200), mirroring
+        /// objects. Calls spell the owner explicitly (`Option.unwrap_or(...)`);
+        /// there is no implicit `self`.
+        methods: Vec<AssociatedFn>,
         span: Span,
     },
     /// Nominal error set (`type E = error { A, B, };`). Plain variants only;
@@ -378,6 +387,10 @@ pub enum Expr {
     ObjectLiteral {
         name: String,
         name_span: Span,
+        /// Explicit type arguments (`List::[u64] { ... }`); empty means infer
+        /// from the expected type or field values.
+        type_args: Vec<VlType>,
+        type_args_span: Option<Span>,
         fields: Vec<(String, Span, Expr)>,
         span: Span,
     },
@@ -808,16 +821,7 @@ impl<'a> Parser<'a> {
             }
             return self.parse_error_item(type_tok.span, name, name_span);
         }
-        if !type_params.is_empty() {
-            let t = self.peek().clone();
-            self.diags.push(
-                Diagnostic::error("object types cannot have type parameters")
-                    .with_label(t.span, "generic parameters are only valid on `union`")
-                    .with_code("E104"),
-            );
-            return None;
-        }
-        self.parse_object_item_after_name(type_tok.span, name, name_span)
+        self.parse_object_item_after_name(type_tok.span, name, name_span, type_params)
     }
 
     fn check_reserved_type_name(&mut self, name: &str, span: Span) {
@@ -846,19 +850,67 @@ impl<'a> Parser<'a> {
             .iter()
             .map(|p| p.name.clone())
             .collect::<Vec<_>>();
+        let owner_allowed = allowed.clone();
         let mut variants = Vec::new();
+        let mut methods = Vec::new();
         let mut variant_spans: std::collections::HashMap<String, Span> =
             std::collections::HashMap::new();
+        let mut member_spans: Vec<(String, Span)> = Vec::new();
+        let check_member = |name: &str,
+                            span: Span,
+                            member_spans: &[(String, Span)],
+                            diags: &mut Vec<Diagnostic>| {
+            if let Some(previous) = member_spans.iter().find(|(n, _)| n == name) {
+                diags.push(
+                    Diagnostic::error(format!("duplicate member `{name}`"))
+                        .with_label(span, "redefined here")
+                        .with_bare_label(previous.1)
+                        .with_code("E200"),
+                );
+            }
+        };
         while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
+            if matches!(self.peek().kind, TokenKind::Fun) {
+                let fun_tok = self.bump();
+                let parsed = self.parse_fn_rest_with_outer(fun_tok, &owner_allowed)?;
+                check_member(
+                    &parsed.name,
+                    parsed.name_span,
+                    &member_spans,
+                    &mut self.diags,
+                );
+                member_spans.push((parsed.name.clone(), parsed.name_span));
+                methods.push(AssociatedFn {
+                    name: parsed.name,
+                    name_span: parsed.name_span,
+                    type_params: parsed.type_params,
+                    params: parsed.params,
+                    ret: parsed.ret,
+                    ret_span: parsed.ret_span,
+                    signature_poisoned: parsed.signature_poisoned,
+                    body: parsed.body,
+                    span: parsed.span,
+                });
+                if matches!(self.peek().kind, TokenKind::Comma) {
+                    self.bump();
+                }
+                continue;
+            }
             let (variant, variant_span) = self.parse_ident()?;
             if let Some(previous) = variant_spans.insert(variant.clone(), variant_span) {
+                // Duplicate variant: single root cause (skip member check to
+                // avoid a second `duplicate member` for the same clash).
                 self.diags.push(
                     Diagnostic::error(format!("duplicate union variant `{variant}`"))
                         .with_label(variant_span, "redefined here")
                         .with_bare_label(previous)
                         .with_code("E200"),
                 );
+            } else {
+                // New variant name: conflict only if a method used it.
+                check_member(&variant, variant_span, &member_spans, &mut self.diags);
             }
+            member_spans.push((variant.clone(), variant_span));
             if !variant.chars().next().is_some_and(char::is_uppercase) {
                 self.diags.push(
                     Diagnostic::error(format!(
@@ -943,6 +995,7 @@ impl<'a> Parser<'a> {
             name_span,
             type_params,
             variants,
+            methods,
             span: Span::new(start.start, semi.span.end.max(close.span.end)),
         })
     }
@@ -1079,9 +1132,11 @@ impl<'a> Parser<'a> {
         start: Span,
         name: String,
         name_span: Span,
+        type_params: Vec<TypeParam>,
     ) -> Option<Item> {
         self.expect(&TokenKind::Object, "`object` after `=`")?;
         self.expect(&TokenKind::LBrace, "`{` after `object`")?;
+        let owner_allowed: Vec<String> = type_params.iter().map(|p| p.name.clone()).collect();
         let mut fields = Vec::new();
         let mut methods = Vec::new();
         let mut member_spans: Vec<(String, Span)> = Vec::new();
@@ -1101,7 +1156,7 @@ impl<'a> Parser<'a> {
         while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
             if matches!(self.peek().kind, TokenKind::Fun) {
                 let fun_tok = self.bump();
-                let parsed = self.parse_fn_rest(fun_tok)?;
+                let parsed = self.parse_fn_rest_with_outer(fun_tok, &owner_allowed)?;
                 check_member(
                     &parsed.name,
                     parsed.name_span,
@@ -1129,7 +1184,7 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::Colon, "`:` after field name")?;
             let fallback = self.peek().clone();
             let type_failed;
-            let (ty, ty_span) = match self.parse_type(&[], true) {
+            let (ty, ty_span) = match self.parse_type(&owner_allowed, true) {
                 Some((ty, span)) if !ty.is_void() => {
                     type_failed = false;
                     (Some(ty), Some(span))
@@ -1184,6 +1239,7 @@ impl<'a> Parser<'a> {
         Some(Item::Object {
             name,
             name_span,
+            type_params,
             fields,
             methods,
             span: Span::new(start.start, semi.span.end.max(close.span.end)),
@@ -1304,7 +1360,10 @@ impl<'a> Parser<'a> {
         // is still consumed so one bad annotation hides no later items.
         if matches!(self.peek().kind, TokenKind::Bang) {
             match atom {
-                VlType::ErrorSet(name) | VlType::Object(name) => {
+                VlType::ErrorSet(name) => {
+                    return self.parse_named_fallible_tail(name, span, allowed, strict);
+                }
+                VlType::Object { name, args } if args.is_empty() => {
                     return self.parse_named_fallible_tail(name, span, allowed, strict);
                 }
                 _ => {
@@ -1641,23 +1700,41 @@ impl<'a> Parser<'a> {
                     }
                 }
                 if full.contains('.') {
-                    // A qualified union instantiation (`m.Option[u64]`) parses
-                    // its argument list here; validation (known union, arity)
-                    // belongs to typechecking, which sees every module.
+                    // A qualified generic instantiation (`m.Option[u64]`,
+                    // `m.List[u64]`) parses its argument list here; whether it
+                    // names a union or a generic object is validated by
+                    // typechecking, which sees every module. Parse as a union
+                    // spelling; the checker reinterprets it as an object when
+                    // the qualified name resolves to a generic object.
                     if matches!(self.peek().kind, TokenKind::LBracket)
                         && name.parse::<VlType>().is_err()
                     {
                         return self.parse_union_args(full, t.span, allowed, strict);
                     }
-                    return Some((VlType::Object(full), Span::new(t.span.start, end.end)));
+                    return Some((
+                        VlType::Object {
+                            name: full,
+                            args: Vec::new(),
+                        },
+                        Span::new(t.span.start, end.end),
+                    ));
                 }
-                // A bare union instantiation (`Option[u64]`). Primitives never
-                // take arguments; a type parameter literally named `Array`
-                // keeps the old path (its brackets stay a downstream error).
+                // A bare generic instantiation (`Option[u64]`, `List[u64]`).
+                // Primitives never take arguments; a type parameter literally
+                // named `Array` keeps the old path (its brackets stay a
+                // downstream error). Objects with type parameters parse here
+                // as object instantiations; everything else stays a union
+                // spelling for typechecking to validate.
                 if matches!(self.peek().kind, TokenKind::LBracket)
                     && name.parse::<VlType>().is_err()
                     && !(name == "Array" && allowed.iter().any(|a| a == "Array"))
                 {
+                    let is_object = self.known_types.contains(&name)
+                        && !self.known_unions.contains(&name)
+                        && !self.known_errors.contains(&name);
+                    if is_object {
+                        return self.parse_object_args(full, t.span, allowed, strict);
+                    }
                     return self.parse_union_args(full, t.span, allowed, strict);
                 }
                 if name == "Array" && !allowed.iter().any(|a| a == "Array") {
@@ -1712,9 +1789,13 @@ impl<'a> Parser<'a> {
                     Err(_) if self.known_errors.contains(&name) => {
                         Some((VlType::ErrorSet(name), t.span))
                     }
-                    Err(_) if self.known_types.contains(&name) => {
-                        Some((VlType::Object(name), t.span))
-                    }
+                    Err(_) if self.known_types.contains(&name) => Some((
+                        VlType::Object {
+                            name,
+                            args: Vec::new(),
+                        },
+                        t.span,
+                    )),
                     // An unknown name followed by `!` is optimistically an
                     // error set so `Bogus!u64` yields one typecheck error
                     // (`unknown error set`) instead of an E105 plus a
@@ -1823,6 +1904,56 @@ impl<'a> Parser<'a> {
             return None;
         }
         Some((VlType::Union { name: head, args }, span))
+    }
+
+    /// Parse the `[T, ...]` tail of a generic object instantiation
+    /// (`List[u64]`). Mirrors [`parse_union_args`](Self::parse_union_args);
+    /// arity is validated by typechecking.
+    fn parse_object_args(
+        &mut self,
+        head: String,
+        head_span: Span,
+        allowed: &[String],
+        strict: bool,
+    ) -> Option<(VlType, Span)> {
+        self.bump(); // `[` (established by lookahead)
+        let mut args = Vec::new();
+        if matches!(self.peek().kind, TokenKind::RBracket) {
+            let close = self.bump();
+            self.diags.push(
+                Diagnostic::error(format!("object `{head}` needs type arguments in `[...]`"))
+                    .with_label(
+                        Span::new(head_span.start, close.span.end),
+                        "write e.g. `List[u64]`, or bare `List` for a monomorphic object",
+                    )
+                    .with_code("E104"),
+            );
+            return None;
+        }
+        loop {
+            let (ty, _) = self.parse_type(allowed, strict)?;
+            args.push(ty);
+            if !matches!(self.peek().kind, TokenKind::Comma) {
+                break;
+            }
+            self.bump();
+            if matches!(self.peek().kind, TokenKind::RBracket) {
+                break;
+            }
+        }
+        let close = self.expect(&TokenKind::RBracket, "`]` after object type arguments")?;
+        let span = Span::new(head_span.start, close.span.end);
+        if args.iter().any(|a| a.is_void()) {
+            self.diags.push(
+                Diagnostic::error(format!(
+                    "object `{head}` cannot take `void` as a type argument"
+                ))
+                .with_label(span, "`void` is not a value type")
+                .with_code("E104"),
+            );
+            return None;
+        }
+        Some((VlType::Object { name: head, args }, span))
     }
 
     /// Skip to the closing `)` of a broken `#(...)` shape (depth-aware
@@ -2385,10 +2516,35 @@ impl<'a> Parser<'a> {
     /// associated functions inside `object` bodies. The caller has already
     /// consumed the leading `fun` token.
     fn parse_fn_rest(&mut self, function_tok: Token) -> Option<ParsedFn> {
+        self.parse_fn_rest_with_outer(function_tok, &[])
+    }
+
+    /// Associated-function variant: `outer` holds the enclosing generic
+    /// object's type parameters (`List[T]`), which are in scope for the
+    /// method's own header, signature, and body. A method's own parameter
+    /// must not shadow an owner parameter (one E200).
+    fn parse_fn_rest_with_outer(
+        &mut self,
+        function_tok: Token,
+        outer: &[String],
+    ) -> Option<ParsedFn> {
         let (name, name_span) = self.parse_ident()?;
         let header_diag_count = self.diags.len();
         let type_params = self.parse_type_params()?;
-        let allowed: Vec<String> = type_params.iter().map(|p| p.name.clone()).collect();
+        for p in &type_params {
+            if outer.iter().any(|o| o == &p.name) {
+                self.diags.push(
+                    Diagnostic::error(format!(
+                        "type parameter `{}` shadows an enclosing object parameter",
+                        p.name
+                    ))
+                    .with_label(p.span, "rename this parameter")
+                    .with_code("E200"),
+                );
+            }
+        }
+        let mut allowed: Vec<String> = outer.to_vec();
+        allowed.extend(type_params.iter().map(|p| p.name.clone()));
         self.expect(&TokenKind::LParen, "`(`")?;
         let mut params = Vec::new();
         if !matches!(self.peek().kind, TokenKind::RParen) {
@@ -3260,9 +3416,30 @@ impl<'a> Parser<'a> {
                 let path = self.parse_path()?;
                 let end = self.toks[self.pos.saturating_sub(1)].span.end;
                 if matches!(self.peek().kind, TokenKind::LBrace) {
-                    return self.parse_object_literal(path.join("."), t.span);
+                    return self.parse_object_literal(path.join("."), t.span, Vec::new(), None);
                 }
                 let (type_args, type_args_span) = self.parse_type_args()?;
+                if matches!(self.peek().kind, TokenKind::LBrace) {
+                    // Generic object literal (`List::[u64] { ... }`); bare
+                    // `List { ... }` above infers from context.
+                    if path.len() != 1 {
+                        let t = self.peek().clone();
+                        self.diags.push(
+                            Diagnostic::error(
+                                "only a bare type name takes `::[...]` object arguments",
+                            )
+                            .with_label(t.span, "write `List::[T] { ... }`")
+                            .with_code("E103"),
+                        );
+                        return None;
+                    }
+                    return self.parse_object_literal(
+                        path.join("."),
+                        t.span,
+                        type_args,
+                        type_args_span,
+                    );
+                }
                 if !type_args.is_empty() && !matches!(self.peek().kind, TokenKind::LParen) {
                     let t = self.peek().clone();
                     self.diags.push(
@@ -3369,7 +3546,13 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_object_literal(&mut self, name: String, name_span: Span) -> Option<Expr> {
+    fn parse_object_literal(
+        &mut self,
+        name: String,
+        name_span: Span,
+        type_args: Vec<VlType>,
+        type_args_span: Option<Span>,
+    ) -> Option<Expr> {
         self.bump(); // `{`
         let mut fields = Vec::new();
         while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
@@ -3395,6 +3578,8 @@ impl<'a> Parser<'a> {
         Some(Expr::ObjectLiteral {
             name,
             name_span,
+            type_args,
+            type_args_span,
             fields,
             span: Span::new(name_span.start, close.span.end),
         })
@@ -3809,11 +3994,16 @@ mod tests {
     }
 
     #[test]
-    fn generic_objects_remain_rejected() {
-        let (_prog, diags) = parse_src("type C[T] = object { value: u64, };");
-        let errors = diags.iter().filter(|d| d.is_error()).collect::<Vec<_>>();
-        assert_eq!(errors.len(), 1, "{diags:?}");
-        assert_eq!(errors[0].code.as_deref(), Some("E104"));
+    fn generic_objects_parse_with_type_params() {
+        let (prog, diags) = parse_src("type C[T] = object { value: T, };");
+        assert!(diags.is_empty(), "{diags:?}");
+        match &prog.items[0] {
+            Item::Object { type_params, .. } => {
+                assert_eq!(type_params.len(), 1);
+                assert_eq!(type_params[0].name, "T");
+            }
+            other => panic!("expected object, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3830,7 +4020,13 @@ mod tests {
                 assert_eq!(methods.len(), 2);
                 assert_eq!(methods[0].name, "init");
                 assert_eq!(methods[0].params.len(), 1);
-                assert_eq!(methods[0].ret, Some(VlType::Object("Counter".into())));
+                assert_eq!(
+                    methods[0].ret,
+                    Some(VlType::Object {
+                        name: "Counter".into(),
+                        args: Vec::new()
+                    })
+                );
                 assert_eq!(methods[1].name, "bump");
                 assert!(!methods[1].signature_poisoned);
             }
@@ -4712,12 +4908,18 @@ mod tests {
             Item::Object { fields, .. } => {
                 assert_eq!(
                     fields[0].ty,
-                    Some(VlType::Mutable(Box::new(VlType::Object("Child".into()))))
+                    Some(VlType::Mutable(Box::new(VlType::Object {
+                        name: "Child".into(),
+                        args: Vec::new()
+                    })))
                 );
                 assert_eq!(
                     fields[1].ty,
                     Some(VlType::Mutable(Box::new(VlType::Array(Box::new(
-                        VlType::Mutable(Box::new(VlType::Object("Child".into())))
+                        VlType::Mutable(Box::new(VlType::Object {
+                            name: "Child".into(),
+                            args: Vec::new()
+                        }))
                     )))))
                 );
             }
@@ -4727,11 +4929,17 @@ mod tests {
             Item::Function { params, ret, .. } => {
                 assert_eq!(
                     params[0].ty,
-                    Some(VlType::Mutable(Box::new(VlType::Object("Parent".into()))))
+                    Some(VlType::Mutable(Box::new(VlType::Object {
+                        name: "Parent".into(),
+                        args: Vec::new()
+                    })))
                 );
                 assert_eq!(
                     *ret,
-                    Some(VlType::Mutable(Box::new(VlType::Object("Parent".into()))))
+                    Some(VlType::Mutable(Box::new(VlType::Object {
+                        name: "Parent".into(),
+                        args: Vec::new()
+                    })))
                 );
             }
             other => panic!("expected fn, got {other:?}"),
@@ -4755,13 +4963,19 @@ mod tests {
                 assert_eq!(
                     params[1].ty,
                     Some(VlType::Array(Box::new(VlType::Mutable(Box::new(
-                        VlType::Object("Foo".into())
+                        VlType::Object {
+                            name: "Foo".into(),
+                            args: Vec::new()
+                        }
                     )))))
                 );
                 assert_eq!(
                     params[2].ty,
                     Some(VlType::Mutable(Box::new(VlType::Array(Box::new(
-                        VlType::Mutable(Box::new(VlType::Object("Foo".into())))
+                        VlType::Mutable(Box::new(VlType::Object {
+                            name: "Foo".into(),
+                            args: Vec::new()
+                        }))
                     )))))
                 );
             }
@@ -4781,7 +4995,10 @@ mod tests {
                 Stmt::Let { value, .. } => match value {
                     Expr::Call { type_args, .. } => assert_eq!(
                         *type_args,
-                        vec![VlType::Mutable(Box::new(VlType::Object("Foo".into())))]
+                        vec![VlType::Mutable(Box::new(VlType::Object {
+                            name: "Foo".into(),
+                            args: Vec::new()
+                        }))]
                     ),
                     other => panic!("expected call, got {other:?}"),
                 },
@@ -4801,13 +5018,17 @@ mod tests {
             Item::Function { params, ret, .. } => {
                 assert_eq!(
                     params[0].ty,
-                    Some(VlType::Object("vl.person.Person".into()))
+                    Some(VlType::Object {
+                        name: "vl.person.Person".into(),
+                        args: Vec::new()
+                    })
                 );
                 assert_eq!(
                     *ret,
-                    Some(VlType::Mutable(Box::new(VlType::Object(
-                        "vl.person.Person".into()
-                    ))))
+                    Some(VlType::Mutable(Box::new(VlType::Object {
+                        name: "vl.person.Person".into(),
+                        args: Vec::new()
+                    })))
                 );
             }
             other => panic!("expected fn, got {other:?}"),
@@ -4816,9 +5037,10 @@ mod tests {
             Item::Function { params, .. } => {
                 assert_eq!(
                     params[0].ty,
-                    Some(VlType::Array(Box::new(VlType::Object(
-                        "vl.person.Person".into()
-                    ))))
+                    Some(VlType::Array(Box::new(VlType::Object {
+                        name: "vl.person.Person".into(),
+                        args: Vec::new()
+                    })))
                 );
             }
             other => panic!("expected fn, got {other:?}"),

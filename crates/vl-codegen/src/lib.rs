@@ -425,7 +425,15 @@ impl NaraKind {
             vl_typecheck::Ty::U8 => Some(NaraKind::U8),
             vl_typecheck::Ty::String => Some(NaraKind::String),
             vl_typecheck::Ty::File => Some(NaraKind::File),
-            vl_typecheck::Ty::Object(name) => Some(NaraKind::Object(name.clone())),
+            vl_typecheck::Ty::Object(o) => {
+                if o.args.is_empty() {
+                    Some(NaraKind::Object(o.name.clone()))
+                } else {
+                    // Generic instantiations use mangled layouts (`List$u64`),
+                    // matching LIR `NewObject` (see `vl-lir::lower`).
+                    Some(NaraKind::Object(vl_typecheck::mangle(&o.name, &o.args)))
+                }
+            }
             // Union values are heap tag+payload containers (reference lane).
             // Type arguments are erased here: each construction site carries
             // its concrete payload kinds on the instruction.
@@ -6397,7 +6405,10 @@ mod tests {
             functions: vec![
                 vl_lir::Function {
                     name: "read".into(),
-                    param_tys: vec![vl_typecheck::Ty::Object("Counter".into())],
+                    param_tys: vec![vl_typecheck::Ty::Object(Box::new(vl_typecheck::ObjectTy {
+                        name: "Counter".into(),
+                        args: vec![],
+                    }))],
                     ret: vl_typecheck::Ty::U64,
                     instrs: vec![
                         Instr::Param {
@@ -6708,9 +6719,18 @@ fun main() {
     fn mutable_and_readonly_share_runtime_abi() {
         use vl_typecheck::Ty;
         // `Foo` and `*Foo` lower to the same register class and container ops.
-        let ro = NaraKind::of_ty(&Ty::Object("Foo".into())).expect("object kind");
-        let mu = NaraKind::of_ty(&Ty::Mutable(Box::new(Ty::Object("Foo".into()))))
-            .expect("mutable kind");
+        let ro = NaraKind::of_ty(&Ty::Object(Box::new(vl_typecheck::ObjectTy {
+            name: "Foo".into(),
+            args: vec![],
+        })))
+        .expect("object kind");
+        let mu = NaraKind::of_ty(&Ty::Mutable(Box::new(Ty::Object(Box::new(
+            vl_typecheck::ObjectTy {
+                name: "Foo".into(),
+                args: vec![],
+            },
+        )))))
+        .expect("mutable kind");
         assert_eq!(ro, mu);
         assert!(ro.is_ref());
         let ro_arr = NaraKind::of_ty(&Ty::Array(Box::new(Ty::U64))).expect("array kind");
@@ -6842,7 +6862,12 @@ fun main() {
             globals: vec![Global {
                 id: 0,
                 name: "g".into(),
-                ty: vl_typecheck::Ty::Mutable(Box::new(vl_typecheck::Ty::Object("Foo".into()))),
+                ty: vl_typecheck::Ty::Mutable(Box::new(vl_typecheck::Ty::Object(Box::new(
+                    vl_typecheck::ObjectTy {
+                        name: "Foo".into(),
+                        args: vec![],
+                    },
+                )))),
                 init: vec![],
                 result: Reg(u32::MAX),
                 span: Span::empty(0),

@@ -102,6 +102,21 @@ The bare name still means the fully qualified type (`my_app.person.Person`
 above), so nominal identity never collides: importing the same name from
 two modules, or alongside a local type of the same name, is an error.
 
+## Generic functions across modules
+
+A generic function is imported like any other function. Type arguments are
+inferred at the call site or written explicitly with `::[...]`, and each
+concrete use is compiled once in the module that defines it:
+
+```vl
+use my_app.lib.id;
+
+fun main() {
+    val x = id(1u64);
+    val y = id::[String]("hi");
+}
+```
+
 ## The standard library
 
 The standard library is a set of ready-made modules: `std` for printing,

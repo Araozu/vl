@@ -2,8 +2,14 @@
 
 ## Status
 
-Implementation plan. This document describes compiler work; it does not change
-the language yet.
+Implemented. Cross-module generic functions shipped: generic source functions
+are published in module interfaces, callers infer or pass explicit type
+arguments across modules (`use my_app.lib.id;` then `id(1u64)` emits `id$u64`
+in the provider), concrete instances are emitted once in the owning module,
+and the generic `std.math.max[T extends Numeric]` helper links per
+compilation. The rest of this document is kept as the design record; its
+non-goals still hold, except generic `object` declarations have since shipped
+(see the README roadmap and `examples/generic_objects.vl`).
 
 ## Summary
 

@@ -95,6 +95,7 @@ pub struct HirMatchArm {
 pub enum HirItem {
     Object {
         name: String,
+        type_params: Vec<HirTypeParam>,
         fields: Vec<(String, Option<VlType>, Span)>,
         span: Span,
     },
@@ -246,6 +247,9 @@ pub enum HirExpr {
     ObjectLiteral {
         id: HirId,
         name: String,
+        /// Explicit type arguments (`List::[u64] { ... }`); empty means infer
+        /// from the expected type or field values.
+        type_args: Vec<VlType>,
         fields: Vec<(String, HirExpr)>,
         span: Span,
     },
@@ -504,12 +508,20 @@ impl<'a> Lowerer<'a> {
     /// those only for names bound by an enclosing `fun f[T]`.
     fn canonical_ty(&self, ty: VlType) -> VlType {
         match ty {
-            VlType::Object(name) if !name.contains('.') => self
-                .res
-                .imported_types
-                .get(&name)
-                .map(|q| VlType::Object(q.clone()))
-                .unwrap_or(VlType::Object(name)),
+            VlType::Object { name, args } if !name.contains('.') => {
+                let args = args.into_iter().map(|a| self.canonical_ty(a)).collect();
+                match self.res.imported_types.get(&name) {
+                    Some(q) => VlType::Object {
+                        name: q.clone(),
+                        args,
+                    },
+                    None => VlType::Object { name, args },
+                }
+            }
+            VlType::Object { name, args } => VlType::Object {
+                name,
+                args: args.into_iter().map(|a| self.canonical_ty(a)).collect(),
+            },
             VlType::Union { name, args } if !name.contains('.') => {
                 let args = args.into_iter().map(|a| self.canonical_ty(a)).collect();
                 match self.res.imported_types.get(&name) {
@@ -606,14 +618,23 @@ impl<'a> Lowerer<'a> {
             AstItem::Use { .. } => unreachable!("use items are filtered before lowering"),
             AstItem::Object {
                 name,
+                type_params,
                 fields,
                 methods,
                 span,
                 ..
             } => {
+                let owner_params: Vec<HirTypeParam> = type_params
+                    .iter()
+                    .map(|p| HirTypeParam {
+                        name: p.name.clone(),
+                        bound: p.bound,
+                    })
+                    .collect();
                 let mut out = Vec::with_capacity(1 + methods.len());
                 out.push(HirItem::Object {
                     name: name.clone(),
+                    type_params: owner_params.clone(),
                     fields: fields
                         .iter()
                         .map(|f| {
@@ -627,18 +648,21 @@ impl<'a> Lowerer<'a> {
                     span: *span,
                 });
                 for m in methods {
+                    // Owner parameters scope over methods (`List[T]`'s `T`
+                    // is visible in `push`'s signature and body). Combine as
+                    // `owner + own` so generic checking and monomorphization
+                    // reuse the free-function paths; call-site inference
+                    // solves owner arguments from the receiver.
+                    let mut combined = owner_params.clone();
+                    combined.extend(m.type_params.iter().map(|p| HirTypeParam {
+                        name: p.name.clone(),
+                        bound: p.bound,
+                    }));
                     out.push(HirItem::Fn {
                         id: self.id(),
                         def: self.def_at_site(m.name_span),
                         name: format!("{name}.{}", m.name),
-                        type_params: m
-                            .type_params
-                            .iter()
-                            .map(|p| HirTypeParam {
-                                name: p.name.clone(),
-                                bound: p.bound,
-                            })
-                            .collect(),
+                        type_params: combined,
                         params: m
                             .params
                             .iter()
@@ -684,31 +708,66 @@ impl<'a> Lowerer<'a> {
                 name,
                 type_params,
                 variants,
+                methods,
                 span,
                 ..
-            } => vec![HirItem::Union {
-                name: name.clone(),
-                type_params: type_params
+            } => {
+                let owner_params: Vec<HirTypeParam> = type_params
                     .iter()
                     .map(|p| HirTypeParam {
                         name: p.name.clone(),
                         bound: p.bound,
                     })
-                    .collect(),
-                variants: variants
-                    .iter()
-                    .map(|v| HirUnionVariant {
-                        name: v.name.clone(),
-                        name_span: v.name_span,
-                        payload: v
-                            .payload
+                    .collect();
+                let mut out = Vec::with_capacity(1 + methods.len());
+                out.push(HirItem::Union {
+                    name: name.clone(),
+                    type_params: owner_params.clone(),
+                    variants: variants
+                        .iter()
+                        .map(|v| HirUnionVariant {
+                            name: v.name.clone(),
+                            name_span: v.name_span,
+                            payload: v
+                                .payload
+                                .iter()
+                                .map(|(ty, span)| (self.canonical_ty(ty.clone()), *span))
+                                .collect(),
+                        })
+                        .collect(),
+                    span: *span,
+                });
+                for m in methods {
+                    let mut combined = owner_params.clone();
+                    combined.extend(m.type_params.iter().map(|p| HirTypeParam {
+                        name: p.name.clone(),
+                        bound: p.bound,
+                    }));
+                    out.push(HirItem::Fn {
+                        id: self.id(),
+                        def: self.def_at_site(m.name_span),
+                        name: format!("{name}.{}", m.name),
+                        type_params: combined,
+                        params: m
+                            .params
                             .iter()
-                            .map(|(ty, span)| (self.canonical_ty(ty.clone()), *span))
+                            .map(|p| {
+                                (
+                                    p.name.clone(),
+                                    self.def_at_site(p.name_span),
+                                    self.canonical_ty_opt(p.ty.clone()),
+                                    p.name_span,
+                                )
+                            })
                             .collect(),
-                    })
-                    .collect(),
-                span: *span,
-            }],
+                        ret: self.canonical_ty_opt(m.ret.clone()),
+                        ret_span: m.ret_span,
+                        body: m.body.iter().map(|s| self.lower_stmt(s)).collect(),
+                        span: m.span,
+                    });
+                }
+                out
+            }
             AstItem::Let {
                 value,
                 span,
@@ -1018,10 +1077,18 @@ impl<'a> Lowerer<'a> {
                 span: *span,
             },
             AstExpr::ObjectLiteral {
-                name, fields, span, ..
+                name,
+                type_args,
+                fields,
+                span,
+                ..
             } => HirExpr::ObjectLiteral {
                 id: self.id(),
                 name: self.canonical_name(name),
+                type_args: type_args
+                    .iter()
+                    .map(|t| self.canonical_ty(t.clone()))
+                    .collect(),
                 fields: fields
                     .iter()
                     .map(|(name, _, value)| (name.clone(), self.lower_expr(value)))
@@ -1604,7 +1671,14 @@ mod tests {
             HirItem::Fn { body, .. } => {
                 match &body[0] {
                     HirStmt::Let { ty, value, .. } => {
-                        assert_eq!(*ty, Some(VlType::Object("vl.dog.Dog".into())), "{ty:?}");
+                        assert_eq!(
+                            *ty,
+                            Some(VlType::Object {
+                                name: "vl.dog.Dog".into(),
+                                args: Vec::new()
+                            }),
+                            "{ty:?}"
+                        );
                         assert!(
                             matches!(value, HirExpr::ObjectLiteral { name, .. } if name == "vl.dog.Dog"),
                             "{value:?}"
@@ -1618,7 +1692,10 @@ mod tests {
                         assert_eq!(
                             *ty,
                             Some(VlType::Mutable(Box::new(VlType::Array(Box::new(
-                                VlType::Object("vl.dog.Dog".into())
+                                VlType::Object {
+                                    name: "vl.dog.Dog".into(),
+                                    args: Vec::new()
+                                }
                             ))))),
                             "{ty:?}"
                         );
@@ -1944,12 +2021,18 @@ mod tests {
             HirItem::Object { fields, .. } => {
                 assert_eq!(
                     fields[0].1,
-                    Some(VlType::Mutable(Box::new(VlType::Object("Child".into()))))
+                    Some(VlType::Mutable(Box::new(VlType::Object {
+                        name: "Child".into(),
+                        args: Vec::new()
+                    })))
                 );
                 assert_eq!(
                     fields[1].1,
                     Some(VlType::Mutable(Box::new(VlType::Array(Box::new(
-                        VlType::Mutable(Box::new(VlType::Object("Child".into())))
+                        VlType::Mutable(Box::new(VlType::Object {
+                            name: "Child".into(),
+                            args: Vec::new()
+                        }))
                     )))))
                 );
             }
@@ -1961,11 +2044,17 @@ mod tests {
             } => {
                 assert_eq!(
                     params[0].2,
-                    Some(VlType::Mutable(Box::new(VlType::Object("Parent".into()))))
+                    Some(VlType::Mutable(Box::new(VlType::Object {
+                        name: "Parent".into(),
+                        args: Vec::new()
+                    })))
                 );
                 assert_eq!(
                     *ret,
-                    Some(VlType::Mutable(Box::new(VlType::Object("Parent".into()))))
+                    Some(VlType::Mutable(Box::new(VlType::Object {
+                        name: "Parent".into(),
+                        args: Vec::new()
+                    })))
                 );
                 // A binding introduces a fresh local; its initializer reads `parent`.
                 let param_def = params[0].1.clone().expect("param def");
@@ -1976,7 +2065,10 @@ mod tests {
                     HirStmt::Let { ty, def, value, .. } => {
                         assert_eq!(
                             *ty,
-                            Some(VlType::Mutable(Box::new(VlType::Object("Child".into()))))
+                            Some(VlType::Mutable(Box::new(VlType::Object {
+                                name: "Child".into(),
+                                args: Vec::new()
+                            })))
                         );
                         let local_def = def.clone().expect("val def must survive");
                         let local = res
@@ -2040,7 +2132,10 @@ mod tests {
                             } => {
                                 assert_eq!(
                                     *type_args,
-                                    vec![VlType::Mutable(Box::new(VlType::Object("Foo".into())))]
+                                    vec![VlType::Mutable(Box::new(VlType::Object {
+                                        name: "Foo".into(),
+                                        args: Vec::new()
+                                    }))]
                                 );
                                 assert!(callee.is_some());
                                 match &args[0] {
@@ -2076,7 +2171,13 @@ mod tests {
                 match &body[3] {
                     HirStmt::Let { value, .. } => match value {
                         HirExpr::Cast { target, .. } => {
-                            assert_eq!(*target, VlType::Object("Foo".into()));
+                            assert_eq!(
+                                *target,
+                                VlType::Object {
+                                    name: "Foo".into(),
+                                    args: Vec::new()
+                                }
+                            );
                         }
                         other => panic!("expected cast, got {other:?}"),
                     },
@@ -2103,7 +2204,10 @@ mod tests {
             HirItem::Let { ty, def, .. } => {
                 assert_eq!(
                     *ty,
-                    Some(VlType::Mutable(Box::new(VlType::Object("Foo".into()))))
+                    Some(VlType::Mutable(Box::new(VlType::Object {
+                        name: "Foo".into(),
+                        args: Vec::new()
+                    })))
                 );
                 assert!(def.is_some());
             }

@@ -1064,6 +1064,89 @@ fn associated_generic_methods_monomorphize() {
 }
 
 #[test]
+fn generic_objects_monomorphize_layouts_and_methods() {
+    let lir = frontend(
+        "use std; type List[T] = object { items: *Array[T], len: u64, fun init(n: u64): *List[T] { var items: *Array[T] = Array.new(n); return List { items = items, len = n }; }, fun get(self: List[T], i: u64): T { return self.items[i]; }, }; fun main() { var l: *List[u64] = List.init::[u64](2); std.print_u64(l.get(0) + l.len); }",
+    )
+    .expect("generic objects must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("fn List.init$u64:"), "{dump}");
+    assert!(dump.contains("fn List.get$u64:"), "{dump}");
+    assert!(dump.contains("new_object List$u64"), "{dump}");
+    assert!(!dump.contains("fn List.init:\n"), "{dump}");
+}
+
+#[test]
+fn generic_union_methods_monomorphize() {
+    let lir = frontend(
+        "use std; type Box[T] = union { Empty, Full(T), fun wrap(v: T): Box[T] { return Box.Full(v); }, fun unwrap_or(self: Box[T], fallback: T): T { match (self) { Box.Full(x) { return x; } Box.Empty { return fallback; } else { return fallback; } } }, }; fun main() { val b = Box.wrap(7u64); std.print_u64(b.unwrap_or(0u64)); }",
+    )
+    .expect("generic union methods must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("fn Box.wrap$u64:"), "{dump}");
+    assert!(dump.contains("fn Box.unwrap_or$u64:"), "{dump}");
+    assert!(!dump.contains("fn Box.wrap:\n"), "{dump}");
+}
+
+#[test]
+fn generic_object_nested_calls_monomorphize() {
+    let lir = frontend(
+        "type Cell[T] = object { value: T, fun get(self: Cell[T]): T { return self.value; }, }; fun forward[T](c: Cell[T]): T { return c.get(); } fun main() { val c = Cell::[u64] { value = 9u64 }; forward(c); }",
+    )
+    .expect("nested generic method must compile");
+    let dump = lir.dump();
+    assert!(dump.contains("fn forward$u64:"), "{dump}");
+    assert!(dump.contains("fn Cell.get$u64:"), "{dump}");
+    assert!(
+        dump.contains("Cell.get$u64"),
+        "forward instance must call Cell.get instance: {dump}"
+    );
+}
+
+#[test]
+fn generic_object_mutable_args_are_rejected() {
+    let err = frontend(
+        "type Child = object { n: u64, }; type Cell[T] = object { v: T, }; fun main() { val c = Cell::[*Child] { v = Child { n = 1 } }; c; }",
+    )
+    .expect_err("mutable generic args must fail");
+    assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1);
+    assert_eq!(err[0].code.as_deref(), Some("E106"));
+}
+
+#[test]
+fn generic_object_in_free_function_emits_layout() {
+    use vl_codegen::Target;
+    let lir = frontend(
+        "type Cell[T] = object { value: T, }; fun f[T](v: T): T { val c = Cell { value = v }; return c.value; } fun main() { val x = f(9u64); x; }",
+    )
+    .expect("free-function nested object must compile");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+}
+
+#[test]
+fn generic_union_mutable_receiver_downgrades() {
+    let lir = frontend(
+        "type Box[T] = union { Empty, Full(T), fun copy(self: Box[T]): Box[T] { return self; }, }; fun main() { var b = Box.Full(1u64); b.copy(); }",
+    )
+    .expect("mutable union receiver must downgrade");
+    assert!(lir.dump().contains("fn Box.copy$u64:"), "{}", lir.dump());
+}
+
+#[test]
+fn generic_object_bounds_reject_concrete_violations() {
+    for src in [
+        "type Cell[T extends Numeric] = object { value: T, }; fun main() { val c = Cell::[String] { value = \"hi\" }; c; }",
+        "type Cell[T extends Numeric] = object { value: T, }; fun main() { val c: Cell[String] = Cell { value = \"hi\" }; c; }",
+    ] {
+        let err = frontend(src).expect_err("bound violation must fail");
+        assert_eq!(err.iter().filter(|d| d.is_error()).count(), 1, "{src}: {err:?}");
+        assert_eq!(err[0].code.as_deref(), Some("E302"), "{src}: {err:?}");
+    }
+}
+
+#[test]
 fn associated_sugar_gate_is_one_error_each() {
     for (src, code, hint) in [
         (

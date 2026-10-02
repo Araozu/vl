@@ -584,16 +584,31 @@ pub(crate) fn single_expr(e: &Expr) -> String {
                 elems.iter().map(single_expr).collect::<Vec<_>>().join(", ")
             )
         }
-        Expr::ObjectLiteral { name, fields, .. } => {
+        Expr::ObjectLiteral {
+            name,
+            type_args,
+            fields,
+            ..
+        } => {
+            let prefix = if type_args.is_empty() {
+                name.clone()
+            } else {
+                let inner = type_args
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{name}::[{inner}]")
+            };
             if fields.is_empty() {
-                return format!("{name} {{}}");
+                return format!("{prefix} {{}}");
             }
             let inner = fields
                 .iter()
                 .map(|(field, _, value)| format!("{field} = {}", single_expr(value)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("{name} {{ {inner} }}")
+            format!("{prefix} {{ {inner} }}")
         }
         Expr::TupleLiteral { elems, .. } => {
             let inner = elems

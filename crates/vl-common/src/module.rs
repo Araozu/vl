@@ -168,6 +168,7 @@ impl std::fmt::Display for TemplateKey {
 pub struct ObjectExport {
     pub name: String,
     pub qualified: String,
+    pub type_params: Vec<TypeParamSig>,
     pub fields: Vec<ObjectFieldSig>,
     /// Associated functions declared inside the object body, each exported
     /// under its short method name (`init` in `Counter.init`). Signatures
@@ -202,14 +203,25 @@ pub struct UnionVariantSig {
     pub payload: Vec<VlType>,
 }
 
-/// Exported nominal union metadata. Unlike [`ObjectExport`], this carries no
-/// layout or associated-method namespace.
+/// Exported nominal union metadata. Carries an associated-method namespace
+/// like objects (`Option.unwrap_or`); layouts remain declaration-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnionExport {
     pub name: String,
     pub qualified: String,
     pub type_params: Vec<TypeParamSig>,
     pub variants: Vec<UnionVariantSig>,
+    /// Associated functions declared inside the union body, each exported
+    /// under its short method name. Entries are `Source` exports (they have
+    /// bodies); generic methods carry combined `owner + own` type params.
+    pub methods: Vec<Export>,
+}
+
+impl UnionExport {
+    /// Look up one associated function by its short method name.
+    pub fn lookup_method(&self, name: &str) -> Option<&Export> {
+        self.methods.iter().find(|m| m.name == name)
+    }
 }
 
 /// One declaration-only error variant exported through a module interface.
@@ -237,7 +249,8 @@ pub struct ModuleSpec {
     pub exports: Vec<Export>,
     /// Exported object layouts, keyed by disambiguation through `qualified`.
     pub objects: Vec<ObjectExport>,
-    /// Exported nominal unions. Unions have no object layout or methods.
+    /// Exported nominal unions. Unions have no object layout but carry an
+    /// associated-method namespace like objects.
     pub unions: Vec<UnionExport>,
     /// Exported nominal error sets (variants may carry payloads, like unions).
     pub errors: Vec<ErrorExport>,
@@ -373,6 +386,7 @@ mod tests {
             objects: vec![ObjectExport {
                 name: "Dog".into(),
                 qualified: "vl.dog.Dog".into(),
+                type_params: vec![],
                 fields: vec![],
                 methods: vec![],
             }],
@@ -381,6 +395,7 @@ mod tests {
                 qualified: "vl.dog.Trick".into(),
                 type_params: vec![],
                 variants: vec![],
+                methods: vec![],
             }],
             errors: vec![ErrorExport {
                 name: "Trip".into(),
@@ -470,6 +485,7 @@ mod tests {
                     name: "Some".into(),
                     payload: vec![VlType::Param("T".into())],
                 }],
+                methods: vec![],
             }],
             errors: vec![ErrorExport {
                 name: "Oops".into(),

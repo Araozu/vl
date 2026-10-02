@@ -285,44 +285,9 @@ fn collect_interface_impl(
                 .collect(),
         });
     }
-    // Union declarations export nominal identity and payload metadata, but
-    // never acquire an object layout or associated-method namespace.
-    for item in &prog.items {
-        let Item::Union {
-            name,
-            type_params,
-            variants,
-            ..
-        } = item
-        else {
-            continue;
-        };
-        if unions.iter().any(|export| export.name == *name) {
-            continue;
-        }
-        unions.push(vl_common::UnionExport {
-            name: name.clone(),
-            qualified: format!("{}.{}", prog.module, name),
-            type_params: type_params
-                .iter()
-                .map(|p| vl_common::TypeParamSig {
-                    name: p.name.clone(),
-                    bound: p.bound,
-                })
-                .collect(),
-            variants: variants
-                .iter()
-                .map(|variant| vl_common::UnionVariantSig {
-                    name: variant.name.clone(),
-                    payload: variant
-                        .payload
-                        .iter()
-                        .map(|(ty, _)| qualify_export_ty(ty, &prog.module, &local_types))
-                        .collect(),
-                })
-                .collect(),
-        });
-    }
+    // Union declarations export nominal identity, payload metadata, and an
+    // associated-method namespace mirroring objects (populated below alongside
+    // objects, after the global-dependence fixed point).
     for item in &prog.items {
         if let Item::Function {
             name, params, body, ..
@@ -336,6 +301,24 @@ fn collect_interface_impl(
             }
         }
         if let Item::Object {
+            name: owner,
+            methods,
+            ..
+        } = item
+        {
+            for m in methods {
+                let key = format!("{owner}.{}", m.name);
+                let mut calls = Vec::new();
+                collect_local_calls(&m.body, &mut calls);
+                // First declaration wins, like the interface below;
+                // duplicates are E200 elsewhere.
+                direct_dependencies.entry(key.clone()).or_insert(calls);
+                if !fn_units.iter().any(|(k, _, _)| k == &key) {
+                    fn_units.push((key, &m.params, &m.body));
+                }
+            }
+        }
+        if let Item::Union {
             name: owner,
             methods,
             ..
@@ -376,6 +359,7 @@ fn collect_interface_impl(
     for item in &prog.items {
         let Item::Object {
             name,
+            type_params: owner_params,
             fields,
             methods,
             ..
@@ -427,14 +411,19 @@ fn collect_interface_impl(
             if depends_on_global.contains(&key) {
                 global_dependent_exports.push(key.clone());
             }
-            let type_param_sigs = m
-                .type_params
+            // Owner parameters scope over methods (`List[T]`); export as
+            // `owner + own` so importers instantiate like locals.
+            let mut type_param_sigs: Vec<vl_common::TypeParamSig> = owner_params
                 .iter()
                 .map(|p| vl_common::TypeParamSig {
                     name: p.name.clone(),
                     bound: p.bound,
                 })
-                .collect::<Vec<_>>();
+                .collect();
+            type_param_sigs.extend(m.type_params.iter().map(|p| vl_common::TypeParamSig {
+                name: p.name.clone(),
+                bound: p.bound,
+            }));
             let sig = vl_common::FuncSig::generic(
                 type_param_sigs,
                 m.params
@@ -460,7 +449,114 @@ fn collect_interface_impl(
         objects.push(vl_common::ObjectExport {
             name: name.clone(),
             qualified,
+            type_params: owner_params
+                .iter()
+                .map(|p| vl_common::TypeParamSig {
+                    name: p.name.clone(),
+                    bound: p.bound,
+                })
+                .collect(),
             fields: out_fields,
+            methods: out_methods,
+        });
+    }
+    // Union declarations export nominal identity, payload metadata, and an
+    // associated-method namespace mirroring objects. Duplicate union names
+    // are reported by resolution (E200); the interface keeps the first so
+    // importers see a stable catalog.
+    for item in &prog.items {
+        let Item::Union {
+            name,
+            type_params: owner_params,
+            variants,
+            methods,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        if unions.iter().any(|export| export.name == *name) {
+            continue;
+        }
+        // Associated functions are public by default, mirroring objects. A
+        // method with an incomplete signature is poisoned under its
+        // `Type.method` key so importers stay quiet on the provider's root
+        // cause (mirrors free functions, which use the bare name).
+        let mut out_methods = Vec::with_capacity(methods.len());
+        for m in methods {
+            let key = format!("{name}.{}", m.name);
+            if m.signature_poisoned || m.ret.is_none() || m.params.iter().any(|p| p.ty.is_none()) {
+                poisoned_exports.push(key.clone());
+                if diagnose_incomplete_signatures {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "exported associated function `{key}` has an incomplete signature"
+                        ))
+                        .with_label(m.name_span, "unsupported cross-module boundary")
+                        .with_code("E208"),
+                    );
+                }
+                continue;
+            }
+            if depends_on_global.contains(&key) {
+                global_dependent_exports.push(key.clone());
+            }
+            // Owner parameters scope over methods (`Option[T]`); export as
+            // `owner + own` so importers instantiate like locals.
+            let mut type_param_sigs: Vec<vl_common::TypeParamSig> = owner_params
+                .iter()
+                .map(|p| vl_common::TypeParamSig {
+                    name: p.name.clone(),
+                    bound: p.bound,
+                })
+                .collect();
+            type_param_sigs.extend(m.type_params.iter().map(|p| vl_common::TypeParamSig {
+                name: p.name.clone(),
+                bound: p.bound,
+            }));
+            let sig = vl_common::FuncSig::generic(
+                type_param_sigs,
+                m.params
+                    .iter()
+                    .filter_map(|p| {
+                        p.ty.clone().map(|ty| vl_common::ParamSig {
+                            name: p.name.clone(),
+                            ty: qualify_export_ty(&ty, &prog.module, &local_types),
+                        })
+                    })
+                    .collect(),
+                m.ret
+                    .clone()
+                    .map(|ty| qualify_export_ty(&ty, &prog.module, &local_types))
+                    .unwrap_or(vl_common::VlType::Void),
+            );
+            if sig.params.len() != m.params.len() {
+                poisoned_exports.push(key);
+                continue;
+            }
+            out_methods.push(vl_common::Export::source(m.name.clone(), sig));
+        }
+        unions.push(vl_common::UnionExport {
+            name: name.clone(),
+            qualified: format!("{}.{}", prog.module, name),
+            type_params: owner_params
+                .iter()
+                .map(|p| vl_common::TypeParamSig {
+                    name: p.name.clone(),
+                    bound: p.bound,
+                })
+                .collect(),
+            variants: variants
+                .iter()
+                .map(|variant| vl_common::UnionVariantSig {
+                    name: variant.name.clone(),
+                    payload: variant
+                        .payload
+                        .iter()
+                        .map(|(ty, _)| qualify_export_ty(ty, &prog.module, &local_types))
+                        .collect(),
+                })
+                .collect(),
             methods: out_methods,
         });
     }
@@ -571,11 +667,23 @@ fn qualify_export_ty(
     local_objects: &std::collections::HashSet<String>,
 ) -> vl_common::VlType {
     match ty {
-        vl_common::VlType::Object(name) if !name.contains('.') => {
+        vl_common::VlType::Object { name, args } if !name.contains('.') => {
+            let args = args
+                .iter()
+                .map(|a| qualify_export_ty(a, module, local_objects))
+                .collect();
             if local_objects.contains(name) {
-                vl_common::VlType::Object(format!("{module}.{name}"))
-            } else {
+                vl_common::VlType::Object {
+                    name: format!("{module}.{name}"),
+                    args,
+                }
+            } else if args.is_empty() {
                 ty.clone()
+            } else {
+                vl_common::VlType::Object {
+                    name: name.clone(),
+                    args,
+                }
             }
         }
         vl_common::VlType::Array(elem) => {
@@ -610,6 +718,13 @@ fn qualify_export_ty(
                     .collect(),
             }
         }
+        vl_common::VlType::Object { name, args } => vl_common::VlType::Object {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| qualify_export_ty(a, module, local_objects))
+                .collect(),
+        },
         vl_common::VlType::ErrorSet(name) if !name.contains('.') => {
             if local_objects.contains(name) {
                 vl_common::VlType::ErrorSet(format!("{module}.{name}"))
@@ -990,11 +1105,28 @@ pub fn resolve_with_modules(
         }
         // Union variant namespaces: first declaration wins, like associated
         // functions, so later duplicates keep quiet here (the E200 above is
-        // the single root cause).
-        if let Item::Union { name, variants, .. } = item {
+        // the single root cause). Union methods join the same `assoc` table
+        // as object methods (`Owner.method`), with owner parameters in scope
+        // for bodies (resolved like object method bodies below).
+        if let Item::Union {
+            name,
+            variants,
+            methods,
+            ..
+        } = item
+        {
             r.local_unions
                 .entry(name.clone())
                 .or_insert_with(|| variants.iter().map(|v| v.name.clone()).collect());
+            for m in methods {
+                let id = r.out.intern_def_as(
+                    format!("{name}.{}", m.name),
+                    m.name_span,
+                    DefKind::Local,
+                    None,
+                );
+                r.assoc.entry((name.clone(), m.name.clone())).or_insert(id);
+            }
         }
         // Error variant namespaces: same first-wins rule as unions.
         if let Item::Error { name, variants, .. } = item {
@@ -1054,7 +1186,12 @@ pub fn resolve_with_modules(
                     r.resolve_fn_body(&m.params, &m.body);
                 }
             }
-            Item::Union { .. } | Item::Error { .. } => {}
+            Item::Union { methods, .. } => {
+                for m in methods {
+                    r.resolve_fn_body(&m.params, &m.body);
+                }
+            }
+            Item::Error { .. } => {}
             Item::Let { value, .. } => {
                 r.resolve_expr(value);
             }
@@ -2322,8 +2459,14 @@ impl Resolver {
         // type names, the union head wins over same-named values. Unknown
         // variants are one E302 here; arity and payload types are validated
         // by typechecking from the recorded site.
+        // Union methods (`Option.unwrap_or(...)`) share the `Owner.method`
+        // spelling but are lowercase by convention; if the second segment
+        // names a method (in `assoc`), fall through to method logic below.
         if callee.len() == 2
             && (self.local_unions.contains_key(&callee[0]) || callee[0] == "Option")
+            && !self
+                .assoc
+                .contains_key(&(callee[0].clone(), callee[1].clone()))
         {
             let union = callee[0].clone();
             let variants = self
@@ -2344,47 +2487,61 @@ impl Resolver {
         }
         // Bare imported union (`use vl.types.{U}` then `U.Variant(...)`).
         // Non-union imports (objects) fall through to the method logic below.
+        // Union methods (`U.method`) share the spelling; if the second
+        // segment names a method, skip variant recording.
         if callee.len() == 2 && !self.local_unions.contains_key(&callee[0]) && callee[0] != "Option"
         {
             if let Some(qualified) = self.imported_types.get(&callee[0]).cloned() {
                 let found = self.modules.iter().find_map(|m| {
                     m.unions.iter().find(|u| u.qualified == qualified).map(|u| {
-                        u.variants
-                            .iter()
-                            .map(|v| v.name.clone())
-                            .collect::<Vec<_>>()
+                        (
+                            u.variants
+                                .iter()
+                                .map(|v| v.name.clone())
+                                .collect::<Vec<_>>(),
+                            u.methods.iter().any(|mm| mm.name == callee[1]),
+                        )
                     })
                 });
-                if let Some(variants) = found {
-                    let display = callee[0].clone();
-                    for arg in args {
-                        self.resolve_expr(arg);
+                if let Some((variants, is_method)) = found {
+                    if is_method {
+                        // Fall through to imported method logic below.
+                    } else {
+                        let display = callee[0].clone();
+                        for arg in args {
+                            self.resolve_expr(arg);
+                        }
+                        return self.record_variant_use(
+                            callee_span,
+                            qualified,
+                            &variants,
+                            &callee[1],
+                            &display,
+                        );
                     }
-                    return self.record_variant_use(
-                        callee_span,
-                        qualified,
-                        &variants,
-                        &callee[1],
-                        &display,
-                    );
                 }
             }
         }
         if callee.len() >= 3 {
             let head = &callee[..callee.len() - 1];
             let variant = callee[callee.len() - 1].clone();
-            if let Some((canonical, variants)) = self.canonical_union_head(head) {
-                let display = head.join(".");
-                for arg in args {
-                    self.resolve_expr(arg);
+            // Lowercase tails name methods (`Box.wrap`), not variants
+            // (`Box.Full`); fall through to method handling below.
+            let is_method_spelling = variant.chars().next().is_some_and(|c| c.is_lowercase());
+            if !is_method_spelling {
+                if let Some((canonical, variants)) = self.canonical_union_head(head) {
+                    let display = head.join(".");
+                    for arg in args {
+                        self.resolve_expr(arg);
+                    }
+                    return self.record_variant_use(
+                        callee_span,
+                        canonical,
+                        &variants,
+                        &variant,
+                        &display,
+                    );
                 }
-                return self.record_variant_use(
-                    callee_span,
-                    canonical,
-                    &variants,
-                    &variant,
-                    &display,
-                );
             }
         }
         if self.poisoned_imports.contains(&full) || self.poisoned_imports.contains(&callee[0]) {
@@ -2397,8 +2554,11 @@ impl Resolver {
             }
             return true;
         }
-        // Local `Type.method`.
-        if callee.len() == 2 && self.local_objects.contains(&callee[0]) {
+        // Local `Type.method` (objects and unions).
+        if callee.len() == 2
+            && (self.local_objects.contains(&callee[0])
+                || self.local_unions.contains_key(&callee[0]))
+        {
             if let Some(id) = self
                 .assoc
                 .get(&(callee[0].clone(), callee[1].clone()))
@@ -2415,7 +2575,11 @@ impl Resolver {
                         callee_span,
                         self.local_fields
                             .get(&callee[0])
-                            .is_some_and(|fields| fields.contains(&callee[1])),
+                            .is_some_and(|fields| fields.contains(&callee[1]))
+                            || self
+                                .local_unions
+                                .get(&callee[0])
+                                .is_some_and(|vs| vs.contains(&callee[1])),
                     ),
                 );
             }
@@ -2514,6 +2678,100 @@ impl Resolver {
                 }
             }
         }
+        // Bare imported union `Type.method` (mirrors objects above).
+        if callee.len() == 2 && !self.local_objects.contains(&callee[0]) {
+            if let Some(qualified) = self.imported_types.get(&callee[0]).cloned() {
+                let provider = self.modules.iter().find_map(|m| {
+                    m.unions
+                        .iter()
+                        .find(|u| u.qualified == qualified)
+                        .map(|u| (m.clone(), u.clone()))
+                });
+                if let Some((spec, uni)) = provider {
+                    let method = callee[1].clone();
+                    let dotted = format!("{}.{}", uni.name, method);
+                    if spec.poisoned_exports.iter().any(|e| e == &dotted) {
+                        let id = self.external_def(
+                            full.clone(),
+                            callee_span,
+                            None,
+                            DefKind::ImportedFunction,
+                            None,
+                        );
+                        self.out
+                            .uses
+                            .insert((callee_span.start, callee_span.end), id);
+                        for arg in args {
+                            self.resolve_expr(arg);
+                        }
+                        return true;
+                    }
+                    match uni.lookup_method(&method) {
+                        None => {
+                            // Fall through to sugar/error below; avoid duplicate
+                            // missing-method diagnostic here when the union has
+                            // no such method (the call will resolve as value
+                            // or report below). To match objects, report now
+                            // only if no variant with that name exists.
+                            if !uni.variants.iter().any(|v| v.name == method) {
+                                self.diags.push(self.missing_method_diag(
+                                    &uni.qualified,
+                                    &method,
+                                    callee_span,
+                                    false,
+                                ));
+                            }
+                        }
+                        Some(export) => {
+                            if spec.global_dependent_exports.iter().any(|e| e == &dotted) {
+                                self.diags.push(
+                                    Diagnostic::error(format!(
+                                        "imported function `{}.{}` depends on module globals",
+                                        spec.path.as_string(),
+                                        dotted
+                                    ))
+                                    .with_label(callee_span, "unsupported cross-module boundary")
+                                    .with_code("E208"),
+                                );
+                                self.poisoned_imports.insert(full.clone());
+                                let id = self.external_def(
+                                    full,
+                                    callee_span,
+                                    None,
+                                    DefKind::ImportedFunction,
+                                    None,
+                                );
+                                self.out
+                                    .uses
+                                    .insert((callee_span.start, callee_span.end), id);
+                                for arg in args {
+                                    self.resolve_expr(arg);
+                                }
+                                return true;
+                            }
+                            let id = self.external_def_with_kind(
+                                full,
+                                callee_span,
+                                Some(export.sig.clone()),
+                                Some(export.kind),
+                                DefKind::ImportedFunction,
+                                Some(SymbolRef {
+                                    module: spec.path.clone(),
+                                    name: dotted,
+                                }),
+                            );
+                            self.out
+                                .uses
+                                .insert((callee_span.start, callee_span.end), id);
+                            for arg in args {
+                                self.resolve_expr(arg);
+                            }
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
         // Instance sugar `head.rest.method(args)`: the head is a bound value.
         // Shadowing an import is E206 at the declaration, but resolution still
         // prefers the bound value here for recovery (like bare names); the
@@ -2559,15 +2817,78 @@ impl Resolver {
             }
             match spec.objects.iter().find(|o| o.name == callee[1]) {
                 None => {
-                    self.diags.push(
-                        Diagnostic::error(format!(
-                            "module `{}` has no object type `{}`",
-                            spec.path.as_string(),
-                            callee[1]
-                        ))
-                        .with_label(callee_span, "unknown object type")
-                        .with_code("E302"),
-                    );
+                    // Try unions before reporting (mirrors bare-import handling).
+                    if let Some(uni) = spec.unions.iter().find(|u| u.name == callee[1]) {
+                        match uni.lookup_method(&callee[2]) {
+                            None => {
+                                self.diags.push(self.missing_method_diag(
+                                    &uni.qualified,
+                                    &callee[2],
+                                    callee_span,
+                                    uni.variants.iter().any(|v| v.name == callee[2]),
+                                ));
+                            }
+                            Some(export) => {
+                                if spec.global_dependent_exports.iter().any(|e| e == &dotted) {
+                                    self.diags.push(
+                                        Diagnostic::error(format!(
+                                            "imported function `{}.{}` depends on module globals",
+                                            spec.path.as_string(),
+                                            dotted
+                                        ))
+                                        .with_label(
+                                            callee_span,
+                                            "unsupported cross-module boundary",
+                                        )
+                                        .with_code("E208"),
+                                    );
+                                    self.poisoned_imports.insert(full.clone());
+                                    let id = self.external_def(
+                                        full,
+                                        callee_span,
+                                        None,
+                                        DefKind::ImportedFunction,
+                                        None,
+                                    );
+                                    self.out
+                                        .uses
+                                        .insert((callee_span.start, callee_span.end), id);
+                                    for arg in args {
+                                        self.resolve_expr(arg);
+                                    }
+                                    return true;
+                                }
+                                let id = self.external_def_with_kind(
+                                    full,
+                                    callee_span,
+                                    Some(export.sig.clone()),
+                                    Some(export.kind),
+                                    DefKind::ImportedFunction,
+                                    Some(SymbolRef {
+                                        module: spec.path.clone(),
+                                        name: dotted,
+                                    }),
+                                );
+                                self.out
+                                    .uses
+                                    .insert((callee_span.start, callee_span.end), id);
+                                for arg in args {
+                                    self.resolve_expr(arg);
+                                }
+                                return true;
+                            }
+                        }
+                    } else {
+                        self.diags.push(
+                            Diagnostic::error(format!(
+                                "module `{}` has no object type `{}`",
+                                spec.path.as_string(),
+                                callee[1]
+                            ))
+                            .with_label(callee_span, "unknown object type")
+                            .with_code("E302"),
+                        );
+                    }
                 }
                 Some(obj) => match obj.lookup_method(&callee[2]) {
                     None => {
@@ -3174,9 +3495,10 @@ mod tests {
             .expect("new export");
         assert_eq!(
             new.sig.ret,
-            vl_common::VlType::Mutable(Box::new(vl_common::VlType::Object(
-                "vl.person.Person".into()
-            )))
+            vl_common::VlType::Mutable(Box::new(vl_common::VlType::Object {
+                name: "vl.person.Person".into(),
+                args: Vec::new()
+            }))
         );
         let print = interface
             .functions
@@ -3185,7 +3507,10 @@ mod tests {
             .expect("print_name export");
         assert_eq!(
             print.sig.params[0].ty,
-            vl_common::VlType::Object("vl.person.Person".into())
+            vl_common::VlType::Object {
+                name: "vl.person.Person".into(),
+                args: Vec::new()
+            }
         );
     }
 
@@ -3390,14 +3715,18 @@ mod tests {
         let init = counter.lookup_method("init").expect("init export");
         assert_eq!(
             init.sig.ret,
-            vl_common::VlType::Mutable(Box::new(vl_common::VlType::Object(
-                "demo.count.Counter".into()
-            )))
+            vl_common::VlType::Mutable(Box::new(vl_common::VlType::Object {
+                name: "demo.count.Counter".into(),
+                args: Vec::new()
+            }))
         );
         let get = counter.lookup_method("get").expect("get export");
         assert_eq!(
             get.sig.params[0].ty,
-            vl_common::VlType::Object("demo.count.Counter".into())
+            vl_common::VlType::Object {
+                name: "demo.count.Counter".into(),
+                args: Vec::new()
+            }
         );
     }
 

@@ -92,9 +92,21 @@ impl<'a> Fmt<'a> {
                 self.out.push(']');
             }
             Expr::ObjectLiteral {
-                name, fields, span, ..
+                name,
+                type_args,
+                fields,
+                span,
+                ..
             } if !fields.is_empty() && self.list_needs_multi(e) => {
                 self.out.push_str(name);
+                if !type_args.is_empty() {
+                    let inner = type_args
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.out.push_str(&format!("::[{inner}]"));
+                }
                 self.out.push_str(" {\n");
                 for (field, _, value) in fields {
                     // The field name span approximates the element start.
@@ -237,8 +249,21 @@ impl<'a> Fmt<'a> {
                 }
                 self.out.push(']');
             }
-            Expr::ObjectLiteral { name, fields, .. } => {
+            Expr::ObjectLiteral {
+                name,
+                type_args,
+                fields,
+                ..
+            } => {
                 self.out.push_str(name);
+                if !type_args.is_empty() {
+                    let inner = type_args
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.out.push_str(&format!("::[{inner}]"));
+                }
                 self.out.push_str(" { ");
                 for (i, (field, _, value)) in fields.iter().enumerate() {
                     if i > 0 {

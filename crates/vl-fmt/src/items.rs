@@ -46,24 +46,30 @@ impl<'a> Fmt<'a> {
             Item::Use { path, names, .. } => self.use_item(path, names, span, level),
             Item::Object {
                 name,
+                type_params,
                 fields,
                 methods,
                 ..
-            } => self.object_decl(name, fields, methods, span, level),
+            } => self.object_decl(name, type_params, fields, methods, span, level),
             Item::Union {
                 name,
                 type_params,
                 variants,
+                methods,
                 ..
             } => {
-                let heads: Vec<(String, usize)> = variants
-                    .iter()
-                    .map(|v| {
-                        let end = v.payload.last().map_or(v.name_span.end, |(_, s)| s.end);
-                        (variant_head(&v.name, &v.payload), end)
-                    })
-                    .collect();
-                self.nominal_decl(name, Some(type_params), "union", &heads, span, level);
+                if methods.is_empty() {
+                    let heads: Vec<(String, usize)> = variants
+                        .iter()
+                        .map(|v| {
+                            let end = v.payload.last().map_or(v.name_span.end, |(_, s)| s.end);
+                            (variant_head(&v.name, &v.payload), end)
+                        })
+                        .collect();
+                    self.nominal_decl(name, Some(type_params), "union", &heads, span, level);
+                } else {
+                    self.union_decl(name, type_params, variants, methods, span, level);
+                }
             }
             Item::Error { name, variants, .. } => {
                 let heads: Vec<(String, usize)> = variants
@@ -247,12 +253,17 @@ impl<'a> Fmt<'a> {
     fn object_decl(
         &mut self,
         name: &str,
+        type_params: &[TypeParam],
         fields: &[vl_syntax::ObjectField],
         methods: &[AssociatedFn],
         span: Span,
         level: usize,
     ) {
-        self.out.push_str(&format!("type {name} = object "));
+        self.out.push_str(&format!("type {name}"));
+        if !type_params.is_empty() {
+            self.emit_type_params(type_params, level);
+        }
+        self.out.push_str(" = object ");
         if fields.is_empty() && methods.is_empty() {
             let open = self.find_open_brace(span.start);
             let close = self.matching_close(open);
@@ -314,6 +325,72 @@ impl<'a> Fmt<'a> {
                     self.out.push(',');
                 }
                 Member::Method(m) => {
+                    self.method(m, level + 1);
+                    self.out.push(',');
+                }
+            }
+            if let Some(comment) = self.trailing(*end) {
+                self.out.push(' ');
+                self.out.push_str(&comment);
+            }
+            self.out.push('\n');
+        }
+        self.lead(close, level + 1, true);
+        self.out.push_str(&indent(level));
+        self.out.push_str("};");
+    }
+
+    /// Union with associated functions: variants plus `fun` members in
+    /// source order (like objects).
+    fn union_decl(
+        &mut self,
+        name: &str,
+        type_params: &[TypeParam],
+        variants: &[vl_syntax::UnionVariant],
+        methods: &[AssociatedFn],
+        span: Span,
+        level: usize,
+    ) {
+        self.out.push_str(&format!("type {name}"));
+        if !type_params.is_empty() {
+            self.emit_type_params(type_params, level);
+        }
+        self.out.push_str(" = union ");
+        enum UMember<'x> {
+            Variant(&'x vl_syntax::UnionVariant),
+            Method(&'x AssociatedFn),
+        }
+        let mut members: Vec<(usize, usize, UMember)> = Vec::new();
+        for v in variants {
+            let end = v.payload.last().map_or(v.name_span.end, |(_, s)| s.end);
+            members.push((v.name_span.start, end, UMember::Variant(v)));
+        }
+        for m in methods {
+            members.push((m.span.start, m.span.end, UMember::Method(m)));
+        }
+        members.sort_by_key(|(start, _, _)| *start);
+        let open = self.find_open_brace(span.start);
+        let close = self.matching_close(open);
+        self.lead(open, level + 1, true);
+        self.out.push_str("{\n");
+        for (i, (start, end, member)) in members.iter().enumerate() {
+            self.lead(*start, level + 1, i == 0);
+            self.out.push_str(&indent(level + 1));
+            match member {
+                UMember::Variant(v) => {
+                    self.out.push_str(&v.name);
+                    if !v.payload.is_empty() {
+                        let inner = v
+                            .payload
+                            .iter()
+                            .map(|(ty, _)| ty.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        self.out.push_str(&format!("({inner})"));
+                    }
+                    self.out.push(',');
+                }
+                UMember::Method(m) => {
                     self.method(m, level + 1);
                     self.out.push(',');
                 }

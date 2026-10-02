@@ -1119,6 +1119,7 @@ mod tests {
                 name: "A".into(),
                 payload: Vec::new(),
             }],
+            methods: vec![],
         });
         let stdlib = Stdlib {
             bodies: HashMap::new(),

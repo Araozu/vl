@@ -48,13 +48,14 @@
     },
     "type-definition": {
       "name": "meta.type.definition.vl",
-      "begin": "\\b(type)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(=)\\s*(object)\\s*(\\{)",
+      "begin": "\\b(type)\\s+([A-Za-z_][A-Za-z0-9_]*)(\\s*\\[[^\\]]+\\])?\\s*(=)\\s*(object)\\s*(\\{)",
       "beginCaptures": {
         "1": { "name": "keyword.declaration.vl" },
         "2": { "name": "entity.name.type.vl" },
-        "3": { "name": "keyword.operator.assignment.vl" },
-        "4": { "name": "keyword.declaration.vl" },
-        "5": { "name": "punctuation.bracket.curly.vl" }
+        "3": { "name": "meta.type.parameters.vl" },
+        "4": { "name": "keyword.operator.assignment.vl" },
+        "5": { "name": "keyword.declaration.vl" },
+        "6": { "name": "punctuation.bracket.curly.vl" }
       },
       "end": "\\}",
       "endCaptures": {
@@ -100,6 +101,8 @@
       },
       "patterns": [
         { "include": "#comment" },
+        { "include": "#function-definition" },
+        { "include": "#block" },
         { "include": "#type" },
         { "include": "#tuple" },
         {

@@ -287,9 +287,47 @@ fn collect_quiet(formal: &Ty, actual: &Ty, per_param: &mut HashMap<String, Vec<T
             true
         }
         (Ty::Array(f), Ty::Array(a)) => collect_quiet(f, a, per_param),
+        (Ty::Union(fu), Ty::Union(au)) if fu.name == au.name && fu.args.len() == au.args.len() => {
+            for (f, a) in fu.args.iter().zip(au.args.iter()) {
+                if !collect_quiet(f, a, per_param) {
+                    return false;
+                }
+            }
+            true
+        }
+        (Ty::Object(fo), Ty::Object(ao))
+            if fo.name == ao.name && fo.args.len() == ao.args.len() =>
+        {
+            for (f, a) in fo.args.iter().zip(ao.args.iter()) {
+                if !collect_quiet(f, a, per_param) {
+                    return false;
+                }
+            }
+            true
+        }
+        (Ty::Tuple(fs), Ty::Tuple(as_)) if fs.len() == as_.len() => {
+            for ((_, f), (_, a)) in fs.iter().zip(as_.iter()) {
+                if !collect_quiet(f, a, per_param) {
+                    return false;
+                }
+            }
+            true
+        }
         (Ty::Mutable(f), Ty::Mutable(a)) => collect_quiet(f, a, per_param),
         (Ty::Array(_), Ty::Mutable(inner)) => match &**inner {
             Ty::Array(_) => collect_quiet(formal, inner, per_param),
+            _ => false,
+        },
+        (Ty::Object(fo), Ty::Mutable(inner)) => match &**inner {
+            Ty::Object(ao) if fo.name == ao.name && fo.args.len() == ao.args.len() => {
+                collect_quiet(formal, inner, per_param)
+            }
+            _ => false,
+        },
+        (Ty::Union(fu), Ty::Mutable(inner)) => match &**inner {
+            Ty::Union(au) if fu.name == au.name && fu.args.len() == au.args.len() => {
+                collect_quiet(formal, inner, per_param)
+            }
             _ => false,
         },
         (Ty::Mutable(f), _) => collect_quiet(f, actual, per_param),

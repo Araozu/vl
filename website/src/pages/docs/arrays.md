@@ -170,6 +170,10 @@ Each concrete use of a generic function gets its own compiled copy. A
 generic function that is never called produces no copy, and `main` itself
 cannot be generic.
 
+Generic functions also work across files: import one and call it as usual —
+each concrete use is compiled once in the module that defines it. See
+[modules](/docs/modules).
+
 ## Constrained generics
 
 An unconstrained `T` can only be moved around, not computed with. Bounds

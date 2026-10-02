@@ -36,8 +36,14 @@ pub enum VlType {
     U8,
     String,
     File,
-    /// A user-defined nominal object type. Objects have reference semantics.
-    Object(String),
+    /// A user-defined nominal object type, possibly generic (`List`, `List[u64]`).
+    /// Reference semantics (heap-allocated layout); always constructed through
+    /// an object literal and read through field access. Generic arguments align
+    /// positionally with the declared type parameters.
+    Object {
+        name: String,
+        args: Vec<VlType>,
+    },
     /// A nominal union instantiation (`Option`, `Option[u64]`). Reference
     /// semantics (heap-allocated tag + payload); always constructed through a
     /// variant (`Option.Some(...)`) and read through `match`.
@@ -85,7 +91,20 @@ impl fmt::Display for VlType {
             VlType::U8 => write!(f, "u8"),
             VlType::String => write!(f, "String"),
             VlType::File => write!(f, "File"),
-            VlType::Object(name) => write!(f, "{name}"),
+            VlType::Object { name, args } => {
+                write!(f, "{name}")?;
+                if !args.is_empty() {
+                    write!(f, "[")?;
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{arg}")?;
+                    }
+                    write!(f, "]")?;
+                }
+                Ok(())
+            }
             VlType::Union { name, args } => {
                 write!(f, "{name}")?;
                 if !args.is_empty() {
@@ -178,6 +197,7 @@ impl VlType {
             VlType::Array(elem) => elem.is_void(),
             VlType::Tuple(fields) => fields.iter().any(|f| f.ty.is_void()),
             VlType::Union { args, .. } => args.iter().any(|a| a.is_void()),
+            VlType::Object { args, .. } => args.iter().any(|a| a.is_void()),
             // `E!void` is void (return position only); a bare set never is.
             VlType::Fallible { ok, .. } => ok.is_void(),
             _ => false,
@@ -211,7 +231,7 @@ impl VlType {
     pub fn is_reference_type(&self) -> bool {
         match self {
             VlType::String | VlType::File => true,
-            VlType::Object(_) => true,
+            VlType::Object { .. } => true,
             VlType::Union { .. } => true,
             VlType::Nullable(_) => true,
             // Fallible values are heap tag+payload containers (like unions);
@@ -259,6 +279,10 @@ impl VlType {
                 ok: Box::new(ok.erase_capability()),
             },
             VlType::Array(elem) => VlType::Array(Box::new(elem.erase_capability())),
+            VlType::Object { name, args } => VlType::Object {
+                name: name.clone(),
+                args: args.iter().map(|a| a.erase_capability()).collect(),
+            },
             VlType::Union { name, args } => VlType::Union {
                 name: name.clone(),
                 args: args.iter().map(|a| a.erase_capability()).collect(),
@@ -315,7 +339,7 @@ impl VlType {
                     | VlType::ErrorSet(_) => {
                         Some(format!("`*{inner}` is not a reference type"))
                     }
-                    VlType::String | VlType::File | VlType::Object(_) | VlType::Union { .. } | VlType::Nullable(_) | VlType::Array(_) | VlType::Tuple(_) => {
+                    VlType::String | VlType::File | VlType::Object { .. } | VlType::Union { .. } | VlType::Nullable(_) | VlType::Array(_) | VlType::Tuple(_) => {
                         // The payload itself may still be malformed
                         // (e.g. `*Array[*u64]`).
                         inner.mutable_wellformed_error()
@@ -323,6 +347,7 @@ impl VlType {
                 }
             }
             VlType::Array(elem) => elem.mutable_wellformed_error(),
+            VlType::Object { args, .. } => args.iter().find_map(|a| a.mutable_wellformed_error()),
             VlType::Nullable(inner) => inner.mutable_wellformed_error(),
             VlType::Fallible { ok, .. } => ok.mutable_wellformed_error(),
             VlType::Tuple(fields) => fields.iter().find_map(|f| f.ty.mutable_wellformed_error()),
@@ -369,7 +394,10 @@ mod tests {
     use super::*;
 
     fn obj(name: &str) -> VlType {
-        VlType::Object(name.into())
+        VlType::Object {
+            name: name.into(),
+            args: Vec::new(),
+        }
     }
 
     #[test]

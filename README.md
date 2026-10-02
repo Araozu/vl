@@ -218,6 +218,25 @@ target concepts. See the [lexical grammar](crates/vl-lex/GRAMMAR.md) and
 
 ## Roadmap
 
-1. Harden/add more `vl-codegen` backends.
-2. Expand `std.fs` beyond `read_file`, add standard input, clocks, and random values, and expose the VM's existing process arguments and exit calls to VL. Checked `std.parse` helpers are implemented in VL; the older `std.string.to_u64` / `hex_to_u64` VM natives still trap on invalid input.
-3. Bytecode/assembly emission + runner.
+Shipped in v0: multi-file projects with cross-module imports (functions,
+object and union types, generic functions — including the generic
+`std.math.max[T extends Numeric]` helper), `object` types with associated
+functions and instance sugar, `union` types with `match`, `?T` nullables,
+Zig-style `error` sets with `E!T` / `try` / `catch`, tuples, bounded
+generics (`Numeric`, `Comparable`), `Array.new` + literals + `a.len`,
+`vl fmt`, JSON diagnostics + stdin input, and the `vl lsp` language server —
+all on the Naravm target.
+
+In progress: `defer` cleanup semantics.
+
+Generic `object` types have shipped (`type List[T] = object { ... };`, see
+`examples/generic_objects.vl`), as have `union` associated functions
+(see `examples/generic_union_methods.vl`).
+
+Still deferred: cross-module globals, standard input, clocks, random values,
+process bindings, and `std.fs` file handles (`get_stdout`/`write`), richer `FsError` codes (the VM
+reports one failure code today), more `vl-codegen` backends, and
+bytecode/assembly emission + runner.
+
+Checked `std.parse` helpers are implemented in VL. The older
+`std.string.to_u64` / `hex_to_u64` VM natives still trap on invalid input.

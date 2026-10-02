@@ -18,9 +18,9 @@ destructure_binding := ident (":" ident)?
 function_item := "fun" ident type_params? "(" params? ")" (":" type)? block
 type_params := "[" type_param ("," type_param)* "]"
 type_param := ident ("extends" ("Numeric" | "Comparable"))?
-object_item := "type" ident "=" "object" "{" object_member* "}" ";"
-union_item := "type" ident type_params? "=" "union" "{" union_variants? "}" ";"
-union_variants := union_variant ("," union_variant)* ","?
+object_item := "type" ident type_params? "=" "object" "{" object_member* "}" ";"
+union_item := "type" ident type_params? "=" "union" "{" union_member* "}" ";"
+union_member := union_variant ("," union_variant)* ","? | assoc_fn
 union_variant := ident ("(" type ("," type)* ")")?
 error_item := "type" ident "=" "error" "{" error_variants? "}" ";"
 error_variants := error_variant ("," error_variant)* ","?
@@ -78,7 +78,8 @@ primary  := literal | string | "null" | array_literal | tuple_literal | object_l
          ; `null` is the empty value of any `?T` (sugar for the builtin `Option.None`; needs an annotation)
 tuple_literal := "#" "(" tuple_elem ("," tuple_elem)* ","? ")"
 tuple_elem := (ident "=")? expr
-object_literal := ident "{" (ident "=" expr ("," ident "=" expr)* ","?)? "}"
+object_literal := ident ("::" "[" type ("," type)* "]")? "{" (ident "=" expr ("," ident "=" expr)* ","?)? "}"
+             ; bare `List { ... }` infers arguments; explicit `List::[u64] { ... }` passes them
 array_literal := "[" (expr ("," expr)* ","?)? "]"
 args     := expr ("," expr)*
 literal  := int | i64 | u64 | f64 | u8 | bool
