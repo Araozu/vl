@@ -553,6 +553,7 @@ fn write_project_output(path: &Path, output: &ProjectOutput) -> Result<(), Strin
 /// Full frontend: returns typed artifacts or the collected diagnostics.
 struct Frontend {
     lir: vl_lir::LirProgram,
+    diags: Vec<vl_common::Diagnostic>,
 }
 
 /// Embedded standard library, loaded once: `std.string` / `std.math` /
@@ -589,10 +590,10 @@ fn run_frontend_check(
     text: &str,
     modules: &[vl_common::ModuleSpec],
     module: &str,
-) -> Result<(), Vec<vl_common::Diagnostic>> {
+) -> Result<Vec<vl_common::Diagnostic>, Vec<vl_common::Diagnostic>> {
     let catalog = modules_with_stdlib(modules);
     let extra = stdlib_world_refs();
-    vl_frontend::check_text(text, module, &catalog, &extra).map(|_| ())
+    vl_frontend::check_text(text, module, &catalog, &extra).map(|ok| ok.diags)
 }
 
 fn run_frontend(
@@ -612,7 +613,10 @@ fn run_frontend(
     // explicitly below. This preserves the existing single-file CLI behavior.
     lir.entrypoint = true;
     lir.entrypoint_module = Some(module.to_owned());
-    Ok(Frontend { lir })
+    Ok(Frontend {
+        lir,
+        diags: ok.diags,
+    })
 }
 
 fn main() -> ExitCode {
@@ -766,10 +770,11 @@ fn check_single_text(name: &str, text: &str, module: &str, fmt: Format) -> ExitC
     // after validation (no lowering).
     let modules = vl_codegen::modules();
     match run_frontend_check(text, &modules, module) {
-        Ok(_) => {
+        Ok(diags) => {
             if json {
-                emit_json(&[]);
+                emit_json(&[(name, text, diags.as_slice())]);
             } else {
+                emit_all(&diags, name, text);
                 write_out(&None, &format!("ok: {name} checks clean\n"));
             }
             ExitCode::SUCCESS
@@ -887,19 +892,22 @@ fn build_single(
     };
 
     if let Some(dump) = matches!(emit, Some(Emit::Lir)).then(|| fe.lir.dump()) {
-        let diags = try_write_out(out, dump.as_bytes())
-            .err()
-            .into_iter()
-            .collect::<Vec<_>>();
+        let mut diags = fe.diags;
+        let write_failed = if let Err(diag) = try_write_out(out, dump.as_bytes()) {
+            diags.push(diag);
+            true
+        } else {
+            false
+        };
         if json {
             emit_json(&[(name.as_str(), text.as_str(), diags.as_slice())]);
         } else {
             emit_all(&diags, &name, &text);
         }
-        return if diags.is_empty() {
-            ExitCode::SUCCESS
-        } else {
+        return if write_failed {
             ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
         };
     }
 
@@ -917,19 +925,21 @@ fn build_single(
         return ExitCode::from(2);
     };
 
-    let (artifact, mut backend_diags) = backend.emit(&fe.lir);
+    let (artifact, backend_diags) = backend.emit(&fe.lir);
+    let mut diags = fe.diags;
+    diags.extend(backend_diags);
     let write_failed = artifact.as_ref().is_some_and(|a| {
         if let Err(diag) = write_artifact(out, a) {
-            backend_diags.push(diag);
+            diags.push(diag);
             true
         } else {
             false
         }
     });
     let failed = if json {
-        emit_json(&[(name.as_str(), text.as_str(), backend_diags.as_slice())])
+        emit_json(&[(name.as_str(), text.as_str(), diags.as_slice())])
     } else {
-        emit_all(&backend_diags, &name, &text)
+        emit_all(&diags, &name, &text)
     };
     if write_failed {
         ExitCode::from(2)
@@ -981,12 +991,13 @@ fn compile_project_source(
     if matches!(emit, Some(Emit::Lir)) {
         return ProjectFileBuild {
             output: Some(ProjectOutput::Text(frontend.lir.dump())),
-            diags: Vec::new(),
+            diags: frontend.diags,
         };
     }
 
     let backend = vl_codegen::lookup(target).expect("project target was validated before building");
-    let (artifact, diags) = backend.emit(&frontend.lir);
+    let (artifact, mut diags) = backend.emit(&frontend.lir);
+    diags.extend(frontend.diags);
     let output = artifact.map(|artifact| match artifact.bytes {
         Some(bytes) => ProjectOutput::Bytes(bytes),
         None => ProjectOutput::Text(artifact.text),

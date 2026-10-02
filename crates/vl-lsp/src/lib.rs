@@ -98,6 +98,7 @@ pub fn module_for_uri(uri: &Url) -> String {
 pub struct Analysis {
     pub text: String,
     pub module: String,
+    pub catalog: Vec<ModuleSpec>,
     pub program: Program,
     pub frontend: Result<FrontendOk, Vec<Diagnostic>>,
     /// Name resolution for hover/goto-definition. Re-resolved over the
@@ -123,21 +124,22 @@ pub fn analyze(text: &str, module: &str, catalog: &[ModuleSpec]) -> Analysis {
     // `FrontendOk`; re-resolve uniformly instead (cheap, pure) so hover and
     // goto-definition share one path for clean and broken files alike.
     let resolution = best_effort_resolution(&program, catalog);
-    let mut analysis = Analysis {
+    let diags = match &frontend {
+        Ok(ok) => ok.diags.clone(),
+        Err(diags) => diags.clone(),
+    };
+    Analysis {
         text: text.to_owned(),
         module: module.to_owned(),
+        catalog: catalog.to_vec(),
         program,
         frontend: match frontend {
             Ok(ok) => Ok(ok),
             Err(diags) => Err(diags),
         },
         resolution,
-        diags: Vec::new(),
-    };
-    if let Err(diags) = &analysis.frontend {
-        analysis.diags = diags.clone();
+        diags,
     }
-    analysis
 }
 
 /// Best-effort name resolution over a parsed program, ignoring the returned
@@ -335,6 +337,20 @@ pub struct CursorDef<'a> {
     pub highlight: Span,
 }
 
+fn module_alias_import_span(program: &Program, alias: &str) -> Option<Span> {
+    program.items.iter().find_map(|item| match item {
+        Item::Use { path, names, span }
+            if names
+                .as_ref()
+                .is_none_or(|names| names.iter().any(|name| name == "self"))
+                && path.last().is_some_and(|leaf| leaf == alias) =>
+        {
+            Some(*span)
+        }
+        _ => None,
+    })
+}
+
 /// Find the definition under `offset`: the narrowest use-span containing it,
 /// else the def-site span containing it.
 pub fn def_at_offset<'a>(resolution: &'a Resolution, offset: usize) -> Option<CursorDef<'a>> {
@@ -438,9 +454,19 @@ pub fn hover_at(analysis: &Analysis, offset: usize) -> Option<(String, Range)> {
     } else {
         format!("{} {}", def_kind_label(def), def.name)
     };
-    let defined_line = offset_to_position(&analysis.text, def.span.start).line + 1;
+    let defined_at = match def.kind {
+        DefKind::Local | DefKind::Parameter => Some(def.span),
+        DefKind::ModuleAlias => module_alias_import_span(&analysis.program, &def.name),
+        DefKind::External | DefKind::ImportedFunction => None,
+    };
+    let location = defined_at
+        .map(|span| {
+            let line = offset_to_position(&analysis.text, span.start).line + 1;
+            format!(" · defined at line {line}")
+        })
+        .unwrap_or_default();
     let contents = format!(
-        "```vl\n{headline}\n```\n\n*{}* · defined at line {defined_line}",
+        "```vl\n{headline}\n```\n\n*{}*{location}",
         def_kind_label(def)
     );
     Some((contents, span_to_range(&analysis.text, cursor.highlight)))
@@ -450,11 +476,15 @@ pub fn hover_at(analysis: &Analysis, offset: usize) -> Option<(String, Range)> {
 /// same (single-file documents in this milestone).
 pub fn definition_at(analysis: &Analysis, uri: &Url, offset: usize) -> Option<Location> {
     let cursor = def_at_offset(&analysis.resolution, offset)?;
-    // A use of a module alias points at the alias itself; everything else
-    // points at the definition site.
+    let span = match cursor.def.kind {
+        DefKind::Local | DefKind::Parameter => cursor.def.span,
+        DefKind::ModuleAlias => module_alias_import_span(&analysis.program, &cursor.def.name)?,
+        // Imported symbols and native externals have no provider source URI.
+        DefKind::External | DefKind::ImportedFunction => return None,
+    };
     Some(Location {
         uri: uri.clone(),
-        range: span_to_range(&analysis.text, cursor.def.span),
+        range: span_to_range(&analysis.text, span),
     })
 }
 
@@ -613,19 +643,6 @@ pub const KEYWORDS: &[&str] = &[
     "break", "continue", "return", "null", "try", "catch", "as", "extends", "self",
 ];
 
-/// Span of one top-level item.
-fn item_span(item: &Item) -> Span {
-    match item {
-        Item::Use { span, .. }
-        | Item::Object { span, .. }
-        | Item::Union { span, .. }
-        | Item::Error { span, .. }
-        | Item::Let { span, .. }
-        | Item::Destructure { span, .. }
-        | Item::Function { span, .. } => *span,
-    }
-}
-
 /// Whether `span` lies inside `outer` (inclusive on both ends, so a cursor
 /// at an item boundary still counts as enclosed).
 fn contains(outer: Span, span: Span) -> bool {
@@ -635,8 +652,213 @@ fn contains(outer: Span, span: Span) -> bool {
 /// Complete at `offset`: keywords plus the names lexically visible there.
 /// Imports, functions, and top-level bindings are file-visible (once
 /// declared — no forward suggestions); parameters and body locals are only
-/// suggested inside their enclosing top-level item. Single-file scope in
-/// this milestone.
+/// suggested while their actual lexical scope is active.
+fn brace_scopes(text: &str) -> Vec<Span> {
+    let (tokens, _) = vl_lex::lex(text);
+    let mut stack = Vec::new();
+    let mut scopes = Vec::new();
+    for token in tokens {
+        match token.kind {
+            vl_lex::TokenKind::LBrace => stack.push(token.span.start),
+            vl_lex::TokenKind::RBrace => {
+                if let Some(start) = stack.pop() {
+                    scopes.push(Span::new(start, token.span.end));
+                }
+            }
+            _ => {}
+        }
+    }
+    for start in stack {
+        scopes.push(Span::new(start, text.len()));
+    }
+    scopes
+}
+
+fn point_in_scope(scope: Span, offset: usize) -> bool {
+    scope.start <= offset && offset <= scope.end
+}
+
+fn stmt_span(stmt: &vl_syntax::Stmt) -> Span {
+    use vl_syntax::Stmt;
+    match stmt {
+        Stmt::Let { span, .. }
+        | Stmt::Assign { span, .. }
+        | Stmt::IndexAssign { span, .. }
+        | Stmt::FieldAssign { span, .. }
+        | Stmt::TupleAssign { span, .. }
+        | Stmt::Destructure { span, .. }
+        | Stmt::If { span, .. }
+        | Stmt::Match { span, .. }
+        | Stmt::While { span, .. }
+        | Stmt::Break { span }
+        | Stmt::Continue { span }
+        | Stmt::Return { span, .. }
+        | Stmt::Defer { span, .. }
+        | Stmt::ErrDefer { span, .. } => *span,
+        Stmt::Expr(expr) => expr.span(),
+    }
+}
+
+fn list_scope(stmts: &[vl_syntax::Stmt], parent: Span, blocks: &[Span]) -> Span {
+    let first = stmts.first().map(stmt_span);
+    let last = stmts.last().map(stmt_span);
+    blocks
+        .iter()
+        .copied()
+        .filter(|block| contains(parent, *block))
+        .filter(|block| match (first, last) {
+            (Some(first), Some(last)) => contains(*block, first) && contains(*block, last),
+            _ => true,
+        })
+        .min_by_key(|block| block.len())
+        .unwrap_or_else(|| {
+            if stmts.len() == 1 {
+                stmt_span(&stmts[0])
+            } else {
+                parent
+            }
+        })
+}
+
+fn collect_stmt_bindings(
+    stmts: &[vl_syntax::Stmt],
+    scope: Span,
+    offset: usize,
+    blocks: &[Span],
+    visible: &mut std::collections::HashSet<(usize, usize)>,
+) {
+    if !point_in_scope(scope, offset) {
+        return;
+    }
+    for stmt in stmts {
+        let stmt_range = stmt_span(stmt);
+        if stmt_range.start > offset {
+            continue;
+        }
+        match stmt {
+            vl_syntax::Stmt::Let {
+                name_span, value, ..
+            } => {
+                if value.span().end <= offset {
+                    visible.insert((name_span.start, name_span.end));
+                }
+            }
+            vl_syntax::Stmt::Destructure {
+                bindings, value, ..
+            } => {
+                for binding in bindings {
+                    if value.span().end <= offset {
+                        visible.insert((binding.binding_span.start, binding.binding_span.end));
+                    }
+                }
+            }
+            vl_syntax::Stmt::If {
+                then_body,
+                else_body,
+                span,
+                ..
+            } => {
+                let then_scope = list_scope(then_body, *span, blocks);
+                collect_stmt_bindings(then_body, then_scope, offset, blocks, visible);
+                if let Some(body) = else_body {
+                    let branch_scope = list_scope(body, *span, blocks);
+                    collect_stmt_bindings(body, branch_scope, offset, blocks, visible);
+                }
+            }
+            vl_syntax::Stmt::While { body, span, .. } => {
+                let body_scope = list_scope(body, *span, blocks);
+                collect_stmt_bindings(body, body_scope, offset, blocks, visible);
+            }
+            vl_syntax::Stmt::Match {
+                arms,
+                else_body,
+                span,
+                ..
+            } => {
+                for arm in arms {
+                    let arm_scope = list_scope(&arm.body, arm.span, blocks);
+                    if point_in_scope(arm_scope, offset) {
+                        for (_, binding_span) in &arm.bindings {
+                            if binding_span.start <= offset {
+                                visible.insert((binding_span.start, binding_span.end));
+                            }
+                        }
+                    }
+                    collect_stmt_bindings(&arm.body, arm_scope, offset, blocks, visible);
+                }
+                if let Some(body) = else_body {
+                    let else_scope = list_scope(body, *span, blocks);
+                    collect_stmt_bindings(body, else_scope, offset, blocks, visible);
+                }
+            }
+            vl_syntax::Stmt::Defer { inner, .. } | vl_syntax::Stmt::ErrDefer { inner, .. } => {
+                collect_stmt_bindings(
+                    std::slice::from_ref(inner),
+                    stmt_span(inner),
+                    offset,
+                    blocks,
+                    visible,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn add_module_export(out: &mut Vec<(String, CompletionItemKind)>, spec: &ModuleSpec, name: &str) {
+    if spec.lookup(name).is_some() {
+        out.push((name.to_owned(), CompletionItemKind::FUNCTION));
+    }
+    if spec.lookup_object(name).is_some() {
+        out.push((name.to_owned(), CompletionItemKind::CLASS));
+    }
+    if spec.lookup_union(name).is_some() || spec.lookup_error(name).is_some() {
+        out.push((name.to_owned(), CompletionItemKind::ENUM));
+    }
+}
+
+fn import_completion_items(analysis: &Analysis) -> Vec<(String, CompletionItemKind)> {
+    let mut out = Vec::new();
+    let module_for_path = |path: &[String]| {
+        analysis
+            .catalog
+            .iter()
+            .find(|spec| spec.path.segments() == path)
+    };
+    for item in &analysis.program.items {
+        let Item::Use { path, names, .. } = item else {
+            continue;
+        };
+        if let Some(spec) = module_for_path(path) {
+            match names {
+                None => {
+                    if let Some(leaf) = path.last() {
+                        out.push((leaf.clone(), CompletionItemKind::MODULE));
+                    }
+                }
+                Some(names) => {
+                    for name in names {
+                        if name == "self" {
+                            if let Some(leaf) = path.last() {
+                                out.push((leaf.clone(), CompletionItemKind::MODULE));
+                            }
+                        } else {
+                            add_module_export(&mut out, spec, name);
+                        }
+                    }
+                }
+            }
+        } else if names.is_none() && path.len() >= 2 {
+            if let Some(spec) = module_for_path(&path[..path.len() - 1]) {
+                if let Some(leaf) = path.last() {
+                    add_module_export(&mut out, spec, leaf);
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn completion_at(analysis: &Analysis, offset: usize) -> Vec<CompletionItem> {
     let mut seen = std::collections::HashSet::new();
     let mut items = Vec::new();
@@ -651,27 +873,78 @@ pub fn completion_at(analysis: &Analysis, offset: usize) -> Vec<CompletionItem> 
     // Binding spans of top-level `let`/`destructure` items: file-visible
     // values (as opposed to function-body locals, which share the same
     // `Local` def kind but live inside a `Function` item span).
-    let mut top_level_values = std::collections::HashSet::new();
+    let mut visible_spans = std::collections::HashSet::new();
+    let blocks = brace_scopes(&analysis.text);
     for item in &analysis.program.items {
         match item {
-            Item::Let { name_span, .. } => {
-                top_level_values.insert((name_span.start, name_span.end));
+            Item::Let {
+                name_span, value, ..
+            } if value.span().end <= offset => {
+                visible_spans.insert((name_span.start, name_span.end));
             }
-            Item::Destructure { bindings, .. } => {
+            Item::Destructure {
+                bindings, value, ..
+            } => {
                 for binding in bindings {
-                    top_level_values.insert((binding.binding_span.start, binding.binding_span.end));
+                    if value.span().end <= offset {
+                        visible_spans
+                            .insert((binding.binding_span.start, binding.binding_span.end));
+                    }
+                }
+            }
+            Item::Function {
+                name_span,
+                params,
+                body,
+                span,
+                ..
+            } if point_in_scope(*span, offset) => {
+                let body_scope = list_scope(body, *span, &blocks);
+                if point_in_scope(body_scope, offset) {
+                    visible_spans.extend(
+                        params
+                            .iter()
+                            .filter(|p| p.name_span.start <= offset)
+                            .map(|p| (p.name_span.start, p.name_span.end)),
+                    );
+                    collect_stmt_bindings(body, body_scope, offset, &blocks, &mut visible_spans);
+                }
+                if name_span.start <= offset {
+                    visible_spans.insert((name_span.start, name_span.end));
+                }
+            }
+            Item::Function { name_span, .. } if name_span.start <= offset => {
+                visible_spans.insert((name_span.start, name_span.end));
+            }
+            Item::Object { methods, .. } | Item::Union { methods, .. } => {
+                for method in methods {
+                    if point_in_scope(method.span, offset) {
+                        let body_scope = list_scope(&method.body, method.span, &blocks);
+                        if !point_in_scope(body_scope, offset) {
+                            continue;
+                        }
+                        visible_spans.extend(
+                            method
+                                .params
+                                .iter()
+                                .filter(|p| p.name_span.start <= offset)
+                                .map(|p| (p.name_span.start, p.name_span.end)),
+                        );
+                        collect_stmt_bindings(
+                            &method.body,
+                            body_scope,
+                            offset,
+                            &blocks,
+                            &mut visible_spans,
+                        );
+                        visible_spans.insert((method.name_span.start, method.name_span.end));
+                    }
                 }
             }
             _ => {}
         }
     }
-    let enclosing = analysis
-        .program
-        .items
-        .iter()
-        .map(item_span)
-        .find(|span| span.start <= offset && offset <= span.end);
-    let mut names: Vec<(&String, CompletionItemKind)> = Vec::new();
+    let mut names: Vec<(String, CompletionItemKind)> = Vec::new();
     for def in &analysis.resolution.defs {
         let kind = match def.kind {
             DefKind::Parameter => CompletionItemKind::VARIABLE,
@@ -683,27 +956,30 @@ pub fn completion_at(analysis: &Analysis, offset: usize) -> Vec<CompletionItem> 
             DefKind::ModuleAlias => CompletionItemKind::MODULE,
         };
         let visible = match def.kind {
-            // Imports resolve file-wide.
-            DefKind::External | DefKind::ImportedFunction | DefKind::ModuleAlias => true,
-            // Functions and methods are file-visible once declared.
-            DefKind::Local if def.binding.is_none() => def.span.start <= offset,
-            // Values: file-visible when top-level and declared, otherwise
-            // confined to the enclosing item (function body, match arm, …).
-            _ => {
+            DefKind::External | DefKind::ImportedFunction | DefKind::ModuleAlias => false,
+            DefKind::Local if def.binding.is_none() => {
                 def.span.start <= offset
-                    && (top_level_values.contains(&(def.span.start, def.span.end))
-                        || enclosing.is_some_and(|span| contains(span, def.span)))
+                    && (visible_spans.contains(&(def.span.start, def.span.end))
+                        || (!def.name.contains('.')
+                            && analysis.program.items.iter().any(|item| {
+                                matches!(item, Item::Function { name, name_span, .. }
+                                if name == &def.name && name_span.start == def.span.start)
+                            })))
+            }
+            _ => {
+                def.span.start <= offset && visible_spans.contains(&(def.span.start, def.span.end))
             }
         };
         if visible {
-            names.push((&def.name, kind));
+            names.push((def.name.clone(), kind));
         }
     }
-    names.sort_by(|a, b| a.0.cmp(b.0));
+    names.extend(import_completion_items(analysis));
+    names.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, kind) in names {
         if seen.insert(name.clone()) {
             items.push(CompletionItem {
-                label: name.clone(),
+                label: name,
                 kind: Some(kind),
                 ..Default::default()
             });
@@ -1173,6 +1449,18 @@ mod tests {
     }
 
     #[test]
+    fn successful_analysis_publishes_frontend_warnings() {
+        let analysis = analyze_test("fun main() { val x = 1u64; val x = 2u64; x; }");
+        assert!(analysis
+            .diags
+            .iter()
+            .any(|d| d.severity == Severity::Warning));
+        assert!(diagnostics_for(&analysis)
+            .iter()
+            .any(|d| d.severity == Some(DiagnosticSeverity::WARNING)));
+    }
+
+    #[test]
     fn hover_shows_function_signature() {
         let text =
             "fun add(a: u64, b: u64): u64 { return a + b; }\nfun main() { add(1u64, 2u64); }\n";
@@ -1206,6 +1494,34 @@ mod tests {
         assert_eq!(
             loc.range.start,
             offset_to_position(text, text.find("fun add").unwrap() + 4)
+        );
+    }
+
+    #[test]
+    fn imported_definitions_have_no_fabricated_provider_location() {
+        let exports: &[vl_common::ExportDecl<'_>] = &[(
+            "print",
+            &[("s", vl_common::VlType::String)],
+            vl_common::VlType::Void,
+        )];
+        let catalog = vec![ModuleSpec::new(&["std"], exports)];
+        let text = "use std; fun main() { std.print(\"hello\"); }";
+        let analysis = analyze(text, "app", &catalog);
+        let print = text.find("print").expect("call") + 1;
+        let uri: Url = "file:///app.vl".parse().unwrap();
+        assert!(definition_at(&analysis, &uri, print).is_none());
+        let (hover, _) = hover_at(&analysis, print).expect("import hover");
+        assert!(hover.contains("fun std.print"), "{hover}");
+        assert!(!hover.contains("defined at line"), "{hover}");
+
+        let alias_text = "use std; fun main() { std; }";
+        let alias_analysis = analyze(alias_text, "app", &catalog);
+        let alias = alias_text.rfind("std").expect("alias use");
+        let location =
+            definition_at(&alias_analysis, &uri, alias).expect("module alias import target");
+        assert_eq!(
+            location.range.start,
+            offset_to_position(alias_text, alias_text.find("use std").unwrap())
         );
     }
 
@@ -1262,6 +1578,93 @@ mod tests {
         let after = completion_at(&analysis, text.len());
         let after_labels: Vec<&str> = after.iter().map(|i| i.label.as_str()).collect();
         assert!(after_labels.contains(&"later"), "{after_labels:?}");
+        let initializer = completion_at(&analysis, text.find("1u64").unwrap());
+        assert!(!initializer.iter().any(|item| item.label == "later"));
+    }
+
+    #[test]
+    fn completion_respects_if_blocks_and_method_scopes() {
+        let if_text = "fun main() { if (1u64 == 1u64) { val secret = 1u64; } val outside = 2u64; }";
+        let analysis = analyze_test(if_text);
+        let at = if_text.find("outside").unwrap();
+        let labels = completion_at(&analysis, at)
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        assert!(!labels.iter().any(|name| name == "secret"), "{labels:?}");
+
+        let unbraced = "fun main() { if (true) val then_name = 1u64; else val else_name = 2u64; }";
+        let analysis = analyze_test(unbraced);
+        let at = unbraced.find("2u64").unwrap();
+        let labels = completion_at(&analysis, at)
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        assert!(!labels.iter().any(|name| name == "then_name"), "{labels:?}");
+        assert!(!labels.iter().any(|name| name == "else_name"), "{labels:?}");
+
+        let later = "fun main() { if (true) { val inside = 1u64; inside; } }";
+        let analysis = analyze_test(later);
+        let at = later.rfind("inside").unwrap();
+        let labels = completion_at(&analysis, at)
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        assert!(labels.iter().any(|name| name == "inside"), "{labels:?}");
+
+        let method_text = "type A = object { fun first(secret: u64): u64 { return secret; } fun second(other: u64): u64 { return other; } };";
+        let analysis = analyze_test(method_text);
+        let at = method_text.find("return other").unwrap();
+        let labels = completion_at(&analysis, at)
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        assert!(!labels.iter().any(|name| name == "secret"), "{labels:?}");
+        assert!(labels.iter().any(|name| name == "other"), "{labels:?}");
+    }
+
+    #[test]
+    fn completion_keeps_match_arm_bindings_in_their_arm() {
+        let text = "type U = union { A(u64), B(u64), }; fun f(u: U) { match (u) { U.A(secret) {} U.B(other) { other; } } }";
+        let analysis = analyze_test(text);
+        let at = text.find("other;").expect("second arm");
+        let labels = completion_at(&analysis, at)
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        assert!(!labels.iter().any(|name| name == "secret"), "{labels:?}");
+        assert!(labels.iter().any(|name| name == "other"), "{labels:?}");
+    }
+
+    #[test]
+    fn completion_offers_unused_imports_from_the_catalog() {
+        let exports: &[vl_common::ExportDecl<'_>] = &[(
+            "print",
+            &[("s", vl_common::VlType::String)],
+            vl_common::VlType::Void,
+        )];
+        let catalog = vec![ModuleSpec::new(&["std"], exports)];
+        let alias_text = "use std; fun main() { }";
+        let alias = analyze(alias_text, "app", &catalog);
+        let alias_labels = completion_at(&alias, alias_text.find('}').unwrap())
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        assert!(
+            alias_labels.iter().any(|name| name == "std"),
+            "{alias_labels:?}"
+        );
+
+        let function_text = "use std.print; fun main() { }";
+        let function = analyze(function_text, "app", &catalog);
+        let function_labels = completion_at(&function, function_text.find('}').unwrap())
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        assert!(
+            function_labels.iter().any(|name| name == "print"),
+            "{function_labels:?}"
+        );
     }
 
     #[test]

@@ -188,6 +188,8 @@ pub struct FrontendOk {
     pub hir: vl_hir::HirProgram,
     pub typed: vl_typecheck::TypedProgram,
     pub plan: vl_typecheck::world::MonomorphizationPlan,
+    /// Warnings produced while checking this otherwise successful source.
+    pub diags: Vec<Diagnostic>,
 }
 
 /// Run the full single-file frontend on in-memory text.
@@ -216,6 +218,7 @@ pub fn check_text(
     }
     let (res, mut d) = vl_semantic::resolve_with_modules(&ast, catalog);
     diags.append(&mut d);
+    let imports_poisoned = res.poisoned_imports;
     if !diags.iter().any(|d| d.is_error()) {
         // `main` is optional, but its signature is checked wherever it is
         // declared (same rule as the driver: zero params, infallible void).
@@ -253,8 +256,11 @@ pub fn check_text(
     diags.append(&mut d);
     // Boundary guard: no unresolved `int`/`Param`/nested-`Error` type may
     // reach lowering without a diagnostic. E500s here are compiler bugs.
-    if !res.poisoned_imports {
+    if !imports_poisoned {
         diags.append(&mut typed.validate_normalized(&hir, &diags));
+    }
+    if imports_poisoned && !diags.iter().any(Diagnostic::is_error) {
+        diags.extend(blocked_import_diagnostics(&ast, catalog));
     }
     if diags.iter().any(|d| d.is_error()) {
         return Err(diags);
@@ -266,16 +272,16 @@ pub fn check_text(
     world_refs.push((&hir, &typed));
     world_refs.extend(extra_world.iter().copied());
     let (plan, world_diags) = vl_typecheck::world::plan_world(&world_refs);
-    for (_, diag) in world_diags {
-        diags.push(diag);
+    for (owner, diag) in world_diags {
+        diags.push(anchor_world_diagnostic(&ast, &res, module, &owner, diag));
     }
     if diags.iter().any(|d| d.is_error()) {
         return Err(diags);
     }
     // Validate every planned instance before lowering; `check` stops
     // successfully after this validation.
-    for (_, diag) in vl_typecheck::world::validate_plan(&plan, &world_refs, &diags) {
-        diags.push(diag);
+    for (owner, diag) in vl_typecheck::world::validate_plan(&plan, &world_refs, &diags) {
+        diags.push(anchor_world_diagnostic(&ast, &res, module, &owner, diag));
     }
     if diags.iter().any(|d| d.is_error()) {
         return Err(diags);
@@ -285,7 +291,132 @@ pub fn check_text(
         hir,
         typed,
         plan,
+        diags,
     })
+}
+
+fn blocked_import_diagnostics(ast: &vl_syntax::Program, catalog: &[ModuleSpec]) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for item in &ast.items {
+        let vl_syntax::Item::Use { path, names, span } = item else {
+            continue;
+        };
+        let key = path.join(".");
+        let full = catalog.iter().find(|m| m.path.as_string() == key);
+        let parent = path
+            .get(..path.len().saturating_sub(1))
+            .map(|prefix| prefix.join("."))
+            .and_then(|parent_key| catalog.iter().find(|m| m.path.as_string() == parent_key));
+        let poisoned = match full {
+            Some(spec) => {
+                spec.parse_poisoned
+                    || names.as_ref().is_some_and(|names| {
+                        names
+                            .iter()
+                            .any(|name| spec.poisoned_exports.contains(name))
+                    })
+            }
+            None => parent.is_some_and(|spec| {
+                spec.parse_poisoned
+                    || path
+                        .last()
+                        .is_some_and(|leaf| spec.poisoned_exports.contains(leaf))
+            }),
+        };
+        if poisoned {
+            let module_name = full.or(parent).map(|m| m.path.as_string()).unwrap_or(key);
+            out.push(
+                Diagnostic::error(format!(
+                    "import from `{module_name}` is unavailable because the provider has errors"
+                ))
+                .with_label(*span, "dependency is blocked here")
+                .with_note("fix the provider errors before using this import")
+                .with_code("E203"),
+            );
+        }
+    }
+    if out.is_empty() {
+        out.push(
+            Diagnostic::error("one or more imported dependencies are unavailable")
+                .with_note("fix the provider errors before using imported values")
+                .with_code("E203"),
+        );
+    }
+    out
+}
+
+fn anchor_world_diagnostic(
+    ast: &vl_syntax::Program,
+    resolution: &vl_semantic::Resolution,
+    module: &str,
+    owner: &str,
+    diag: Diagnostic,
+) -> Diagnostic {
+    if owner == module {
+        return diag;
+    }
+    let import = ast
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            vl_syntax::Item::Use { path, span, .. } => {
+                let name = path.join(".");
+                (owner == name || owner.starts_with(&format!("{name}.")))
+                    .then_some((name.len(), *span))
+            }
+            _ => None,
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, span)| (span, "instantiation requested through this import"));
+    let call = import.or_else(|| {
+        resolution
+            .defs
+            .iter()
+            .filter(|def| {
+                matches!(
+                    def.kind,
+                    vl_semantic::DefKind::ImportedFunction | vl_semantic::DefKind::External
+                ) && def
+                    .symbol
+                    .as_ref()
+                    .is_some_and(|symbol| symbol.module.as_string() == owner)
+            })
+            .map(|def| (def.span, "instantiation requested at this call"))
+            .next()
+    });
+    let original_ranges = diag
+        .labels
+        .iter()
+        .map(|label| {
+            label.message.as_ref().map_or_else(
+                || format!("{}..{}", label.span.start, label.span.end),
+                |message| format!("{}..{} ({message})", label.span.start, label.span.end),
+            )
+        })
+        .collect::<Vec<_>>();
+    let context = if original_ranges.is_empty() {
+        format!("provider module `{owner}`")
+    } else {
+        format!(
+            "provider module `{owner}`, original byte range(s) {}",
+            original_ranges.join(", ")
+        )
+    };
+    let mut mapped = match diag.severity {
+        vl_common::Severity::Error => Diagnostic::error(diag.message),
+        vl_common::Severity::Warning => Diagnostic::warning(diag.message),
+    };
+    if let Some((span, label)) = call {
+        mapped = mapped.with_label(span, label);
+    }
+    if let Some(code) = diag.code {
+        mapped = mapped.with_code(code);
+    }
+    let note = match diag.note {
+        Some(note) => format!("{context}; {note}"),
+        None => context,
+    };
+    mapped.with_note(note)
 }
 
 /// Entrypoint return check: `main` is infallible by definition (the VM
@@ -354,6 +485,106 @@ mod tests {
             Err(diags) => panic!("clean snippet must check: {diags:?}"),
         };
         assert_eq!(ok.hir.items.len(), 1);
+        assert!(ok.diags.is_empty());
+    }
+
+    #[test]
+    fn successful_result_preserves_warnings() {
+        let ok = check_text(
+            "fun main() { val x = 1u64; val x = 2u64; x; }",
+            "test",
+            &empty_catalog(),
+            &[],
+        )
+        .expect("shadow warning must not fail checking");
+        assert!(ok
+            .diags
+            .iter()
+            .any(|d| d.severity == vl_common::Severity::Warning));
+    }
+
+    #[test]
+    fn poisoned_dependency_is_a_blocked_failure_without_cascades() {
+        let mut broken = ModuleSpec::new(&["broken"], &[]);
+        broken.parse_poisoned = true;
+        let result = check_text("use broken.{f}; fun main() { f(); }", "app", &[broken], &[]);
+        let Err(diags) = result else {
+            panic!("poisoned import must block successful artifacts")
+        };
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E203")),
+            "{diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.code.as_deref() == Some("E500")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn clean_exact_child_import_is_not_poisoned_by_parent_module() {
+        let mut parent = ModuleSpec::new(&["parent"], &[]);
+        parent.parse_poisoned = true;
+        let child = ModuleSpec::new(&["parent", "child"], &[]);
+        let result = check_text(
+            "use parent.child; use broken.{f}; fun main() { f(); }",
+            "app",
+            &[parent, child, {
+                let mut broken = ModuleSpec::new(&["broken"], &[]);
+                broken.parse_poisoned = true;
+                broken
+            }],
+            &[],
+        );
+        let Err(diags) = result else {
+            panic!("the broken import should block success")
+        };
+        let blocked = diags
+            .iter()
+            .filter(|diag| diag.code.as_deref() == Some("E203"))
+            .collect::<Vec<_>>();
+        assert_eq!(blocked.len(), 1, "{diags:?}");
+        assert!(blocked[0].message.contains("`broken`"), "{blocked:?}");
+    }
+
+    #[test]
+    fn foreign_world_error_is_anchored_to_local_import_with_provider_context() {
+        let provider_src = "// provider padding to make foreign spans distinct\n\nfun grow[T](x: T) { grow([x]); }";
+        let (tokens, _) = vl_lex::lex(provider_src);
+        let (provider_ast, parse_diags) =
+            vl_syntax::parse_with_module(&tokens, provider_src, "lib");
+        assert!(parse_diags.is_empty(), "{parse_diags:?}");
+        let (interface, interface_diags) = vl_semantic::collect_interface(&provider_ast);
+        assert!(interface_diags.is_empty(), "{interface_diags:?}");
+        let (provider_resolution, resolution_diags) =
+            vl_semantic::resolve_with_modules(&provider_ast, &[]);
+        assert!(resolution_diags.is_empty(), "{resolution_diags:?}");
+        let provider_hir = vl_hir::lower(&provider_ast, &provider_resolution);
+        let (provider_typed, type_diags) = vl_typecheck::check_with_modules(&provider_hir, &[]);
+        assert!(type_diags.is_empty(), "{type_diags:?}");
+
+        let caller = "use lib.{grow}; fun caller() { grow(1u64); }";
+        let catalog = vec![interface.as_spec()];
+        let result = check_text(caller, "app", &catalog, &[(&provider_hir, &provider_typed)]);
+        let Err(diags) = result else {
+            panic!("polymorphic recursion must fail planning")
+        };
+        let diag = diags
+            .iter()
+            .find(|d| d.code.as_deref() == Some("E303"))
+            .expect("world planner diagnostic");
+        let import_start = caller.find("use lib").expect("import");
+        assert_eq!(diag.labels[0].span.start, import_start);
+        assert!(diag
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("provider module `lib`")
+                && note.contains("original byte range")));
+        let json = collect_json("app.vl", caller, std::slice::from_ref(diag));
+        assert_eq!(
+            json[0].labels[0].span.end,
+            caller.find(';').expect("semicolon") + 1
+        );
     }
 
     #[test]
