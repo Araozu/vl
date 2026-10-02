@@ -816,3 +816,100 @@ fn shallow_project_dumps_do_not_validate_duplicate_entrypoints() {
     );
     fs::remove_dir_all(root).expect("remove temporary project");
 }
+
+#[test]
+fn imported_generic_readonly_projection_cannot_return_mutable_capability() {
+    let root = temp_project("imported-readonly-projection");
+    fs::create_dir_all(root.join("src")).expect("source directory");
+    fs::write(root.join("vl.toml"), "module = \"demo\"\n").expect("config");
+    fs::write(
+        root.join("src/lib.vl"),
+        "fun first[T](a: Array[T]): T { val x = a[0u64]; return x; }",
+    )
+    .expect("provider");
+    fs::write(root.join("src/main.vl"), "use demo.lib.{first}; type Foo = object { value: u64, }; fun main() { val a: Array[*Foo] = [Foo { value = 1u64 }]; var leaked = first(a); leaked.value = 2u64; }").expect("caller");
+    let output = run(&root, &["build", "--format", "json"]);
+    assert!(!output.status.success(), "mutable capability escaped");
+    let report = parse_stdout_json(&output);
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|d| d["severity"] == "error"),
+        "{report}"
+    );
+    assert!(
+        !report["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|d| d["code"] == "E500"),
+        "{report}"
+    );
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
+
+#[test]
+fn warning_only_single_file_checks_and_builds_keep_diagnostics() {
+    let root = temp_project("json-success-warnings");
+    fs::write(
+        root.join("warn.vl"),
+        "fun main() { val x = 1u64; val x = 2u64; x; }",
+    )
+    .expect("source");
+    for args in [
+        vec!["check", "warn.vl", "--format", "json"],
+        vec!["build", "warn.vl", "--format", "json", "--out", "warn.nara"],
+        vec![
+            "build", "warn.vl", "--emit", "lir", "--format", "json", "--out", "warn.lir",
+        ],
+    ] {
+        let output = run(&root, &args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let report = parse_stdout_json(&output);
+        assert_eq!(report["ok"], true, "{report}");
+        assert!(
+            report["diagnostics"]
+                .as_array()
+                .expect("diagnostics")
+                .iter()
+                .any(|d| d["severity"] == "warning"),
+            "{report}"
+        );
+    }
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
+
+#[test]
+fn imported_identity_cannot_launder_a_generic_readonly_projection() {
+    let root = temp_project("imported-identity-projection");
+    fs::create_dir_all(root.join("src")).expect("source directory");
+    fs::write(root.join("vl.toml"), "module = \"demo\"\n").expect("config");
+    fs::write(root.join("src/lib.vl"), "fun id[T](x: T): T { return x; }").expect("provider");
+    fs::write(root.join("src/main.vl"), "use demo.lib.{id}; type Foo = object { value: u64, }; fun first[T](a: Array[T]): T { return id(a[0u64]); } fun main() { val a: Array[*Foo] = [Foo { value = 1u64 }]; var leaked = first(a); leaked.value = 2u64; }").expect("caller");
+    let output = run(&root, &["build", "--format", "json"]);
+    assert!(!output.status.success(), "mutable capability escaped");
+    let report = parse_stdout_json(&output);
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|d| d["severity"] == "error"),
+        "{report}"
+    );
+    assert!(
+        !report["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|d| d["code"] == "E500"),
+        "{report}"
+    );
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
