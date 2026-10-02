@@ -276,6 +276,108 @@ fn parens_preserve_meaning() {
 }
 
 #[test]
+fn comments_do_not_remove_expression_grouping() {
+    let cases = [
+        "fun main() { val x = (1u64 + 2u64) * foo( // note\n        3u64); }\n",
+        "fun main() { val x = -(1u64 + foo( // note\n        2u64)); }\n",
+        "fun main() { val x = (a || b) && foo( // note\n        c); }\n",
+        "fun main() { val x = a && (b && foo( // note\n        c)); }\n",
+    ];
+    for src in cases {
+        let once = format(src, "test").expect("source parses");
+        let before = vl_lex::lex(src)
+            .0
+            .into_iter()
+            .map(|t| t.kind)
+            .filter(|kind| !matches!(kind, vl_lex::TokenKind::Comma))
+            .collect::<Vec<_>>();
+        let after = vl_lex::lex(&once)
+            .0
+            .into_iter()
+            .map(|t| t.kind)
+            .filter(|kind| !matches!(kind, vl_lex::TokenKind::Comma))
+            .collect::<Vec<_>>();
+        assert_eq!(before, after, "token values changed:\n{once}");
+        assert_eq!(
+            format(&once, "test").expect("formatted source parses"),
+            once
+        );
+    }
+}
+
+#[test]
+fn long_chain_split_keeps_grouped_operands() {
+    let long = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for src in [
+        format!("fun main() {{ val x = (a || b) && {long}; }}\n"),
+        format!("fun main() {{ val x = (f() catch g()) catch {long}; }}\n"),
+        format!("fun main() {{ val x = f() catch (g() catch h()) && {long}; }}\n"),
+    ] {
+        let once = format(&src, "test").expect("source parses");
+        let before = vl_lex::lex(&src)
+            .0
+            .into_iter()
+            .map(|t| t.kind)
+            .filter(|kind| !matches!(kind, vl_lex::TokenKind::Comma))
+            .collect::<Vec<_>>();
+        let after = vl_lex::lex(&once)
+            .0
+            .into_iter()
+            .map(|t| t.kind)
+            .filter(|kind| !matches!(kind, vl_lex::TokenKind::Comma))
+            .collect::<Vec<_>>();
+        assert_eq!(before, after, "token values changed:\n{once}");
+        assert_eq!(
+            format(&once, "test").expect("formatted source parses"),
+            once
+        );
+    }
+}
+
+#[test]
+fn exponent_float_formatting_preserves_bits() {
+    let values = [
+        0.0f64,
+        1.0f64,
+        -0.0f64,
+        1e-21f64,
+        f64::MIN_POSITIVE,
+        f64::from_bits(1),
+        f64::from_bits(0x000f_ffff_ffff_ffff),
+        1e100,
+    ];
+    for value in values {
+        let literal = crate::scalar_text(&vl_common::Scalar::F64(value.to_bits()));
+        let src = format!("fun main() {{ val x = {literal}; }}\n");
+        let once = format(&src, "test").expect("source parses");
+        let token_bits = |text: &str| {
+            vl_lex::lex(text)
+                .0
+                .into_iter()
+                .find_map(|t| match t.kind {
+                    vl_lex::TokenKind::F64(bits) => Some(bits),
+                    _ => None,
+                })
+                .expect("float token")
+        };
+        if value.is_sign_positive() {
+            assert_eq!(token_bits(&src), value.to_bits());
+        }
+        let before = vl_lex::lex(&src)
+            .0
+            .into_iter()
+            .map(|t| t.kind)
+            .collect::<Vec<_>>();
+        let after = vl_lex::lex(&once)
+            .0
+            .into_iter()
+            .map(|t| t.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(before, after, "token values changed: {once}");
+    }
+}
+
+#[test]
 fn error_set_formats() {
     check(
         "type Io = error { NotFound, Denied, };\n",

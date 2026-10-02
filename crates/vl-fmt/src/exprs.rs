@@ -1,7 +1,7 @@
 //! Expression writer: trailing-comma-steered lists plus width-driven
 //! chain splitting. See the crate docs for the layout contract.
 
-use super::{indent, single_expr, split_chain, Fmt, MAX_WIDTH};
+use super::{indent, single_expr, split_chain, wrap, Fmt, MAX_WIDTH};
 use vl_syntax::Expr;
 
 impl<'a> Fmt<'a> {
@@ -158,6 +158,17 @@ impl<'a> Fmt<'a> {
     fn write_expr_deep(&mut self, e: &Expr, level: usize) {
         match e {
             Expr::Binary { op, lhs, rhs, .. } => {
+                let parent = match op {
+                    vl_syntax::BinOp::Or => 10,
+                    vl_syntax::BinOp::And => 30,
+                    vl_syntax::BinOp::Eq | vl_syntax::BinOp::Ne => 40,
+                    vl_syntax::BinOp::Lt
+                    | vl_syntax::BinOp::Le
+                    | vl_syntax::BinOp::Gt
+                    | vl_syntax::BinOp::Ge => 60,
+                    vl_syntax::BinOp::Add | vl_syntax::BinOp::Sub => 70,
+                    vl_syntax::BinOp::Mul | vl_syntax::BinOp::Div => 80,
+                };
                 let text = match op {
                     vl_syntax::BinOp::Add => "+",
                     vl_syntax::BinOp::Sub => "-",
@@ -172,45 +183,45 @@ impl<'a> Fmt<'a> {
                     vl_syntax::BinOp::And => "&&",
                     vl_syntax::BinOp::Or => "||",
                 };
-                self.write_expr(lhs, level);
+                self.write_child(lhs, level, parent, true);
                 self.out.push(' ');
                 self.out.push_str(text);
                 self.out.push(' ');
-                self.write_expr(rhs, level);
+                self.write_child(rhs, level, parent, false);
             }
             Expr::Catch { lhs, fallback, .. } => {
-                self.write_expr(lhs, level);
+                self.write_child(lhs, level, 20, false);
                 self.out.push_str(" catch ");
-                self.write_expr(fallback, level);
+                self.write_child(fallback, level, 20, true);
             }
             Expr::Unary { op, rhs, .. } => {
                 self.out.push_str(match op {
                     vl_syntax::UnOp::Neg => "-",
                     vl_syntax::UnOp::Not => "!",
                 });
-                self.write_expr(rhs, level);
+                self.write_child(rhs, level, 90, true);
             }
             Expr::Try { inner, .. } => {
                 self.out.push_str("try ");
-                self.write_expr(inner, level);
+                self.write_child(inner, level, 90, true);
             }
             Expr::Cast { inner, target, .. } => {
-                self.write_expr(inner, level);
+                self.write_child(inner, level, 50, true);
                 self.out.push_str(&format!(" as {target}"));
             }
             Expr::Index { base, index, .. } => {
-                self.write_expr(base, level);
+                self.write_child(base, level, 100, true);
                 self.out.push('[');
                 self.write_expr(index, level);
                 self.out.push(']');
             }
             Expr::Field { base, name, .. } => {
-                self.write_expr(base, level);
+                self.write_child(base, level, 100, true);
                 self.out.push('.');
                 self.out.push_str(name);
             }
             Expr::TupleIndex { base, index, .. } => {
-                self.write_expr(base, level);
+                self.write_child(base, level, 100, true);
                 self.out.push_str(&format!(".`{index}"));
             }
             Expr::Call {
@@ -291,6 +302,17 @@ impl<'a> Fmt<'a> {
         }
     }
 
+    fn write_child(&mut self, child: &Expr, level: usize, parent: u8, same_ok: bool) {
+        let p = super::precedence(child);
+        if p < parent || (p == parent && !same_ok) {
+            self.out.push('(');
+            self.write_expr(child, level);
+            self.out.push(')');
+        } else {
+            self.write_expr(child, level);
+        }
+    }
+
     /// Finish a `let` / assignment / expression-statement / return value.
     /// The `prefix` (`val x = `, `return `, ...) is already in `out` on the
     /// current line; this appends the value plus width-driven chain splits.
@@ -311,13 +333,19 @@ impl<'a> Fmt<'a> {
             return;
         }
         if let Some((op, parts)) = split_chain(value) {
-            self.out.push_str(&single_expr(parts[0]));
-            for part in &parts[1..] {
+            let parent = match op {
+                "&&" => 30,
+                "||" => 10,
+                _ => 20,
+            };
+            self.out.push_str(&wrap(parts[0], parent, op != "catch"));
+            for (i, part) in parts[1..].iter().enumerate() {
                 self.out.push('\n');
                 self.out.push_str(&indent(level + 1));
                 self.out.push_str(op);
                 self.out.push(' ');
-                self.out.push_str(&single_expr(part));
+                let same_ok = op == "catch" && i + 1 == parts.len() - 1;
+                self.out.push_str(&wrap(part, parent, same_ok));
             }
             return;
         }

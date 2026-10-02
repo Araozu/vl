@@ -466,20 +466,46 @@ pub(crate) fn scalar_text(s: &Scalar) -> String {
             let short = format!("{v:?}");
             if short.contains('.') && !short.contains('e') && !short.contains('E') {
                 format!("{short}f64")
+            } else if short.contains('e') || short.contains('E') {
+                format!("{}f64", expand_exponent(&short))
             } else {
-                // Shortest form uses an exponent, which the lexer cannot
-                // re-read: fall back to plain decimal (always has a `.`).
-                let mut long = format!("{v:.17}");
-                while long.ends_with('0') {
-                    long.pop();
-                }
-                if long.ends_with('.') {
-                    long.push('0');
-                }
-                format!("{long}f64")
+                format!("{short}.0f64")
             }
         }
     }
+}
+
+/// Convert Rust's shortest round-tripping exponent form to plain decimal.
+/// VL does not accept exponent notation, so move the decimal point without
+/// changing or rounding any significant digits.
+fn expand_exponent(value: &str) -> String {
+    let (mantissa, exponent) = value.split_once(['e', 'E']).expect("exponent form");
+    let exponent: i32 = exponent.parse().expect("Rust float exponent is numeric");
+    let negative = mantissa.starts_with('-');
+    let mantissa = mantissa.strip_prefix('-').unwrap_or(mantissa);
+    let decimal = mantissa.find('.').unwrap_or(mantissa.len()) as i32;
+    let digits: String = mantissa.chars().filter(|&c| c != '.').collect();
+    let point = decimal + exponent;
+    let body = if point <= 0 {
+        format!("0.{}{}", "0".repeat((-point) as usize), digits)
+    } else if point as usize >= digits.len() {
+        format!("{}{}", digits, "0".repeat(point as usize - digits.len()))
+    } else {
+        format!(
+            "{}.{}",
+            &digits[..point as usize],
+            &digits[point as usize..]
+        )
+    };
+    format!(
+        "{}{}",
+        if negative { "-" } else { "" },
+        if body.contains('.') {
+            body
+        } else {
+            format!("{body}.0")
+        }
+    )
 }
 
 /// Re-quote string bytes with VL escapes.
@@ -503,7 +529,7 @@ pub(crate) fn string_text(bytes: &[u8]) -> String {
 }
 
 /// Precedence levels (higher binds tighter) for parenthesization.
-fn prec(e: &Expr) -> u8 {
+pub(crate) fn precedence(e: &Expr) -> u8 {
     match e {
         Expr::Binary { op, .. } => match op {
             BinOp::Or => 10,
@@ -539,9 +565,9 @@ fn bin_op_text(op: &BinOp) -> &'static str {
 }
 
 /// Wrap `e` in parentheses when its precedence is below `parent`.
-fn wrap(e: &Expr, parent: u8, same_ok: bool) -> String {
+pub(crate) fn wrap(e: &Expr, parent: u8, same_ok: bool) -> String {
     let s = single_expr(e);
-    let p = prec(e);
+    let p = precedence(e);
     if p < parent || (p == parent && !same_ok) {
         format!("({s})")
     } else {
