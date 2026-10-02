@@ -913,3 +913,28 @@ fn imported_identity_cannot_launder_a_generic_readonly_projection() {
     );
     fs::remove_dir_all(root).expect("remove temporary project");
 }
+
+#[test]
+fn project_stdlib_error_sets_match_like_single_file() {
+    let root = temp_project("stdlib-error-match");
+    fs::create_dir_all(root.join("src")).expect("create source tree");
+    fs::write(root.join("vl.toml"), "module = \"demo\"\n").expect("write config");
+    fs::write(
+        root.join("src/main.vl"),
+        "use std; use std.parse; use std.parse.{ParseError}; fun main() { match (parse.u64(\"1\")) { ParseError.Empty { std.println(\"e\"); } else { std.println(\"ok\"); } } match (parse.u64(\"x\")) { std.parse.ParseError.InvalidDigit { std.println(\"bad\"); } else { std.println(\"ok\"); } } }",
+    )
+    .expect("write main");
+    let output = run(&root, &["check", "src/main.vl"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = run(&root, &["build", "--emit", "lir"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(root).expect("remove temporary project");
+}

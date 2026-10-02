@@ -1146,7 +1146,7 @@ fn batch_frontend(
             continue;
         }
         let hir = vl_hir::lower(ast, &res);
-        let (typed, mut td) = vl_typecheck::check_with_modules(&hir, modules);
+        let (typed, mut td) = vl_typecheck::check_with_modules(&hir, &catalog);
         d.append(&mut td);
         if !res.poisoned_imports {
             d.append(&mut typed.validate_normalized(&hir, &d));
