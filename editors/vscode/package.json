@@ -1,7 +1,7 @@
 {
   "name": "vl-language-support",
   "displayName": "VL Language Support",
-  "description": "Syntax highlighting and editor configuration for the VL programming language.",
+  "description": "Syntax highlighting and language server client for the VL programming language.",
   "version": "0.1.0",
   "packageManager": "pnpm@12.4.2",
   "publisher": "vl-lang",
@@ -22,11 +22,23 @@
     "language",
     "syntax highlighting"
   ],
+  "main": "./client/out/extension.js",
+  "activationEvents": [
+    "onLanguage:vl"
+  ],
   "scripts": {
-    "package": "vsce package --out vl-language-support.vsix"
+    "build": "tsc -p tsconfig.json",
+    "package": "pnpm build && vsce package --out vl-language-support.vsix",
+    "vscode:prepublish": "pnpm build"
+  },
+  "dependencies": {
+    "vscode-languageclient": "9.0.1"
   },
   "devDependencies": {
-    "@vscode/vsce": "3.6.2"
+    "@types/node": "22.10.2",
+    "@types/vscode": "1.96.0",
+    "@vscode/vsce": "3.6.2",
+    "typescript": "5.7.2"
   },
   "contributes": {
     "languages": [
@@ -48,6 +60,16 @@
         "scopeName": "source.vl",
         "path": "./syntaxes/vl.tmLanguage.json"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "VL",
+      "properties": {
+        "vl.server.path": {
+          "type": "string",
+          "default": "vl",
+          "description": "Path to the `vl` binary (the language server runs as `vl lsp`)."
+        }
+      }
+    }
   }
 }

@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "module": "node16",
+    "target": "es2022",
+    "moduleResolution": "node16",
+    "outDir": "client/out",
+    "rootDir": "client/src",
+    "sourceMap": true,
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "include": ["client/src"]
+}

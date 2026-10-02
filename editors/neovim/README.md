@@ -8,8 +8,38 @@ Native Neovim runtime support for VL files:
 - Brace-aware indentation
 - Optional Tree-sitter highlighting, indentation, folds, and incremental selection
 
-No language server is required. The native Vim syntax and indentation files are
-used as a fallback when no VL Tree-sitter parser is installed.
+The native Vim syntax and indentation files are used as a fallback when no
+VL Tree-sitter parser is installed.
+
+## Language server (`vl lsp`)
+
+`plugin/vl-lsp.lua` starts the VL language server over stdio for every `.vl`
+buffer via Neovim's built-in LSP client (diagnostics, hover,
+goto-definition, symbols, formatting, completion). It needs `vl` on `PATH`
+(build the repo with `cargo build` and link or copy `target/debug/vl`).
+
+To use a different server binary (e.g. a local debug build):
+
+```lua
+vim.g.vl_lsp_cmd = { vim.fn.expand("~/projects/rust/vl/target/debug/vl"), "lsp" }
+```
+
+The workspace root is the nearest `vl.toml`, else the nearest `.git`, else
+the file's directory. Suggested keymaps (attach to `LspAttach` as usual):
+
+```lua
+vim.api.nvim_create_autocmd("LspAttach", {
+  callback = function(args)
+    local client = vim.lsp.get_client_by_id(args.data.client_id)
+    if client and client.name == "vl" then
+      local opts = { buffer = args.buf }
+      vim.keymap.set("n", "gd", vim.lsp.buf.definition, opts)
+      vim.keymap.set("n", "K", vim.lsp.buf.hover, opts)
+      vim.keymap.set("n", "<leader>f", vim.lsp.buf.format, opts)
+    end
+  end,
+})
+```
 
 ## lazy.nvim
 
