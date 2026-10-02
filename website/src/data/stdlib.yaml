@@ -1,7 +1,6 @@
-# The user-facing standard-library catalog.
-#
-# Native entries mirror `vl-codegen::modules`; source entries mirror the
-# embedded modules in `crates/vl-stdlib/src/std`. A module page combines both.
+# Editorial descriptions and examples for the standard library.
+# Modules, exports, signatures, generic bounds, and error variants come from
+# `vl stdlib` at build time. New exports appear even without editorial entries.
 
 - id: std
   order: 1
@@ -22,30 +21,21 @@
     - name: print
       params:
         - name: value
-          type: String
           detail: Byte string to write. No newline is added.
-      returns:
-        type: void
       detail: Writes a string to standard output without adding a newline.
       example: |
         std.print("ready");
     - name: println
       params:
         - name: value
-          type: String
           detail: Byte string to write.
-      returns:
-        type: void
       detail: Writes a string to standard output followed by a newline.
       example: |
         std.println("ready");
     - name: print_u64
       params:
         - name: value
-          type: u64
           detail: Unsigned integer to write.
-      returns:
-        type: void
       detail: Writes an unsigned integer to standard output.
       example: |
         std.print_u64(42u64);
@@ -74,61 +64,41 @@
     - name: len
       params:
         - name: value
-          type: String
           detail: String whose byte length should be measured.
-      returns:
-        type: u64
       detail: Native operation that returns the byte length of a string.
       example: |
         val n = string.len("hi");
     - name: concat
       params:
         - name: a
-          type: String
           detail: First string.
         - name: b
-          type: String
           detail: Second string.
-      returns:
-        type: String
       detail: Native operation that concatenates two byte strings.
     - name: eq
       params:
         - name: a
-          type: String
           detail: First string.
         - name: b
-          type: String
           detail: Second string.
-      returns:
-        type: bool
       detail: Native operation that compares two byte strings.
     - name: to_u64
       params:
         - name: value
-          type: String
           detail: Decimal string to parse.
-      returns:
-        type: u64
       detail: Native conversion from a decimal byte string to `u64`; invalid input traps.
     - name: hex_to_u64
       params:
         - name: value
-          type: String
           detail: Hexadecimal string to parse.
-      returns:
-        type: u64
       detail: Native conversion from a hexadecimal byte string to `u64`; invalid input traps.
     - name: byte_at
       params:
         - name: value
-          type: String
           detail: String whose byte should be read.
         - name: index
-          type: u64
           detail: Zero-based byte index.
       returns:
-        type: StringError!u8
         detail: Byte at the given index, or a `StringError`.
       detail: Bounds-checked byte read. `OutOfBounds` is returned when the index is outside the string.
       example: |
@@ -136,16 +106,12 @@
     - name: slice
       params:
         - name: value
-          type: String
           detail: String to slice.
         - name: start
-          type: u64
           detail: Inclusive starting byte index.
         - name: end
-          type: u64
           detail: Exclusive ending byte index.
       returns:
-        type: StringError!String
         detail: The selected byte range, or a `StringError`.
       detail: Bounds-checked byte slice. `OutOfBounds` and `InvalidRange` report invalid endpoints and reversed ranges.
       example: |
@@ -153,72 +119,51 @@
     - name: is_empty
       params:
         - name: s
-          type: String
           detail: String to test.
-      returns:
-        type: bool
       detail: VL helper returning whether the string has zero bytes.
       example: |
         val empty = string.is_empty("hi");
     - name: strings_equal
       params:
         - name: a
-          type: String
           detail: First string.
         - name: b
-          type: String
           detail: Second string.
-      returns:
-        type: bool
       detail: VL helper built on the native string equality operation.
       example: |
         val same = string.strings_equal("VL", "VL");
     - name: to_bytes
       params:
         - name: s
-          type: String
           detail: UTF-8 byte string to copy.
-      returns:
-        type: "*Array[u8]"
       detail: Copies every string byte into a new mutable fixed-length array. Mutating the array does not change the original string; no reverse byte-array-to-string helper is provided.
       example: |
         val bytes = string.to_bytes("hi");
     - name: starts_with
       params:
         - name: value
-          type: String
           detail: String to search.
         - name: prefix
-          type: String
           detail: Candidate prefix.
-      returns:
-        type: bool
       detail: Returns whether `value` begins with all bytes in `prefix`. An empty prefix matches every string.
       example: |
         val has_prefix = string.starts_with("hello", "he");
     - name: ends_with
       params:
         - name: value
-          type: String
           detail: String to search.
         - name: suffix
-          type: String
           detail: Candidate suffix.
-      returns:
-        type: bool
       detail: Returns whether `value` ends with all bytes in `suffix`. An empty suffix matches every string.
       example: |
         val has_suffix = string.ends_with("hello", "lo");
     - name: find
       params:
         - name: value
-          type: String
           detail: String to search.
         - name: needle
-          type: String
           detail: Byte sequence to find.
       returns:
-        type: u64
         detail: Starting byte offset of the first match, or `value`'s byte length when there is no match.
       detail: Searches from byte offset zero. An empty needle matches at offset zero. Indices are byte offsets, not Unicode character positions.
       example: |
@@ -226,16 +171,12 @@
     - name: find_from
       params:
         - name: value
-          type: String
           detail: String to search.
         - name: needle
-          type: String
           detail: Byte sequence to find.
         - name: from
-          type: u64
           detail: Starting byte offset.
       returns:
-        type: u64
         detail: Starting byte offset of the first match at or after `from`, or `value`'s byte length when there is no match.
       detail: If `from` exceeds the byte length, returns that length. An empty needle matches at `from` when `from` is within the string, including at the end. Indices count bytes.
       example: |
@@ -243,85 +184,60 @@
     - name: contains
       params:
         - name: value
-          type: String
           detail: String to search.
         - name: needle
-          type: String
           detail: Byte sequence to find.
-      returns:
-        type: bool
       detail: Returns whether `needle` occurs in `value`; an empty needle is always present.
       example: |
         val found = string.contains("banana", "nan");
     - name: trim
       params:
         - name: value
-          type: String
           detail: String to trim.
-      returns:
-        type: String
       detail: Removes ASCII space, tab, LF, CR, VT, and FF bytes from both ends. It leaves all other bytes unchanged and does not recognize Unicode whitespace.
       example: |
         val clean = string.trim("  hello\n");
     - name: trim_start
       params:
         - name: value
-          type: String
           detail: String to trim.
-      returns:
-        type: String
       detail: Removes ASCII space, tab, LF, CR, VT, and FF bytes from the beginning. It leaves all other bytes unchanged and does not recognize Unicode whitespace.
       example: |
         val clean = string.trim_start("  hello");
     - name: trim_end
       params:
         - name: value
-          type: String
           detail: String to trim.
-      returns:
-        type: String
       detail: Removes ASCII space, tab, LF, CR, VT, and FF bytes from the end. It leaves all other bytes unchanged and does not recognize Unicode whitespace.
       example: |
         val clean = string.trim_end("hello\n");
     - name: repeat
       params:
         - name: value
-          type: String
           detail: Byte string to repeat.
         - name: count
-          type: u64
           detail: Number of copies.
-      returns:
-        type: String
       detail: Concatenates `count` copies of `value`; zero copies returns the empty string. Large counts can require substantial time and memory.
       example: |
         val line = string.repeat("-", 5u64);
     - name: replace
       params:
         - name: value
-          type: String
           detail: String whose matches are replaced.
         - name: needle
-          type: String
           detail: Non-overlapping byte sequence to find.
         - name: replacement
-          type: String
           detail: Text inserted for each match.
-      returns:
-        type: String
       detail: Replaces non-overlapping byte matches from left to right. An empty `needle` returns `value` unchanged. Search offsets count bytes, not Unicode characters.
       example: |
         val greeting = string.replace("hello, Ada", "Ada", "VL");
     - name: split
       params:
         - name: value
-          type: String
           detail: Byte string to split.
         - name: separator
-          type: String
           detail: Non-overlapping byte sequence used as the separator.
       returns:
-        type: "*Array[String]"
         detail: New mutable fixed-length array of fields.
       detail: Splits at non-overlapping separator matches and keeps trailing empty fields. An empty separator returns a one-element array containing the input; empty input with a non-empty separator also returns one empty field.
       example: |
@@ -329,13 +245,9 @@
     - name: join
       params:
         - name: parts
-          type: Array[String]
           detail: Strings to combine.
         - name: separator
-          type: String
           detail: Bytes inserted between adjacent strings.
-      returns:
-        type: String
       detail: Joins array elements with `separator` between each pair. Empty input returns the empty string, and a single element is returned unchanged.
       example: |
         val fields: *Array[String] = ["red", "blue"];
@@ -344,7 +256,6 @@
     The helpers are implemented in [`string.vl`](https://github.com/Araozu/vl/tree/main/crates/vl-stdlib/src/std/string.vl); the remaining entries are target natives.
   errors:
     - name: StringError
-      variants: [OutOfBounds, InvalidRange]
       detail: |
         Checked string operations return this set when an index or range is
         invalid. The VM currently maps multiple bounds statuses to `OutOfBounds`.
@@ -371,130 +282,91 @@
     - name: is_ascii
       params:
         - name: s
-          type: String
           detail: String to inspect.
-      returns:
-        type: bool
       detail: Returns true when every byte is in the ASCII range 0 through 127; the empty string passes.
       example: |
         val ascii_only = ascii.is_ascii("plain text");
     - name: is_alpha
       params:
         - name: b
-          type: u8
           detail: Byte to classify.
-      returns:
-        type: bool
       detail: Returns true for ASCII `A` through `Z` or `a` through `z`.
       example: |
         val is_letter = ascii.is_alpha(65u8);
     - name: is_lower
       params:
         - name: b
-          type: u8
           detail: Byte to classify.
-      returns:
-        type: bool
       detail: Returns true for ASCII lowercase letters `a` through `z`.
       example: |
         val lower = ascii.is_lower(97u8);
     - name: is_upper
       params:
         - name: b
-          type: u8
           detail: Byte to classify.
-      returns:
-        type: bool
       detail: Returns true for ASCII uppercase letters `A` through `Z`.
       example: |
         val upper = ascii.is_upper(65u8);
     - name: is_alnum
       params:
         - name: b
-          type: u8
           detail: Byte to classify.
-      returns:
-        type: bool
       detail: Returns true for ASCII letters or decimal digits.
       example: |
         val alphanumeric = ascii.is_alnum(57u8);
     - name: is_digit
       params:
         - name: b
-          type: u8
           detail: Byte to classify.
-      returns:
-        type: bool
       detail: Returns true for ASCII decimal digits `0` through `9`.
       example: |
         val is_number = ascii.is_digit(55u8);
     - name: is_hex_digit
       params:
         - name: b
-          type: u8
           detail: Byte to classify.
-      returns:
-        type: bool
       detail: Returns true for ASCII decimal digits and letters `A` through `F` or `a` through `f`.
       example: |
         val is_hex = ascii.is_hex_digit(102u8);
     - name: is_whitespace
       params:
         - name: b
-          type: u8
           detail: Byte to classify.
-      returns:
-        type: bool
       detail: Returns true for ASCII space, horizontal tab, line feed, carriage return, vertical tab, or form feed.
       example: |
         val is_space = ascii.is_whitespace(32u8);
     - name: is_control
       params:
         - name: b
-          type: u8
           detail: Byte to classify.
-      returns:
-        type: bool
       detail: Returns true for ASCII control bytes 0 through 31 and DEL (127).
       example: |
         val control = ascii.is_control(10u8);
     - name: is_printable
       params:
         - name: b
-          type: u8
           detail: Byte to classify.
-      returns:
-        type: bool
       detail: Returns true for visible ASCII bytes 32 through 126, including spaces and punctuation.
       example: |
         val printable = ascii.is_printable(65u8);
     - name: is_punctuation
       params:
         - name: b
-          type: u8
           detail: Byte to classify.
-      returns:
-        type: bool
       detail: "Returns true for four ASCII punctuation ranges: exclamation mark through slash, colon through at sign, left bracket through grave accent, and left brace through tilde."
       example: |
         val punctuation = ascii.is_punctuation(33u8);
     - name: to_lower
       params:
         - name: b
-          type: u8
           detail: Byte to convert.
-      returns:
-        type: u8
       detail: Converts ASCII uppercase letters to lowercase; all other byte values are returned unchanged.
       example: |
         val lower = ascii.to_lower(65u8);
     - name: to_upper
       params:
         - name: b
-          type: u8
           detail: Byte to convert.
-      returns:
-        type: u8
       detail: Converts ASCII lowercase letters to uppercase; all other byte values are returned unchanged.
       example: |
         val upper = ascii.to_upper(97u8);
@@ -523,46 +395,33 @@
     - name: u64
       params:
         - name: value
-          type: String
           detail: Full decimal representation to parse.
-      returns:
-        type: ParseError!u64
       detail: Parses an unsigned base-10 integer. Empty input returns `Empty`; non-decimal bytes return `InvalidDigit`; values above `u64::MAX` return `Overflow`. Signs, whitespace, and trailing bytes are rejected.
       example: |
         val count = parse.u64("42") catch 0u64;
     - name: hex_u64
       params:
         - name: value
-          type: String
           detail: Full hexadecimal representation to parse.
-      returns:
-        type: ParseError!u64
       detail: Parses an unsigned base-16 integer using `0`–`9`, `A`–`F`, or `a`–`f`. No `0x` prefix is accepted. Empty input returns `Empty`; invalid bytes return `InvalidDigit`; values above `u64::MAX` return `Overflow`.
       example: |
         val flags = parse.hex_u64("ff") catch 0u64;
     - name: i64
       params:
         - name: value
-          type: String
           detail: Full signed decimal representation to parse.
-      returns:
-        type: ParseError!i64
       detail: Parses a signed base-10 integer, accepting one leading `-` but rejecting `+` as `InvalidSign`. Empty input or a lone minus returns `Empty`; invalid digits return `InvalidDigit`; values outside `i64::MIN..i64::MAX` return `Overflow`. The minimum signed value is handled exactly.
       example: |
         val delta = parse.i64("-42") catch 0i64;
     - name: bool
       params:
         - name: value
-          type: String
           detail: Boolean spelling to parse.
-      returns:
-        type: ParseError!bool
       detail: Accepts exactly the lowercase byte strings `true` and `false`. Every other input returns `InvalidDigit`.
       example: |
         val enabled = parse.bool("true") catch false;
   errors:
     - name: ParseError
-      variants: [Empty, InvalidDigit, InvalidSign, Overflow]
       detail: |
         `Empty` marks empty input, `InvalidDigit` marks an unsupported byte or
         spelling, `Overflow` marks a value too large for the destination, and
@@ -592,59 +451,42 @@
     }
   functions:
     - name: is_empty
-      type_params: [T]
       params:
         - name: a
-          type: Array[T]
           detail: Array to inspect.
-      returns:
-        type: bool
       detail: Returns true when the array length is zero.
       example: |
         val empty_array: Array[u64] = [];
         val empty = array.is_empty(empty_array);
     - name: clone
-      type_params: [T]
       params:
         - name: a
-          type: Array[T]
           detail: Array whose elements are copied.
-      returns:
-        type: "*Array[T]"
       detail: Allocates a new mutable array of the same length and copies elements into it. The new array can be changed independently; reference-valued elements still refer to the same objects.
       example: |
         val values: *Array[u64] = [3u64, 1u64, 2u64];
         val duplicate = array.clone(values);
     - name: slice
-      type_params: [T]
       params:
         - name: source
-          type: Array[T]
           detail: Array to copy a range from.
         - name: start
-          type: u64
           detail: Inclusive start index.
         - name: end
-          type: u64
           detail: Exclusive end index.
       returns:
-        type: "ArrayError!*Array[T]"
         detail: New array containing the selected range, or `ArrayError.InvalidRange` if `start > end` or `end > source.len`.
       detail: Copies the range `start..end` into a new mutable array. Empty ranges are valid, including `source.len..source.len`.
       example: |
         val source: *Array[u64] = [3u64, 1u64, 2u64];
         val part = array.slice(source, 1u64, 3u64) catch Array.new::[u64](0u64);
     - name: concat
-      type_params: [T]
       params:
         - name: left
-          type: Array[T]
           detail: First array.
         - name: right
-          type: Array[T]
           detail: Second array.
       returns:
-        type: "ArrayError!*Array[T]"
         detail: New concatenated array, or `ArrayError.Overflow` if the combined length exceeds `u64::MAX`.
       detail: Allocates a new array and copies the elements from `left` followed by `right`. The source arrays are unchanged.
       example: |
@@ -652,93 +494,64 @@
         val right: *Array[u64] = [3u64];
         val all = array.concat(left, right) catch Array.new::[u64](0u64);
     - name: copy
-      type_params: [T]
       params:
         - name: source
-          type: Array[T]
           detail: Array to copy from.
         - name: destination
-          type: "*Array[T]"
           detail: Writable array to copy into.
         - name: destination_start
-          type: u64
           detail: Destination offset for the first copied element.
-      returns:
-        type: bool
       detail: Copies all elements if they fit starting at `destination_start`; otherwise returns false and makes no writes. Arrays remain fixed length. Copying overlapping ranges in the same array proceeds from low to high indices, so use a temporary clone if overlap matters.
       example: |
         val source: *Array[u64] = [3u64, 1u64];
         var destination: *Array[u64] = Array.new::[u64](3u64);
         val copied = array.copy(source, destination, 1u64);
     - name: fill
-      type_params: [T]
       params:
         - name: a
-          type: "*Array[T]"
           detail: Array to fill.
         - name: value
-          type: T
           detail: Value written at every index.
-      returns:
-        type: void
       detail: Replaces every element with `value`; an empty array performs no writes.
       example: |
         var values: *Array[u64] = [3u64, 1u64, 2u64];
         array.fill(values, 0u64);
     - name: reverse
-      type_params: [T]
       params:
         - name: a
-          type: "*Array[T]"
           detail: Array to reverse in place.
-      returns:
-        type: void
       detail: Reverses the element order in place. Empty and one-element arrays are unchanged.
       example: |
         var values: *Array[u64] = [3u64, 1u64, 2u64];
         array.reverse(values);
     - name: find
-      type_params: ["T extends Comparable"]
       params:
         - name: a
-          type: Array[T]
           detail: Array to search.
         - name: value
-          type: T
           detail: Value to compare.
       returns:
-        type: u64
         detail: First matching index, or `a.len` when the value is absent.
       detail: Returns the index of the first element equal to `value`; values use VL `==` equality.
       example: |
         val values: *Array[u64] = [3u64, 8u64, 2u64];
         val index = array.find(values, 8u64);
     - name: contains
-      type_params: ["T extends Comparable"]
       params:
         - name: a
-          type: Array[T]
           detail: Array to search.
         - name: value
-          type: T
           detail: Value to compare.
-      returns:
-        type: bool
       detail: Returns whether any element equals `value` under VL `==` equality.
       example: |
         val values: *Array[u64] = [3u64, 8u64, 2u64];
         val found = array.contains(values, 8u64);
     - name: equal
-      type_params: ["T extends Comparable"]
       params:
         - name: a
-          type: Array[T]
           detail: First array.
         - name: b
-          type: Array[T]
           detail: Second array.
-      returns:
-        type: bool
       detail: Returns true when lengths match and every pair of elements compares equal with `==`.
       example: |
         val left: *Array[u64] = [1u64, 2u64];
@@ -747,10 +560,7 @@
     - name: sum_u64
       params:
         - name: a
-          type: Array[u64]
           detail: Unsigned integer array to add.
-      returns:
-        type: u64
       detail: Adds all values from left to right. The empty array returns zero; arithmetic follows VL `u64` overflow behavior.
       example: |
         val values: *Array[u64] = [1u64, 2u64, 3u64];
@@ -758,59 +568,41 @@
     - name: sum_i64
       params:
         - name: a
-          type: Array[i64]
           detail: Signed integer array to add.
-      returns:
-        type: i64
       detail: Adds all values from left to right. The empty array returns zero; arithmetic follows VL `i64` overflow behavior.
       example: |
         val values: *Array[i64] = [1i64, -2i64, 3i64];
         val total = array.sum_i64(values);
     - name: min
-      type_params: ["T extends Numeric"]
       params:
         - name: a
-          type: Array[T]
           detail: Numeric array to inspect.
         - name: fallback
-          type: T
           detail: Value to return when the array is empty.
-      returns:
-        type: T
       detail: Returns the smallest element, or `fallback` for an empty array. Naravm currently lowers numeric ordering for `u64`, `i64`, and `u8`; `f64` ordering still needs backend support.
       example: |
         val values: *Array[u64] = [1u64, 2u64, 3u64];
         val smallest = array.min(values, 0u64);
     - name: max
-      type_params: ["T extends Numeric"]
       params:
         - name: a
-          type: Array[T]
           detail: Numeric array to inspect.
         - name: fallback
-          type: T
           detail: Value to return when the array is empty.
-      returns:
-        type: T
       detail: Returns the largest element, or `fallback` for an empty array. Naravm currently lowers numeric ordering for `u64`, `i64`, and `u8`; `f64` ordering still needs backend support.
       example: |
         val values: *Array[u64] = [1u64, 2u64, 3u64];
         val largest = array.max(values, 0u64);
     - name: sort
-      type_params: ["T extends Numeric"]
       params:
         - name: a
-          type: "*Array[T]"
           detail: Numeric array to sort.
-      returns:
-        type: void
       detail: Sorts elements in ascending order in place using stable insertion sort. It is O(n²) and requires a writable array view. Naravm currently lowers numeric ordering for `u64`, `i64`, and `u8`; `f64` ordering still needs backend support.
       example: |
         var values: *Array[u64] = [3u64, 1u64, 2u64];
         array.sort(values);
   errors:
     - name: ArrayError
-      variants: [InvalidRange, Overflow]
       detail: "`slice` returns `InvalidRange` for reversed or out-of-bounds endpoints. `concat` returns `Overflow` when the combined length cannot fit in `u64`."
   outro: |
     Arrays have a fixed length. Growth can be built by allocating a new array and copying elements, but each resize costs a full copy; a VM resize operation could make that cheaper.
@@ -837,53 +629,37 @@
     - name: is_absolute
       params:
         - name: path
-          type: String
           detail: Path string to inspect.
-      returns:
-        type: bool
       detail: Returns true when the first byte is `/`. An empty string is relative.
       example: |
         val absolute = path.is_absolute("/tmp/data");
     - name: basename
       params:
         - name: path
-          type: String
           detail: Path string to inspect.
-      returns:
-        type: String
       detail: Returns the final path component after stripping trailing `/` bytes, except that `/` remains `/`. Empty input returns the empty string. It does not normalize `.` or `..`.
       example: |
         val name = path.basename("/tmp/report.txt");
     - name: dirname
       params:
         - name: path
-          type: String
           detail: Path string to inspect.
-      returns:
-        type: String
       detail: Returns the parent portion before the final component, with trailing separators removed. Empty input and paths without a parent return `.`; a root parent returns `/`.
       example: |
         val parent = path.dirname("/tmp/report.txt");
     - name: extension
       params:
         - name: path
-          type: String
           detail: Path string to inspect.
-      returns:
-        type: String
       detail: Returns the final basename suffix after its last dot, without the dot. A leading dot alone is not an extension (`.profile` returns empty); a later dot is (`archive.tar.gz` returns `gz`).
       example: |
         val suffix = path.extension("archive.tar.gz");
     - name: join
       params:
         - name: left
-          type: String
           detail: Base path.
         - name: right
-          type: String
           detail: Path component to append, or an absolute path.
-      returns:
-        type: String
       detail: Returns the non-empty side when either side is empty. An absolute `right` replaces `left`; otherwise inserts `/` only when `left` does not already end in `/`. It preserves repeated separators and `.` / `..` components.
       example: |
         val full = path.join("/tmp", "report.txt");
@@ -911,172 +687,118 @@
     - name: mod_u64
       params:
         - name: a
-          type: u64
           detail: Dividend.
         - name: b
-          type: u64
           detail: Non-zero divisor.
-      returns:
-        type: u64
       detail: Native unsigned remainder operation.
       example: |
         val remainder = math.mod_u64(17u64, 5u64);
     - name: max_u64
       params:
         - name: a
-          type: u64
           detail: First value.
         - name: b
-          type: u64
           detail: Second value.
-      returns:
-        type: u64
       detail: VL helper returning the larger unsigned integer.
       example: |
         val larger = math.max_u64(3u64, 8u64);
     - name: min_u64
       params:
         - name: a
-          type: u64
           detail: First value.
         - name: b
-          type: u64
           detail: Second value.
-      returns:
-        type: u64
       detail: VL helper returning the smaller unsigned integer.
       example: |
         val smaller = math.min_u64(3u64, 8u64);
     - name: clamp_u64
       params:
         - name: v
-          type: u64
           detail: Value to clamp.
         - name: lo
-          type: u64
           detail: Lower bound.
         - name: hi
-          type: u64
           detail: Upper bound.
-      returns:
-        type: u64
       detail: VL helper limiting a value to an inclusive range. Bounds are not validated; pass `lo <= hi`.
       example: |
         val bounded = math.clamp_u64(9u64, 0u64, 5u64);
     - name: max_i64
       params:
         - name: a
-          type: i64
           detail: First value.
         - name: b
-          type: i64
           detail: Second value.
-      returns:
-        type: i64
       detail: VL helper returning the larger signed integer.
       example: |
         val larger = math.max_i64(-3i64, 8i64);
     - name: min_i64
       params:
         - name: a
-          type: i64
           detail: First value.
         - name: b
-          type: i64
           detail: Second value.
-      returns:
-        type: i64
       detail: VL helper returning the smaller signed integer.
       example: |
         val smaller = math.min_i64(-3i64, 8i64);
     - name: abs_i64
       params:
         - name: a
-          type: i64
           detail: Signed integer.
-      returns:
-        type: i64
       detail: VL helper returning the absolute value. The minimum `i64` value cannot be represented as a positive `i64` and wraps to itself.
       example: |
         val magnitude = math.abs_i64(-8i64);
     - name: is_even
       params:
         - name: v
-          type: u64
           detail: Unsigned integer to test.
-      returns:
-        type: bool
       detail: VL helper testing whether a number is even.
       example: |
         val even = math.is_even(42u64);
     - name: max
-      type_params: ["T extends Numeric"]
       params:
         - name: a
-          type: T
           detail: First numeric value.
         - name: b
-          type: T
           detail: Second numeric value.
-      returns:
-        type: T
       detail: Generic VL helper for any `T extends Numeric`. Naravm currently lowers numeric ordering for `u64`, `i64`, and `u8`; `f64` ordering still needs backend support.
       example: |
         val larger = math.max(3u64, 8u64);
     - name: min
-      type_params: ["T extends Numeric"]
       params:
         - name: a
-          type: T
           detail: First numeric value.
         - name: b
-          type: T
           detail: Second numeric value.
-      returns:
-        type: T
       detail: Generic VL helper returning the smaller of two values whose type extends `Numeric`. Naravm currently lowers numeric ordering for `u64`, `i64`, and `u8`; `f64` ordering still needs backend support.
       example: |
         val smaller = math.min(3u64, 8u64);
     - name: clamp
-      type_params: ["T extends Numeric"]
       params:
         - name: v
-          type: T
           detail: Value to clamp.
         - name: lo
-          type: T
           detail: Lower bound; expected to be no greater than `hi`.
         - name: hi
-          type: T
           detail: Upper bound; expected to be no less than `lo`.
-      returns:
-        type: T
       detail: Generic VL helper returning `v` limited to the inclusive range `lo..hi`. Bounds are not validated; pass `lo <= hi`. Naravm currently lowers numeric ordering for `u64`, `i64`, and `u8`; `f64` ordering still needs backend support.
       example: |
         val bounded = math.clamp(9u64, 0u64, 5u64);
     - name: gcd_u64
       params:
         - name: a
-          type: u64
           detail: First non-negative integer.
         - name: b
-          type: u64
           detail: Second non-negative integer.
-      returns:
-        type: u64
       detail: Computes the greatest common divisor with the Euclidean algorithm. `gcd_u64(0, 0)` is zero.
       example: |
         val divisor = math.gcd_u64(48u64, 18u64);
     - name: checked_mul_u64
       params:
         - name: a
-          type: u64
           detail: First factor.
         - name: b
-          type: u64
           detail: Second factor.
       returns:
-        type: MathError!u64
         detail: Product, or `MathError.Overflow` if it exceeds `u64::MAX`.
       detail: Multiplies unsigned integers after checking overflow.
       example: |
@@ -1084,13 +806,10 @@
     - name: checked_add_u64
       params:
         - name: a
-          type: u64
           detail: First unsigned integer.
         - name: b
-          type: u64
           detail: Second unsigned integer.
       returns:
-        type: MathError!u64
         detail: Sum, or `MathError.Overflow` if it exceeds `u64::MAX`.
       detail: Adds unsigned integers after checking overflow.
       example: |
@@ -1098,13 +817,10 @@
     - name: checked_sub_u64
       params:
         - name: a
-          type: u64
           detail: Minuend.
         - name: b
-          type: u64
           detail: Subtrahend.
       returns:
-        type: MathError!u64
         detail: Difference, or `MathError.Overflow` when `b > a`.
       detail: Subtracts unsigned integers after checking underflow.
       example: |
@@ -1112,13 +828,10 @@
     - name: checked_div_u64
       params:
         - name: a
-          type: u64
           detail: Dividend.
         - name: b
-          type: u64
           detail: Divisor.
       returns:
-        type: MathError!u64
         detail: Quotient, or `MathError.DivisionByZero` if `b` is zero.
       detail: Divides unsigned integers and reports a zero divisor as a typed error.
       example: |
@@ -1126,10 +839,8 @@
     - name: checked_abs_i64
       params:
         - name: value
-          type: i64
           detail: Signed integer to make non-negative.
       returns:
-        type: MathError!i64
         detail: Absolute value, or `MathError.Overflow` for `i64::MIN`.
       detail: Computes signed absolute value with an explicit error for the one value whose positive magnitude does not fit in `i64`.
       example: |
@@ -1137,13 +848,10 @@
     - name: lcm_u64
       params:
         - name: a
-          type: u64
           detail: First non-negative integer.
         - name: b
-          type: u64
           detail: Second non-negative integer.
       returns:
-        type: MathError!u64
         detail: Least common multiple, or `MathError.Overflow` if it exceeds `u64::MAX`.
       detail: Returns zero when either input is zero; otherwise divides by the greatest common divisor before checked multiplication.
       example: |
@@ -1151,20 +859,16 @@
     - name: pow_u64
       params:
         - name: base
-          type: u64
           detail: Value to raise.
         - name: exponent
-          type: u64
           detail: Non-negative integer exponent.
       returns:
-        type: MathError!u64
         detail: Power, or `MathError.Overflow` if it exceeds `u64::MAX`.
       detail: Computes integer powers by repeated squaring. Exponent zero returns one, including `0^0`.
       example: |
         val square = math.pow_u64(12u64, 2u64) catch 0u64;
   errors:
     - name: MathError
-      variants: [Overflow, DivisionByZero]
       detail: Checked addition, subtraction, multiplication, LCM, exponentiation, and absolute value return `Overflow` when their result is out of range. Checked division returns `DivisionByZero` for a zero divisor.
   outro: |
     The helpers are implemented in [`math.vl`](https://github.com/Araozu/vl/tree/main/crates/vl-stdlib/src/std/math.vl).
@@ -1189,82 +893,57 @@
     - name: u64_to_s
       params:
         - name: value
-          type: u64
           detail: Unsigned integer to convert.
-      returns:
-        type: String
       detail: Target-native unsigned integer to string conversion.
       example: |
         val text = fmt.u64_to_s(42u64);
     - name: u64_to_string
       params:
         - name: v
-          type: u64
           detail: Unsigned integer to convert.
-      returns:
-        type: String
       detail: VL helper wrapping `u64_to_s`.
       example: |
         val text = fmt.u64_to_string(42u64);
     - name: bool_to_string
       params:
         - name: v
-          type: bool
           detail: Boolean value to convert.
-      returns:
-        type: String
       detail: Returns the lowercase spelling `true` or `false`.
       example: |
         val text = fmt.bool_to_string(false);
     - name: i64_to_string
       params:
         - name: v
-          type: i64
           detail: Signed integer to convert.
-      returns:
-        type: String
       detail: Returns the base-10 signed spelling, including a leading minus sign for negative values.
       example: |
         val text = fmt.i64_to_string(-42i64);
     - name: hex_u64_to_string
       params:
         - name: value
-          type: u64
           detail: Unsigned integer to convert.
-      returns:
-        type: String
       detail: Returns lowercase hexadecimal with a `0x` prefix and no unnecessary leading zeroes; zero is `0x0`.
       example: |
         val text = fmt.hex_u64_to_string(255u64);
     - name: pad_left
       params:
         - name: value
-          type: String
           detail: String to pad.
         - name: width
-          type: u64
           detail: Minimum output width in bytes.
         - name: pad
-          type: String
           detail: Non-empty byte string repeated to fill the width.
-      returns:
-        type: String
       detail: Prepends repeated `pad` bytes until the output has at least `width` bytes. If `pad` is empty or `value` already meets the width, returns `value`. A multi-byte pad may be cut at a byte boundary.
       example: |
         val text = fmt.pad_left("7", 3u64, "0");
     - name: pad_right
       params:
         - name: value
-          type: String
           detail: String to pad.
         - name: width
-          type: u64
           detail: Minimum output width in bytes.
         - name: pad
-          type: String
           detail: Non-empty byte string repeated to fill the width.
-      returns:
-        type: String
       detail: Appends repeated `pad` bytes until the output has at least `width` bytes. If `pad` is empty or `value` already meets the width, returns `value`. A multi-byte pad may be cut at a byte boundary.
       example: |
         val text = fmt.pad_right("7", 3u64, "0");
@@ -1295,10 +974,8 @@
     - name: read_file
       params:
         - name: path
-          type: String
           detail: Path of the file to read.
       returns:
-        type: FsError!String
         detail: File contents, or an `FsError`.
       detail: Native operation that reads the file into a string. Handle failure with `try`, `catch`, or `match`.
       example: |
@@ -1310,7 +987,6 @@
     TCP sockets ([std.net.tcp](/std/tcp)) follow the same native-only rule.
   errors:
     - name: FsError
-      variants: [IoError]
       detail: The VM reports one filesystem failure status, mapped to `IoError`.
 
 - id: tcp
@@ -1344,75 +1020,52 @@
     - name: connect
       params:
         - name: host
-          type: String
           detail: Hostname or IP literal to connect to.
         - name: port
-          type: u64
           detail: Port to connect to (1-65535).
-      returns:
-        type: TcpError!u64
       detail: Native operation that connects and returns a socket handle.
       example: |
         val sock = tcp.connect("127.0.0.1", 80u64) catch 0u64;
     - name: listen
       params:
         - name: address
-          type: String
           detail: IPv4/IPv6 literal to bind, or empty for all interfaces.
         - name: port
-          type: u64
           detail: Port to bind, or 0 for an ephemeral port.
         - name: backlog
-          type: u64
           detail: Pending-connection queue length.
-      returns:
-        type: TcpError!#(u64, u64)
       detail: Native operation that binds a listener; returns the listener handle and the bound port.
       example: |
         val #(listener, port) = tcp.listen("", 0u64, 8u64) catch #(0u64, 0u64);
     - name: accept
       params:
         - name: listener
-          type: u64
           detail: Listener handle to accept from.
-      returns:
-        type: TcpError!u64
       detail: Native operation that blocks for the next connection and returns its socket handle.
       example: |
         val sock = tcp.accept(listener) catch 0u64;
     - name: read
       params:
         - name: socket
-          type: u64
           detail: Socket handle to read from.
         - name: max_bytes
-          type: u64
           detail: Maximum bytes for this read (1-65536).
-      returns:
-        type: TcpError!#(String, bool)
       detail: Native operation performing one stream read; returns the bytes and whether EOF was reached.
       example: |
         val #(data, eof) = tcp.read(sock, 64u64) catch #("ERR", true);
     - name: write
       params:
         - name: socket
-          type: u64
           detail: Socket handle to write to.
         - name: data
-          type: String
           detail: Byte string to send (may contain NUL or non-UTF-8 bytes).
-      returns:
-        type: TcpError!u64
       detail: Native operation that sends bytes; returns how many were written.
       example: |
         val n = tcp.write(sock, "hello") catch 0u64;
     - name: close
       params:
         - name: handle
-          type: u64
           detail: Socket or listener handle to close.
-      returns:
-        type: TcpError!void
       detail: Native operation that closes a handle, invalidating it.
       example: |
         tcp.close(sock) catch std.print("close failed\n");
@@ -1425,7 +1078,6 @@
     on linux-x86_64 instead.
   errors:
     - name: TcpError
-      variants: [InvalidArgument, IoError, InvalidHandle, WrongHandleKind, TooManyHandles, OutOfMemory, CapabilityUnavailable]
       detail: |
         One variant is provided for each native TCP status code. TCP functions
         return this error set when a socket operation fails.

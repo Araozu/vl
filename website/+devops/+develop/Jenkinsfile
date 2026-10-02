@@ -29,17 +29,16 @@ pipeline {
     stages {
         stage('Build and push Docker image') {
             steps {
-                // Context is website/: the Astro site root.
+                // Context is the repository: Rust exports the current stdlib
+                // catalog before the Astro stage builds its reference pages.
                 // Bake the host Luna WASM artifact into the image as a
                 // fallback; the compose volume overrides it at runtime.
-                dir ("website") {
-                    sh "cp /var/bin/naravm-luna-ai.wasm public/naravm.wasm || echo 'luna wasm not on build host, image relies on runtime volume'"
-                    script {
-                        docker.build(
-                            "${FULL_REGISTRY_URL}:${BUILD_REF}",
-                            "--pull -f +devops/docker/Dockerfile .",
-                        )
-                    }
+                sh "cp /var/bin/naravm-luna-ai.wasm website/public/naravm.wasm || echo 'luna wasm not on build host, image relies on runtime volume'"
+                script {
+                    docker.build(
+                        "${FULL_REGISTRY_URL}:${BUILD_REF}",
+                        "--pull -f website/+devops/docker/Dockerfile .",
+                    )
                 }
             }
         }

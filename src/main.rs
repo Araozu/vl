@@ -61,6 +61,8 @@ enum Cmd {
     Run { name: Option<String> },
     /// List available codegen backends.
     Targets,
+    /// Export the merged standard-library API as JSON for documentation tooling.
+    Stdlib,
     /// Format `.vl` files in place (zig fmt style, non-overridable defaults).
     Fmt {
         /// Files or directories to format (directories recurse for `.vl`).
@@ -619,9 +621,70 @@ fn run_frontend(
     })
 }
 
+/// Use exactly the merged catalog consumed by the frontend, including generic
+/// helper templates and target natives. Prose belongs to the docs site.
+fn stdlib_catalog_json() -> serde_json::Value {
+    let mut catalog = modules_with_stdlib(&vl_codegen::modules());
+    catalog.sort_by_key(|module| module.path.as_string());
+    serde_json::Value::Array(
+        catalog
+            .into_iter()
+            .map(|module| {
+                let path = module.path.as_string();
+                let local_type =
+                    |ty: &vl_common::VlType| ty.to_string().replace(&format!("{path}."), "");
+                let functions: Vec<_> = module
+                    .exports
+                    .iter()
+                    .map(|export| {
+                        let params: Vec<_> = export.sig.params.iter().map(|param| {
+                        serde_json::json!({ "name": param.name, "type": local_type(&param.ty) })
+                    }).collect();
+                        let type_params: Vec<_> = export
+                            .sig
+                            .type_params
+                            .iter()
+                            .map(|param| match param.bound {
+                                Some(bound) => format!("{} extends {bound}", param.name),
+                                None => param.name.clone(),
+                            })
+                            .collect();
+                        serde_json::json!({
+                            "name": export.name,
+                            "type_params": type_params,
+                            "params": params,
+                            "returns": { "type": local_type(&export.sig.ret) },
+                            "implementation": match export.kind {
+                                vl_common::ExportKind::Source => "source",
+                                vl_common::ExportKind::Target => "native",
+                            },
+                        })
+                    })
+                    .collect();
+                let errors: Vec<_> = module
+                    .errors
+                    .iter()
+                    .map(|error| {
+                        let variants: Vec<_> =
+                            error.variants.iter().map(|variant| &variant.name).collect();
+                        serde_json::json!({ "name": error.name, "variants": variants })
+                    })
+                    .collect();
+                serde_json::json!({ "module": path, "functions": functions, "errors": errors })
+            })
+            .collect(),
+    )
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Stdlib => {
+            let json = serde_json::to_string_pretty(&stdlib_catalog_json())
+                .expect("the standard-library catalog contains only JSON values");
+            write_out(&None, &format!("{json}\n"));
+            ExitCode::SUCCESS
+        }
         Cmd::Init { module } => match init_project(module) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {

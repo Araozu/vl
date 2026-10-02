@@ -27,7 +27,7 @@ const section = pathname.startsWith('/std')
       ? 'internals'
       : 'docs';
 // The std sidebar (and its pages) is generated from the stdlib catalog,
-// so adding a module to `src/data/stdlib.yaml` updates both at once.
+// so exports discovered by the compiler update navigation and pages together.
 const stdModules = (await getCollection('stdlib')).sort((a, b) => a.data.order - b.data.order);
 const sectionSidebars = {
   docs: {

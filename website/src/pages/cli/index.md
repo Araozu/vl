@@ -122,6 +122,17 @@ List the code-generation targets known to the compiler:
 vl targets
 ```
 
+### `stdlib`
+
+Export the current standard library API as JSON, combining target-native
+functions and embedded VL helpers. The output includes module names, parameter
+and return types, generic bounds, and error variants. Website builds use this
+catalog to generate the standard library reference:
+
+```sh
+vl stdlib
+```
+
 `naravm` produces a runnable Naravm vmfile and is the only supported target.
 
 ## Build options
