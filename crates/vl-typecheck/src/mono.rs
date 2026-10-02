@@ -98,6 +98,12 @@ impl Monomorphizer<'_> {
                 break;
             }
             self.visited.insert(mangled.clone());
+            if let Some(diagnostic) =
+                super::world::specialization_diagnostic(self.prog, self.typed, def, &sig, &args)
+            {
+                self.diags.push(diagnostic);
+                continue;
+            }
             let (param_tys, ret_ty) = sig.instantiate(&args);
             // Defensive: only normalized signatures reach LIR; anything else
             // is a checker bug (already guarded above, but stay quiet rather
@@ -238,12 +244,7 @@ fn fn_span_for(prog: &HirProgram, def: u32) -> Span {
 /// Convert an explicit type argument under an instance environment:
 /// outer parameter names substitute, concrete types convert directly.
 fn vl_in_instance(v: &VlType, env: &HashMap<String, Ty>) -> Ty {
-    match v {
-        VlType::Param(name) => env.get(name).cloned().unwrap_or(Ty::Param(name.clone())),
-        VlType::Array(elem) => Ty::Array(Box::new(vl_in_instance(elem, env))),
-        VlType::Mutable(inner) => Ty::Mutable(Box::new(vl_in_instance(inner, env))),
-        _ => Ty::from_vl(v),
-    }
+    super::world::vl_in_instance(v, env)
 }
 
 /// Quiet inference for worklist expansion (errors were already reported

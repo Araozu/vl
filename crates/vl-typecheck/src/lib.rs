@@ -432,34 +432,38 @@ fn mangle_ty(ty: &Ty) -> String {
         Ty::String => "String".into(),
         Ty::File => "File".into(),
         Ty::Object(o) => {
-            let mut out = format!("Object_{}", sanitize_object_name(&o.name));
-            for arg in &o.args {
-                out.push('_');
-                out.push_str(&mangle_ty(arg));
+            if o.args.is_empty() {
+                format!("Object_{}", sanitize_object_name(&o.name))
+            } else {
+                format!(
+                    "Object_{}_{}",
+                    encode_component(&sanitize_object_name(&o.name)),
+                    encode_list(&o.args.iter().map(mangle_ty).collect::<Vec<_>>())
+                )
             }
-            out
         }
         Ty::Union(u) => {
-            // `Option[u64]` -> `Union_Option_u64`; bare `Option` ->
-            // `Union_Option`. `$` never appears inside an encoded argument,
-            // so multi-argument joins stay collision-free.
-            let mut out = format!("Union_{}", sanitize_object_name(&u.name));
-            for arg in &u.args {
-                out.push('_');
-                out.push_str(&mangle_ty(arg));
+            // Prefix lengths delimit nested generic arguments unambiguously.
+            if u.args.is_empty() {
+                format!("Union_{}", sanitize_object_name(&u.name))
+            } else {
+                format!(
+                    "Union_{}_{}",
+                    encode_component(&sanitize_object_name(&u.name)),
+                    encode_list(&u.args.iter().map(mangle_ty).collect::<Vec<_>>())
+                )
             }
-            out
         }
         Ty::Array(elem) => format!("Array_{}", mangle_ty(elem)),
         Ty::Tuple(fields) => {
             let parts: Vec<String> = fields
                 .iter()
                 .map(|(name, ty)| match name {
-                    Some(name) => format!("{name}_{}", mangle_ty(ty)),
+                    Some(name) => format!("{}_{}", encode_component(name), mangle_ty(ty)),
                     None => mangle_ty(ty),
                 })
                 .collect();
-            format!("Tuple_{}", parts.join("_"))
+            format!("Tuple_{}", encode_list(&parts))
         }
         Ty::Mutable(inner) => format!("Mut_{}", mangle_ty(inner)),
         // `E!u64` -> `Fallible_E_u64`; `!u64` -> `Fallible_Any_u64`.
@@ -480,6 +484,58 @@ fn mangle_ty(ty: &Ty) -> String {
         Ty::Void => "void".into(),
         Ty::Error => "error".into(),
     }
+}
+
+fn projection_paths_for_params(ty: &Ty, params: &HashSet<String>) -> HashSet<Vec<usize>> {
+    match ty {
+        Ty::Tuple(fields) => fields
+            .iter()
+            .enumerate()
+            .flat_map(|(index, (_, ty))| {
+                projection_paths_for_params(ty, params)
+                    .into_iter()
+                    .map(move |mut path| {
+                        path.insert(0, index);
+                        path
+                    })
+            })
+            .collect(),
+        Ty::Mutable(inner) => projection_paths_for_params(inner, params),
+        Ty::Fallible(f) => projection_paths_for_params(&f.ok, params),
+        _ if !type_params_in(ty).is_disjoint(params) => HashSet::from([Vec::new()]),
+        _ => HashSet::new(),
+    }
+}
+
+fn type_params_in(ty: &Ty) -> HashSet<String> {
+    fn collect(ty: &Ty, out: &mut HashSet<String>) {
+        match ty {
+            Ty::Param(name) => {
+                out.insert(name.clone());
+            }
+            Ty::Array(t) | Ty::Mutable(t) => collect(t, out),
+            Ty::Tuple(fields) => fields.iter().for_each(|(_, t)| collect(t, out)),
+            Ty::Object(o) => o.args.iter().for_each(|t| collect(t, out)),
+            Ty::Union(u) => u.args.iter().for_each(|t| collect(t, out)),
+            Ty::Fallible(f) => collect(&f.ok, out),
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    collect(ty, &mut out);
+    out
+}
+
+fn encode_component(s: &str) -> String {
+    format!("{}_{s}", s.len())
+}
+fn encode_list(parts: &[String]) -> String {
+    let mut out = format!("{}", parts.len());
+    for part in parts {
+        out.push('_');
+        out.push_str(&encode_component(part));
+    }
+    out
 }
 
 /// Statically known layout of one user-defined object, possibly generic.
@@ -738,6 +794,15 @@ pub struct TypedProgram {
     pub func_defs: std::collections::HashSet<u32>,
     /// Function `DefId.0` -> declared signature (param + return types).
     pub func_sigs: HashMap<u32, FuncSigTy>,
+    /// Opaque generic values whose projections revoked mutation authority.
+    pub readonly_projection_ids: HashSet<u32>,
+    /// Bindings retaining that provenance through aliases or assignments.
+    pub readonly_projection_defs: HashSet<u32>,
+    /// Template return parameters that cannot specialize to mutable views.
+    pub readonly_return_params: HashMap<u32, HashSet<String>>,
+    /// Parameters passed or stored after projection: concrete instances must
+    /// reject mutable contracts without rewriting their signature or key.
+    pub readonly_mutable_call_params: HashMap<u32, HashSet<String>>,
     /// Monomorphic call site (`HirId.0`) -> mangled instance name.
     /// Only calls in non-generic code land here; calls inside generic
     /// templates resolve per-instance in [`TypedProgram::inst_calls`].
@@ -1873,8 +1938,13 @@ fn validate_qualified_types(
                     }
                 }
             }
-            // Error variants carry no payloads; nothing to walk.
-            HirItem::Error { .. } => {}
+            HirItem::Error { variants, .. } => {
+                for variant in variants {
+                    for (ty, span) in &variant.payload {
+                        check_ty(ty, *span, objects, unions, errors, &mut diags);
+                    }
+                }
+            }
             HirItem::Let {
                 ty, ty_span, value, ..
             } => {
@@ -1938,6 +2008,9 @@ pub fn check_with_modules(
         fn_span: Span::empty(0),
         type_env: HashMap::new(),
         type_bounds: HashMap::new(),
+        fn_def: None,
+        projection_paths: HashMap::new(),
+        projection_def_paths: HashMap::new(),
         module: prog.module.clone(),
         pending_instances: Vec::new(),
         pending_imported: Vec::new(),
@@ -2474,6 +2547,10 @@ struct Checker {
     type_env: HashMap<String, Ty>,
     /// Bounds of the current function's type parameters (`T -> Numeric`).
     type_bounds: HashMap<String, GenericBound>,
+    fn_def: Option<u32>,
+    // Tuple slot paths keep projected and untouched siblings distinct.
+    projection_paths: HashMap<u32, HashSet<Vec<usize>>>,
+    projection_def_paths: HashMap<u32, HashSet<Vec<usize>>>,
     /// Owning module for object canonicalization in instance keys.
     module: String,
     /// Concrete `(template DefId.0, args)` pairs awaiting the separate
@@ -2570,6 +2647,133 @@ fn expected_union_args(expected: Option<&Ty>, union: &str, arity: usize) -> Opti
 }
 
 impl Checker {
+    fn projection_paths(&self, id: u32) -> HashSet<Vec<usize>> {
+        self.projection_paths.get(&id).cloned().unwrap_or_else(|| {
+            if self.typed.readonly_projection_ids.contains(&id) {
+                HashSet::from([Vec::new()])
+            } else {
+                HashSet::new()
+            }
+        })
+    }
+    fn mark_projection_paths(&mut self, id: u32, paths: HashSet<Vec<usize>>) {
+        if !paths.is_empty() {
+            self.typed.readonly_projection_ids.insert(id);
+            self.projection_paths.entry(id).or_default().extend(paths);
+        }
+    }
+    fn bind_projection(&mut self, def: u32, id: u32) {
+        let paths = self.projection_paths(id);
+        if !paths.is_empty() {
+            self.typed.readonly_projection_defs.insert(def);
+            self.projection_def_paths
+                .entry(def)
+                .or_default()
+                .extend(paths);
+        }
+    }
+    fn tuple_projection_paths(&self, base: u32, index: usize) -> HashSet<Vec<usize>> {
+        self.projection_paths(base)
+            .into_iter()
+            .filter_map(|path| {
+                if path.is_empty() {
+                    Some(path)
+                } else if path[0] == index {
+                    Some(path[1..].to_vec())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+    fn projection_params(&self, id: u32, ty: &Ty) -> HashSet<String> {
+        let mut params = HashSet::new();
+        for path in self.projection_paths(id) {
+            let mut selected = ty.clone();
+            for index in path {
+                if let Some(fields) = selected.tuple_elems() {
+                    if let Some((_, field)) = fields.get(index) {
+                        selected = field.clone();
+                    }
+                }
+            }
+            params.extend(type_params_in(&selected));
+        }
+        params
+    }
+    fn record_projection_store(&mut self, value: &HirExpr, want: &Ty) {
+        if let Some(caller) = self.fn_def {
+            let got = self
+                .typed
+                .types
+                .get(&value.id().0)
+                .cloned()
+                .unwrap_or(Ty::Error);
+            let params = self.projection_params(value.id().0, &got);
+            let wanted = type_params_in(want);
+            self.typed
+                .readonly_mutable_call_params
+                .entry(caller)
+                .or_default()
+                .extend(params.intersection(&wanted).cloned());
+        }
+    }
+    fn infer_poisoned_initializer(&mut self, value: &HirExpr) {
+        match value {
+            HirExpr::ObjectLiteral { fields, .. } => {
+                for (_, field) in fields {
+                    self.infer_expr(field);
+                }
+                self.record(value.id(), Ty::Error);
+            }
+            HirExpr::Variant { args, .. } => {
+                for arg in args {
+                    self.infer_expr(arg);
+                }
+                self.record(value.id(), Ty::Error);
+            }
+            _ => {
+                self.infer_expr(value);
+            }
+        }
+    }
+    fn record_projection_call(
+        &mut self,
+        id: u32,
+        result_ty: &Ty,
+        actual_tys: &[Ty],
+        actuals: &[&HirExpr],
+        formals: &[Ty],
+    ) {
+        let result_params = type_params_in(result_ty);
+        for (i, actual) in actuals.iter().enumerate() {
+            if !self.typed.readonly_projection_ids.contains(&actual.id().0) {
+                continue;
+            }
+            let Some(actual_ty) = actual_tys.get(i) else {
+                continue;
+            };
+            let params = self.projection_params(actual.id().0, actual_ty);
+            if !params.is_disjoint(&result_params) {
+                self.mark_projection_paths(id, projection_paths_for_params(result_ty, &params));
+            }
+            if let (Some(caller), Some(formal)) = (self.fn_def, formals.get(i)) {
+                let formal_params = type_params_in(formal);
+                self.typed
+                    .readonly_mutable_call_params
+                    .entry(caller)
+                    .or_default()
+                    .extend(params.intersection(&formal_params).cloned());
+            }
+        }
+    }
+    fn project_capability(&mut self, id: u32, receiver: &Ty, member: &Ty) -> Ty {
+        let projected = project_capability(receiver, member);
+        if !receiver.is_mutable_view() && matches!(member, Ty::Param(_)) {
+            self.mark_projection_paths(id, HashSet::from([Vec::new()]));
+        }
+        projected
+    }
     fn record(&mut self, id: vl_hir::HirId, ty: Ty) -> Ty {
         self.typed.types.insert(id.0, ty.clone());
         ty
@@ -2669,6 +2873,7 @@ impl Checker {
                 self.record(*id, ty.clone());
                 if let Some(def) = def {
                     self.bindings.insert(def.0, ty);
+                    self.bind_projection(def.0, value.id().0);
                     if *kind == BindingKind::Val {
                         self.fixed_defs.insert(def.0);
                     }
@@ -2690,8 +2895,8 @@ impl Checker {
                 self.record(*id, base.clone());
                 for b in bindings {
                     if let Some(def) = &b.def {
-                        self.bindings
-                            .insert(def.0, self.binding_element_ty(&base, b));
+                        let elem_ty = self.binding_element_ty(&base, b);
+                        self.bindings.insert(def.0, elem_ty);
                         if *kind == BindingKind::Val {
                             self.fixed_defs.insert(def.0);
                         }
@@ -2772,6 +2977,7 @@ impl Checker {
                 // below); a bare tail value never satisfies the return type.
                 self.fn_ret = ret_ty.clone();
                 self.fn_name = name.clone();
+                self.fn_def = def.as_ref().map(|d| d.0);
                 self.fn_ret_span = *ret_span;
                 self.fn_span = *span;
                 for stmt in body {
@@ -2779,6 +2985,7 @@ impl Checker {
                 }
                 self.type_env.clear();
                 self.type_bounds.clear();
+                self.fn_def = None;
                 if poisoned_sig {
                     return;
                 }
@@ -2817,7 +3024,7 @@ impl Checker {
 
     /// Element type for one destructure binding given the checked base
     /// tuple type (or `Error` when the base was poisoned).
-    fn binding_element_ty(&self, base: &Ty, b: &vl_hir::HirDestructureBinding) -> Ty {
+    fn binding_element_ty(&mut self, base: &Ty, b: &vl_hir::HirDestructureBinding) -> Ty {
         if ty_has_error(base) {
             return Ty::Error;
         }
@@ -2900,10 +3107,14 @@ impl Checker {
                 return Ty::Error;
             }
         }
-        let base = match &ann {
+        let mut base = match &ann {
             Some(a) => self.infer_expr_expected(value, a),
             None => self.infer_expr(value),
         };
+        if ann.is_none() && ty_contains_int(&base) {
+            let expected = default_inferred_ty(base.clone());
+            base = self.infer_expr_expected(value, &expected);
+        }
         if ty_has_error(&base) {
             poison(self);
             return Ty::Error;
@@ -3030,7 +3241,27 @@ impl Checker {
             }
             if let Some(def) = &b.def {
                 // Default untyped int elements through the u64 lane.
-                let ty = if ty == Ty::Int { Ty::U64 } else { ty };
+                let ty = default_inferred_ty(ty);
+                let index = if unnamed {
+                    b.index
+                } else {
+                    let want = b.field.as_deref().unwrap_or(b.binding.as_str());
+                    elems
+                        .iter()
+                        .position(|(n, _)| n.as_deref() == Some(want))
+                        .expect("validated named destructuring field")
+                };
+                let mut paths = self.tuple_projection_paths(value.id().0, index);
+                if !base.is_mutable_view() && matches!(ty, Ty::Param(_)) {
+                    paths.insert(Vec::new());
+                }
+                if !paths.is_empty() {
+                    self.typed.readonly_projection_defs.insert(def.0);
+                    self.projection_def_paths
+                        .entry(def.0)
+                        .or_default()
+                        .extend(paths);
+                }
                 self.bindings.insert(def.0, ty);
                 if kind == BindingKind::Val {
                     self.fixed_defs.insert(def.0);
@@ -3066,7 +3297,7 @@ impl Checker {
         });
         if let Some(a) = &ann {
             if ty_has_error(a) {
-                let _ = self.infer_expr(value);
+                self.infer_poisoned_initializer(value);
                 return Ty::Error;
             }
             if ty_has_unknown_qualified(a, &self.typed.objects, &self.typed.unions) {
@@ -3281,6 +3512,7 @@ impl Checker {
                 self.record(*id, ty.clone());
                 if let Some(def) = def {
                     self.bindings.insert(def.0, ty);
+                    self.bind_projection(def.0, value.id().0);
                     if *kind == BindingKind::Val {
                         self.fixed_defs.insert(def.0);
                     }
@@ -3341,6 +3573,16 @@ impl Checker {
                     }
                     Some(e) => {
                         let got = self.infer_expr_expected(e, &self.fn_ret.clone());
+                        if self.typed.readonly_projection_ids.contains(&e.id().0) {
+                            if let Some(def) = self.fn_def {
+                                let params = self.projection_params(e.id().0, &got);
+                                self.typed
+                                    .readonly_return_params
+                                    .entry(def)
+                                    .or_default()
+                                    .extend(params);
+                            }
+                        }
                         // Poisoned values already reported; the statement still
                         // diverges, so the missing-`return` check stays quiet.
                         if ty_has_error(&got) || ty_has_error(&self.fn_ret) {
@@ -3429,6 +3671,7 @@ impl Checker {
                     self.record(*id, Ty::Error);
                     return;
                 }
+                self.bind_projection(def.0, value.id().0);
                 match self.bindings.get(&def.0).cloned() {
                     None => {
                         self.diags.push(
@@ -3561,6 +3804,7 @@ impl Checker {
                     self.record(*id, Ty::Error);
                     return;
                 }
+                self.record_projection_store(value, &elem);
                 self.record(*id, elem);
             }
             HirStmt::FieldAssign {
@@ -3840,6 +4084,7 @@ impl Checker {
                     self.record(*id, Ty::Error);
                     return;
                 }
+                self.record_projection_store(value, &want);
                 self.record(*id, want);
             }
             HirStmt::Destructure {
@@ -4998,6 +5243,8 @@ impl Checker {
                 }
             }
         }
+        let actuals: Vec<&HirExpr> = std::iter::once(receiver).chain(args.iter()).collect();
+        self.record_projection_call(id.0, &ret_ty, &full_tys, &actuals, &param_tys);
         self.record(id, ret_ty)
     }
 
@@ -5352,13 +5599,44 @@ impl Checker {
                 param_tys: formal_tys,
                 ret: Ty::Void,
                 type_params: sig.type_params.clone(),
-                bounds: HashMap::new(),
+                bounds: sig.bounds.clone(),
             };
             self.infer_type_args(&display, span, &synthetic, &arg_tys)
         };
         let Some(resolved) = resolved else {
             return self.record(id, Ty::Error);
         };
+        let bound_sig = FuncSigTy {
+            param_names: vec![],
+            param_tys: vec![],
+            ret: Ty::Void,
+            type_params: sig.type_params.clone(),
+            bounds: sig.bounds.clone(),
+        };
+        if !self.check_bounds(&display, span, &bound_sig, &resolved) {
+            return self.record(id, Ty::Error);
+        }
+        for arg in &resolved {
+            if ty_contains_mutable(arg) {
+                self.diags.push(
+                    Diagnostic::error("nominal type arguments cannot contain mutable views")
+                        .with_label(
+                            span,
+                            "mutation authority cannot flow through generic arguments",
+                        )
+                        .with_code("E106"),
+                );
+                return self.record(id, Ty::Error);
+            }
+            if arg.is_void() {
+                self.diags.push(
+                    Diagnostic::error("type argument cannot be `void`")
+                        .with_label(span, "`void` is not a value type")
+                        .with_code("E308"),
+                );
+                return self.record(id, Ty::Error);
+            }
+        }
         let Some(wants) = self.variant_payload_tys(&sig, tag, &resolved) else {
             return self.record(id, Ty::Error);
         };
@@ -5880,11 +6158,16 @@ impl Checker {
         // Exact match first: a `?T` value where `?T` is expected needs no
         // wrap (avoids a spurious inner probe that would mismatch `?T`
         // vs `T`).
-        let current = self.infer_expr(expr);
-        if ty_has_error(&current) {
+        let contextual_only = needs_expected_context(expr);
+        let current = if contextual_only {
+            Ty::Error
+        } else {
+            self.infer_expr(expr)
+        };
+        if !contextual_only && ty_has_error(&current) {
             return Some(self.record(expr.id(), Ty::Error));
         }
-        if can_coerce(&current, expected) {
+        if !contextual_only && can_coerce(&current, expected) {
             return None;
         }
         let probe = self.infer_expr_expected(expr, &inner);
@@ -5944,11 +6227,16 @@ impl Checker {
         }
         // Exact match first: an `E!T` value where `E!T` is expected needs
         // no wrap (avoids a spurious inner probe).
-        let current = self.infer_expr(expr);
-        if ty_has_error(&current) {
+        let contextual_only = needs_expected_context(expr);
+        let current = if contextual_only {
+            Ty::Error
+        } else {
+            self.infer_expr(expr)
+        };
+        if !contextual_only && ty_has_error(&current) {
             return Some(self.record(expr.id(), Ty::Error));
         }
-        if can_coerce(&current, expected) {
+        if !contextual_only && can_coerce(&current, expected) {
             return None;
         }
         // An error-typed value (a variable holding an error, a `catch`
@@ -6126,6 +6414,15 @@ impl Checker {
                             }
                         }
                         if !conflict && can_coerce(&acc, expected_elem) {
+                            for elem in elems {
+                                self.record_projection_store(elem, expected_elem);
+                            }
+                            if elems
+                                .iter()
+                                .any(|e| self.typed.readonly_projection_ids.contains(&e.id().0))
+                            {
+                                self.mark_projection_paths(id.0, HashSet::from([Vec::new()]));
+                            }
                             // Record elements already via recursion; record the
                             // literal itself as the expected shape when fresh
                             // (or as readonly Array when expected readonly).
@@ -6195,6 +6492,14 @@ impl Checker {
                         }
                     }
                     if !conflict {
+                        let mut paths = HashSet::new();
+                        for (index, (_, value)) in elems.iter().enumerate() {
+                            for mut path in self.projection_paths(value.id().0) {
+                                path.insert(0, index);
+                                paths.insert(path);
+                            }
+                        }
+                        self.mark_projection_paths(id.0, paths);
                         if expected.is_mutable_view() {
                             return self.record(*id, expected.clone());
                         } else {
@@ -6496,6 +6801,15 @@ impl Checker {
                 if poisoned {
                     return self.record(*id, Ty::Error);
                 }
+                for elem in elems {
+                    self.record_projection_store(elem, &first);
+                }
+                if elems
+                    .iter()
+                    .any(|e| self.typed.readonly_projection_ids.contains(&e.id().0))
+                {
+                    self.mark_projection_paths(id.0, HashSet::from([Vec::new()]));
+                }
                 self.record(*id, Ty::Array(Box::new(first)))
             }
             HirExpr::ObjectLiteral {
@@ -6750,6 +7064,54 @@ impl Checker {
                     }
                     return self.record(*id, Ty::Error);
                 };
+                let bound_sig = FuncSigTy {
+                    param_names: vec![],
+                    param_tys: vec![],
+                    ret: Ty::Void,
+                    type_params: sig.type_params.clone(),
+                    bounds: sig.bounds.clone(),
+                };
+                if !self.check_bounds(name, *span, &bound_sig, &resolved_args) {
+                    for (_, value) in fields {
+                        self.infer_expr(value);
+                    }
+                    return self.record(*id, Ty::Error);
+                }
+                for arg in &resolved_args {
+                    if ty_contains_mutable(arg) {
+                        self.diags.push(
+                            Diagnostic::error(
+                                "nominal type arguments cannot contain mutable views",
+                            )
+                            .with_label(
+                                *span,
+                                "mutation authority cannot flow through generic arguments",
+                            )
+                            .with_code("E106"),
+                        );
+                        for (_, value) in fields {
+                            self.infer_expr(value);
+                        }
+                        return self.record(*id, Ty::Error);
+                    }
+                    if arg.is_void() {
+                        self.diags.push(
+                            Diagnostic::error("type argument cannot be `void`")
+                                .with_label(*span, "`void` is not a value type")
+                                .with_code("E308"),
+                        );
+                        for (_, value) in fields {
+                            self.infer_expr(value);
+                        }
+                        return self.record(*id, Ty::Error);
+                    }
+                    if !validate_capability(arg, *span, &mut self.diags) {
+                        for (_, value) in fields {
+                            self.infer_expr(value);
+                        }
+                        return self.record(*id, Ty::Error);
+                    }
+                }
                 let env: HashMap<String, Ty> = sig
                     .type_params
                     .iter()
@@ -6896,6 +7258,14 @@ impl Checker {
                 if poisoned {
                     return self.record(*id, Ty::Error);
                 }
+                let mut paths = HashSet::new();
+                for (index, (_, value)) in elems.iter().enumerate() {
+                    for mut path in self.projection_paths(value.id().0) {
+                        path.insert(0, index);
+                        paths.insert(path);
+                    }
+                }
+                self.mark_projection_paths(id.0, paths);
                 self.record(*id, Ty::Tuple(out))
             }
             HirExpr::TupleIndex {
@@ -6938,7 +7308,10 @@ impl Checker {
                     );
                     return self.record(*id, Ty::Error);
                 };
-                self.record(*id, project_capability(&bt, elem))
+                let projected = self.project_capability(id.0, &bt, elem);
+                let paths = self.tuple_projection_paths(base.id().0, *index);
+                self.mark_projection_paths(id.0, paths);
+                self.record(*id, projected)
             }
             HirExpr::Index {
                 id, base, index, ..
@@ -6966,7 +7339,8 @@ impl Checker {
                 }
                 // Reading works through either capability; reference elements
                 // project transitively (`Array[*Foo][i]` -> `Foo`).
-                self.record(*id, project_capability(&bt, &elem))
+                let projected = self.project_capability(id.0, &bt, &elem);
+                self.record(*id, projected)
             }
             HirExpr::Field {
                 id,
@@ -7009,7 +7383,14 @@ impl Checker {
                         );
                         return self.record(*id, Ty::Error);
                     };
-                    return self.record(*id, project_capability(&bt, elem));
+                    let projected = self.project_capability(id.0, &bt, elem);
+                    let index = elems
+                        .iter()
+                        .position(|(n, _)| n.as_deref() == Some(name.as_str()))
+                        .expect("validated tuple field");
+                    let paths = self.tuple_projection_paths(base.id().0, index);
+                    self.mark_projection_paths(id.0, paths);
+                    return self.record(*id, projected);
                 }
                 let Some(object_name) = object_base(&bt) else {
                     if !ty_has_error(&bt) {
@@ -7051,7 +7432,8 @@ impl Checker {
                 let inst = subst_ty(ty, &env);
                 // Transitive projection: `Parent.child` -> `Child`,
                 // `*Parent.child` -> `*Child`.
-                self.record(*id, project_capability(&bt, &inst))
+                let projected = self.project_capability(id.0, &bt, &inst);
+                self.record(*id, projected)
             }
             HirExpr::Var { id, def, span, .. } => {
                 // Unresolved names were already reported by `vl-semantic`;
@@ -7076,6 +7458,14 @@ impl Checker {
                             }
                             Ty::Error
                         });
+                    if self.typed.readonly_projection_defs.contains(&def_id) {
+                        let paths = self
+                            .projection_def_paths
+                            .get(&def_id)
+                            .cloned()
+                            .unwrap_or_else(|| HashSet::from([Vec::new()]));
+                        self.mark_projection_paths(id.0, paths);
+                    }
                     self.record(*id, ty)
                 }
             }
@@ -7289,6 +7679,8 @@ impl Checker {
                                 // emitting an unresolved call.
                             }
                         }
+                        let actuals: Vec<&HirExpr> = args.iter().collect();
+                        self.record_projection_call(id.0, &ret_ty, &arg_tys, &actuals, &param_tys);
                         return self.record(*id, ret_ty);
                     }
                     // Target-native exports are never generic:
@@ -7432,6 +7824,8 @@ impl Checker {
                         self.pending_instances.push((d.0, resolved.clone()));
                     }
                 }
+                let actuals: Vec<&HirExpr> = args.iter().collect();
+                self.record_projection_call(id.0, &ret_ty, &arg_tys, &actuals, &param_tys);
                 self.record(*id, ret_ty)
             }
             HirExpr::MethodCall {
@@ -7460,13 +7854,24 @@ impl Checker {
                 span,
                 ..
             } => self.check_error_value(*id, set, variant, args, *span, false),
-            HirExpr::Try { id, inner, span } => self.check_try(*id, inner, *span),
+            HirExpr::Try { id, inner, span } => {
+                let ty = self.check_try(*id, inner, *span);
+                let paths = self.projection_paths(inner.id().0);
+                self.mark_projection_paths(id.0, paths);
+                ty
+            }
             HirExpr::Catch {
                 id,
                 lhs,
                 fallback,
                 span,
-            } => self.check_catch(*id, lhs, fallback, *span),
+            } => {
+                let ty = self.check_catch(*id, lhs, fallback, *span);
+                let mut paths = self.projection_paths(lhs.id().0);
+                paths.extend(self.projection_paths(fallback.id().0));
+                self.mark_projection_paths(id.0, paths);
+                ty
+            }
             HirExpr::Unary {
                 id,
                 op,
@@ -8674,6 +9079,27 @@ fn project_capability(receiver: &Ty, member: &Ty) -> Ty {
         member.clone()
     } else {
         member.readonly_view()
+    }
+}
+
+fn needs_expected_context(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::ArrayLiteral { elems, .. } => {
+            elems.is_empty() || elems.iter().any(needs_expected_context)
+        }
+        HirExpr::TupleLiteral { elems, .. } => elems.iter().any(|(_, e)| needs_expected_context(e)),
+        HirExpr::ObjectLiteral { fields, .. } => {
+            fields.iter().any(|(_, e)| needs_expected_context(e))
+        }
+        HirExpr::Call {
+            name,
+            type_args,
+            args,
+            ..
+        } => {
+            (name == "Array.new" && type_args.is_empty()) || args.iter().any(needs_expected_context)
+        }
+        _ => false,
     }
 }
 
@@ -10951,5 +11377,66 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
         // Same `id[u64]` twice: one pending key (deduplicated).
         assert_eq!(typed.pending_imported.len(), 1);
+    }
+
+    #[test]
+    fn verified_review_regressions() {
+        let (_, d) = check_src("type Foo = object { value: u64, }; fun first[T](a: Array[T]): T { return a[0u64]; } fun main() { val a: Array[*Foo] = [Foo { value = 1u64 }]; var leaked = first(a); leaked.value = 2u64; }");
+        assert!(
+            d.iter()
+                .any(|d| d.code.as_deref() == Some("E302") || d.code.as_deref() == Some("E306")),
+            "projection laundering: {d:?}"
+        );
+
+        let (_, d) = check_src("type Num[T extends Numeric] = union { Some(T), }; fun main() { val bad = Num.Some(\"s\"); bad; }");
+        assert!(
+            d.iter().any(|d| d.code.as_deref() == Some("E303")),
+            "union bound: {d:?}"
+        );
+        let (_, d) = check_src("type Num[T extends Numeric] = object { value: T, }; fun main() { val bad = Num { value = \"s\" }; bad; }");
+        assert!(
+            d.iter().any(|d| d.code.as_deref() == Some("E303")),
+            "object bound: {d:?}"
+        );
+        let (_, d) = check_src("type Box[T] = union { Some(T), }; type Foo = object { value: u64, }; fun main() { var f = Foo { value = 1u64 }; val b = Box.Some(f); b; }");
+        assert!(
+            d.iter().any(|d| d.code.as_deref() == Some("E106")),
+            "union mutable argument: {d:?}"
+        );
+
+        let (_, d) = check_src("fun nullable(): ?Array[u64] { return []; } fun fallible(): !Array[u64] { return Array.new(1u64); } fun main() {}");
+        assert!(d.is_empty(), "nullable/fallible context: {d:?}");
+        let (_, d) = check_src("fun main() { val #(a, b) = #(1, 2); a; b; }");
+        assert!(d.is_empty(), "destructure defaults: {d:?}");
+        let (_, d) = check_src("type E = error { Bad(no.such.Type), }; fun main() {}");
+        assert_eq!(
+            d.iter()
+                .filter(|d| d.code.as_deref() == Some("E302"))
+                .count(),
+            1,
+            "error payload qualified name: {d:?}"
+        );
+
+        let nested_a = Ty::Tuple(vec![
+            (None, Ty::U64),
+            (
+                None,
+                Ty::Tuple(vec![(None, Ty::U64), (None, Ty::U64), (None, Ty::U64)]),
+            ),
+        ]);
+        let nested_b = Ty::Tuple(vec![
+            (None, Ty::U64),
+            (None, Ty::Tuple(vec![(None, Ty::U64), (None, Ty::U64)])),
+            (None, Ty::U64),
+        ]);
+        assert_ne!(mangle("id", &[nested_a]), mangle("id", &[nested_b]));
+
+        let (typed, d) = check_src("fun id[U](x: U): U { return x; } fun wrap[T](x: T): #(T, T) { return id::[#(T, T)](#(x, x)); } fun main() { val p = wrap(1u64); p; }");
+        assert!(d.is_empty(), "nested explicit generic: {d:?}");
+        assert!(
+            typed.instances.keys().any(|name| name.starts_with("id$")),
+            "nested specialization missing: {:?}",
+            typed.instances.keys()
+        );
     }
 }

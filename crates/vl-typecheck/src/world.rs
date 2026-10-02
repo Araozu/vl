@@ -75,13 +75,145 @@ fn instance_name(prog: &HirProgram, def: u32) -> Option<String> {
     })
 }
 
-fn vl_in_instance(v: &VlType, env: &HashMap<String, Ty>) -> Ty {
+pub(super) fn vl_in_instance(v: &VlType, env: &HashMap<String, Ty>) -> Ty {
     match v {
-        VlType::Param(name) => env.get(name).cloned().unwrap_or(Ty::Param(name.clone())),
-        VlType::Array(elem) => Ty::Array(Box::new(vl_in_instance(elem, env))),
-        VlType::Mutable(inner) => Ty::Mutable(Box::new(vl_in_instance(inner, env))),
+        VlType::Param(n) => env.get(n).cloned().unwrap_or(Ty::Param(n.clone())),
+        VlType::Array(t) => Ty::Array(Box::new(vl_in_instance(t, env))),
+        VlType::Mutable(t) => Ty::Mutable(Box::new(vl_in_instance(t, env))),
+        VlType::Tuple(fs) => Ty::Tuple(
+            fs.iter()
+                .map(|f| (f.name.clone(), vl_in_instance(&f.ty, env)))
+                .collect(),
+        ),
+        VlType::Object { name, args } => Ty::Object(Box::new(super::ObjectTy {
+            name: name.clone(),
+            args: args.iter().map(|t| vl_in_instance(t, env)).collect(),
+        })),
+        VlType::Union { name, args } => Ty::Union(Box::new(super::UnionTy {
+            name: name.clone(),
+            args: args.iter().map(|t| vl_in_instance(t, env)).collect(),
+        })),
+        VlType::Nullable(t) => Ty::Union(Box::new(super::UnionTy {
+            name: "Option".into(),
+            args: vec![vl_in_instance(t, env)],
+        })),
+        VlType::Fallible { err, ok } => Ty::Fallible(Box::new(super::FallibleTy {
+            err: err.clone(),
+            ok: vl_in_instance(ok, env),
+        })),
         _ => Ty::from_vl(v),
     }
+}
+
+/// Check invariants that only become visible once a generic function is
+/// instantiated. This is shared by local and project-wide expansion so local
+/// and imported templates enforce the same capability rules.
+pub(super) fn specialization_diagnostic(
+    prog: &HirProgram,
+    typed: &TypedProgram,
+    def: u32,
+    sig: &FuncSigTy,
+    args: &[Ty],
+) -> Option<Diagnostic> {
+    let span = function_span(prog, def);
+    let name = instance_name(prog, def).unwrap_or_else(|| format!("def#{def}"));
+
+    if let Some(readonly) = typed.readonly_return_params.get(&def) {
+        if sig
+            .type_params
+            .iter()
+            .zip(args)
+            .any(|(param, arg)| readonly.contains(param) && arg.is_mutable_view())
+        {
+            return Some(
+                Diagnostic::error(format!(
+                    "generic `{name}` returns a read-only projection as `{}`",
+                    sig.ret
+                ))
+                .with_label(span, "this return loses mutable capability")
+                .with_code("E302"),
+            );
+        }
+    }
+
+    if let Some(required) = typed.readonly_mutable_call_params.get(&def) {
+        if let Some((param, arg)) = sig
+            .type_params
+            .iter()
+            .zip(args)
+            .find(|(param, arg)| required.contains(*param) && arg.is_mutable_view())
+        {
+            return Some(
+                Diagnostic::error(format!(
+                    "generic `{name}` passes read-only `{param}` to a mutable parameter, but `{param}` specializes to `{arg}`"
+                ))
+                .with_label(span, "this specialization would restore mutation authority")
+                .with_code("E106"),
+            );
+        }
+    }
+
+    let env: HashMap<String, Ty> = sig
+        .type_params
+        .iter()
+        .cloned()
+        .zip(args.iter().cloned())
+        .collect();
+    let (params, ret) = sig.instantiate(args);
+    let invalid = params
+        .iter()
+        .chain(std::iter::once(&ret))
+        .find(|ty| has_mutable_nominal_argument(ty))
+        .cloned()
+        .or_else(|| {
+            super::template_ids_for(prog, def)
+                .into_iter()
+                .find_map(|id| {
+                    typed
+                        .types
+                        .get(&id)
+                        .map(|ty| subst_ty(ty, &env))
+                        .filter(has_mutable_nominal_argument)
+                })
+        });
+    invalid.map(|ty| {
+        Diagnostic::error(format!(
+            "generic `{name}` specializes to nominal type `{ty}` with mutable type arguments"
+        ))
+        .with_label(span, "nominal type arguments cannot contain mutable views")
+        .with_code("E106")
+    })
+}
+
+fn has_mutable_nominal_argument(ty: &Ty) -> bool {
+    match ty {
+        Ty::Object(o) => {
+            o.args.iter().any(super::ty_contains_mutable)
+                || o.args.iter().any(has_mutable_nominal_argument)
+        }
+        Ty::Union(u) => {
+            u.args.iter().any(super::ty_contains_mutable)
+                || u.args.iter().any(has_mutable_nominal_argument)
+        }
+        Ty::Array(inner) | Ty::Mutable(inner) => has_mutable_nominal_argument(inner),
+        Ty::Tuple(fields) => fields
+            .iter()
+            .any(|(_, field)| has_mutable_nominal_argument(field)),
+        Ty::Fallible(f) => has_mutable_nominal_argument(&f.ok),
+        _ => false,
+    }
+}
+
+fn function_span(prog: &HirProgram, def: u32) -> Span {
+    prog.items
+        .iter()
+        .find_map(|item| match item {
+            HirItem::Fn {
+                def: Some(d), span, ..
+            } if d.0 == def => Some(*span),
+            _ => None,
+        })
+        .unwrap_or(Span::empty(0))
 }
 
 fn infer_quiet(sig: &FuncSigTy, actuals: &[Ty]) -> Option<Vec<Ty>> {
@@ -549,6 +681,16 @@ pub fn plan_world(
             }
         }
         visited.insert(key.clone());
+        if let Some(diagnostic) = specialization_diagnostic(
+            modules[info.owner_idx].0,
+            modules[info.owner_idx].1,
+            info.def,
+            &info.sig,
+            &key.args,
+        ) {
+            diags.push((key.template.module.clone(), diagnostic));
+            continue;
+        }
         let (param_tys, ret_ty) = info.sig.instantiate(&key.args);
         if param_tys.iter().any(ty_has_error) || ty_has_error(&ret_ty) {
             continue;
@@ -680,180 +822,6 @@ pub fn validate_plan(
     let mut out = Vec::new();
     // Owner HIR/typed lookup for body validation.
     let find_owner = |owner: &str| modules.iter().find(|(h, _)| h.module == owner);
-    // All HirId.0 values of one template (item id + every node in its body).
-    fn template_ids(prog: &HirProgram, def: u32) -> HashSet<u32> {
-        fn expr_ids(e: &HirExpr, out: &mut HashSet<u32>) {
-            out.insert(e.id().0);
-            match e {
-                HirExpr::ArrayLiteral { elems, .. } => {
-                    for el in elems {
-                        expr_ids(el, out);
-                    }
-                }
-                HirExpr::ObjectLiteral { fields, .. } => {
-                    for (_, v) in fields {
-                        expr_ids(v, out);
-                    }
-                }
-                HirExpr::Variant { args, .. } => {
-                    for a in args {
-                        expr_ids(a, out);
-                    }
-                }
-                HirExpr::TupleLiteral { elems, .. } => {
-                    for (_, v) in elems {
-                        expr_ids(v, out);
-                    }
-                }
-                HirExpr::TupleIndex { base, .. } => expr_ids(base, out),
-                HirExpr::Index { base, index, .. } => {
-                    expr_ids(base, out);
-                    expr_ids(index, out);
-                }
-                HirExpr::Field { base, .. } => expr_ids(base, out),
-                HirExpr::Call { args, .. } => {
-                    for a in args {
-                        expr_ids(a, out);
-                    }
-                }
-                HirExpr::MethodCall { receiver, args, .. } => {
-                    expr_ids(receiver, out);
-                    for a in args {
-                        expr_ids(a, out);
-                    }
-                }
-                HirExpr::Binary { lhs, rhs, .. } => {
-                    expr_ids(lhs, out);
-                    expr_ids(rhs, out);
-                }
-                HirExpr::Unary { inner, .. } => expr_ids(inner, out),
-                HirExpr::Try { inner, .. } => expr_ids(inner, out),
-                HirExpr::Catch { lhs, fallback, .. } => {
-                    expr_ids(lhs, out);
-                    expr_ids(fallback, out);
-                }
-                HirExpr::Cast { inner, .. } => expr_ids(inner, out),
-                HirExpr::Literal { .. }
-                | HirExpr::String { .. }
-                | HirExpr::Null { .. }
-                | HirExpr::Var { .. } => {}
-                HirExpr::ErrorValue { args, .. } => {
-                    for a in args {
-                        expr_ids(a, out);
-                    }
-                }
-            }
-        }
-        fn stmt_ids(s: &HirStmt, out: &mut HashSet<u32>) {
-            match s {
-                HirStmt::Let { id, value, .. } | HirStmt::Assign { id, value, .. } => {
-                    out.insert(id.0);
-                    expr_ids(value, out);
-                }
-                HirStmt::IndexAssign {
-                    id,
-                    array,
-                    index,
-                    value,
-                    ..
-                } => {
-                    out.insert(id.0);
-                    expr_ids(array, out);
-                    expr_ids(index, out);
-                    expr_ids(value, out);
-                }
-                HirStmt::FieldAssign {
-                    id, base, value, ..
-                } => {
-                    out.insert(id.0);
-                    expr_ids(base, out);
-                    expr_ids(value, out);
-                }
-                HirStmt::TupleAssign {
-                    id, base, value, ..
-                } => {
-                    out.insert(id.0);
-                    expr_ids(base, out);
-                    expr_ids(value, out);
-                }
-                HirStmt::Destructure { id, value, .. } => {
-                    out.insert(id.0);
-                    expr_ids(value, out);
-                }
-                HirStmt::Expr(e) => expr_ids(e, out),
-                HirStmt::Return { value, .. } => {
-                    if let Some(e) = value {
-                        expr_ids(e, out);
-                    }
-                }
-                HirStmt::If {
-                    condition,
-                    then_body,
-                    else_body,
-                    ..
-                } => {
-                    expr_ids(condition, out);
-                    for st in then_body {
-                        stmt_ids(st, out);
-                    }
-                    if let Some(body) = else_body {
-                        for st in body {
-                            stmt_ids(st, out);
-                        }
-                    }
-                }
-                HirStmt::Match {
-                    scrutinee,
-                    arms,
-                    else_body,
-                    ..
-                } => {
-                    expr_ids(scrutinee, out);
-                    for arm in arms {
-                        for st in &arm.body {
-                            stmt_ids(st, out);
-                        }
-                    }
-                    if let Some(body) = else_body {
-                        for st in body {
-                            stmt_ids(st, out);
-                        }
-                    }
-                }
-                HirStmt::While {
-                    condition, body, ..
-                } => {
-                    expr_ids(condition, out);
-                    for st in body {
-                        stmt_ids(st, out);
-                    }
-                }
-                HirStmt::Defer { inner, .. } | HirStmt::ErrDefer { inner, .. } => {
-                    stmt_ids(inner, out);
-                }
-                HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
-            }
-        }
-        let mut out = HashSet::new();
-        for item in &prog.items {
-            if let HirItem::Fn {
-                id,
-                def: Some(d),
-                body,
-                ..
-            } = item
-            {
-                if d.0 != def {
-                    continue;
-                }
-                out.insert(id.0);
-                for st in body {
-                    stmt_ids(st, &mut out);
-                }
-            }
-        }
-        out
-    }
     for (owner, instances) in &plan.instances_by_owner {
         let Some((hir, typed)) = find_owner(owner) else {
             continue;
@@ -925,7 +893,7 @@ pub fn validate_plan(
                     _ => None,
                 })
                 .unwrap_or_default();
-            for id in template_ids(hir, inst.orig) {
+            for id in super::template_ids_for(hir, inst.orig) {
                 if let Some(ty) = typed.types.get(&id) {
                     let substed = subst_ty(ty, &env);
                     if ty_has_error(&substed) {
@@ -950,4 +918,59 @@ pub fn validate_plan(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod specialization_tests {
+    use super::*;
+    use crate::{ObjectTy, UnionTy};
+
+    fn mutable_foo() -> Ty {
+        Ty::Mutable(Box::new(Ty::Object(Box::new(ObjectTy {
+            name: "Foo".into(),
+            args: Vec::new(),
+        }))))
+    }
+
+    #[test]
+    fn deferred_readonly_mutable_call_is_rejected_at_concrete_instance() {
+        let prog = HirProgram {
+            module: "test".into(),
+            items: Vec::new(),
+        };
+        let mut typed = TypedProgram::default();
+        typed
+            .readonly_mutable_call_params
+            .insert(7, ["T".to_string()].into_iter().collect());
+        let sig = FuncSigTy {
+            param_names: vec!["x".into()],
+            param_tys: vec![Ty::Param("T".into())],
+            ret: Ty::Param("T".into()),
+            type_params: vec!["T".into()],
+            bounds: HashMap::new(),
+        };
+
+        let diagnostic = specialization_diagnostic(&prog, &typed, 7, &sig, &[mutable_foo()])
+            .expect("mutable specialization must not restore authority");
+        assert_eq!(diagnostic.code.as_deref(), Some("E106"));
+        assert!(specialization_diagnostic(&prog, &typed, 7, &sig, &[Ty::U64]).is_none());
+    }
+
+    #[test]
+    fn nominal_argument_validation_recurses_through_composites() {
+        let invalid = Ty::Array(Box::new(Ty::Tuple(vec![(
+            None,
+            Ty::Fallible(Box::new(crate::FallibleTy {
+                err: None,
+                ok: Ty::Union(Box::new(UnionTy {
+                    name: "Box".into(),
+                    args: vec![Ty::Array(Box::new(mutable_foo()))],
+                })),
+            })),
+        )])));
+        assert!(has_mutable_nominal_argument(&invalid));
+        assert!(!has_mutable_nominal_argument(&Ty::Array(Box::new(
+            mutable_foo()
+        ))));
+    }
 }

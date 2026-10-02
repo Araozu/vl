@@ -846,7 +846,7 @@ fun main() {
     assert!(dump.contains("new_variant Option.Some#1"), "{dump}");
     assert!(dump.contains("new_variant Option.None#0"), "{dump}");
     // `wrap(?u64)` monomorphizes over the nullable union argument.
-    assert!(dump.contains("fn wrap$Union_Option_u64:"), "{dump}");
+    assert!(dump.contains("fn wrap$Union_6_Option_1_3_u64:"), "{dump}");
     assert!(dump.contains("tag_of"), "{dump}");
 }
 
