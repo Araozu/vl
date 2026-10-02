@@ -1126,6 +1126,8 @@ struct NaraEmit {
     values: Vec<u64>,
     value_index: std::collections::HashMap<u64, usize>,
     constants: Vec<NaraConstant>,
+    /// Shared native constant for String equality operators across functions.
+    string_eq_fn_idx: Option<usize>,
     bytecode: Vec<u8>,
     diags: Vec<Diagnostic>,
     rv_map: std::collections::HashMap<vl_lir::Reg, u8>,
@@ -1272,11 +1274,12 @@ impl NaraEmit {
     }
 
     fn ensure_one(&mut self, span: Span) -> Option<u8> {
-        if let Some(rv) = self.one_rv {
-            return Some(rv);
-        }
         let idx = self.add_value(1, span)?;
-        let rv = self.fresh_rv(span)?;
+        let rv = match self.one_rv {
+            Some(rv) => rv,
+            None => self.fresh_rv(span)?,
+        };
+        // Reload at each use: the first use may be in a skipped branch.
         self.bytecode.extend_from_slice(&[0x02, rv, idx as u8]);
         self.one_rv = Some(rv);
         Some(rv)
@@ -1285,22 +1288,24 @@ impl NaraEmit {
     /// A cached zero register, for container `create` calls that need an
     /// explicit "0 references" count operand.
     fn ensure_zero(&mut self, span: Span) -> Option<u8> {
-        if let Some(rv) = self.zero_rv {
-            return Some(rv);
-        }
         let idx = self.add_value(0, span)?;
-        let rv = self.fresh_rv(span)?;
+        let rv = match self.zero_rv {
+            Some(rv) => rv,
+            None => self.fresh_rv(span)?,
+        };
+        // Reload at each use: the first use may be in a skipped branch.
         self.bytecode.extend_from_slice(&[0x02, rv, idx as u8]);
         self.zero_rv = Some(rv);
         Some(rv)
     }
 
     fn ensure_bias(&mut self, span: Span) -> Option<u8> {
-        if let Some(rv) = self.bias_rv {
-            return Some(rv);
-        }
         let idx = self.add_value(0x8000_0000_0000_0000, span)?;
-        let rv = self.fresh_rv(span)?;
+        let rv = match self.bias_rv {
+            Some(rv) => rv,
+            None => self.fresh_rv(span)?,
+        };
+        // Reload at each use: the first use may be in a skipped branch.
         self.bytecode.extend_from_slice(&[0x02, rv, idx as u8]);
         self.bias_rv = Some(rv);
         Some(rv)
@@ -1367,6 +1372,7 @@ impl NaraEmit {
 
 /// Per-function emission context: the LIR signature plus program-wide
 /// callee tables built by the pre-pass.
+#[derive(Clone, Copy)]
 struct NaraFnCtx<'a> {
     func: &'a vl_lir::Function,
     is_main: bool,
@@ -1602,6 +1608,7 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
         values: Vec::new(),
         value_index: std::collections::HashMap::new(),
         constants: Vec::new(),
+        string_eq_fn_idx: None,
         bytecode: Vec::new(),
         diags: Vec::new(),
         rv_map: std::collections::HashMap::new(),
@@ -2105,8 +2112,9 @@ fn nara_resolve_jumps(e: &mut NaraEmit) -> bool {
 /// A purely textual scan is unsound for loops: a register last used *inside*
 /// a loop body re-executes that use on every back edge, so freeing its
 /// machine register mid-loop lets a later temporary clobber a still-live
-/// value (e.g. a loop-invariant parameter). Every backward jump therefore
-/// extends the liveness of the registers it loops over to the jump itself.
+/// value (e.g. a loop-invariant parameter). Backward jumps extend values
+/// defined before the loop; temporaries defined inside it are recreated on
+/// each iteration and can die at their last use.
 fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::Reg, usize> {
     use vl_lir::Instr as I;
     let mut uses: std::collections::HashMap<vl_lir::Reg, Vec<usize>> =
@@ -2115,7 +2123,40 @@ fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::R
         uses.entry(reg).or_default().push(idx);
     };
     let mut label_pos: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut first_def = std::collections::HashMap::new();
     for (idx, ins) in func.instrs.iter().enumerate() {
+        let dst = match ins {
+            I::Const { dst, .. }
+            | I::StringConst { dst, .. }
+            | I::Param { dst, .. }
+            | I::Copy { dst, .. }
+            | I::Cast { dst, .. }
+            | I::Not { dst, .. }
+            | I::BinOp { dst, .. }
+            | I::Call { dst, .. }
+            | I::NewArray { dst, .. }
+            | I::ArrayLit { dst, .. }
+            | I::ArrayGet { dst, .. }
+            | I::ArrayLen { dst, .. }
+            | I::NewObject { dst, .. }
+            | I::ObjectGet { dst, .. }
+            | I::TupleLit { dst, .. }
+            | I::TupleGet { dst, .. }
+            | I::NewVariant { dst, .. }
+            | I::TagOf { dst, .. }
+            | I::PayloadGet { dst, .. }
+            | I::WrapOk { dst, .. }
+            | I::WrapErr { dst, .. }
+            | I::RewrapErr { dst, .. }
+            | I::UnwrapOk { dst, .. }
+            | I::UnwrapErr { dst, .. }
+            | I::ErrPayloadGet { dst, .. }
+            | I::GlobalLoad { dst, .. } => Some(*dst),
+            _ => None,
+        };
+        if let Some(dst) = dst {
+            first_def.entry(dst).or_insert(idx);
+        }
         if let I::Label { id, .. } = ins {
             label_pos.insert(*id, idx);
         }
@@ -2218,8 +2259,9 @@ fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::R
             | I::Label { .. } => {}
         }
     }
-    // Backward-jump ranges: (header position, jump position). A register used
-    // anywhere inside such a range stays live until the jump.
+    // Values defined before a loop and used inside it must survive its back
+    // edge. Keeping loop-local temporaries live too needlessly exhausts the
+    // machine registers in parsers and other arithmetic-heavy loops.
     let mut loops: Vec<(usize, usize)> = Vec::new();
     for (idx, ins) in func.instrs.iter().enumerate() {
         let target = match ins {
@@ -2236,7 +2278,9 @@ fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::R
     for (reg, idxs) in uses {
         let mut end = idxs.iter().copied().max().unwrap_or(0);
         for (header, jump) in &loops {
-            if idxs.iter().any(|u| *header <= *u && *u <= *jump) {
+            if first_def.get(&reg).is_some_and(|def| *def < *header)
+                && idxs.iter().any(|u| *header <= *u && *u <= *jump)
+            {
                 end = end.max(*jump);
             }
         }
@@ -2568,7 +2612,18 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             rhs,
             span,
         } => {
-            nara_binop(e, *dst, *op, *lhs, *rhs, *span);
+            if matches!(op, LirOp::Eq | LirOp::Ne) && e.kinds.get(lhs) == Some(&NaraKind::String) {
+                nara_string_eq(e, ctx, *dst, *lhs, *rhs, *span);
+                if *op == LirOp::Ne {
+                    if let (Some(result), Some(one)) =
+                        (e.rv_map.get(dst).copied(), e.ensure_one(*span))
+                    {
+                        e.bytecode.extend_from_slice(&[0x12, result, result, one]);
+                    }
+                }
+            } else {
+                nara_binop(e, *dst, *op, *lhs, *rhs, *span);
+            }
         }
         Instr::Call {
             dst,
@@ -5466,6 +5521,58 @@ fn nara_ret(e: &mut NaraEmit, ctx: &NaraFnCtx, src: vl_lir::Reg, span: Span) {
     e.bytecode.push(0x00);
 }
 
+/// String equality uses the existing byte-comparison native, with the same
+/// argument spills as explicit calls so live rf32 values remain intact.
+fn nara_string_eq(
+    e: &mut NaraEmit,
+    ctx: &NaraFnCtx,
+    dst: vl_lir::Reg,
+    lhs: vl_lir::Reg,
+    rhs: vl_lir::Reg,
+    span: Span,
+) {
+    let callee = vl_lir::FunctionRef {
+        module: "std.string".into(),
+        function: "eq".into(),
+    };
+    let fn_idx = if let Some(idx) = ctx.imported_fn_consts.get(&callee).copied() {
+        idx
+    } else if let Some(idx) = e.string_eq_fn_idx {
+        idx
+    } else {
+        let (Some(module), Some(function)) = (
+            e.add_string(b"std::string", span),
+            e.add_string(b"eq", span),
+        ) else {
+            e.invalid.insert(dst);
+            return;
+        };
+        let Some(idx) = nara_push_fn_const(e, module, function) else {
+            e.invalid.insert(dst);
+            return;
+        };
+        e.string_eq_fn_idx = Some(idx);
+        idx
+    };
+    let mut imports = ctx.imports.clone();
+    imports.insert(
+        callee.clone(),
+        vl_lir::FunctionImport {
+            symbol: callee.clone(),
+            param_tys: vec![vl_typecheck::Ty::String, vl_typecheck::Ty::String],
+            ret: vl_typecheck::Ty::Bool,
+        },
+    );
+    let mut imported_fn_consts = ctx.imported_fn_consts.clone();
+    imported_fn_consts.insert(callee.clone(), fn_idx);
+    let call_ctx = NaraFnCtx {
+        imports: &imports,
+        imported_fn_consts: &imported_fn_consts,
+        ..*ctx
+    };
+    nara_user_call(e, &call_ctx, dst, &callee, &[lhs, rhs], span);
+}
+
 fn nara_binop(
     e: &mut NaraEmit,
     dst: vl_lir::Reg,
@@ -5761,6 +5868,7 @@ mod tests {
             values: Vec::new(),
             value_index: std::collections::HashMap::new(),
             constants: Vec::new(),
+            string_eq_fn_idx: None,
             bytecode: Vec::new(),
             diags: Vec::new(),
             rv_map: std::collections::HashMap::new(),
@@ -5983,6 +6091,98 @@ mod tests {
         let hir = vl_hir::lower(&prog, &res);
         let (typed, _) = vl_typecheck::check(&hir);
         vl_lir::lower(&hir, &typed)
+    }
+
+    #[test]
+    fn string_equality_reuses_native_constant_and_preserves_reference_arguments() {
+        let span = Span::empty(0);
+        let lhs = vl_lir::Reg(0);
+        let rhs = vl_lir::Reg(1);
+        let dst = vl_lir::Reg(2);
+        let mut e = empty_emitter();
+        for _ in 0..2 {
+            e.reset_fn(std::collections::HashMap::from([(dst, 1)]));
+            e.rf_map.insert(lhs, 0x32);
+            e.rf_map.insert(rhs, 0x33);
+            e.kinds.insert(lhs, NaraKind::String);
+            e.kinds.insert(rhs, NaraKind::String);
+            emit_test_instr(
+                &mut e,
+                &Instr::BinOp {
+                    dst,
+                    op: LirOp::Eq,
+                    lhs,
+                    rhs,
+                    span,
+                },
+            );
+            assert!(e.diags.is_empty(), "{:?}", e.diags);
+            assert_eq!(e.constants.len(), 3, "one shared native function constant");
+            assert_eq!(e.kinds[&dst], NaraKind::Bool);
+            assert!(
+                e.bytecode.windows(2).any(|i| i == [0x08, 0x32]),
+                "save rf32 before argument moves"
+            );
+            assert!(
+                e.bytecode.windows(2).any(|i| i == [0x09, 0x32]),
+                "restore live rf32 after comparison"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_constants_reload_at_every_control_flow_use() {
+        let mut e = empty_emitter();
+        for ensure in [
+            NaraEmit::ensure_one,
+            NaraEmit::ensure_zero,
+            NaraEmit::ensure_bias,
+        ] {
+            let first = ensure(&mut e, Span::new(0, 0)).expect("constant register");
+            let before = e.bytecode.len();
+            let second = ensure(&mut e, Span::new(0, 0)).expect("cached register");
+            assert_eq!(first, second);
+            assert_eq!(&e.bytecode[before..before + 2], &[0x02, second]);
+        }
+    }
+
+    #[test]
+    fn loop_local_temporaries_are_recreated_without_exhausting_registers() {
+        let body = "total = total + 1u64; ".repeat(40);
+        let src = format!(
+            "fun count(n: u64): u64 {{ var total = 0u64; var i = 0u64; while (i < n) {{ {body} i = i + 1u64; }} return total; }} fun main() {{ val n = count(3u64); n; }}"
+        );
+        let lir = lir_of(&src);
+        let (artifact, diags) = NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(artifact.is_some());
+        let count = lir
+            .functions
+            .iter()
+            .find(|f| f.name == "count")
+            .expect("count");
+        let last = nara_last_use(count);
+        let header = count
+            .instrs
+            .iter()
+            .position(|i| matches!(i, Instr::Label { .. }))
+            .expect("loop header");
+        let back_edge = count
+            .instrs
+            .iter()
+            .rposition(|i| matches!(i, Instr::Jump { .. }))
+            .expect("back edge");
+        let constant = count.instrs[header + 1..back_edge]
+            .iter()
+            .find_map(|i| match i {
+                Instr::Const { dst, .. } => Some(dst),
+                _ => None,
+            })
+            .expect("loop-local constant");
+        assert!(
+            last[constant] < back_edge,
+            "loop-local constant dies before back edge"
+        );
     }
 
     #[test]
