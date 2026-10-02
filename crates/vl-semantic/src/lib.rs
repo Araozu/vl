@@ -737,6 +737,9 @@ fn collect_local_calls(stmts: &[Stmt], calls: &mut Vec<String>) {
                     visit_expr(value, calls);
                 }
             }
+            Stmt::Defer { inner, .. } | Stmt::ErrDefer { inner, .. } => {
+                collect_local_calls(std::slice::from_ref(inner), calls);
+            }
             Stmt::Break { .. } | Stmt::Continue { .. } => {}
         }
     }
@@ -892,6 +895,12 @@ fn function_depends_on_global(
                     .as_ref()
                     .is_some_and(|value| expr_depends(value, locals, globals, types)),
                 Stmt::Expr(expr) => expr_depends(expr, locals, globals, types),
+                Stmt::Defer { inner, .. } | Stmt::ErrDefer { inner, .. } => stmts_depend(
+                    std::slice::from_ref(inner),
+                    &mut locals.clone(),
+                    globals,
+                    types,
+                ),
                 Stmt::Break { .. } | Stmt::Continue { .. } => false,
             };
             if depends {
@@ -1365,6 +1374,13 @@ impl Resolver {
                 }
             }
             Stmt::Expr(e) => self.resolve_expr(e),
+            Stmt::Defer { inner, .. } | Stmt::ErrDefer { inner, .. } => {
+                // Deferred bodies get a private execution scope: free names
+                // resolve at the registration site, bindings never escape.
+                self.scopes.push(HashMap::new());
+                self.resolve_stmt(inner);
+                self.scopes.pop();
+            }
             Stmt::Return { value, .. } => {
                 if let Some(e) = value {
                     self.resolve_expr(e);

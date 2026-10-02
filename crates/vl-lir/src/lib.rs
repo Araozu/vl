@@ -816,6 +816,17 @@ fn fmt_scalar(value: Scalar) -> String {
 struct LoopTargets {
     break_target: u32,
     continue_target: u32,
+    /// Cleanup stack depth before the loop body scope was pushed.
+    /// `break`/`continue` unwind scopes with index >= this depth.
+    base_depth: usize,
+}
+
+/// One pending cleanup registration. `is_err` marks `errdefer` (runs only
+/// on error exits); `defer` runs on all exits. Shared LIFO per scope.
+#[derive(Debug, Clone)]
+struct Deferred {
+    stmt: HirStmt,
+    is_err: bool,
 }
 
 struct Lowerer<'t> {
@@ -831,6 +842,13 @@ struct Lowerer<'t> {
     globals: HashMap<u32, u32>,
     next_label: u32,
     loop_stack: Vec<LoopTargets>,
+    /// Lexical cleanup scopes: one entry per active brace block (function
+    /// body, if/else branch, loop body, match arm/else). Each holds its
+    /// shared `defer`/`errdefer` list in registration order. Registration
+    /// occurs only when execution reaches the defer statement; each
+    /// registration runs exactly once per scope activation, innermost-first,
+    /// in reverse registration order. Normal exits skip `errdefer` entries.
+    cleanup: Vec<Vec<Deferred>>,
     /// Instance substitution (`Param` -> concrete) for monomorphized bodies;
     /// empty when lowering non-generic code.
     env: HashMap<String, Ty>,
@@ -1073,6 +1091,9 @@ fn collect_import_stmt(
                 collect_import_stmt(s, typed, out);
             }
         }
+        HirStmt::Defer { inner, .. } | HirStmt::ErrDefer { inner, .. } => {
+            collect_import_stmt(inner, typed, out);
+        }
         HirStmt::Return { value: None, .. } | HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
     }
 }
@@ -1132,6 +1153,98 @@ impl Lowerer<'_> {
         let ty = self.resolved_ty(id)?;
         let elems = ty.tuple_elems()?;
         Some(elems.into_iter().map(|(_, t)| rt(&t)).collect())
+    }
+
+    fn push_cleanup_scope(&mut self) {
+        self.cleanup.push(Vec::new());
+    }
+
+    /// Emit one deferred body in a private execution scope. Bindings declared
+    /// inside never escape; assignments to outer homes persist (shared refs
+    /// stay visible). Nested `defer`/`errdefer` register in the private scope
+    /// and run (normal only) at its end; nested `errdefer` therefore never
+    /// observes the outer error reason.
+    fn lower_deferred_body(&mut self, stmt: &HirStmt, typed: &vl_typecheck::TypedProgram) {
+        let before: std::collections::HashSet<u32> = self.bindings.keys().copied().collect();
+        self.push_cleanup_scope();
+        self.lower_stmt(stmt, typed);
+        // Flush nested defers registered during execution (normal completion
+        // only: execution itself cannot error — no `try`/`return` inside).
+        if let Some(scope) = self.cleanup.pop() {
+            for deferred in scope.iter().rev() {
+                if deferred.is_err {
+                    continue;
+                }
+                let nested = deferred.stmt.clone();
+                // Recurse with fresh scopes; depth is bounded by nesting.
+                self.lower_deferred_body(&nested, typed);
+            }
+        }
+        self.bindings.retain(|k, _| before.contains(k));
+    }
+
+    /// Normal exit of the innermost scope: run its `defer`s (skip
+    /// `errdefer`s) in reverse registration order, then pop. Each
+    /// registration runs exactly once per activation with fresh regs/labels.
+    fn exit_scope_normal(&mut self, typed: &vl_typecheck::TypedProgram) {
+        let Some(scope) = self.cleanup.pop() else {
+            return;
+        };
+        for deferred in scope.iter().rev() {
+            if deferred.is_err {
+                continue;
+            }
+            let stmt = deferred.stmt.clone();
+            self.lower_deferred_body(&stmt, typed);
+        }
+    }
+
+    /// Unwind for an early exit without popping (sibling paths still need the
+    /// registrations). `retain_depth` scopes are kept; scopes with index >=
+    /// it are unwound innermost-first, each in reverse registration order.
+    /// Error unwinds include `errdefer`s; normal unwinds skip them.
+    fn emit_unwind(
+        &mut self,
+        is_error: bool,
+        retain_depth: usize,
+        typed: &vl_typecheck::TypedProgram,
+    ) {
+        let depth = self.cleanup.len();
+        if retain_depth >= depth {
+            return;
+        }
+        // Clone the pending lists so emission (which pushes temporary
+        // execution scopes) cannot observe its own pushes.
+        let mut pending: Vec<Vec<Deferred>> = Vec::new();
+        for d in retain_depth..depth {
+            pending.push(self.cleanup[d].clone());
+        }
+        for scope in pending.iter().rev() {
+            for deferred in scope.iter().rev() {
+                if !is_error && deferred.is_err {
+                    continue;
+                }
+                let stmt = deferred.stmt.clone();
+                self.lower_deferred_body(&stmt, typed);
+            }
+        }
+    }
+
+    /// Classify a `return <expr>` for cleanup: error injection (explicit
+    /// `E.V` into `E!T`, via `fallible_err_wraps`) is an error exit;
+    /// an already-fallible value is dynamic (runtime tag); everything else
+    /// (including `T` into `E!T` via `fallible_ok_wraps`) is normal.
+    fn return_is_error_static(&self, e: &HirExpr) -> Option<bool> {
+        if self.typed.fallible_err_wraps.contains(&e.id().0) {
+            return Some(true);
+        }
+        if self.typed.fallible_ok_wraps.contains(&e.id().0) {
+            return Some(false);
+        }
+        match self.resolved_ty(e.id()) {
+            Some(Ty::Fallible(_)) => None,
+            _ => Some(false),
+        }
     }
 }
 
@@ -1255,6 +1368,25 @@ fn lower_fn_stmt(
             l.lower_continue(*span);
             *topped_return = false;
         }
+        HirStmt::Defer { inner, .. } => {
+            // Registration evaluates nothing; values are read at cleanup.
+            if let Some(top) = l.cleanup.last_mut() {
+                top.push(Deferred {
+                    stmt: (**inner).clone(),
+                    is_err: false,
+                });
+            }
+            *topped_return = false;
+        }
+        HirStmt::ErrDefer { inner, .. } => {
+            if let Some(top) = l.cleanup.last_mut() {
+                top.push(Deferred {
+                    stmt: (**inner).clone(),
+                    is_err: true,
+                });
+            }
+            *topped_return = false;
+        }
     }
 }
 
@@ -1265,11 +1397,22 @@ fn lower_fn_stmt(
 /// level does not end with an unconditional `return`. The payload is a
 /// normalized `u64` zero (`void` backends ignore it); never an unresolved
 /// `int`.
-fn lower_fn_epilogue(l: &mut Lowerer, topped_return: bool, ret: &Ty) {
+fn lower_fn_epilogue(
+    l: &mut Lowerer,
+    topped_return: bool,
+    ret: &Ty,
+    typed: &vl_typecheck::TypedProgram,
+) {
     let ends_with_ret = topped_return && matches!(l.instrs.last(), Some(Instr::Ret { .. }));
     if ends_with_ret {
+        // Return path already unwound; discard the function scope without
+        // emitting dead cleanup after `Ret`.
+        let _ = l.cleanup.pop();
         return;
     }
+    // Fallthrough path: run function-scope defers (normal only) before the
+    // default return.
+    l.exit_scope_normal(typed);
     // `E!void` fallthrough is success: build the ok container (tag 0, no
     // payload) instead of the dummy zero that `void` backends ignore. The
     // `value` register is unused for a void payload (backends skip it).
@@ -1515,6 +1658,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                 globals: global_map.clone(),
                 next_label: 0,
                 loop_stack: Vec::new(),
+                cleanup: Vec::new(),
                 env: HashMap::new(),
                 outer: None,
                 plan: None,
@@ -1573,6 +1717,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
             globals: global_map.clone(),
             next_label: 0,
             loop_stack: Vec::new(),
+            cleanup: Vec::new(),
             env: HashMap::new(),
             outer: None,
             plan: None,
@@ -1638,6 +1783,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                     globals: global_map.clone(),
                     next_label: 0,
                     loop_stack: Vec::new(),
+                    cleanup: Vec::new(),
                     env: HashMap::new(),
                     outer: None,
                     plan: None,
@@ -1659,11 +1805,12 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                     }
                 }
 
+                l.push_cleanup_scope();
                 let mut topped_return = false;
                 for stmt in body {
                     lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
                 }
-                lower_fn_epilogue(&mut l, topped_return, &ret_ty);
+                lower_fn_epilogue(&mut l, topped_return, &ret_ty, typed);
                 out.functions.push(Function {
                     name: name.clone(),
                     param_tys,
@@ -1704,6 +1851,7 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
             globals: global_map.clone(),
             next_label: 0,
             loop_stack: Vec::new(),
+            cleanup: Vec::new(),
             env,
             outer: Some(m.clone()),
             plan: None,
@@ -1723,11 +1871,12 @@ pub fn lower(prog: &HirProgram, typed: &vl_typecheck::TypedProgram) -> LirProgra
                 l.bindings.insert(def.0, dst);
             }
         }
+        l.push_cleanup_scope();
         let mut topped_return = false;
         for stmt in body {
             lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
         }
-        lower_fn_epilogue(&mut l, topped_return, &inst.sig.ret);
+        lower_fn_epilogue(&mut l, topped_return, &inst.sig.ret, typed);
         out.functions.push(Function {
             name: m.clone(),
             param_tys: inst.sig.param_tys.iter().map(rt).collect(),
@@ -1769,6 +1918,7 @@ pub fn lower_stdlib_instance(
         globals: global_map,
         next_label: 0,
         loop_stack: Vec::new(),
+        cleanup: Vec::new(),
         env: env.clone(),
         outer: Some(placeholder),
         plan: Some(plan),
@@ -1788,11 +1938,12 @@ pub fn lower_stdlib_instance(
             l.bindings.insert(def.0, dst);
         }
     }
+    l.push_cleanup_scope();
     let mut topped_return = false;
     for stmt in body {
         lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
     }
-    lower_fn_epilogue(&mut l, topped_return, &inst.sig.ret);
+    lower_fn_epilogue(&mut l, topped_return, &inst.sig.ret, typed);
     Some(Function {
         name: String::new(),
         param_tys: inst.sig.param_tys.iter().map(rt).collect(),
@@ -1825,6 +1976,7 @@ pub fn lower_stdlib_mono(
         globals: global_map,
         next_label: 0,
         loop_stack: Vec::new(),
+        cleanup: Vec::new(),
         env: HashMap::new(),
         outer: None,
         plan: Some(plan),
@@ -1844,11 +1996,12 @@ pub fn lower_stdlib_mono(
             l.bindings.insert(def.0, dst);
         }
     }
+    l.push_cleanup_scope();
     let mut topped_return = false;
     for stmt in body {
         lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
     }
-    lower_fn_epilogue(&mut l, topped_return, ret);
+    lower_fn_epilogue(&mut l, topped_return, ret, typed);
     // Signature from HIR (monomorphic, runtime-erased).
     let param_tys = params
         .iter()
@@ -1952,6 +2105,7 @@ pub fn lower_project(
             globals: global_map.clone(),
             next_label: 0,
             loop_stack: Vec::new(),
+            cleanup: Vec::new(),
             env: HashMap::new(),
             outer: None,
             plan: Some(plan),
@@ -2013,6 +2167,7 @@ pub fn lower_project(
                     globals: global_map.clone(),
                     next_label: 0,
                     loop_stack: Vec::new(),
+                    cleanup: Vec::new(),
                     env: HashMap::new(),
                     outer: None,
                     plan: Some(plan),
@@ -2032,11 +2187,12 @@ pub fn lower_project(
                         l.bindings.insert(def.0, dst);
                     }
                 }
+                l.push_cleanup_scope();
                 let mut topped_return = false;
                 for stmt in body {
                     lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
                 }
-                lower_fn_epilogue(&mut l, topped_return, &ret_ty);
+                lower_fn_epilogue(&mut l, topped_return, &ret_ty, typed);
                 out.functions.push(Function {
                     name: name.clone(),
                     param_tys,
@@ -2081,6 +2237,7 @@ pub fn lower_project(
                 globals: global_map.clone(),
                 next_label: 0,
                 loop_stack: Vec::new(),
+                cleanup: Vec::new(),
                 env,
                 outer: Some(m.clone()),
                 plan: Some(plan),
@@ -2100,11 +2257,12 @@ pub fn lower_project(
                     l.bindings.insert(def.0, dst);
                 }
             }
+            l.push_cleanup_scope();
             let mut topped_return = false;
             for stmt in body {
                 lower_fn_stmt(&mut l, stmt, typed, &mut topped_return);
             }
-            lower_fn_epilogue(&mut l, topped_return, &inst.sig.ret);
+            lower_fn_epilogue(&mut l, topped_return, &inst.sig.ret, typed);
             out.functions.push(Function {
                 name: m,
                 param_tys: inst.sig.param_tys.iter().map(rt).collect(),
@@ -2474,6 +2632,9 @@ fn collect_project_imports(
                 for s in body {
                     walk_stmt(prog, typed, plan, outer, s, by_symbol);
                 }
+            }
+            HirStmt::Defer { inner, .. } | HirStmt::ErrDefer { inner, .. } => {
+                walk_stmt(prog, typed, plan, outer, inner, by_symbol);
             }
             HirStmt::Return { value: None, .. }
             | HirStmt::Break { .. }
@@ -3355,6 +3516,22 @@ impl Lowerer<'_> {
             HirStmt::Continue { span } => {
                 self.lower_continue(*span);
             }
+            HirStmt::Defer { inner, .. } => {
+                if let Some(top) = self.cleanup.last_mut() {
+                    top.push(Deferred {
+                        stmt: (**inner).clone(),
+                        is_err: false,
+                    });
+                }
+            }
+            HirStmt::ErrDefer { inner, .. } => {
+                if let Some(top) = self.cleanup.last_mut() {
+                    top.push(Deferred {
+                        stmt: (**inner).clone(),
+                        is_err: true,
+                    });
+                }
+            }
         }
     }
 
@@ -3377,6 +3554,8 @@ impl Lowerer<'_> {
                 if let Ty::Fallible(f) = &self.fn_ret {
                     if f.ok == Ty::Void && self.resolved_ty(e.id()).is_some_and(|t| t == Ty::Void) {
                         let _ = self.lower_expr(e, typed);
+                        // Normal exit: success, errdefers are skipped.
+                        self.emit_unwind(false, 0, typed);
                         let zero = self.reg();
                         self.instrs.push(Instr::Const {
                             dst: zero,
@@ -3394,13 +3573,75 @@ impl Lowerer<'_> {
                         return;
                     }
                 }
-                if let Some(r) = self.lower_expr(e, typed) {
-                    self.instrs.push(Instr::Ret { src: r, span });
+                let Some(r) = self.lower_expr(e, typed) else {
+                    return;
+                };
+                // Freeze the return value before cleanup can mutate its source
+                // (`var x=1; defer x=2; return x;` returns 1). Cleanup calls
+                // also use return registers, so a protected copy is required.
+                let protected = self.reg();
+                self.instrs.push(Instr::Copy {
+                    dst: protected,
+                    src: r,
+                    span,
+                });
+                match self.return_is_error_static(e) {
+                    Some(true) => {
+                        self.emit_unwind(true, 0, typed);
+                        self.instrs.push(Instr::Ret {
+                            src: protected,
+                            span,
+                        });
+                    }
+                    Some(false) => {
+                        self.emit_unwind(false, 0, typed);
+                        self.instrs.push(Instr::Ret {
+                            src: protected,
+                            span,
+                        });
+                    }
+                    None => {
+                        // Forwarded fallible (`return result;` where
+                        // `result: E!T`): runtime tag selects the unwind.
+                        let is_ok = self.lower_fallible_tag(protected, span);
+                        let Some(is_ok) = is_ok else {
+                            self.instrs.push(Instr::Ret {
+                                src: protected,
+                                span,
+                            });
+                            return;
+                        };
+                        let err_label = self.label();
+                        let end_label = self.label();
+                        self.instrs.push(Instr::BranchIfFalse {
+                            cond: is_ok,
+                            target: err_label,
+                            span,
+                        });
+                        self.emit_unwind(false, 0, typed);
+                        self.instrs.push(Instr::Jump {
+                            target: end_label,
+                            span,
+                        });
+                        self.instrs.push(Instr::Label {
+                            id: err_label,
+                            span,
+                        });
+                        self.emit_unwind(true, 0, typed);
+                        self.instrs.push(Instr::Label {
+                            id: end_label,
+                            span,
+                        });
+                        self.instrs.push(Instr::Ret {
+                            src: protected,
+                            span,
+                        });
+                    }
                 }
             }
             None => {
-                // Bare `return;` in an `E!void` function succeeds: build
-                // the ok container like the fallthrough epilogue does.
+                // Bare `return;`: normal exit (success for `E!void`).
+                self.emit_unwind(false, 0, typed);
                 if let Ty::Fallible(f) = &self.fn_ret {
                     if f.ok == Ty::Void {
                         let zero = self.reg();
@@ -3749,6 +3990,10 @@ impl Lowerer<'_> {
             ok: rebuild,
             span,
         });
+        // Error exit: preserve the rebuilt error (payload-preserving
+        // `RewrapErr`, not code-only), run defers+errdefers, then return.
+        // `scrut`/`errv` are protected temps; cleanup cannot rebind them.
+        self.emit_unwind(true, 0, typed);
         self.instrs.push(Instr::Ret { src: errv, span });
         self.instrs.push(Instr::Label {
             id: end_label,
@@ -3978,9 +4223,12 @@ impl Lowerer<'_> {
     ) {
         let start_label = self.label();
         let end_label = self.label();
+        // Each loop iteration creates a fresh body-scope activation.
+        let base_depth = self.cleanup.len();
         self.loop_stack.push(LoopTargets {
             break_target: end_label,
             continue_target: start_label,
+            base_depth,
         });
         let incoming = self.bindings.clone();
         self.instrs.push(Instr::Label {
@@ -4000,9 +4248,12 @@ impl Lowerer<'_> {
             target: end_label,
             span,
         });
+        self.push_cleanup_scope();
         for stmt in body {
             self.lower_stmt(stmt, typed);
         }
+        // Normal iteration completion runs body defers (errdefers skipped).
+        self.exit_scope_normal(typed);
         self.instrs.push(Instr::Jump {
             target: start_label,
             span,
@@ -4019,20 +4270,23 @@ impl Lowerer<'_> {
 
     fn lower_break(&mut self, span: Span) {
         // Outside a loop the resolver already reported E204; stay quiet.
+        // Normal exit: unwind the current loop body inclusive, retain outer.
         if let Some(targets) = self.loop_stack.last() {
-            self.instrs.push(Instr::Jump {
-                target: targets.break_target,
-                span,
-            });
+            let base = targets.base_depth;
+            let target = targets.break_target;
+            let typed = self.typed;
+            self.emit_unwind(false, base, typed);
+            self.instrs.push(Instr::Jump { target, span });
         }
     }
 
     fn lower_continue(&mut self, span: Span) {
         if let Some(targets) = self.loop_stack.last() {
-            self.instrs.push(Instr::Jump {
-                target: targets.continue_target,
-                span,
-            });
+            let base = targets.base_depth;
+            let target = targets.continue_target;
+            let typed = self.typed;
+            self.emit_unwind(false, base, typed);
+            self.instrs.push(Instr::Jump { target, span });
         }
     }
 
@@ -4055,9 +4309,11 @@ impl Lowerer<'_> {
             target: else_label,
             span,
         });
+        self.push_cleanup_scope();
         for stmt in then_body {
             self.lower_stmt(stmt, typed);
         }
+        self.exit_scope_normal(typed);
         self.instrs.push(Instr::Jump {
             target: end_label,
             span,
@@ -4067,11 +4323,13 @@ impl Lowerer<'_> {
             span,
         });
         self.bindings = incoming.clone();
+        self.push_cleanup_scope();
         if let Some(body) = else_body {
             for stmt in body {
                 self.lower_stmt(stmt, typed);
             }
         }
+        self.exit_scope_normal(typed);
         self.bindings = incoming;
         self.instrs.push(Instr::Label {
             id: end_label,
@@ -4213,9 +4471,11 @@ impl Lowerer<'_> {
                 span,
             });
             self.bindings = incoming.clone();
+            self.push_cleanup_scope();
             for stmt in &arm.body {
                 self.lower_stmt(stmt, typed);
             }
+            self.exit_scope_normal(typed);
             self.instrs.push(Instr::Jump {
                 target: end_label,
                 span,
@@ -4223,11 +4483,13 @@ impl Lowerer<'_> {
             self.instrs.push(Instr::Label { id: *next, span });
         }
         self.bindings = incoming.clone();
+        self.push_cleanup_scope();
         if let Some(body) = else_body {
             for stmt in body {
                 self.lower_stmt(stmt, typed);
             }
         }
+        self.exit_scope_normal(typed);
         self.bindings = incoming;
         self.instrs.push(Instr::Label {
             id: end_label,
@@ -4313,6 +4575,7 @@ impl Lowerer<'_> {
             });
             // Bind this variant's error payloads, then run the arm.
             self.bindings = incoming.clone();
+            self.push_cleanup_scope();
             for (i, b) in arm.bindings.iter().enumerate() {
                 if i >= tys.len() {
                     break;
@@ -4346,6 +4609,7 @@ impl Lowerer<'_> {
             for stmt in &arm.body {
                 self.lower_stmt(stmt, typed);
             }
+            self.exit_scope_normal(typed);
             self.instrs.push(Instr::Jump {
                 target: end_label,
                 span,
@@ -4362,9 +4626,11 @@ impl Lowerer<'_> {
             span,
         });
         self.bindings = incoming.clone();
+        self.push_cleanup_scope();
         for stmt in else_body {
             self.lower_stmt(stmt, typed);
         }
+        self.exit_scope_normal(typed);
         self.bindings = incoming;
         self.instrs.push(Instr::Label {
             id: end_label,
@@ -4437,6 +4703,7 @@ impl Lowerer<'_> {
             });
             // Bind this variant's payloads, then run the arm.
             self.bindings = incoming.clone();
+            self.push_cleanup_scope();
             for (i, b) in arm.bindings.iter().enumerate() {
                 if i >= tys.len() {
                     break;
@@ -4470,6 +4737,7 @@ impl Lowerer<'_> {
             for stmt in &arm.body {
                 self.lower_stmt(stmt, typed);
             }
+            self.exit_scope_normal(typed);
             self.instrs.push(Instr::Jump {
                 target: end_label,
                 span,
@@ -4477,11 +4745,13 @@ impl Lowerer<'_> {
             self.instrs.push(Instr::Label { id: *next, span });
         }
         self.bindings = incoming.clone();
+        self.push_cleanup_scope();
         if let Some(body) = else_body {
             for stmt in body {
                 self.lower_stmt(stmt, typed);
             }
         }
+        self.exit_scope_normal(typed);
         self.bindings = incoming;
         self.instrs.push(Instr::Label {
             id: end_label,

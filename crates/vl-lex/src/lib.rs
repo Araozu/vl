@@ -36,6 +36,8 @@ pub enum TokenKind {
     Break,
     Continue,
     Return,
+    Defer,
+    ErrDefer,
     /// Explicit numeric conversion (`value as u8`).
     As,
     /// Generic bound introducer (`T extends Numeric`).
@@ -410,6 +412,8 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                     "break" => TokenKind::Break,
                     "continue" => TokenKind::Continue,
                     "return" => TokenKind::Return,
+                    "defer" => TokenKind::Defer,
+                    "errdefer" => TokenKind::ErrDefer,
                     "as" => TokenKind::As,
                     "extends" => TokenKind::Extends,
                     "true" => TokenKind::Bool(true),

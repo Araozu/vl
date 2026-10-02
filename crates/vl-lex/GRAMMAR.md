@@ -31,8 +31,8 @@ newline is then whitespace. An unterminated comment at EOF simply stops.
 
 ```text
 keyword    := "var" | "val" | "fun" | "type" | "object" | "union" | "error" | "match" | "if" | "else"
-             | "while" | "break" | "continue" | "return" | "as" | "extends" | "null"
-             | "try" | "catch"
+              | "while" | "break" | "continue" | "return" | "as" | "extends" | "null"
+              | "try" | "catch" | "defer" | "errdefer"
 ident      := [a-zA-Z_] [a-zA-Z0-9_]*
 number     := digits ("." digits)? suffix?
 suffix     := "u64" | "i64" | "f64" | "u8"
@@ -67,6 +67,8 @@ bytes; no UTF-8 decoding is performed.
 | `var`, `val`, `fun`, `type`, `object`, `union`, `error`, `match`, `if`, `else`, `while`, `break`, `continue`, `return` | matching keyword | word span |
 | `try` | `Try` (fallible propagation) | word span |
 | `catch` | `Catch` (fallible fallback) | word span |
+| `defer` | `Defer` (cleanup on all block exits) | word span |
+| `errdefer` | `ErrDefer` (cleanup on error exits) | word span |
 | `as` | `As` | word span |
 | `extends` | `Extends` | word span |
 | `[a-zA-Z_][a-zA-Z0-9_]*` | `Ident(String)` | word span |

@@ -338,6 +338,9 @@ fn calls_in_template(prog: &HirProgram, typed: &TypedProgram, def: u32) -> Vec<N
                     walk_stmt(prog, typed, s, out);
                 }
             }
+            HirStmt::Defer { inner, .. } | HirStmt::ErrDefer { inner, .. } => {
+                walk_stmt(prog, typed, inner, out);
+            }
             HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
         }
     }
@@ -786,6 +789,9 @@ pub fn validate_plan(
                     for st in body {
                         stmt_ids(st, out);
                     }
+                }
+                HirStmt::Defer { inner, .. } | HirStmt::ErrDefer { inner, .. } => {
+                    stmt_ids(inner, out);
                 }
                 HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
             }

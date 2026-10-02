@@ -222,6 +222,14 @@ pub enum HirStmt {
         value: Option<HirExpr>,
         span: Span,
     },
+    Defer {
+        inner: Box<HirStmt>,
+        span: Span,
+    },
+    ErrDefer {
+        inner: Box<HirStmt>,
+        span: Span,
+    },
     Expr(HirExpr),
 }
 
@@ -912,6 +920,14 @@ impl<'a> Lowerer<'a> {
             },
             AstStmt::Break { span } => HirStmt::Break { span: *span },
             AstStmt::Continue { span } => HirStmt::Continue { span: *span },
+            AstStmt::Defer { inner, span } => HirStmt::Defer {
+                inner: Box::new(self.lower_stmt(inner)),
+                span: *span,
+            },
+            AstStmt::ErrDefer { inner, span } => HirStmt::ErrDefer {
+                inner: Box::new(self.lower_stmt(inner)),
+                span: *span,
+            },
             AstStmt::While {
                 condition,
                 body,

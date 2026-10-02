@@ -361,6 +361,22 @@ pub enum Stmt {
         value: Option<Expr>,
         span: Span,
     },
+    /// Deferred cleanup: `defer <stmt>` runs on all exits from the owning
+    /// brace block (fallthrough, return, try-error, break/continue exiting
+    /// the block). `errdefer` runs only on error exits (`try` unwinding or
+    /// `return <error>` from a fallible function). The inner statement keeps
+    /// its own terminating `;` when simple; a compound inner
+    /// (`if`/`while`/`match`) takes one trailing `;` after it. Registration
+    /// evaluates nothing; names resolve at the registration site and values
+    /// are read when cleanup executes. Bindings declared inside never escape.
+    Defer {
+        inner: Box<Stmt>,
+        span: Span,
+    },
+    ErrDefer {
+        inner: Box<Stmt>,
+        span: Span,
+    },
     Expr(Expr),
 }
 
@@ -2458,6 +2474,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stmt(&mut self, allowed: &[String]) -> Option<Stmt> {
+        if matches!(self.peek().kind, TokenKind::Defer | TokenKind::ErrDefer) {
+            return self.parse_defer_stmt(allowed);
+        }
         if matches!(self.peek().kind, TokenKind::If) {
             return self.parse_if_stmt(allowed);
         }
@@ -2794,6 +2813,40 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse `defer <stmt>` / `errdefer <stmt>`. A simple inner statement
+    /// keeps its own terminating `;` with no additional `;`; a compound
+    /// inner (`if`/`while`/`match`) takes one trailing `;` after it.
+    /// Recovery drops the wrapper rather than executing a recovered child
+    /// as an ordinary statement.
+    fn parse_defer_stmt(&mut self, allowed: &[String]) -> Option<Stmt> {
+        let head = self.bump();
+        let is_err = matches!(head.kind, TokenKind::ErrDefer);
+        let inner = self.parse_stmt(allowed)?;
+        let needs_semi = matches!(
+            inner,
+            Stmt::If { .. } | Stmt::While { .. } | Stmt::Match { .. }
+        );
+        let end = if needs_semi {
+            self.expect(&TokenKind::Semi, "`;` after deferred statement")?
+                .span
+                .end
+        } else {
+            stmt_end(&inner)
+        };
+        let span = Span::new(head.span.start, end);
+        if is_err {
+            Some(Stmt::ErrDefer {
+                inner: Box::new(inner),
+                span,
+            })
+        } else {
+            Some(Stmt::Defer {
+                inner: Box::new(inner),
+                span,
+            })
+        }
+    }
+
     fn parse_block(&mut self, allowed: &[String]) -> Option<Vec<Stmt>> {
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut body = Vec::new();
@@ -2838,6 +2891,8 @@ impl<'a> Parser<'a> {
                 | TokenKind::Break
                 | TokenKind::Continue
                 | TokenKind::Return
+                | TokenKind::Defer
+                | TokenKind::ErrDefer
                 | TokenKind::Type => return,
                 _ => {
                     self.bump();
@@ -3401,6 +3456,26 @@ impl<'a> Parser<'a> {
     }
 }
 
+fn stmt_end(s: &Stmt) -> usize {
+    match s {
+        Stmt::Let { span, .. }
+        | Stmt::Assign { span, .. }
+        | Stmt::IndexAssign { span, .. }
+        | Stmt::FieldAssign { span, .. }
+        | Stmt::TupleAssign { span, .. }
+        | Stmt::Destructure { span, .. }
+        | Stmt::If { span, .. }
+        | Stmt::Match { span, .. }
+        | Stmt::While { span, .. }
+        | Stmt::Break { span }
+        | Stmt::Continue { span }
+        | Stmt::Return { span, .. }
+        | Stmt::Defer { span, .. }
+        | Stmt::ErrDefer { span, .. } => span.end,
+        Stmt::Expr(e) => e.span().end,
+    }
+}
+
 fn discriminant(k: &TokenKind) -> std::mem::Discriminant<TokenKind> {
     std::mem::discriminant(k)
 }
@@ -3431,6 +3506,8 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::Break => "`break`".into(),
         TokenKind::Continue => "`continue`".into(),
         TokenKind::Return => "`return`".into(),
+        TokenKind::Defer => "`defer`".into(),
+        TokenKind::ErrDefer => "`errdefer`".into(),
         TokenKind::As => "`as`".into(),
         TokenKind::Extends => "`extends`".into(),
         TokenKind::Plus => "`+`".into(),

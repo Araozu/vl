@@ -30,7 +30,11 @@ fun main() {
         std.print("no server: connect failed\n");
     }
     else {
+        // Cleanup runs at the end of this `else` scope on every path:
+        // normal fallthrough, `try` error propagation inside `fetch`, and
+        // `break`/`continue` if this were a loop. `errdefer` would run only
+        // on the error paths.
+        defer tcp.close(sock) catch std.print("close failed\n");
         std.print(fetch(sock) catch "fetch failed\n");
-        tcp.close(sock) catch std.print("close failed\n");
     }
 }

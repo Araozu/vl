@@ -413,7 +413,7 @@
         },
         {
           "name": "keyword.control.loop.vl",
-          "match": "\\b(?:while|break|continue|return|try)\\b"
+          "match": "\\b(?:while|break|continue|return|try|defer|errdefer)\\b"
         },
         {
           "name": "constant.language.null.vl",

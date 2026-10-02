@@ -224,6 +224,9 @@ fn hir_stmt_has_generic_call(stmt: &vl_hir::HirStmt, typed: &vl_typecheck::Typed
             hir_expr_has_generic_call(condition, typed)
                 || body.iter().any(|s| hir_stmt_has_generic_call(s, typed))
         }
+        vl_hir::HirStmt::Defer { inner, .. } | vl_hir::HirStmt::ErrDefer { inner, .. } => {
+            hir_stmt_has_generic_call(inner, typed)
+        }
         vl_hir::HirStmt::Break { .. } | vl_hir::HirStmt::Continue { .. } => false,
     }
 }
