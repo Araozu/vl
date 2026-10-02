@@ -243,6 +243,7 @@ fn collect_interface_impl(
             _ => None,
         })
         .collect::<std::collections::HashSet<_>>();
+    let imported_types = export_import_type_names(prog);
     let global_names = prog
         .items
         .iter()
@@ -279,7 +280,9 @@ fn collect_interface_impl(
                     payload: variant
                         .payload
                         .iter()
-                        .map(|(ty, _)| qualify_export_ty(ty, &prog.module, &local_types))
+                        .map(|(ty, _)| {
+                            qualify_export_ty(ty, &prog.module, &local_types, &imported_types)
+                        })
                         .collect(),
                 })
                 .collect(),
@@ -379,7 +382,7 @@ fn collect_interface_impl(
             let ty = field
                 .ty
                 .clone()
-                .map(|ty| qualify_export_ty(&ty, &prog.module, &local_types));
+                .map(|ty| qualify_export_ty(&ty, &prog.module, &local_types, &imported_types));
             out_fields.push(vl_common::ObjectFieldSig {
                 name: field.name.clone(),
                 // A missing field type was already reported by the parser;
@@ -431,13 +434,13 @@ fn collect_interface_impl(
                     .filter_map(|p| {
                         p.ty.clone().map(|ty| vl_common::ParamSig {
                             name: p.name.clone(),
-                            ty: qualify_export_ty(&ty, &prog.module, &local_types),
+                            ty: qualify_export_ty(&ty, &prog.module, &local_types, &imported_types),
                         })
                     })
                     .collect(),
                 m.ret
                     .clone()
-                    .map(|ty| qualify_export_ty(&ty, &prog.module, &local_types))
+                    .map(|ty| qualify_export_ty(&ty, &prog.module, &local_types, &imported_types))
                     .unwrap_or(vl_common::VlType::Void),
             );
             if sig.params.len() != m.params.len() {
@@ -521,13 +524,13 @@ fn collect_interface_impl(
                     .filter_map(|p| {
                         p.ty.clone().map(|ty| vl_common::ParamSig {
                             name: p.name.clone(),
-                            ty: qualify_export_ty(&ty, &prog.module, &local_types),
+                            ty: qualify_export_ty(&ty, &prog.module, &local_types, &imported_types),
                         })
                     })
                     .collect(),
                 m.ret
                     .clone()
-                    .map(|ty| qualify_export_ty(&ty, &prog.module, &local_types))
+                    .map(|ty| qualify_export_ty(&ty, &prog.module, &local_types, &imported_types))
                     .unwrap_or(vl_common::VlType::Void),
             );
             if sig.params.len() != m.params.len() {
@@ -553,7 +556,9 @@ fn collect_interface_impl(
                     payload: variant
                         .payload
                         .iter()
-                        .map(|(ty, _)| qualify_export_ty(ty, &prog.module, &local_types))
+                        .map(|(ty, _)| {
+                            qualify_export_ty(ty, &prog.module, &local_types, &imported_types)
+                        })
                         .collect(),
                 })
                 .collect(),
@@ -626,12 +631,12 @@ fn collect_interface_impl(
                 .filter_map(|p| {
                     p.ty.clone().map(|ty| vl_common::ParamSig {
                         name: p.name.clone(),
-                        ty: qualify_export_ty(&ty, &prog.module, &local_types),
+                        ty: qualify_export_ty(&ty, &prog.module, &local_types, &imported_types),
                     })
                 })
                 .collect(),
             ret.clone()
-                .map(|ty| qualify_export_ty(&ty, &prog.module, &local_types))
+                .map(|ty| qualify_export_ty(&ty, &prog.module, &local_types, &imported_types))
                 .unwrap_or(vl_common::VlType::Void),
         );
         if sig.params.len() != params.len() {
@@ -656,6 +661,54 @@ fn collect_interface_impl(
     )
 }
 
+/// Build the provider's imported type namespace from its `use` declarations.
+/// Type exports must carry nominal identities through either bare imports or
+/// module aliases; local declarations shadow imports in `qualify_export_ty`.
+fn export_import_type_names(prog: &Program) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for item in &prog.items {
+        let Item::Use { path, names, .. } = item else {
+            continue;
+        };
+        let module = path.join(".");
+        match names {
+            Some(names) => {
+                for name in names {
+                    if name == "self" {
+                        if let Some(alias) = path.last() {
+                            out.insert(format!("{alias}.*"), module.clone());
+                        }
+                        continue;
+                    }
+                    out.entry(name.clone())
+                        .or_insert_with(|| format!("{module}.{name}"));
+                }
+            }
+            None if path.len() >= 2 => {
+                let module_alias = path.last().cloned().unwrap_or_default();
+                // Qualify only known type spellings encountered in signatures
+                // later; this alias prefix is consumed by `alias.Type` below.
+                // Without a catalog this may be a module or single-type
+                // import. Retain both spellings; resolution validates kind.
+                out.entry(module_alias.clone())
+                    .or_insert_with(|| module.clone());
+                out.insert(format!("{module_alias}.*"), module);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn imported_type_identity(name: &str, imports: &HashMap<String, String>) -> Option<String> {
+    if let Some(qualified) = imports.get(name) {
+        return Some(qualified.clone());
+    }
+    let (alias, leaf) = name.split_once('.')?;
+    let module = imports.get(&format!("{alias}.*"))?;
+    Some(format!("{module}.{leaf}"))
+}
+
 /// Rewrite bare references to this module's own object types into their
 /// fully qualified identity (`Person` -> `<module>.Person`). Already
 /// qualified names, primitives, and type parameters pass through; `Array`
@@ -664,17 +717,25 @@ fn collect_interface_impl(
 fn qualify_export_ty(
     ty: &vl_common::VlType,
     module: &str,
-    local_objects: &std::collections::HashSet<String>,
+    local_types: &std::collections::HashSet<String>,
+    imported_types: &HashMap<String, String>,
 ) -> vl_common::VlType {
     match ty {
-        vl_common::VlType::Object { name, args } if !name.contains('.') => {
+        vl_common::VlType::Object { name, args }
+            if !name.contains('.') || imported_type_identity(name, imported_types).is_some() =>
+        {
             let args = args
                 .iter()
-                .map(|a| qualify_export_ty(a, module, local_objects))
+                .map(|a| qualify_export_ty(a, module, local_types, imported_types))
                 .collect();
-            if local_objects.contains(name) {
+            if local_types.contains(name) {
                 vl_common::VlType::Object {
                     name: format!("{module}.{name}"),
+                    args,
+                }
+            } else if let Some(qualified) = imported_type_identity(name, imported_types) {
+                vl_common::VlType::Object {
+                    name: qualified.clone(),
                     args,
                 }
             } else if args.is_empty() {
@@ -686,35 +747,45 @@ fn qualify_export_ty(
                 }
             }
         }
-        vl_common::VlType::Array(elem) => {
-            vl_common::VlType::Array(Box::new(qualify_export_ty(elem, module, local_objects)))
-        }
-        vl_common::VlType::Nullable(inner) => {
-            vl_common::VlType::Nullable(Box::new(qualify_export_ty(inner, module, local_objects)))
-        }
+        vl_common::VlType::Array(elem) => vl_common::VlType::Array(Box::new(qualify_export_ty(
+            elem,
+            module,
+            local_types,
+            imported_types,
+        ))),
+        vl_common::VlType::Nullable(inner) => vl_common::VlType::Nullable(Box::new(
+            qualify_export_ty(inner, module, local_types, imported_types),
+        )),
         vl_common::VlType::Tuple(fields) => vl_common::VlType::Tuple(
             fields
                 .iter()
                 .map(|f| vl_common::TupleField {
                     name: f.name.clone(),
-                    ty: Box::new(qualify_export_ty(&f.ty, module, local_objects)),
+                    ty: Box::new(qualify_export_ty(
+                        &f.ty,
+                        module,
+                        local_types,
+                        imported_types,
+                    )),
                 })
                 .collect(),
         ),
-        vl_common::VlType::Mutable(inner) => {
-            vl_common::VlType::Mutable(Box::new(qualify_export_ty(inner, module, local_objects)))
-        }
-        vl_common::VlType::Union { name, args } if !name.contains('.') => {
-            let name = if local_objects.contains(name) {
+        vl_common::VlType::Mutable(inner) => vl_common::VlType::Mutable(Box::new(
+            qualify_export_ty(inner, module, local_types, imported_types),
+        )),
+        vl_common::VlType::Union { name, args }
+            if !name.contains('.') || imported_type_identity(name, imported_types).is_some() =>
+        {
+            let name = if local_types.contains(name) {
                 format!("{module}.{name}")
             } else {
-                name.clone()
+                imported_type_identity(name, imported_types).unwrap_or_else(|| name.clone())
             };
             vl_common::VlType::Union {
                 name,
                 args: args
                     .iter()
-                    .map(|a| qualify_export_ty(a, module, local_objects))
+                    .map(|a| qualify_export_ty(a, module, local_types, imported_types))
                     .collect(),
             }
         }
@@ -722,25 +793,31 @@ fn qualify_export_ty(
             name: name.clone(),
             args: args
                 .iter()
-                .map(|a| qualify_export_ty(a, module, local_objects))
+                .map(|a| qualify_export_ty(a, module, local_types, imported_types))
                 .collect(),
         },
-        vl_common::VlType::ErrorSet(name) if !name.contains('.') => {
-            if local_objects.contains(name) {
+        vl_common::VlType::ErrorSet(name)
+            if !name.contains('.') || imported_type_identity(name, imported_types).is_some() =>
+        {
+            if local_types.contains(name) {
                 vl_common::VlType::ErrorSet(format!("{module}.{name}"))
+            } else if let Some(qualified) = imported_type_identity(name, imported_types) {
+                vl_common::VlType::ErrorSet(qualified)
             } else {
                 ty.clone()
             }
         }
         vl_common::VlType::Fallible { err, ok } => vl_common::VlType::Fallible {
             err: err.as_ref().map(|set| {
-                if !set.contains('.') && local_objects.contains(set) {
+                if !set.contains('.') && local_types.contains(set) {
                     format!("{module}.{set}")
+                } else if let Some(qualified) = imported_type_identity(set, imported_types) {
+                    qualified
                 } else {
                     set.clone()
                 }
             }),
-            ok: Box::new(qualify_export_ty(ok, module, local_objects)),
+            ok: Box::new(qualify_export_ty(ok, module, local_types, imported_types)),
         },
         _ => ty.clone(),
     }
@@ -1806,13 +1883,23 @@ impl Resolver {
                     let (head, variant) = callee.split_at(callee.len() - 1);
                     if let Some((canonical, variants)) = self.canonical_error_head(head) {
                         let display = head.join(".");
-                        self.record_error_use(
+                        let known = self.record_error_use(
                             *callee_span,
                             canonical,
                             &variants,
                             &variant[0],
                             &display,
                         );
+                        if known && !type_args.is_empty() {
+                            self.diags.push(
+                                Diagnostic::error("error constructors do not take type arguments")
+                                    .with_label(
+                                        type_args_span.unwrap_or(*callee_span),
+                                        "error sets are not generic",
+                                    )
+                                    .with_code("E303"),
+                            );
+                        }
                         for arg in args {
                             self.resolve_expr(arg);
                         }
@@ -2479,7 +2566,8 @@ impl Resolver {
         // spelling but are lowercase by convention; if the second segment
         // names a method (in `assoc`), fall through to method logic below.
         if callee.len() == 2
-            && (self.local_unions.contains_key(&callee[0]) || callee[0] == "Option")
+            && (self.local_unions.contains_key(&callee[0])
+                || (callee[0] == "Option" && !self.imported_types.contains_key(&callee[0])))
             && !self
                 .assoc
                 .contains_key(&(callee[0].clone(), callee[1].clone()))
@@ -2505,8 +2593,7 @@ impl Resolver {
         // Non-union imports (objects) fall through to the method logic below.
         // Union methods (`U.method`) share the spelling; if the second
         // segment names a method, skip variant recording.
-        if callee.len() == 2 && !self.local_unions.contains_key(&callee[0]) && callee[0] != "Option"
-        {
+        if callee.len() == 2 && !self.local_unions.contains_key(&callee[0]) {
             if let Some(qualified) = self.imported_types.get(&callee[0]).cloned() {
                 let found = self.modules.iter().find_map(|m| {
                     m.unions.iter().find(|u| u.qualified == qualified).map(|u| {
@@ -2971,7 +3058,9 @@ impl Resolver {
             let prefix = callee[..callee.len() - 1].join(".");
             if let Some(local) = prefix
                 .strip_prefix(&format!("{}.", self.module))
-                .filter(|rest| self.local_objects.contains(*rest))
+                .filter(|rest| {
+                    self.local_objects.contains(*rest) || self.local_unions.contains_key(*rest)
+                })
             {
                 if let Some(id) = self
                     .assoc
@@ -2999,10 +3088,15 @@ impl Resolver {
                 return true;
             }
             for spec in self.modules.clone() {
-                let Some(obj) = spec.objects.iter().find(|o| o.qualified == prefix) else {
+                let object = spec.objects.iter().find(|o| o.qualified == prefix);
+                let union = spec.unions.iter().find(|u| u.qualified == prefix);
+                let Some(owner_name) = object
+                    .map(|o| o.name.as_str())
+                    .or_else(|| union.map(|u| u.name.as_str()))
+                else {
                     continue;
                 };
-                let dotted = format!("{}.{}", obj.name, method);
+                let dotted = format!("{}.{}", owner_name, method);
                 if spec.poisoned_exports.iter().any(|e| e == &dotted) {
                     let id = self.external_def(
                         full.clone(),
@@ -3019,13 +3113,19 @@ impl Resolver {
                     }
                     return true;
                 }
-                match obj.lookup_method(&method) {
+                let export = object
+                    .and_then(|o| o.lookup_method(&method))
+                    .or_else(|| union.and_then(|u| u.lookup_method(&method)));
+                match export {
                     None => {
+                        let member_exists = object
+                            .is_some_and(|o| o.fields.iter().any(|f| f.name == method))
+                            || union.is_some_and(|u| u.variants.iter().any(|v| v.name == method));
                         self.diags.push(self.missing_method_diag(
                             &prefix,
                             &method,
                             callee_span,
-                            obj.fields.iter().any(|f| f.name == method),
+                            member_exists,
                         ));
                     }
                     Some(export) => {
@@ -3624,6 +3724,113 @@ mod tests {
             Some(("vl.dog".to_string(), "Dog.new"))
         );
         assert!(res.sugar_receivers.is_empty());
+    }
+
+    #[test]
+    fn export_signatures_canonicalize_imported_types_recursively() {
+        let (toks, _) = vl_lex::lex("use demo.other; use demo.other.{C}; fun f[T](x: Array[C], y: other.C, z: T): C { return x[0u64]; }");
+        let (prog, pdiags) = vl_syntax::parse_with_module(&toks, "", "demo.provider");
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (interface, idiags) = collect_interface(&prog);
+        assert!(idiags.is_empty(), "{idiags:?}");
+        let sig = &interface
+            .functions
+            .iter()
+            .find(|f| f.name == "f")
+            .expect("export f")
+            .sig;
+        assert_eq!(
+            sig.params[0].ty,
+            vl_common::VlType::Array(Box::new(vl_common::VlType::Object {
+                name: "demo.other.C".into(),
+                args: vec![]
+            }))
+        );
+        assert_eq!(
+            sig.params[1].ty,
+            vl_common::VlType::Object {
+                name: "demo.other.C".into(),
+                args: vec![]
+            }
+        );
+        assert_eq!(sig.params[2].ty, vl_common::VlType::Param("T".into()));
+        assert_eq!(
+            sig.ret,
+            vl_common::VlType::Object {
+                name: "demo.other.C".into(),
+                args: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn exported_type_identities_follow_single_and_self_imports() {
+        for import in ["use demo.other.C;", "use demo.other.{self, C};"] {
+            let ty = if import.contains("self") {
+                "other.C"
+            } else {
+                "C"
+            };
+            let src = format!("{import} fun f(x: {ty}): Array[{ty}] {{ return [x]; }}");
+            let (tokens, lex_diags) = vl_lex::lex(&src);
+            let (prog, parse_diags) = vl_syntax::parse_with_module(&tokens, &src, "demo.provider");
+            assert!(lex_diags.is_empty() && parse_diags.is_empty());
+            let (interface, diags) = collect_interface(&prog);
+            assert!(diags.is_empty(), "{diags:?}");
+            let expected = vl_common::VlType::Object {
+                name: "demo.other.C".into(),
+                args: vec![],
+            };
+            assert_eq!(interface.functions[0].sig.params[0].ty, expected);
+            assert_eq!(
+                interface.functions[0].sig.ret,
+                vl_common::VlType::Array(Box::new(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn error_constructor_type_arguments_are_one_root_error() {
+        for src in [
+            "type E = error { A, }; fun main() { E.A::[u64](); }",
+            "type E = error { A(u64), }; fun main() { E.A::[u64](1u64); }",
+        ] {
+            let (_, diags) = resolve_src(src);
+            let errors: Vec<_> = diags.iter().filter(|d| d.is_error()).collect();
+            assert_eq!(errors.len(), 1, "{diags:?}");
+            assert_eq!(errors[0].code.as_deref(), Some("E303"));
+        }
+    }
+
+    #[test]
+    fn imported_option_resolves_its_own_variant() {
+        let module = provider_spec("type Option = union { Other, };", "demo.provider");
+        let (toks, _) = vl_lex::lex("use demo.provider.{Option}; fun main() { Option.Other(); }");
+        let (prog, pdiags) = vl_syntax::parse_with_module(&toks, "", "demo.client");
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, diags) = resolve_with_modules(&prog, &[module]);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(res
+            .variants
+            .values()
+            .any(|u| u.union == "demo.provider.Option" && u.variant == "Other"));
+    }
+
+    #[test]
+    fn qualified_union_method_resolves_from_catalog() {
+        let module = provider_spec(
+            "type U = union { A, fun get(): u64 { return 1u64; }, };",
+            "demo.provider",
+        );
+        let (toks, _) = vl_lex::lex("fun main() { demo.provider.U.get(); }");
+        let (prog, pdiags) = vl_syntax::parse_with_module(&toks, "", "demo.client");
+        assert!(pdiags.is_empty(), "{pdiags:?}");
+        let (res, diags) = resolve_with_modules(&prog, &[module]);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(res.defs.iter().any(|d| d
+            .symbol
+            .as_ref()
+            .is_some_and(|s| s.module.as_string() == "demo.provider" && s.name == "U.get")));
     }
 
     #[test]
