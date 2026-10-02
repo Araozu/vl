@@ -16,8 +16,10 @@ Ariadne error reporting, and a Naravm backend with target-neutral LIR.
   │  vl-codegen    LIR -> backend output via `Target` trait
   ▼
    vl (driver)      CLI wiring + the ONLY place that prints diagnostics
-   vl-frontend      in-memory `check_text` (lex..typecheck + world plan),
-                    `LineIndex`, JSON diagnostics — the tooling/LSP foundation
+    vl-frontend      in-memory `check_text` (lex..typecheck + world plan),
+                     `LineIndex`, JSON diagnostics — the tooling/LSP foundation
+    vl-lsp           stdio language server (`vl lsp`): diagnostics, hover,
+                     goto-definition, symbols, formatting, completion
    vl-common        spans, source table, Ariadne-backed `Diagnostic`
 ```
 
@@ -46,6 +48,7 @@ cargo run -- build examples/arith.vl --target naravm
 cargo run -- lex examples/hello.vl
 cargo run -- parse examples/hello.vl
 cargo run -- targets                         # list backends
+cargo run -- lsp                             # stdio language server (editors/vscode, editors/neovim)
 ```
 
 ## Projects

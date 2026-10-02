@@ -1,0 +1,26 @@
+[package]
+name = "vl-lsp"
+version = "0.1.0"
+edition = "2021"
+description = "VL language server (stdio LSP over the vl-frontend pipeline)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+vl-common = { path = "../vl-common" }
+vl-lex = { path = "../vl-lex" }
+vl-syntax = { path = "../vl-syntax" }
+vl-semantic = { path = "../vl-semantic" }
+vl-hir = { path = "../vl-hir" }
+vl-typecheck = { path = "../vl-typecheck" }
+vl-frontend = { path = "../vl-frontend" }
+vl-stdlib = { path = "../vl-stdlib" }
+vl-codegen = { path = "../vl-codegen" }
+vl-fmt = { path = "../vl-fmt" }
+lsp-server = "0.7"
+lsp-types = "0.94"
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+url = "2"

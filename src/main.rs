@@ -70,6 +70,8 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
+    /// Start the VL language server over stdio (for editor integrations).
+    Lsp,
 }
 
 #[derive(Debug, Deserialize)]
@@ -737,6 +739,13 @@ fn main() -> ExitCode {
         },
         Cmd::Run { name } => run_project_script(name.as_deref()),
         Cmd::Fmt { paths, check } => fmt_paths(&paths, check),
+        Cmd::Lsp => match vl_lsp::run_stdio() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                emit_driver_error(&format!("language server failed: {error}"), "E606");
+                ExitCode::from(2)
+            }
+        },
         Cmd::Targets => {
             let mut output = String::new();
             for t in vl_codegen::all_targets() {
