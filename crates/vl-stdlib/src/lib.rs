@@ -1,8 +1,9 @@
 //! vl-stdlib: the embedded VL standard library.
 //!
-//! Real modules, not a prelude: `src/std/string.vl` is module `std.string`,
-//! `src/std/math.vl` is `std.math`, `src/std/fmt.vl` is `std.fmt`. Nothing
-//! is available without an explicit `use`; there are no implicit globals.
+//! Real modules, not a prelude: the embedded `src/std/*.vl` files provide
+//! source helpers in `std.ascii`, `std.array`, `std.fmt`, `std.math`,
+//! `std.parse`, `std.path`, and `std.string`. Nothing is available without
+//! an explicit `use`; there are no implicit globals.
 //!
 //! Each module view is a *merge* of two owners:
 //!
@@ -39,6 +40,22 @@ struct EmbeddedModule {
 }
 
 const EMBEDDED: &[EmbeddedModule] = &[
+    EmbeddedModule {
+        path: "std.ascii",
+        src: include_str!("std/ascii.vl"),
+    },
+    EmbeddedModule {
+        path: "std.array",
+        src: include_str!("std/array.vl"),
+    },
+    EmbeddedModule {
+        path: "std.parse",
+        src: include_str!("std/parse.vl"),
+    },
+    EmbeddedModule {
+        path: "std.path",
+        src: include_str!("std/path.vl"),
+    },
     EmbeddedModule {
         path: "std.string",
         src: include_str!("std/string.vl"),
@@ -298,6 +315,15 @@ pub fn load() -> Stdlib {
                         existing.unions.push(union.clone());
                     }
                 }
+                for error in &spec.errors {
+                    if !existing
+                        .errors
+                        .iter()
+                        .any(|candidate| candidate.qualified == error.qualified)
+                    {
+                        existing.errors.push(error.clone());
+                    }
+                }
             }
             None => merged.push(spec),
         }
@@ -403,6 +429,15 @@ impl Stdlib {
                             .any(|candidate| candidate.qualified == union.qualified)
                         {
                             existing.unions.push(union.clone());
+                        }
+                    }
+                    for error in &spec.errors {
+                        if !existing
+                            .errors
+                            .iter()
+                            .any(|candidate| candidate.qualified == error.qualified)
+                        {
+                            existing.errors.push(error.clone());
                         }
                     }
                 }
@@ -933,22 +968,130 @@ mod tests {
         let stdlib = load();
         assert_eq!(
             stdlib.helper_names("std.string"),
-            vec!["is_empty", "strings_equal"]
+            vec![
+                "contains",
+                "ends_with",
+                "find",
+                "find_from",
+                "is_empty",
+                "join",
+                "repeat",
+                "replace",
+                "split",
+                "starts_with",
+                "strings_equal",
+                "to_bytes",
+                "trim",
+                "trim_end",
+                "trim_start"
+            ]
         );
         assert_eq!(
             stdlib.helper_names("std.math"),
             vec![
                 "abs_i64",
+                "checked_abs_i64",
+                "checked_add_u64",
+                "checked_div_u64",
+                "checked_mul_u64",
+                "checked_sub_u64",
+                "clamp",
                 "clamp_u64",
+                "gcd_u64",
                 "is_even",
+                "lcm_u64",
                 "max",
                 "max_i64",
                 "max_u64",
+                "min",
                 "min_i64",
-                "min_u64"
+                "min_u64",
+                "pow_u64"
             ]
         );
-        assert_eq!(stdlib.helper_names("std.fmt"), vec!["u64_to_string"]);
+        assert_eq!(
+            stdlib.helper_names("std.array"),
+            vec![
+                "clone", "concat", "contains", "copy", "equal", "fill", "find", "is_empty", "max",
+                "min", "reverse", "slice", "sort", "sum_i64", "sum_u64"
+            ]
+        );
+        assert_eq!(
+            stdlib.helper_names("std.ascii"),
+            vec![
+                "is_alnum",
+                "is_alpha",
+                "is_ascii",
+                "is_control",
+                "is_digit",
+                "is_hex_digit",
+                "is_lower",
+                "is_printable",
+                "is_punctuation",
+                "is_upper",
+                "is_whitespace",
+                "to_lower",
+                "to_upper"
+            ]
+        );
+        assert_eq!(
+            stdlib.helper_names("std.fmt"),
+            vec![
+                "bool_to_string",
+                "hex_u64_to_string",
+                "i64_to_string",
+                "pad_left",
+                "pad_right",
+                "u64_to_string"
+            ]
+        );
+        assert_eq!(
+            stdlib.helper_names("std.parse"),
+            vec!["bool", "hex_u64", "i64", "u64"]
+        );
+        assert_eq!(
+            stdlib.helper_names("std.path"),
+            vec!["basename", "dirname", "extension", "is_absolute", "join"]
+        );
+    }
+
+    #[test]
+    fn parse_error_set_is_importable_and_linkable() {
+        use vl_codegen::Target;
+        let stdlib = load();
+        let lir = user_lir(
+            &stdlib,
+            "use std.parse; use std.parse.{ParseError}; fun parse_value(s: String): ParseError!u64 { return try parse.u64(s); } fun main() { match (parse_value(\"x\")) { ParseError.InvalidDigit { 0u64; } else { 1u64; } } }",
+        );
+        let dump = lir.dump();
+        assert!(dump.contains("fn std$parse$u64:"), "{dump}");
+        let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(&artifact.unwrap().bytes.unwrap()[..4], b"nara");
+    }
+
+    #[test]
+    fn helper_error_sets_merge_into_the_module_catalog() {
+        let stdlib = load();
+        let mut catalog = vl_codegen::modules();
+        stdlib.extend_catalog(&mut catalog);
+        let math = catalog
+            .iter()
+            .find(|module| module.path.as_string() == "std.math")
+            .expect("native std.math module");
+        assert!(math.errors.iter().any(|error| error.name == "MathError"));
+        let array = catalog
+            .iter()
+            .find(|module| module.path.as_string() == "std.array")
+            .expect("helper std.array module");
+        assert!(array.errors.iter().any(|error| error.name == "ArrayError"));
+
+        let lir = user_lir(
+            &stdlib,
+            "use std.math; use std.math.{MathError}; use std.array; use std.array.{ArrayError}; fun pow_value(): MathError!u64 { return try math.pow_u64(2u64, 8u64); } fun slice_value(a: Array[u64]): ArrayError!*Array[u64] { return try array.slice(a, 0u64, a.len); } fun main() { val p = pow_value() catch 0u64; val a = [1u64]; val s = slice_value(a) catch Array.new::[u64](0u64); p; s; }",
+        );
+        assert!(lir.dump().contains("std$math$pow_u64"));
+        assert!(lir.dump().contains("std$array$slice$u64"));
     }
 
     #[test]

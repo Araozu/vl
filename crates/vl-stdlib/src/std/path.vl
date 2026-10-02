@@ -1,0 +1,90 @@
+// Pure POSIX-style path helpers. These operate on `/` bytes and do not query
+// the filesystem or normalize `.` / `..` components.
+use std.string;
+
+fun is_absolute(path: String): bool {
+    return string.starts_with(path, "/");
+}
+
+fun basename(path: String): String {
+    val n = string.len(path);
+    if (n == 0u64) {
+        return "";
+    }
+    var end = n;
+    while (end > 1u64 && (string.byte_at(path, end - 1u64) catch 0u8) == 47u8) {
+        end = end - 1u64;
+    }
+    if (end == 1u64 && (string.byte_at(path, 0u64) catch 0u8) == 47u8) {
+        return "/";
+    }
+    var start = end;
+    while (start > 0u64 && (string.byte_at(path, start - 1u64) catch 0u8) != 47u8) {
+        start = start - 1u64;
+    }
+    return string.slice(path, start, end) catch "";
+}
+
+fun dirname(path: String): String {
+    val n = string.len(path);
+    if (n == 0u64) {
+        return ".";
+    }
+    var end = n;
+    while (end > 1u64 && (string.byte_at(path, end - 1u64) catch 0u8) == 47u8) {
+        end = end - 1u64;
+    }
+    var slash = end;
+    while (slash > 0u64 && (string.byte_at(path, slash - 1u64) catch 0u8) != 47u8) {
+        slash = slash - 1u64;
+    }
+    if (slash == 0u64) {
+        return ".";
+    }
+    if (slash == 1u64 && (string.byte_at(path, 0u64) catch 0u8) == 47u8) {
+        return "/";
+    }
+    var parent_end = slash - 1u64;
+    while (parent_end > 0u64 && (string.byte_at(path, parent_end - 1u64) catch 0u8) == 47u8) {
+        parent_end = parent_end - 1u64;
+    }
+    if (parent_end == 0u64) {
+        if ((string.byte_at(path, 0u64) catch 0u8) == 47u8) {
+            return "/";
+        }
+        return ".";
+    }
+    return string.slice(path, 0u64, parent_end) catch ".";
+}
+
+// Returns the final extension without its dot. A leading dot alone is not an
+// extension (`.profile` -> empty); a later dot is (`a.tar.gz` -> `gz`).
+fun extension(path: String): String {
+    val name = basename(path);
+    val n = string.len(name);
+    var i = n;
+    while (i > 1u64) {
+        i = i - 1u64;
+        if ((string.byte_at(name, i) catch 0u8) == 46u8) {
+            return string.slice(name, i + 1u64, n) catch "";
+        }
+    }
+    return "";
+}
+
+// If `right` is absolute it replaces `left`; otherwise append one `/` only
+// when `left` does not already end with `/`. Components are not normalized.
+// Empty components return the other component unchanged.
+fun join(left: String, right: String): String {
+    if (string.len(right) == 0u64) {
+        return left;
+    }
+    if (is_absolute(right) || string.len(left) == 0u64) {
+        return right;
+    }
+    val n = string.len(left);
+    if ((string.byte_at(left, n - 1u64) catch 0u8) == 47u8) {
+        return string.concat(left, right);
+    }
+    return string.concat(string.concat(left, "/"), right);
+}

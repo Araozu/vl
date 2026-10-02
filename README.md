@@ -170,7 +170,17 @@ calls infer them (`first(a)`) or pass them explicitly (`first::[u64](a)`)
 (see `examples/generics.vl`).
 Sum types use `union` declarations with uppercase variants (`type Option[T] = union { None, Some(T), };`); variants build as `Option.Some(1u64)` / `Option.None` (optional turbofish `Option.Some::[u64](...)`) and are read with `match (o) { Option.Some(v) { ... } Option.None { ... } else { ... } }` (see `examples/unions.vl` and the [unions guide](website/src/pages/docs/unions.md)).
 Nullables model missing values without a declaration: `?u64` is the type of a `u64` or `null`, sugar over the builtin `Option` union (see `examples/nullable.vl`). A plain `u64` value wraps as `Some` implicitly wherever `?u64` is expected, `x == null` / `x != null` test for presence, and `match` takes a `null` arm for the empty case (`match (o) { Option.Some(v) { ... } null { ... } }`).
-Error sets model failures Zig-style (see `examples/errors.vl`): `type Io = error { NotFound, Missing(String), };` declares variants with optional union-style payloads, `Io.NotFound` is a plain error value (a global code), and `Io!u64` (or `!u64` for the inferred set) is a fallible value. Payload constructions (`Io.Missing(path)`) only carry data through fallible values — a plain `Io` holds just the code. `try expr` unwraps or returns the error (payloads forward untouched) from the enclosing fallible function, `expr catch fallback` handles it inline, and `match` reads payloads back: over a plain set for codes, or over a fallible where listed arms bind error payloads and `else` covers the ok value plus unlisted variants. `E!void` marks fallible side effects. A plain `T` value wraps as ok — and an `E` value as the error — wherever `E!T` is expected; discarding a fallible without `try`/`catch` is an error. `main` stays infallible: handle errors inside it with `catch`. Bounds-checked `std.string` natives (`byte_at`, `slice`) return `StringError!T` and `std.fs.read_file` returns `FsError!String` (see `examples/checked.vl`): the VM's `rv10` statuses lower to typed error values.
+Error sets model failures Zig-style (see `examples/errors.vl`): `type Io = error { NotFound, Missing(String), };` declares variants with optional union-style payloads, `Io.NotFound` is a plain error value (a global code), and `Io!u64` (or `!u64` for the inferred set) is a fallible value. Payload constructions (`Io.Missing(path)`) only carry data through fallible values — a plain `Io` holds just the code. `try expr` unwraps or returns the error (payloads forward untouched) from the enclosing fallible function, `expr catch fallback` handles it inline, and `match` reads payloads back: over a plain set for codes, or over a fallible where listed arms bind error payloads and `else` covers the ok value plus unlisted variants. `E!void` marks fallible side effects. A plain `T` value wraps as ok — and an `E` value as the error — wherever `E!T` is expected; discarding a fallible without `try`/`catch` is an error. `main` stays infallible: handle errors inside it with `catch`. Bounds-checked `std.string` natives (`byte_at`, `slice`) return `StringError!T`, `std.parse` offers checked integer and boolean conversions as `ParseError!T`, and `std.fs.read_file` returns `FsError!String` (see `examples/checked.vl`): VM status registers lower to typed error values.
+
+The standard library includes `std` for output, `std.ascii` for ASCII byte
+helpers, `std.array` for fixed-length algorithms, `std.fmt` for formatting,
+`std.fs` for file reads, `std.math` for numeric helpers, `std.net.tcp` for
+sockets, `std.parse` for checked conversions, `std.path` for POSIX-style path
+strings, and `std.string` for byte-string operations. `std.fs` and
+`std.net.tcp` require a native linux-x86_64 host; the other modules work in
+the wasm32 playground. See the [website standard library catalog](website/src/pages/std/index.astro)
+and its [module/function data](website/src/data/stdlib.yaml).
+
 Tuples are fixed-arity heterogeneous values with copy semantics
 (see `examples/tuples.vl`): `#(u64, String)` is unnamed (backtick indexing),
 `#(x: u64, y: String)` is named (`u.x` access), `#(1u64, "a")` /
@@ -209,5 +219,5 @@ target concepts. See the [lexical grammar](crates/vl-lex/GRAMMAR.md) and
 ## Roadmap
 
 1. Harden/add more `vl-codegen` backends.
-2. Fallible parsing (`to_u64`/`hex_to_u64` trap today; their VM natives report no status yet), `std.fs` file handles (`get_stdout`/`write`), richer `FsError` codes (the VM reports one failure code today).
+2. Expand `std.fs` beyond `read_file`, add standard input, clocks, and random values, and expose the VM's existing process arguments and exit calls to VL. Checked `std.parse` helpers are implemented in VL; the older `std.string.to_u64` / `hex_to_u64` VM natives still trap on invalid input.
 3. Bytecode/assembly emission + runner.

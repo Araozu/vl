@@ -105,8 +105,10 @@ two modules, or alongside a local type of the same name, is an error.
 ## The standard library
 
 The standard library is a set of ready-made modules: `std` for printing,
-`std.string` for text, `std.math` for numbers, `std.fmt` for turning
-numbers into strings, `std.fs` for files, and `std.net.tcp` for TCP
+`std.ascii` for ASCII byte classification, `std.parse` for checked parsing,
+`std.array` for fixed-length array algorithms, `std.path` for POSIX-style
+path strings, `std.string` for text, `std.math` for numbers, `std.fmt` for
+converting numbers to strings, `std.fs` for files, and `std.net.tcp` for TCP
 sockets (`std.fs` and `std.net.tcp` are native linux-x86_64 only,
 not available in the wasm32 playground). See the [standard library](/std) for the full list.
 

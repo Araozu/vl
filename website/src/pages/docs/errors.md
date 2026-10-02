@@ -132,4 +132,11 @@ fun strict(): Io!u64 {
 }
 ```
 
+The standard library uses named error sets for checked operations. For
+example, `std.parse` returns `ParseError!T` for invalid or overflowing
+conversions, `std.array.slice` returns `ArrayError!*Array[T]` for an invalid
+range, and checked arithmetic returns `MathError!T` for overflow or division
+by zero. Bounds-checked string access uses `StringError!T`. See the
+[standard library reference](/std) for each set's variants and functions.
+
 Continue with [strings](/docs/strings).

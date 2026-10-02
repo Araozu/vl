@@ -1,0 +1,177 @@
+// Fixed-length Array[T] helpers. Constructors allocate with Array.new; the
+// VM has no growable-array operation, so copy/clone preserve the source length.
+type ArrayError = error {
+    InvalidRange,
+    Overflow,
+};
+
+fun is_empty[T](a: Array[T]): bool {
+    return a.len == 0u64;
+}
+
+fun clone[T](a: Array[T]): *Array[T] {
+    var out: *Array[T] = Array.new(a.len);
+    var i = 0u64;
+    while (i < a.len) {
+        out[i] = a[i];
+        i = i + 1u64;
+    }
+    return out;
+}
+
+fun slice[T](source: Array[T], start: u64, end: u64): ArrayError!*Array[T] {
+    if (start > end || end > source.len) {
+        return ArrayError.InvalidRange;
+    }
+    var result: *Array[T] = Array.new(end - start);
+    var i = 0u64;
+    while (i < end - start) {
+        result[i] = source[start + i];
+        i = i + 1u64;
+    }
+    return result;
+}
+
+fun concat[T](left: Array[T], right: Array[T]): ArrayError!*Array[T] {
+    if (left.len > 18446744073709551615u64 - right.len) {
+        return ArrayError.Overflow;
+    }
+    val total = left.len + right.len;
+    var result: *Array[T] = Array.new(total);
+    var i = 0u64;
+    while (i < left.len) {
+        result[i] = left[i];
+        i = i + 1u64;
+    }
+    var j = 0u64;
+    while (j < right.len) {
+        result[left.len + j] = right[j];
+        j = j + 1u64;
+    }
+    return result;
+}
+
+fun copy[T](source: Array[T], destination: *Array[T], destination_start: u64): bool {
+    if (destination_start > destination.len || source.len > destination.len - destination_start) {
+        return false;
+    }
+    var i = 0u64;
+    while (i < source.len) {
+        destination[destination_start + i] = source[i];
+        i = i + 1u64;
+    }
+    return true;
+}
+
+fun fill[T](a: *Array[T], value: T): void {
+    var i = 0u64;
+    while (i < a.len) {
+        a[i] = value;
+        i = i + 1u64;
+    }
+}
+
+fun reverse[T](a: *Array[T]): void {
+    var i = 0u64;
+    while (i < a.len / 2u64) {
+        val j = a.len - 1u64 - i;
+        val temp = a[i];
+        a[i] = a[j];
+        a[j] = temp;
+        i = i + 1u64;
+    }
+}
+
+fun find[T extends Comparable](a: Array[T], value: T): u64 {
+    var i = 0u64;
+    while (i < a.len) {
+        if (a[i] == value) {
+            return i;
+        }
+        i = i + 1u64;
+    }
+    return a.len;
+}
+
+fun contains[T extends Comparable](a: Array[T], value: T): bool {
+    return find(a, value) < a.len;
+}
+
+fun equal[T extends Comparable](a: Array[T], b: Array[T]): bool {
+    if (a.len != b.len) {
+        return false;
+    }
+    var i = 0u64;
+    while (i < a.len) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i = i + 1u64;
+    }
+    return true;
+}
+
+fun sum_u64(a: Array[u64]): u64 {
+    var total = 0u64;
+    var i = 0u64;
+    while (i < a.len) {
+        total = total + a[i];
+        i = i + 1u64;
+    }
+    return total;
+}
+
+fun sum_i64(a: Array[i64]): i64 {
+    var total = 0i64;
+    var i = 0u64;
+    while (i < a.len) {
+        total = total + a[i];
+        i = i + 1u64;
+    }
+    return total;
+}
+
+fun min[T extends Numeric](a: Array[T], fallback: T): T {
+    if (a.len == 0u64) {
+        return fallback;
+    }
+    var result = a[0];
+    var i = 1u64;
+    while (i < a.len) {
+        if (a[i] < result) {
+            result = a[i];
+        }
+        i = i + 1u64;
+    }
+    return result;
+}
+
+fun max[T extends Numeric](a: Array[T], fallback: T): T {
+    if (a.len == 0u64) {
+        return fallback;
+    }
+    var result = a[0];
+    var i = 1u64;
+    while (i < a.len) {
+        if (a[i] > result) {
+            result = a[i];
+        }
+        i = i + 1u64;
+    }
+    return result;
+}
+
+// In-place stable insertion sort. Runs in O(n^2) and requires Numeric order.
+fun sort[T extends Numeric](a: *Array[T]): void {
+    var i = 1u64;
+    while (i < a.len) {
+        val value = a[i];
+        var j = i;
+        while (j > 0u64 && a[j - 1u64] > value) {
+            a[j] = a[j - 1u64];
+            j = j - 1u64;
+        }
+        a[j] = value;
+        i = i + 1u64;
+    }
+}

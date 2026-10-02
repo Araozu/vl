@@ -13,6 +13,7 @@ const stdlibParam = z.object({
 
 const stdlibFunction = z.object({
   name: z.string(),
+  type_params: z.array(z.string()).optional(),
   // Structured signature. Mirrors the compiler-owned extern signatures
   // (`vl-codegen::modules`); every export is fully typed.
   params: z.array(stdlibParam),

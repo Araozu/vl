@@ -12,3 +12,204 @@ fun is_empty(s: String): bool {
 fun strings_equal(a: String, b: String): bool {
     return string.eq(a, b);
 }
+
+// Copies the UTF-8 bytes into a fixed-length mutable byte array.
+fun to_bytes(s: String): *Array[u8] {
+    val n = string.len(s);
+    var result: *Array[u8] = Array.new(n);
+    var i = 0u64;
+    while (i < n) {
+        result[i] = string.byte_at(s, i) catch 0u8;
+        i = i + 1u64;
+    }
+    return result;
+}
+
+fun starts_with(value: String, prefix: String): bool {
+    val n = string.len(value);
+    val p = string.len(prefix);
+    if (p > n) {
+        return false;
+    }
+    return string.eq(string.slice(value, 0u64, p) catch "", prefix);
+}
+
+fun ends_with(value: String, suffix: String): bool {
+    val n = string.len(value);
+    val p = string.len(suffix);
+    if (p > n) {
+        return false;
+    }
+    return string.eq(string.slice(value, n - p, n) catch "", suffix);
+}
+
+// Returns `string.len(value)` when no match exists. An empty needle matches
+// at `from`, including at the end of the haystack. Indices count UTF-8 bytes.
+fun find_from(value: String, needle: String, from: u64): u64 {
+    val n = string.len(value);
+    val m = string.len(needle);
+    if (from > n) {
+        return n;
+    }
+    if (m == 0u64) {
+        return from;
+    }
+    if (m > n - from) {
+        return n;
+    }
+    var i = from;
+    while (i <= n - m) {
+        if (string.eq(string.slice(value, i, i + m) catch "", needle)) {
+            return i;
+        }
+        i = i + 1u64;
+    }
+    return n;
+}
+
+fun find(value: String, needle: String): u64 {
+    return find_from(value, needle, 0u64);
+}
+
+fun contains(value: String, needle: String): bool {
+    if (string.len(needle) == 0u64) {
+        return true;
+    }
+    return find(value, needle) < string.len(value);
+}
+
+// Removes ASCII whitespace (space, tab, CR, LF, VT, FF) at both ends.
+// This scans and slices bytes, so it does not treat Unicode whitespace specially.
+fun trim(value: String): String {
+    val n = string.len(value);
+    var start = 0u64;
+    var end = n;
+    while (start < end) {
+        val b = string.byte_at(value, start) catch 0u8;
+        if (b == 32u8 || b == 9u8 || b == 10u8 || b == 13u8 || b == 11u8 || b == 12u8) {
+            start = start + 1u64;
+        }
+        else {
+            break;
+        }
+    }
+    while (end > start) {
+        val b = string.byte_at(value, end - 1u64) catch 0u8;
+        if (b == 32u8 || b == 9u8 || b == 10u8 || b == 13u8 || b == 11u8 || b == 12u8) {
+            end = end - 1u64;
+        }
+        else {
+            break;
+        }
+    }
+    return string.slice(value, start, end) catch "";
+}
+
+fun trim_start(value: String): String {
+    val n = string.len(value);
+    var start = 0u64;
+    while (start < n) {
+        val b = string.byte_at(value, start) catch 0u8;
+        if (b == 32u8 || b == 9u8 || b == 10u8 || b == 13u8 || b == 11u8 || b == 12u8) {
+            start = start + 1u64;
+        }
+        else {
+            break;
+        }
+    }
+    return string.slice(value, start, n) catch "";
+}
+
+fun trim_end(value: String): String {
+    val n = string.len(value);
+    var end = n;
+    while (end > 0u64) {
+        val b = string.byte_at(value, end - 1u64) catch 0u8;
+        if (b == 32u8 || b == 9u8 || b == 10u8 || b == 13u8 || b == 11u8 || b == 12u8) {
+            end = end - 1u64;
+        }
+        else {
+            break;
+        }
+    }
+    return string.slice(value, 0u64, end) catch "";
+}
+
+// Repeats by concatenation. `count == 0` returns the empty string.
+fun repeat(value: String, count: u64): String {
+    if (count == 0u64 || string.len(value) == 0u64) {
+        return "";
+    }
+    var result: String = "";
+    var i = 0u64;
+    while (i < count) {
+        result = string.concat(result, value);
+        i = i + 1u64;
+    }
+    return result;
+}
+
+// Replaces non-overlapping byte matches. An empty needle returns the input.
+fun replace(value: String, needle: String, replacement: String): String {
+    val n = string.len(value);
+    val m = string.len(needle);
+    if (string.len(needle) == 0u64) {
+        return value;
+    }
+    var result: String = "";
+    var cursor = 0u64;
+    var found = find_from(value, needle, cursor);
+    while (found < n) {
+        result = string.concat(result, string.slice(value, cursor, found) catch "");
+        result = string.concat(result, replacement);
+        cursor = found + m;
+        found = find_from(value, needle, cursor);
+    }
+    return string.concat(result, string.slice(value, cursor, n) catch "");
+}
+
+// Splits on a nonempty byte separator. The final field is retained when the
+// input ends with a separator; an empty input produces one empty field.
+fun split(value: String, separator: String): *Array[String] {
+    val n = string.len(value);
+    val m = string.len(separator);
+    if (m == 0u64) {
+        var single: *Array[String] = Array.new(1u64);
+        single[0u64] = value;
+        return single;
+    }
+    var count = 1u64;
+    var cursor = 0u64;
+    var found = find_from(value, separator, cursor);
+    while (found < n) {
+        count = count + 1u64;
+        cursor = found + m;
+        found = find_from(value, separator, cursor);
+    }
+    var result: *Array[String] = Array.new(count);
+    cursor = 0u64;
+    found = find_from(value, separator, cursor);
+    var i = 0u64;
+    while (found < n) {
+        result[i] = string.slice(value, cursor, found) catch "";
+        i = i + 1u64;
+        cursor = found + m;
+        found = find_from(value, separator, cursor);
+    }
+    result[i] = string.slice(value, cursor, n) catch "";
+    return result;
+}
+
+// Joins byte strings with a separator between each adjacent pair.
+fun join(parts: Array[String], separator: String): String {
+    if (parts.len == 0u64) {
+        return "";
+    }
+    var result: String = parts[0u64];
+    var i = 1u64;
+    while (i < parts.len) {
+        result = string.concat(string.concat(result, separator), parts[i]);
+        i = i + 1u64;
+    }
+    return result;
+}

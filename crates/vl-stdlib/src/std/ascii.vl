@@ -1,0 +1,75 @@
+// Byte-oriented ASCII classification and case conversion.
+// These helpers never perform Unicode decoding or locale-dependent rules.
+use std.string;
+
+fun is_ascii(s: String): bool {
+    var i = 0u64;
+    while (i < string.len(s)) {
+        if ((string.byte_at(s, i) catch 0u8) > 127u8) {
+            return false;
+        }
+        i = i + 1u64;
+    }
+    return true;
+}
+
+fun is_alpha(b: u8): bool {
+    return b >= 65u8 && b <= 90u8 || b >= 97u8 && b <= 122u8;
+}
+
+fun is_lower(b: u8): bool {
+    return b >= 97u8 && b <= 122u8;
+}
+
+fun is_upper(b: u8): bool {
+    return b >= 65u8 && b <= 90u8;
+}
+
+fun is_alnum(b: u8): bool {
+    return is_alpha(b) || is_digit(b);
+}
+
+fun is_digit(b: u8): bool {
+    return b >= 48u8 && b <= 57u8;
+}
+
+fun is_hex_digit(b: u8): bool {
+    return is_digit(b) || b >= 65u8 && b <= 70u8 || b >= 97u8 && b <= 102u8;
+}
+
+fun is_whitespace(b: u8): bool {
+    return b == 32u8 || b == 9u8 || b == 10u8 || b == 13u8 || b == 11u8 || b == 12u8;
+}
+
+fun is_control(b: u8): bool {
+    return b < 32u8 || b == 127u8;
+}
+
+fun is_printable(b: u8): bool {
+    return b >= 32u8 && b <= 126u8;
+}
+
+fun is_punctuation(b: u8): bool {
+    return b >= 33u8 && b <= 47u8
+        || b >= 58u8 && b <= 64u8
+        || b >= 91u8 && b <= 96u8
+        || b >= 123u8 && b <= 126u8;
+}
+
+fun to_lower(b: u8): u8 {
+    if (b >= 65u8 && b <= 90u8) {
+        return b + 32u8;
+    }
+    else {
+        return b;
+    }
+}
+
+fun to_upper(b: u8): u8 {
+    if (b >= 97u8 && b <= 122u8) {
+        return b - 32u8;
+    }
+    else {
+        return b;
+    }
+}

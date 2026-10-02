@@ -2,7 +2,75 @@
 //
 // Nothing here is available without an explicit `use std.fmt;`.
 use std.fmt;
+use std.string;
+use std.math;
 
 fun u64_to_string(v: u64): String {
     return fmt.u64_to_s(v);
+}
+
+fun bool_to_string(v: bool): String {
+    if (v) {
+        return "true";
+    }
+    return "false";
+}
+
+fun i64_to_string(v: i64): String {
+    if (v < 0i64) {
+        val magnitude = 0u64 - (v as u64);
+        return string.concat("-", fmt.u64_to_s(magnitude));
+    }
+    return fmt.u64_to_s(v as u64);
+}
+
+// Lowercase hexadecimal with a `0x` prefix. Zero is `0x0`.
+fun hex_u64_to_string(value: u64): String {
+    if (value == 0u64) {
+        return "0x0";
+    }
+    var digits: String = "";
+    var remaining = value;
+    while (remaining > 0u64) {
+        val nibble = math.mod_u64(remaining, 16u64);
+        val alphabet = "0123456789abcdef";
+        val digit = string.slice(alphabet, nibble, nibble + 1u64) catch "0";
+        digits = string.concat(digit, digits);
+        remaining = remaining / 16u64;
+    }
+    return string.concat("0x", digits);
+}
+
+// Left pads with a nonempty string. Width is measured in UTF-8 bytes;
+// if `pad` is empty, the input is returned unchanged.
+fun pad_left(value: String, width: u64, pad: String): String {
+    val n = string.len(value);
+    val p = string.len(pad);
+    if (n >= width || p == 0u64) {
+        return value;
+    }
+    val missing = width - n;
+    var count = missing / p;
+    if (math.mod_u64(missing, p) != 0u64) {
+        count = count + 1u64;
+    }
+    val padding = string.repeat(pad, count);
+    val needed = missing;
+    return string.concat(string.slice(padding, 0u64, needed) catch "", value);
+}
+
+// Right pads by UTF-8 byte width. If `pad` is empty, the input is returned.
+fun pad_right(value: String, width: u64, pad: String): String {
+    val n = string.len(value);
+    val p = string.len(pad);
+    if (n >= width || p == 0u64) {
+        return value;
+    }
+    val missing = width - n;
+    var count = missing / p;
+    if (math.mod_u64(missing, p) != 0u64) {
+        count = count + 1u64;
+    }
+    val padding = string.repeat(pad, count);
+    return string.concat(value, string.slice(padding, 0u64, missing) catch "");
 }

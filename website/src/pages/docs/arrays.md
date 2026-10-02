@@ -87,6 +87,47 @@ Arrays share rather than copy. Passing an array to a function hands over the
 same array, so an element write through a writable name changes the shared
 array.
 
+## Array helpers
+
+`std.array` provides algorithms for fixed-length arrays. Read-only operations
+accept `Array[T]`; operations that change elements need `*Array[T]`:
+
+```vl
+use std.array;
+
+fun main() {
+    var values: *Array[u64] = [3u64, 1u64, 2u64];
+    val total = array.sum_u64(values);
+    val index = array.find(values, 1u64);
+    array.sort(values);
+}
+```
+
+`is_empty`, `find`, `contains`, and `equal` inspect arrays. `find` returns
+`a.len` when there is no match. The constrained `find`/`contains`/`equal`
+helpers accept element types that implement VL's `Comparable` bound.
+`sum_u64` and `sum_i64` add unsigned and signed integer arrays respectively;
+an empty array sums to zero. `min` and `max` accept `Numeric` elements and
+take a fallback value for an empty array. `sort` orders numeric values in
+place with stable insertion sort, so it takes O(n²) comparisons. Although
+`Numeric` includes `f64`, Naravm currently lowers ordering only for `u64`,
+`i64`, and `u8`; float ordering needs backend support.
+
+`slice(source, start, end)` returns a new mutable copy of the half-open range
+or `ArrayError.InvalidRange` when the endpoints are reversed or out of bounds.
+`concat(left, right)` allocates a new array containing both inputs and returns
+`ArrayError.Overflow` if their combined length exceeds `u64`. Both results
+contain copied elements; reference-valued elements continue to refer to the
+same objects.
+
+`fill`, `reverse`, and `sort` mutate the shared array. `clone` allocates a
+separate array of the same length and copies each element; reference-valued
+elements still point to the same objects. `copy(source, destination, start)`
+copies all elements only when they fit and otherwise returns `false` without
+writing. It does not resize arrays. If source and destination overlap in the
+same array, the copy proceeds from left to right; clone the source first if
+that overlap would overwrite values you still need.
+
 ## Generic functions
 
 Sometimes an algorithm does not care what the element type is. A generic type

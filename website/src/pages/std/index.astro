@@ -35,15 +35,46 @@ const modules = (await getCollection('stdlib')).sort((a, b) => a.data.order - b.
   }
   <h2 id="availability">Availability</h2>
   <p>
-    These entries describe the current Naravm surface. Native functions are
-    supplied by the target; source modules are embedded into the compiled
-    program when one of their helpers is used.
+    Native functions are supplied by the target. Helpers written in VL are
+    embedded into the compiled program when used; modules such as
+    <code>std.ascii</code>, <code>std.array</code>, <code>std.parse</code>, and <code>std.path</code>
+    build on language operations and do not need dedicated VM calls.
   </p>
   <p>
-    `std`, `std.string`, `std.math`, and `std.fmt` work everywhere, including
-    the browser playground (wasm32-freestanding). `std.fs` and `std.net.tcp`
+    `std`, `std.ascii`, `std.array`, `std.parse`, `std.path`, `std.string`,
+    `std.math`, and `std.fmt` work everywhere, including the browser playground
+    (wasm32-freestanding). `std.fs` and `std.net.tcp`
     are native-only: available when running on linux-x86_64, not available
     in the playground (freestanding WASM hosts do not register filesystem
     or socket support).
+  </p>
+  <h2 id="runtime-work">Runtime work for a broader standard library</h2>
+  <p>
+    Naravm already provides printing, byte-string operations, unsigned decimal
+    and hexadecimal conversion, modulo, file reading, TCP sockets, process
+    arguments, and process exit. VL binds only the functions listed on these
+    pages. For example, <code>process.argv</code> and <code>process.exit</code>
+    exist in the VM but still need VL native signatures and backend mappings
+    before VL programs can call them.
+  </p>
+  <p>
+    Additional VM capabilities for a wider standard library include stdin,
+    general file open/read/write/close and directory or metadata operations,
+    a clock, and a random source. The existing stdout write is byte-at-a-time
+    and lacks a typed failure result. `std.string.to_bytes` currently copies
+    through checked byte reads; a length-aware bridge over the raw
+    string/container conversion natives would make array-to-string conversion
+    practical and safe. Recoverable allocation failures and native status
+    codes would also support typed errors instead of traps.
+  </p>
+  <p>
+    Some work is in VL or the compiler rather than the VM: `Array.new` and
+    copying can build growable collections, while a native resize operation
+    would make growth cheaper. Generic object support is needed for an
+    ergonomic `List[T]`, and first-class callbacks would enable APIs such as
+    map/filter. Unicode decoding and validation can be written over current
+    byte access; VM support would make character-aware operations faster.
+    Numeric ordering for `f64` also needs backend lowering before generic
+    extrema and sort can use it on Naravm.
   </p>
 </Docs>

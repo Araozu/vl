@@ -3,6 +3,11 @@
 // Nothing here is available without an explicit `use std.math;`.
 use std.math;
 
+type MathError = error {
+    Overflow,
+    DivisionByZero,
+};
+
 fun max_u64(a: u64, b: u64): u64 {
     if (a > b) {
         return a;
@@ -66,4 +71,89 @@ fun max[T extends Numeric](a: T, b: T): T {
     else {
         return b;
     }
+}
+
+fun min[T extends Numeric](a: T, b: T): T {
+    if (a < b) {
+        return a;
+    }
+    else {
+        return b;
+    }
+}
+
+fun clamp[T extends Numeric](v: T, lo: T, hi: T): T {
+    return min(max(v, lo), hi);
+}
+
+fun gcd_u64(a: u64, b: u64): u64 {
+    var x = a;
+    var y = b;
+    while (y != 0u64) {
+        val r = math.mod_u64(x, y);
+        x = y;
+        y = r;
+    }
+    return x;
+}
+
+fun checked_mul_u64(a: u64, b: u64): MathError!u64 {
+    if (b != 0u64 && a > 18446744073709551615u64 / b) {
+        return MathError.Overflow;
+    }
+    return a * b;
+}
+
+fun checked_add_u64(a: u64, b: u64): MathError!u64 {
+    if (a > 18446744073709551615u64 - b) {
+        return MathError.Overflow;
+    }
+    return a + b;
+}
+
+fun checked_sub_u64(a: u64, b: u64): MathError!u64 {
+    if (a < b) {
+        return MathError.Overflow;
+    }
+    return a - b;
+}
+
+fun checked_div_u64(a: u64, b: u64): MathError!u64 {
+    if (b == 0u64) {
+        return MathError.DivisionByZero;
+    }
+    return a / b;
+}
+
+fun checked_abs_i64(value: i64): MathError!i64 {
+    if (value == -9223372036854775807i64 - 1i64) {
+        return MathError.Overflow;
+    }
+    if (value < 0i64) {
+        return 0i64 - value;
+    }
+    return value;
+}
+
+fun lcm_u64(a: u64, b: u64): MathError!u64 {
+    if (a == 0u64 || b == 0u64) {
+        return 0u64;
+    }
+    return try checked_mul_u64(a / gcd_u64(a, b), b);
+}
+
+fun pow_u64(base: u64, exponent: u64): MathError!u64 {
+    var result = 1u64;
+    var factor = base;
+    var exp = exponent;
+    while (exp > 0u64) {
+        if (math.mod_u64(exp, 2u64) == 1u64) {
+            result = try checked_mul_u64(result, factor);
+        }
+        exp = exp / 2u64;
+        if (exp > 0u64) {
+            factor = try checked_mul_u64(factor, factor);
+        }
+    }
+    return result;
 }

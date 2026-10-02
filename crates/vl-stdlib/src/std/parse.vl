@@ -1,0 +1,98 @@
+// Checked parsers. Input is ASCII and must consume the whole string.
+use std.string;
+use std.ascii;
+
+type ParseError = error {
+    Empty,
+    InvalidDigit,
+    InvalidSign,
+    Overflow,
+};
+
+fun u64(value: String): ParseError!u64 {
+    val n = string.len(value);
+    if (n == 0u64) {
+        return ParseError.Empty;
+    }
+    var result = 0u64;
+    var i = 0u64;
+    while (i < n) {
+        val b = string.byte_at(value, i) catch 0u8;
+        if (!ascii.is_digit(b)) {
+            return ParseError.InvalidDigit;
+        }
+        val digit = b - 48u8 as u64;
+        if (result > 1844674407370955161u64 || result == 1844674407370955161u64 && digit > 5u64) {
+            return ParseError.Overflow;
+        }
+        result = result * 10u64 + digit;
+        i = i + 1u64;
+    }
+    return result;
+}
+
+fun hex_u64(value: String): ParseError!u64 {
+    val n = string.len(value);
+    if (n == 0u64) {
+        return ParseError.Empty;
+    }
+    var result = 0u64;
+    var i = 0u64;
+    while (i < n) {
+        val b = string.byte_at(value, i) catch 0u8;
+        var digit = 0u64;
+        if (b >= 48u8 && b <= 57u8) {
+            digit = b - 48u8 as u64;
+        }
+        else if (b >= 65u8 && b <= 70u8) {
+            digit = b - 55u8 as u64;
+        }
+        else if (b >= 97u8 && b <= 102u8) {
+            digit = b - 87u8 as u64;
+        }
+        else {
+            return ParseError.InvalidDigit;
+        }
+        if (result > 1152921504606846975u64) {
+            return ParseError.Overflow;
+        }
+        result = result * 16u64 + digit;
+        i = i + 1u64;
+    }
+    return result;
+}
+
+// Parses signed decimal integers. A leading `-` is accepted; `+` is
+// rejected as InvalidSign. Values outside the i64 range report Overflow.
+fun i64(value: String): ParseError!i64 {
+    val n = string.len(value);
+    if (n == 0u64) {
+        return ParseError.Empty;
+    }
+    val first = string.byte_at(value, 0u64) catch 0u8;
+    if (first == 43u8) {
+        return ParseError.InvalidSign;
+    }
+    if (first == 45u8) {
+        val magnitude = try u64(string.slice(value, 1u64, n) catch "");
+        if (magnitude > 9223372036854775808u64) {
+            return ParseError.Overflow;
+        }
+        return 0i64 - (magnitude as i64);
+    }
+    val magnitude = try u64(value);
+    if (magnitude > 9223372036854775807u64) {
+        return ParseError.Overflow;
+    }
+    return magnitude as i64;
+}
+
+fun bool(value: String): ParseError!bool {
+    if (string.eq(value, "true")) {
+        return true;
+    }
+    if (string.eq(value, "false")) {
+        return false;
+    }
+    return ParseError.InvalidDigit;
+}

@@ -6,11 +6,13 @@ import { highlightVl } from '../../lib/vl-code';
 
 function signature(module: string, fn: {
   name: string;
+  type_params?: string[];
   params: Array<{ name: string; type: string }>;
   returns: { type: string };
 }): string {
   const params = fn.params.map((p) => `${p.name}: ${p.type}`).join(', ');
-  return `${module}.${fn.name}(${params}) -> ${fn.returns.type}`;
+  const typeParams = fn.type_params?.length ? `[${fn.type_params.join(', ')}]` : '';
+  return `${module}.${fn.name}${typeParams}(${params}) -> ${fn.returns.type}`;
 }
 
 export async function getStaticPaths() {

@@ -1,4 +1,4 @@
-// Standard library v1: VM natives plus VL helpers in real modules.
+// Standard library modules: VM natives plus VL helpers in real modules.
 //
 // Thin externs (`std.string`, `std.math`, `std.fmt`) map to natives the VM
 // already registers; `std.net.tcp` maps to the fallible `std::net::tcp`
@@ -14,6 +14,10 @@ use std;
 use std.string;
 use std.math;
 use std.fmt;
+use std.ascii;
+use std.parse;
+use std.array;
+use std.path;
 
 fun main() {
     val greeting = string.concat("Hello, ", "stdlib!");
@@ -33,4 +37,17 @@ fun main() {
     if (math.is_even(4u64)) {
         std.print("even\n");
     }
+    std.print(fmt.bool_to_string(ascii.is_alpha(65u8)));
+    std.print(fmt.i64_to_string(parse.i64("-8") catch 0i64));
+    std.print(fmt.hex_u64_to_string(255u64));
+    std.print(string.replace("red blue red", "red", "green"));
+    val pieces = string.split("a,b,c", ",");
+    std.print(string.join(pieces, "|"));
+    std.print(path.dirname("/tmp/file.txt"));
+    val bytes = string.to_bytes("VL");
+    std.print_u64(bytes[0u64] as u64);
+    var values: *Array[u64] = [3u64, 1u64, 2u64];
+    array.sort(values);
+    std.print_u64(array.sum_u64(values));
+    std.print_u64(math.pow_u64(2u64, 8u64) catch 0u64);
 }
