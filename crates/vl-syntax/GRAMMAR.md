@@ -42,7 +42,10 @@ union_type := ident ("[" type ("," type)* "]")?   ; bare `Option` or applied `Op
 tuple_type := "#" "(" tuple_type_elem ("," tuple_type_elem)* ","? ")"
 tuple_type_elem := (ident ":")? type
 block    := "{" stmt* "}"
-stmt     := binding_stmt | assign_stmt | index_assign_stmt | field_assign_stmt | tuple_assign_stmt | destructure_stmt | if_stmt | match_stmt | while_stmt | break_stmt | continue_stmt | return_stmt | expr_stmt
+stmt     := binding_stmt | assign_stmt | index_assign_stmt | field_assign_stmt | tuple_assign_stmt | destructure_stmt | if_stmt | match_stmt | while_stmt | break_stmt | continue_stmt | return_stmt | defer_stmt | errdefer_stmt | expr_stmt
+defer_stmt := "defer" stmt_inner
+errdefer_stmt := "errdefer" stmt_inner
+           ; `stmt_inner` is any single `stmt`; a simple inner keeps its own `;` with no extra `;`, a compound inner (`if`/`while`/`match`) takes one trailing `;` after it
 binding_stmt := ("var" | "val") (ident | destructure) (":" type)? "=" expr ";"
 destructure_stmt := ("var" | "val") destructure (":" type)? "=" expr ";"
 assign_stmt := ident "=" expr ";"
@@ -87,7 +90,7 @@ path     := ident ("." ident)*
 ```
 
 Terminal names are `vl-lex` `TokenKind`s: `Var Val Fun Type Object Union Error Try Catch Match
-If Else While Break Continue Return As Extends Eq EqEq Bang BangEq Lt LtEq Gt GtEq AmpAmp PipePipe
+If Else While Break Continue Return Defer ErrDefer As Extends Eq EqEq Bang BangEq Lt LtEq Gt GtEq AmpAmp PipePipe
 Plus Minus Star Slash Semi LParen RParen LBrace RBrace LBracket RBracket Comma
 Dot Colon Hash Backtick ColonColon Question Null Ident Int I64 U64 F64 U8 Bool String Invalid Eof`.
 
@@ -200,6 +203,7 @@ Stmt ::= Let { kind: Var | Val, name, name_span, ty, ty_span, value: Expr, span 
        | While { condition, body, span }
        | Break { span } | Continue { span }
        | Return { value: Option<Expr>, span }
+       | Defer { inner: Box<Stmt>, span } | ErrDefer { inner: Box<Stmt>, span }
        | Expr(Expr)
 MatchArm ::= { path: Vec<String>, path_span, bindings: Vec<(String, Span)>, body: Vec<Stmt>, span }
 Expr ::= Literal(Scalar, Span) | String(Vec<u8>, Span) | ArrayLiteral { elems, span }

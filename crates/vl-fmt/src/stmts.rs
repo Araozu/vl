@@ -20,6 +20,8 @@ pub(crate) fn stmt_start(s: &Stmt) -> usize {
         | Stmt::While { span, .. }
         | Stmt::Break { span }
         | Stmt::Continue { span }
+        | Stmt::Defer { span, .. }
+        | Stmt::ErrDefer { span, .. }
         | Stmt::Return { span, .. } => span.start,
         Stmt::Expr(e) => e.span().start,
     }
@@ -38,6 +40,8 @@ pub(crate) fn stmt_end(s: &Stmt) -> usize {
         | Stmt::While { span, .. }
         | Stmt::Break { span }
         | Stmt::Continue { span }
+        | Stmt::Defer { span, .. }
+        | Stmt::ErrDefer { span, .. }
         | Stmt::Return { span, .. } => span.end,
         Stmt::Expr(e) => e.span().end,
     }
@@ -142,6 +146,8 @@ impl<'a> Fmt<'a> {
             }
             Stmt::Break { .. } => self.out.push_str("break;"),
             Stmt::Continue { .. } => self.out.push_str("continue;"),
+            Stmt::Defer { inner, .. } => self.write_defer(inner, false, level),
+            Stmt::ErrDefer { inner, .. } => self.write_defer(inner, true, level),
             Stmt::Return { value, .. } => match value {
                 Some(v) => {
                     self.out.push_str("return ");
@@ -160,6 +166,130 @@ impl<'a> Fmt<'a> {
             self.out.push_str(&comment);
         }
         self.out.push('\n');
+    }
+
+    /// `defer <stmt>` / `errdefer <stmt>`: simple inners keep their own `;`,
+    /// compound inners (`if`/`while`/`match`) take one trailing `;` after them.
+    fn write_defer(&mut self, inner: &Stmt, is_err: bool, level: usize) {
+        self.out
+            .push_str(if is_err { "errdefer " } else { "defer " });
+        match inner {
+            Stmt::Let {
+                kind,
+                name,
+                ty,
+                value,
+                ..
+            } => {
+                self.out.push_str(&format!("{} {name}", kind_text(kind)));
+                if let Some(ty) = ty {
+                    self.out.push_str(&format!(": {ty}"));
+                }
+                self.out.push_str(" = ");
+                self.finish_value(value, level);
+                self.out.push(';');
+            }
+            Stmt::Assign { name, value, .. } => {
+                self.out.push_str(&format!("{name} = "));
+                self.finish_value(value, level);
+                self.out.push(';');
+            }
+            Stmt::IndexAssign {
+                array,
+                index,
+                value,
+                ..
+            } => {
+                self.write_expr(array, level);
+                self.out.push('[');
+                self.write_expr(index, level);
+                self.out.push_str("] = ");
+                self.finish_value(value, level);
+                self.out.push(';');
+            }
+            Stmt::FieldAssign {
+                base, field, value, ..
+            } => {
+                self.write_expr(base, level);
+                self.out.push_str(&format!(".{field} = "));
+                self.finish_value(value, level);
+                self.out.push(';');
+            }
+            Stmt::TupleAssign {
+                base, index, value, ..
+            } => {
+                self.write_expr(base, level);
+                self.out.push_str(&format!(".`{index} = "));
+                self.finish_value(value, level);
+                self.out.push(';');
+            }
+            Stmt::Destructure {
+                kind,
+                bindings,
+                ty,
+                value,
+                ..
+            } => {
+                self.out.push_str(kind_text(kind));
+                self.out.push(' ');
+                self.emit_pattern(bindings, level);
+                if let Some(ty) = ty {
+                    self.out.push_str(&format!(": {ty}"));
+                }
+                self.out.push_str(" = ");
+                self.finish_value(value, level);
+                self.out.push(';');
+            }
+            Stmt::If {
+                condition,
+                then_body,
+                else_body,
+                span,
+            } => {
+                self.write_if(condition, then_body, else_body, *span, level);
+                self.out.push(';');
+            }
+            Stmt::Match {
+                scrutinee,
+                arms,
+                else_body,
+                span,
+            } => {
+                self.write_match(scrutinee, arms, else_body, *span, level);
+                self.out.push(';');
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                self.out.push_str("while (");
+                self.write_expr(condition, level);
+                self.out.push_str(") ");
+                if self.is_braced(condition.span().end) {
+                    let open = self.find_open_brace(condition.span().end);
+                    let close = self.matching_close(open);
+                    self.block_at(body, level, open, close);
+                } else {
+                    self.normalize_branch(body, level);
+                }
+                self.out.push(';');
+            }
+            Stmt::Break { .. } => self.out.push_str("break;"),
+            Stmt::Continue { .. } => self.out.push_str("continue;"),
+            Stmt::Return { value, .. } => match value {
+                Some(v) => {
+                    self.out.push_str("return ");
+                    self.finish_value(v, level);
+                    self.out.push(';');
+                }
+                None => self.out.push_str("return;"),
+            },
+            Stmt::Defer { inner, .. } => self.write_defer(inner, false, level),
+            Stmt::ErrDefer { inner, .. } => self.write_defer(inner, true, level),
+            Stmt::Expr(e) => {
+                self.finish_value(e, level);
+                self.out.push(';');
+            }
+        }
     }
 
     /// `if (c) {...}` with `else` on its own line. An `else` holding exactly

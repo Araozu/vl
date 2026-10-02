@@ -1043,6 +1043,9 @@ fn template_stmt_ids(s: &HirStmt, out: &mut HashSet<u32>) {
                 template_stmt_ids(st, out);
             }
         }
+        HirStmt::Defer { inner, .. } | HirStmt::ErrDefer { inner, .. } => {
+            template_stmt_ids(inner, out);
+        }
         HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
     }
 }
@@ -1845,6 +1848,9 @@ fn validate_qualified_types(
                     if let Some(value) = value {
                         check_expr(value, objects, unions, errors, diags);
                     }
+                }
+                HirStmt::Defer { inner, .. } | HirStmt::ErrDefer { inner, .. } => {
+                    check_stmts(std::slice::from_ref(inner), objects, unions, errors, diags);
                 }
                 HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
             }
@@ -3849,6 +3855,34 @@ impl Checker {
                 self.record(*id, base);
             }
             HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
+            HirStmt::Defer { inner, span } | HirStmt::ErrDefer { inner, span } => {
+                let is_err = matches!(stmt, HirStmt::ErrDefer { .. });
+                let what = if is_err { "`errdefer`" } else { "`defer`" };
+                if let Some((bad_span, kind)) = defer_forbidden(inner) {
+                    self.diags.push(
+                        Diagnostic::error(format!(
+                            "{what} body cannot contain `{kind}`"
+                        ))
+                        .with_label(bad_span, format!("`{kind}` is not allowed in {what}"))
+                        .with_note(
+                            "deferred cleanup must be infallible and non-diverging: no `try`, no `return`/`break`/`continue`; handle fallible values with `catch` inline",
+                        )
+                        .with_code("E309"),
+                    );
+                }
+                // Private execution scope: bindings declared inside never escape.
+                let bindings_snapshot = self.bindings.clone();
+                let fixed_snapshot = self.fixed_defs.clone();
+                self.check_stmt(inner);
+                // Remove any bindings introduced inside the deferred body.
+                let before: std::collections::HashSet<u32> =
+                    bindings_snapshot.keys().copied().collect();
+                self.bindings.retain(|k, _| before.contains(k));
+                let before_fixed: std::collections::HashSet<u32> =
+                    fixed_snapshot.iter().copied().collect();
+                self.fixed_defs.retain(|k| before_fixed.contains(k));
+                let _ = span;
+            }
             HirStmt::While {
                 condition, body, ..
             } => {
@@ -8127,12 +8161,120 @@ pub enum Flow {
     Continues,
 }
 
+/// Structural restriction for deferred bodies: no `try`, `return`,
+/// `break`, or `continue` at any syntactic depth. Nested
+/// `defer`/`errdefer` are allowed and own a private execution scope, so the
+/// walk does not descend into them (their own checking reports their inner
+/// violations once). Returns the first forbidden site and its keyword.
+fn defer_forbidden(stmt: &HirStmt) -> Option<(Span, &'static str)> {
+    fn expr_has_try(e: &vl_hir::HirExpr) -> Option<Span> {
+        match e {
+            vl_hir::HirExpr::Try { span, .. } => Some(*span),
+            vl_hir::HirExpr::ArrayLiteral { elems, .. } => elems.iter().find_map(expr_has_try),
+            vl_hir::HirExpr::ObjectLiteral { fields, .. } => {
+                fields.iter().find_map(|(_, v)| expr_has_try(v))
+            }
+            vl_hir::HirExpr::Variant { args, .. } => args.iter().find_map(expr_has_try),
+            vl_hir::HirExpr::ErrorValue { args, .. } => args.iter().find_map(expr_has_try),
+            vl_hir::HirExpr::Index { base, index, .. } => {
+                expr_has_try(base).or_else(|| expr_has_try(index))
+            }
+            vl_hir::HirExpr::Field { base, .. }
+            | vl_hir::HirExpr::Unary { inner: base, .. }
+            | vl_hir::HirExpr::Cast { inner: base, .. } => expr_has_try(base),
+            vl_hir::HirExpr::TupleLiteral { elems, .. } => {
+                elems.iter().find_map(|(_, v)| expr_has_try(v))
+            }
+            vl_hir::HirExpr::TupleIndex { base, .. } => expr_has_try(base),
+            vl_hir::HirExpr::Call { args, .. } => args.iter().find_map(expr_has_try),
+            vl_hir::HirExpr::MethodCall { receiver, args, .. } => {
+                expr_has_try(receiver).or_else(|| args.iter().find_map(expr_has_try))
+            }
+            vl_hir::HirExpr::Binary { lhs, rhs, .. } => {
+                expr_has_try(lhs).or_else(|| expr_has_try(rhs))
+            }
+            vl_hir::HirExpr::Catch { lhs, fallback, .. } => {
+                expr_has_try(lhs).or_else(|| expr_has_try(fallback))
+            }
+            vl_hir::HirExpr::Literal { .. }
+            | vl_hir::HirExpr::String { .. }
+            | vl_hir::HirExpr::Null { .. }
+            | vl_hir::HirExpr::Var { .. } => None,
+        }
+    }
+    fn stmt_has(stmt: &HirStmt) -> Option<(Span, &'static str)> {
+        match stmt {
+            HirStmt::Return { span, .. } => Some((*span, "return")),
+            HirStmt::Break { span } => Some((*span, "break")),
+            HirStmt::Continue { span } => Some((*span, "continue")),
+            // Nested defers own a private scope; their own checking reports once.
+            HirStmt::Defer { .. } | HirStmt::ErrDefer { .. } => None,
+            HirStmt::Let { value, .. } | HirStmt::Assign { value, .. } | HirStmt::Expr(value) => {
+                expr_has_try(value).map(|s| (s, "try"))
+            }
+            HirStmt::IndexAssign {
+                array,
+                index,
+                value,
+                ..
+            } => expr_has_try(array)
+                .or_else(|| expr_has_try(index))
+                .or_else(|| expr_has_try(value))
+                .map(|s| (s, "try")),
+            HirStmt::FieldAssign { base, value, .. } => expr_has_try(base)
+                .or_else(|| expr_has_try(value))
+                .map(|s| (s, "try")),
+            HirStmt::TupleAssign { base, value, .. } => expr_has_try(base)
+                .or_else(|| expr_has_try(value))
+                .map(|s| (s, "try")),
+            HirStmt::Destructure { value, .. } => expr_has_try(value).map(|s| (s, "try")),
+            HirStmt::While {
+                condition, body, ..
+            } => expr_has_try(condition)
+                .map(|s| (s, "try"))
+                .or_else(|| body.iter().find_map(stmt_has)),
+            HirStmt::If {
+                condition,
+                then_body,
+                else_body,
+                ..
+            } => expr_has_try(condition)
+                .map(|s| (s, "try"))
+                .or_else(|| then_body.iter().find_map(stmt_has))
+                .or_else(|| {
+                    else_body
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .find_map(stmt_has)
+                }),
+            HirStmt::Match {
+                scrutinee,
+                arms,
+                else_body,
+                ..
+            } => expr_has_try(scrutinee)
+                .map(|s| (s, "try"))
+                .or_else(|| arms.iter().find_map(|a| a.body.iter().find_map(stmt_has)))
+                .or_else(|| {
+                    else_body
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .find_map(stmt_has)
+                }),
+        }
+    }
+    stmt_has(stmt)
+}
+
 /// Flow of one statement.
 pub fn stmt_flow(stmt: &HirStmt) -> Flow {
     match stmt {
         HirStmt::Return { .. } => Flow::Returns,
         HirStmt::Break { .. } => Flow::Breaks,
         HirStmt::Continue { .. } => Flow::Continues,
+        HirStmt::Defer { .. } | HirStmt::ErrDefer { .. } => Flow::FallsThrough,
         HirStmt::Let { .. }
         | HirStmt::Assign { .. }
         | HirStmt::IndexAssign { .. }
@@ -8241,6 +8383,9 @@ fn check_unreachable(stmts: &[HirStmt], diags: &mut Vec<Diagnostic>) {
                 }
             }
             HirStmt::While { body, .. } => check_unreachable(body, diags),
+            HirStmt::Defer { inner, .. } | HirStmt::ErrDefer { inner, .. } => {
+                check_unreachable(std::slice::from_ref(inner), diags);
+            }
             _ => {}
         }
         if stmt_flow(stmt) != Flow::FallsThrough {
@@ -8263,6 +8408,8 @@ fn stmt_span(stmt: &HirStmt) -> Span {
         | HirStmt::While { span, .. }
         | HirStmt::Break { span }
         | HirStmt::Continue { span }
+        | HirStmt::Defer { span, .. }
+        | HirStmt::ErrDefer { span, .. }
         | HirStmt::Return { span, .. } => *span,
         HirStmt::Expr(e) => e.span(),
     }

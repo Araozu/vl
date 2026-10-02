@@ -2219,6 +2219,78 @@ fn checked_string_and_fs_calls_compile_to_naravm() {
 }
 
 #[test]
+fn defer_runs_lifo_on_normal_exit() {
+    let lir = frontend(
+        "use std; fun main() { defer std.print_u64(1u64); defer std.print_u64(2u64); std.print_u64(3u64); }",
+    )
+    .expect("defer must compile");
+    let dump = lir.dump();
+    let body = dump.find("3u64").expect("{dump}");
+    let second = dump.find("2u64").expect("{dump}");
+    let first = dump.find("1u64").expect("{dump}");
+    assert!(body < second && second < first, "{dump}");
+}
+
+#[test]
+fn defer_runs_on_try_error_and_errdefer_only_on_error() {
+    let lir = frontend(
+        "use std; type E = error { A, }; fun f(ok: bool): E!u64 { defer std.print_u64(1u64); errdefer std.print_u64(2u64); if (ok) { return 1u64; } return E.A; } fun main() { std.print_u64(f(true) catch 9u64); std.print_u64(f(false) catch 8u64); }",
+    )
+    .expect("defer/errdefer must compile");
+    let dump = lir.dump();
+    // Ok return: only `always` (1u64); error return: `err` (2u64) then `always` (shared LIFO).
+    assert!(dump.contains("1u64"), "{dump}");
+    assert!(dump.contains("2u64"), "{dump}");
+    assert!(dump.contains("wrap_err"), "{dump}");
+}
+
+#[test]
+fn defer_in_loop_runs_on_break_without_outer() {
+    let lir = frontend(
+        "use std; fun main() { defer std.print_u64(9u64); while (true) { defer std.print_u64(7u64); break; } }",
+    )
+    .expect("loop defer must compile");
+    let dump = lir.dump();
+    // Inner runs on break (before the loop join), outer only at function exit.
+    let inner = dump.find("7u64").expect("{dump}");
+    let outer = dump.find("9u64").expect("{dump}");
+    assert!(inner < outer, "{dump}");
+}
+
+#[test]
+fn defer_bodies_reject_try_and_jumps() {
+    for (src, msg) in [
+        (
+            "use std; type E = error { A, }; fun f(): E!u64 { defer val x = try f(); return 1u64; } fun main() {}",
+            "cannot contain `try`",
+        ),
+        (
+            "use std; fun main() { defer return; }",
+            "cannot contain `return`",
+        ),
+        (
+            "use std; fun main() { while (true) { defer break; } }",
+            "cannot contain `break`",
+        ),
+    ] {
+        let err = frontend(src).expect_err("forbidden defer body must fail");
+        assert!(
+            err.iter().any(|d| d.message.contains(msg)),
+            "{src}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn defer_compound_needs_trailing_semi() {
+    let err = frontend("use std; fun main() { defer if (true) { std.print(\"x\\n\"); } }")
+        .expect_err("compound defer needs `;`");
+    assert!(err.iter().any(|d| d.message.contains("`;`")), "{err:?}");
+    frontend("use std; fun main() { defer if (true) { std.print(\"x\\n\"); }; }")
+        .expect("compound defer with `;` must compile");
+}
+
+#[test]
 fn checked_call_sets_are_typed() {
     let catalog = vl_codegen::modules();
     let string = catalog

@@ -514,6 +514,9 @@ fn calls_in_item(
                     walk_stmt(typed, s, out);
                 }
             }
+            HirStmt::Defer { inner, .. } | HirStmt::ErrDefer { inner, .. } => {
+                walk_stmt(typed, inner, out);
+            }
             HirStmt::Break { .. } | HirStmt::Continue { .. } => {}
         }
     }
