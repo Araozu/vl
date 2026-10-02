@@ -747,3 +747,72 @@ fn build_json_requires_out_and_reports_on_stdout() {
     assert!(root.join("bad.out").is_file());
     fs::remove_dir_all(root).expect("remove temporary project");
 }
+
+#[test]
+fn single_file_json_reports_artifact_write_errors_in_every_emit_mode() {
+    let root = temp_project("json-write-error");
+    fs::write(root.join("valid.vl"), "fun main() {}").expect("write source");
+    for emit in [None, Some("tokens"), Some("ast"), Some("lir"), Some("asm")] {
+        let mut args = vec![
+            "build",
+            "valid.vl",
+            "--format",
+            "json",
+            "--out",
+            "missing/output",
+        ];
+        if let Some(emit) = emit {
+            args.extend(["--emit", emit]);
+        }
+        let output = run(&root, &args);
+        assert_eq!(output.status.code(), Some(2), "emit {emit:?}");
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = parse_stdout_json(&output);
+        assert_eq!(report["ok"], false, "{report}");
+        assert!(
+            report["diagnostics"]
+                .as_array()
+                .expect("diagnostics array")
+                .iter()
+                .any(|d| d["code"] == "E601"),
+            "{report}"
+        );
+    }
+    fs::remove_dir_all(root).expect("remove temporary project");
+}
+
+#[test]
+fn shallow_project_dumps_do_not_validate_duplicate_entrypoints() {
+    let root = temp_project("shallow-entrypoints");
+    fs::create_dir_all(root.join("src")).expect("source directory");
+    fs::write(root.join("vl.toml"), "module = \"demo\"\n").expect("config");
+    for name in ["a", "b"] {
+        fs::write(root.join(format!("src/{name}.vl")), "fun main() {}").expect("source");
+    }
+    for emit in ["tokens", "ast"] {
+        let output = run(&root, &["build", "--emit", emit, "--format", "json"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let report = parse_stdout_json(&output);
+        assert_eq!(report["ok"], true, "{report}");
+    }
+    let output = run(&root, &["build", "--format", "json"]);
+    assert!(!output.status.success());
+    let report = parse_stdout_json(&output);
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .any(|d| d["code"] == "E401"),
+        "{report}"
+    );
+    fs::remove_dir_all(root).expect("remove temporary project");
+}

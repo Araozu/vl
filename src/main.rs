@@ -841,14 +841,20 @@ fn build_single(
         } else {
             format!("{toks:#?}\n")
         };
-        write_out(out, &dump);
-        return if json {
-            if emit_json(&[(name.as_str(), text.as_str(), diags.as_slice())]) {
-                ExitCode::from(1)
-            } else {
-                ExitCode::SUCCESS
-            }
-        } else if emit_all(&diags, &name, &text) {
+        let write_failed = if let Err(diag) = try_write_out(out, dump.as_bytes()) {
+            diags.push(diag);
+            true
+        } else {
+            false
+        };
+        let failed = if json {
+            emit_json(&[(name.as_str(), text.as_str(), diags.as_slice())])
+        } else {
+            emit_all(&diags, &name, &text)
+        };
+        return if write_failed {
+            ExitCode::from(2)
+        } else if failed {
             ExitCode::from(1)
         } else {
             ExitCode::SUCCESS
@@ -881,11 +887,20 @@ fn build_single(
     };
 
     if let Some(dump) = matches!(emit, Some(Emit::Lir)).then(|| fe.lir.dump()) {
-        write_out(out, &dump);
+        let diags = try_write_out(out, dump.as_bytes())
+            .err()
+            .into_iter()
+            .collect::<Vec<_>>();
         if json {
-            emit_json(&[]);
+            emit_json(&[(name.as_str(), text.as_str(), diags.as_slice())]);
+        } else {
+            emit_all(&diags, &name, &text);
         }
-        return ExitCode::SUCCESS;
+        return if diags.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        };
     }
 
     let Some(backend) = vl_codegen::lookup(target) else {
@@ -902,22 +917,26 @@ fn build_single(
         return ExitCode::from(2);
     };
 
-    let (artifact, backend_diags) = backend.emit(&fe.lir);
+    let (artifact, mut backend_diags) = backend.emit(&fe.lir);
+    let write_failed = artifact.as_ref().is_some_and(|a| {
+        if let Err(diag) = write_artifact(out, a) {
+            backend_diags.push(diag);
+            true
+        } else {
+            false
+        }
+    });
     let failed = if json {
         emit_json(&[(name.as_str(), text.as_str(), backend_diags.as_slice())])
     } else {
         emit_all(&backend_diags, &name, &text)
     };
-    match artifact {
-        Some(a) if !failed => {
-            write_artifact(out, &a);
-            ExitCode::SUCCESS
-        }
-        Some(a) => {
-            write_artifact(out, &a);
-            ExitCode::from(1)
-        }
-        None => ExitCode::from(1),
+    if write_failed {
+        ExitCode::from(2)
+    } else if failed || artifact.is_none() {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -1311,7 +1330,7 @@ fn build_project_at(
                 modules.push(interface.as_spec());
             }
         }
-        if !collides && new_source {
+        if !shallow_emit && !collides && new_source {
             for item in &ast.items {
                 if let vl_syntax::Item::Function { name, span, .. } = item {
                     if name == "main" {
@@ -1849,40 +1868,38 @@ fn fmt_paths(paths: &[PathBuf], check: bool) -> ExitCode {
     }
 }
 
-fn write_out(out: &Option<PathBuf>, text: &str) {
+fn try_write_out(out: &Option<PathBuf>, bytes: &[u8]) -> Result<(), vl_common::Diagnostic> {
     match out {
-        Some(p) => fs::write(p, text).unwrap_or_else(|e| {
-            emit_driver_error(&format!("cannot write {}: {e}", p.display()), "E601");
-            std::process::exit(2);
+        Some(path) => fs::write(path, bytes).map_err(|error| {
+            driver_diagnostic(&format!("cannot write {}: {error}", path.display()), "E601")
         }),
         None => {
             use std::io::Write;
-            if let Err(e) = std::io::stdout().write_all(text.as_bytes()) {
-                emit_driver_error(&format!("cannot write stdout: {e}"), "E601");
-                std::process::exit(2);
-            }
+            std::io::stdout().write_all(bytes).map_err(|error| {
+                driver_diagnostic(&format!("cannot write stdout: {error}"), "E601")
+            })
         }
     }
 }
 
-fn write_artifact(out: &Option<PathBuf>, artifact: &vl_codegen::Artifact) {
-    if let Some(bytes) = &artifact.bytes {
-        match out {
-            Some(path) => fs::write(path, bytes).unwrap_or_else(|e| {
-                emit_driver_error(&format!("cannot write {}: {e}", path.display()), "E601");
-                std::process::exit(2);
-            }),
-            None => {
-                use std::io::Write;
-                std::io::stdout().write_all(bytes).unwrap_or_else(|e| {
-                    emit_driver_error(&format!("cannot write stdout: {e}"), "E601");
-                    std::process::exit(2);
-                });
-            }
-        }
-    } else {
-        write_out(out, &artifact.text);
+fn write_out(out: &Option<PathBuf>, text: &str) {
+    if let Err(diag) = try_write_out(out, text.as_bytes()) {
+        emit_driver_error(&diag.message, "E601");
+        std::process::exit(2);
     }
+}
+
+fn write_artifact(
+    out: &Option<PathBuf>,
+    artifact: &vl_codegen::Artifact,
+) -> Result<(), vl_common::Diagnostic> {
+    try_write_out(
+        out,
+        artifact
+            .bytes
+            .as_deref()
+            .unwrap_or(artifact.text.as_bytes()),
+    )
 }
 
 fn emit_driver_error(message: &str, code: &str) {
