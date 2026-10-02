@@ -2,7 +2,7 @@
 //! renders human output with Ariadne, while tooling can serialize the same
 //! values as JSON or LSP diagnostics. Libraries do not print diagnostics.
 
-use ariadne::{sources, Color, Label as ALabel, Report, ReportKind};
+use ariadne::{sources, Color, Config, IndexType, Label as ALabel, Report, ReportKind};
 
 use crate::span::Span;
 
@@ -100,6 +100,7 @@ impl Diagnostic {
 
     fn build_report(&self, filename: &str) -> Report<'_, (String, std::ops::Range<usize>)> {
         let mut builder = Report::build(self.kind(), filename.to_owned(), self.primary_start())
+            .with_config(Config::default().with_index_type(IndexType::Byte))
             .with_message(self.message.clone());
 
         if let Some(code) = &self.code {
@@ -183,5 +184,24 @@ mod tests {
         assert!(out.contains("unexpected character"));
         // Ariadne draws box graphics; guard against silent fallback.
         assert!(out.contains("─") || out.contains("│") || out.contains('|'));
+    }
+
+    #[test]
+    fn unicode_before_multiline_label_keeps_byte_span_aligned() {
+        let source = "val s = \"😀 é\";\nval x = @;\n";
+        let at = source.find('@').expect("test marker");
+        let out = Diagnostic::error("unexpected character `@`")
+            .with_label(Span::new(at, at + 1), "here")
+            .render("unicode.vl", source);
+        let plain = out
+            .split('\u{1b}')
+            .map(|part| match part.find('m') {
+                Some(i) if !part[..i].contains('\n') => &part[i + 1..],
+                _ => part,
+            })
+            .collect::<String>();
+        assert!(plain.contains("unicode.vl:2:9"), "wrong location:\n{plain}");
+        assert!(plain.contains("val x = @;"), "wrong source line:\n{plain}");
+        assert!(plain.contains("here"), "missing label:\n{plain}");
     }
 }
