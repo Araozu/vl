@@ -12,10 +12,22 @@ if not (vim.lsp and vim.lsp.start) then
 end
 
 local function root_dir(fname)
+  local dir = vim.fn.fnamemodify(fname, ":p:h")
   if vim.fs and vim.fs.root then
-    return vim.fs.root(fname, { "vl.toml", ".git" })
+    -- `vim.fs.root` returns nil when no marker is found; fall back to
+    -- the file's directory instead of handing `vim.lsp.start` a nil root.
+    return vim.fs.root(fname, { "vl.toml", ".git" }) or dir
   end
-  return vim.fn.fnamemodify(fname, ":p:h")
+  -- Pre-0.10 Neovim without `vim.fs`: search upward manually.
+  local vl_toml = vim.fn.findfile("vl.toml", dir .. ";")
+  if vl_toml ~= "" then
+    return vim.fn.fnamemodify(vl_toml, ":p:h")
+  end
+  local git = vim.fn.finddir(".git", dir .. ";")
+  if git ~= "" then
+    return vim.fn.fnamemodify(git, ":p:h")
+  end
+  return dir
 end
 
 vim.api.nvim_create_autocmd("FileType", {

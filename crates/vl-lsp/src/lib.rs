@@ -90,18 +90,21 @@ pub fn module_for_uri(uri: &Url) -> String {
 // Analysis.
 // ---------------------------------------------------------------------------
 
-/// One open document's checked state: the parsed program (present even when
-/// checking fails, for symbols/completion), the full frontend result, and a
-/// best-effort resolution kept across errors so hover/goto-definition keep
-/// working mid-edit.
+/// One open document's checked state: the parsed program (the parser
+/// recovers per item, so this is present even when checking fails — for
+/// symbols/completion), the full frontend result, and a best-effort
+/// resolution re-run over the recovered program so hover/goto-definition
+/// keep working mid-edit.
 pub struct Analysis {
     pub text: String,
     pub module: String,
-    pub program: Option<Program>,
+    pub program: Program,
     pub frontend: Result<FrontendOk, Vec<Diagnostic>>,
-    /// Name resolution for hover/goto-definition. `Some` whenever the file
-    /// parses (even with type errors); `None` only for lex/parse failures.
-    pub resolution: Option<Resolution>,
+    /// Name resolution for hover/goto-definition. Re-resolved over the
+    /// recovered program (cheap, pure), so it exists even when `frontend`
+    /// is an error; resolution diagnostics are dropped here because the
+    /// frontend already reported them.
+    pub resolution: Resolution,
     /// Diagnostics to publish: frontend errors, or lex/parse errors when the
     /// file never reaches checking.
     pub diags: Vec<Diagnostic>,
@@ -123,7 +126,7 @@ pub fn analyze(text: &str, module: &str, catalog: &[ModuleSpec]) -> Analysis {
     let mut analysis = Analysis {
         text: text.to_owned(),
         module: module.to_owned(),
-        program: Some(program),
+        program,
         frontend: match frontend {
             Ok(ok) => Ok(ok),
             Err(diags) => Err(diags),
@@ -138,12 +141,10 @@ pub fn analyze(text: &str, module: &str, catalog: &[ModuleSpec]) -> Analysis {
 }
 
 /// Best-effort name resolution over a parsed program, ignoring the returned
-/// diagnostics (already reported or about to be). Returns `None` when even
-/// resolution cannot run — currently never, but the option keeps the
-/// mid-edit path explicit.
-fn best_effort_resolution(program: &Program, catalog: &[ModuleSpec]) -> Option<Resolution> {
+/// diagnostics (already reported or about to be).
+fn best_effort_resolution(program: &Program, catalog: &[ModuleSpec]) -> Resolution {
     let (resolution, _) = vl_semantic::resolve_with_modules(program, catalog);
-    Some(resolution)
+    resolution
 }
 
 /// Analyze with the default catalog (target natives + stdlib).
@@ -156,16 +157,43 @@ pub fn analyze_default(text: &str, module: &str) -> Analysis {
 // Positions: byte offsets/spans (1-based scalar columns) <-> LSP (UTF-16).
 // ---------------------------------------------------------------------------
 
-/// Byte offset of each line's first byte. Always starts with `0`; one entry
-/// is pushed after every `\n`.
-fn line_starts(text: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    for (i, b) in text.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push(i + 1);
+/// Line table over the LSP line endings (`\r\n`, `\r`, `\n`). `starts[i]`
+/// is the first byte of line `i`; `ends[i]` is one past its last content
+/// byte (line-break bytes excluded, so columns never count a `\r`).
+#[derive(Debug)]
+struct LineTable {
+    starts: Vec<usize>,
+    ends: Vec<usize>,
+}
+
+impl LineTable {
+    fn new(text: &str) -> Self {
+        let bytes = text.as_bytes();
+        let mut starts = vec![0];
+        let mut ends = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\r' if bytes.get(i + 1) == Some(&b'\n') => {
+                    ends.push(i);
+                    starts.push(i + 2);
+                    i += 2;
+                }
+                b'\r' | b'\n' => {
+                    ends.push(i);
+                    starts.push(i + 1);
+                    i += 1;
+                }
+                _ => i += 1,
+            }
         }
+        ends.push(text.len());
+        Self { starts, ends }
     }
-    starts
+
+    fn line_count(&self) -> usize {
+        self.starts.len()
+    }
 }
 
 /// UTF-16 code units in `s` (LSP columns count these, not bytes or scalars).
@@ -185,27 +213,26 @@ fn clamp_offset(text: &str, offset: usize) -> usize {
 /// Byte `offset` → LSP position (0-based line, UTF-16 character).
 pub fn offset_to_position(text: &str, offset: usize) -> Position {
     let offset = clamp_offset(text, offset);
-    let starts = line_starts(text);
-    let line = starts.partition_point(|&s| s <= offset).max(1) - 1;
-    let character = utf16_len(&text[starts[line]..offset]);
+    let table = LineTable::new(text);
+    let line = table.starts.partition_point(|&s| s <= offset).max(1) - 1;
+    let character = utf16_len(&text[table.starts[line]..offset]);
     Position {
         line: line as u32,
         character: character as u32,
     }
 }
 
-/// LSP position → byte offset. Out-of-range lines/characters clamp to the
-/// line end; mid-character positions snap down to the boundary.
+/// LSP position → byte offset. Out-of-range lines clamp to EOF and
+/// out-of-range characters clamp to the line end; mid-character positions
+/// snap down to the boundary.
 pub fn position_to_offset(text: &str, pos: Position) -> usize {
-    let starts = line_starts(text);
-    let line = (pos.line as usize).min(starts.len() - 1);
-    let line_start = starts[line];
-    let line_end = if line + 1 < starts.len() {
-        // Exclude the `\n` itself so clamping lands on line content.
-        starts[line + 1] - 1
-    } else {
-        text.len()
-    };
+    let table = LineTable::new(text);
+    if (pos.line as usize) >= table.line_count() {
+        return text.len();
+    }
+    let line = pos.line as usize;
+    let line_start = table.starts[line];
+    let line_end = table.ends[line];
     let mut offset = line_start;
     let mut units = 0u32;
     for ch in text[line_start..line_end].chars() {
@@ -393,8 +420,7 @@ fn format_typed_sig(name: &str, sig: &FuncSigTy) -> String {
 /// Markdown hover for the name under `offset`, or `None` when the cursor is
 /// not on a known name. Returns the contents plus the range to highlight.
 pub fn hover_at(analysis: &Analysis, offset: usize) -> Option<(String, Range)> {
-    let resolution = analysis.resolution.as_ref()?;
-    let cursor = def_at_offset(resolution, offset)?;
+    let cursor = def_at_offset(&analysis.resolution, offset)?;
     let def = cursor.def;
     let headline = if matches!(def.kind, DefKind::Local)
         && analysis
@@ -423,8 +449,7 @@ pub fn hover_at(analysis: &Analysis, offset: usize) -> Option<(String, Range)> {
 /// Goto-definition target for the name under `offset`: the URI stays the
 /// same (single-file documents in this milestone).
 pub fn definition_at(analysis: &Analysis, uri: &Url, offset: usize) -> Option<Location> {
-    let resolution = analysis.resolution.as_ref()?;
-    let cursor = def_at_offset(resolution, offset)?;
+    let cursor = def_at_offset(&analysis.resolution, offset)?;
     // A use of a module alias points at the alias itself; everything else
     // points at the definition site.
     Some(Location {
@@ -461,9 +486,7 @@ fn item_symbol(
 /// Top-level symbols for the outline: functions, objects (with methods as
 /// children), unions, error sets, globals, and imports.
 pub fn document_symbols(analysis: &Analysis) -> Vec<lsp_types::DocumentSymbol> {
-    let Some(program) = &analysis.program else {
-        return Vec::new();
-    };
+    let program = &analysis.program;
     let text = &analysis.text;
     let mut symbols = Vec::new();
     for item in &program.items {
@@ -590,9 +613,31 @@ pub const KEYWORDS: &[&str] = &[
     "break", "continue", "return", "null", "try", "catch", "as", "extends", "self",
 ];
 
-/// Complete at `offset`: keywords plus every name in scope (definitions and
-/// imports). Single-file scope in this milestone.
-pub fn completion_at(analysis: &Analysis, _offset: usize) -> Vec<CompletionItem> {
+/// Span of one top-level item.
+fn item_span(item: &Item) -> Span {
+    match item {
+        Item::Use { span, .. }
+        | Item::Object { span, .. }
+        | Item::Union { span, .. }
+        | Item::Error { span, .. }
+        | Item::Let { span, .. }
+        | Item::Destructure { span, .. }
+        | Item::Function { span, .. } => *span,
+    }
+}
+
+/// Whether `span` lies inside `outer` (inclusive on both ends, so a cursor
+/// at an item boundary still counts as enclosed).
+fn contains(outer: Span, span: Span) -> bool {
+    outer.start <= span.start && span.end <= outer.end
+}
+
+/// Complete at `offset`: keywords plus the names lexically visible there.
+/// Imports, functions, and top-level bindings are file-visible (once
+/// declared — no forward suggestions); parameters and body locals are only
+/// suggested inside their enclosing top-level item. Single-file scope in
+/// this milestone.
+pub fn completion_at(analysis: &Analysis, offset: usize) -> Vec<CompletionItem> {
     let mut seen = std::collections::HashSet::new();
     let mut items = Vec::new();
     for keyword in KEYWORDS {
@@ -603,29 +648,65 @@ pub fn completion_at(analysis: &Analysis, _offset: usize) -> Vec<CompletionItem>
             ..Default::default()
         });
     }
-    if let Some(resolution) = &analysis.resolution {
-        let mut names: Vec<(&String, CompletionItemKind)> = Vec::new();
-        for def in &resolution.defs {
-            let kind = match def.kind {
-                DefKind::Parameter => CompletionItemKind::VARIABLE,
-                DefKind::Local => match def.binding {
-                    Some(_) => CompletionItemKind::VARIABLE,
-                    None => CompletionItemKind::FUNCTION,
-                },
-                DefKind::External | DefKind::ImportedFunction => CompletionItemKind::FUNCTION,
-                DefKind::ModuleAlias => CompletionItemKind::MODULE,
-            };
+    // Binding spans of top-level `let`/`destructure` items: file-visible
+    // values (as opposed to function-body locals, which share the same
+    // `Local` def kind but live inside a `Function` item span).
+    let mut top_level_values = std::collections::HashSet::new();
+    for item in &analysis.program.items {
+        match item {
+            Item::Let { name_span, .. } => {
+                top_level_values.insert((name_span.start, name_span.end));
+            }
+            Item::Destructure { bindings, .. } => {
+                for binding in bindings {
+                    top_level_values.insert((binding.binding_span.start, binding.binding_span.end));
+                }
+            }
+            _ => {}
+        }
+    }
+    let enclosing = analysis
+        .program
+        .items
+        .iter()
+        .map(item_span)
+        .find(|span| span.start <= offset && offset <= span.end);
+    let mut names: Vec<(&String, CompletionItemKind)> = Vec::new();
+    for def in &analysis.resolution.defs {
+        let kind = match def.kind {
+            DefKind::Parameter => CompletionItemKind::VARIABLE,
+            DefKind::Local => match def.binding {
+                Some(_) => CompletionItemKind::VARIABLE,
+                None => CompletionItemKind::FUNCTION,
+            },
+            DefKind::External | DefKind::ImportedFunction => CompletionItemKind::FUNCTION,
+            DefKind::ModuleAlias => CompletionItemKind::MODULE,
+        };
+        let visible = match def.kind {
+            // Imports resolve file-wide.
+            DefKind::External | DefKind::ImportedFunction | DefKind::ModuleAlias => true,
+            // Functions and methods are file-visible once declared.
+            DefKind::Local if def.binding.is_none() => def.span.start <= offset,
+            // Values: file-visible when top-level and declared, otherwise
+            // confined to the enclosing item (function body, match arm, …).
+            _ => {
+                def.span.start <= offset
+                    && (top_level_values.contains(&(def.span.start, def.span.end))
+                        || enclosing.is_some_and(|span| contains(span, def.span)))
+            }
+        };
+        if visible {
             names.push((&def.name, kind));
         }
-        names.sort_by(|a, b| a.0.cmp(b.0));
-        for (name, kind) in names {
-            if seen.insert(name.clone()) {
-                items.push(CompletionItem {
-                    label: name.clone(),
-                    kind: Some(kind),
-                    ..Default::default()
-                });
-            }
+    }
+    names.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, kind) in names {
+        if seen.insert(name.clone()) {
+            items.push(CompletionItem {
+                label: name.clone(),
+                kind: Some(kind),
+                ..Default::default()
+            });
         }
     }
     items
@@ -710,41 +791,98 @@ fn request_params<P: serde::de::DeserializeOwned>(req: &Request) -> Option<P> {
     serde_json::from_value(req.params.clone()).ok()
 }
 
+/// One handler result: either a JSON result or a JSON-RPC error.
+enum HandlerOutcome {
+    Ok(serde_json::Value),
+    Err(lsp_server::ErrorCode, String),
+}
+
+fn respond(
+    sender: &Sender<Message>,
+    id: lsp_server::RequestId,
+    outcome: HandlerOutcome,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let response = match outcome {
+        HandlerOutcome::Ok(result) => lsp_server::Response {
+            id,
+            result: Some(result),
+            error: None,
+        },
+        HandlerOutcome::Err(code, message) => lsp_server::Response {
+            id,
+            result: None,
+            error: Some(lsp_server::ResponseError {
+                code: code as i32,
+                message,
+                data: None,
+            }),
+        },
+    };
+    sender.send(Message::Response(response))?;
+    Ok(())
+}
+
 fn handle_request(
     req: Request,
     docs: &Documents,
+    shutdown: bool,
     sender: &Sender<Message>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // Unknown methods and malformed params answer null so the client moves on.
-    let result = match req.method.as_str() {
-        lsp_types::request::HoverRequest::METHOD => request_params(&req)
-            .map(|params| hover_request(docs, params))
-            .and_then(|result| serde_json::to_value(result).ok())
-            .unwrap_or(serde_json::Value::Null),
-        lsp_types::request::GotoDefinition::METHOD => request_params(&req)
-            .map(|params| definition_request(docs, params))
-            .and_then(|result| serde_json::to_value(result).ok())
-            .unwrap_or(serde_json::Value::Null),
-        lsp_types::request::DocumentSymbolRequest::METHOD => request_params(&req)
-            .map(|params| symbols_request(docs, params))
-            .and_then(|result| serde_json::to_value(result).ok())
-            .unwrap_or(serde_json::Value::Null),
-        lsp_types::request::Formatting::METHOD => request_params(&req)
-            .map(|params| formatting_request(docs, params))
-            .and_then(|result| serde_json::to_value(result).ok())
-            .unwrap_or(serde_json::Value::Null),
-        lsp_types::request::Completion::METHOD => request_params(&req)
-            .map(|params| completion_request(docs, params))
-            .and_then(|result| serde_json::to_value(result).ok())
-            .unwrap_or(serde_json::Value::Null),
-        _ => serde_json::Value::Null,
+    // After `shutdown`, the server answers no further requests.
+    if shutdown {
+        return respond(
+            sender,
+            req.id.clone(),
+            HandlerOutcome::Err(
+                lsp_server::ErrorCode::InvalidRequest,
+                "server is shut down".to_owned(),
+            ),
+        );
+    }
+    // Malformed params are a client bug: answer `InvalidParams` so the
+    // client can diagnose it, and keep serving.
+    let outcome = match req.method.as_str() {
+        lsp_types::request::HoverRequest::METHOD => match request_params(&req) {
+            Some(params) => HandlerOutcome::Ok(serde_json::to_value(hover_request(docs, params))?),
+            None => invalid_params(&req.method),
+        },
+        lsp_types::request::GotoDefinition::METHOD => match request_params(&req) {
+            Some(params) => {
+                HandlerOutcome::Ok(serde_json::to_value(definition_request(docs, params))?)
+            }
+            None => invalid_params(&req.method),
+        },
+        lsp_types::request::DocumentSymbolRequest::METHOD => match request_params(&req) {
+            Some(params) => {
+                HandlerOutcome::Ok(serde_json::to_value(symbols_request(docs, params))?)
+            }
+            None => invalid_params(&req.method),
+        },
+        lsp_types::request::Formatting::METHOD => match request_params(&req) {
+            Some(params) => {
+                HandlerOutcome::Ok(serde_json::to_value(formatting_request(docs, params))?)
+            }
+            None => invalid_params(&req.method),
+        },
+        lsp_types::request::Completion::METHOD => match request_params(&req) {
+            Some(params) => {
+                HandlerOutcome::Ok(serde_json::to_value(completion_request(docs, params))?)
+            }
+            None => invalid_params(&req.method),
+        },
+        _ => HandlerOutcome::Err(
+            lsp_server::ErrorCode::MethodNotFound,
+            format!("unsupported method `{}`", req.method),
+        ),
     };
-    sender.send(Message::Response(lsp_server::Response {
-        id: req.id.clone(),
-        result: Some(result),
-        error: None,
-    }))?;
-    Ok(())
+    respond(sender, req.id.clone(), outcome)
+}
+
+fn invalid_params(method: &str) -> HandlerOutcome {
+    HandlerOutcome::Err(
+        lsp_server::ErrorCode::InvalidParams,
+        format!("invalid params for `{method}`"),
+    )
 }
 
 fn hover_request(docs: &Documents, params: HoverParams) -> Option<Hover> {
@@ -818,20 +956,32 @@ fn completion_request(docs: &Documents, params: CompletionParams) -> Option<Comp
     }))
 }
 
+/// Best-effort notification parameters: a malformed notification is a
+/// client bug and must never take the server down, so it is ignored.
+fn notification_params<P: serde::de::DeserializeOwned>(notif: &Notification) -> Option<P> {
+    serde_json::from_value(notif.params.clone()).ok()
+}
+
 fn handle_notification(
     notif: Notification,
     docs: &mut Documents,
     sender: &Sender<Message>,
-) -> Result<bool, Box<dyn Error + Send + Sync>> {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     match notif.method.as_str() {
         DidOpenTextDocument::METHOD => {
-            let params: DidOpenTextDocumentParams = serde_json::from_value(notif.params)?;
+            let Some(params): Option<DidOpenTextDocumentParams> = notification_params(&notif)
+            else {
+                return Ok(());
+            };
             let uri = params.text_document.uri.clone();
             let diags = docs.open(uri.clone(), params.text_document.text);
             publish(sender, uri, diags)?;
         }
         DidChangeTextDocument::METHOD => {
-            let params: DidChangeTextDocumentParams = serde_json::from_value(notif.params)?;
+            let Some(params): Option<DidChangeTextDocumentParams> = notification_params(&notif)
+            else {
+                return Ok(());
+            };
             if let Some(change) = params.content_changes.into_iter().last() {
                 let uri = params.text_document.uri.clone();
                 let diags = docs.change(uri.clone(), change.text);
@@ -839,11 +989,21 @@ fn handle_notification(
             }
         }
         DidCloseTextDocument::METHOD => {
-            let params: DidCloseTextDocumentParams = serde_json::from_value(notif.params)?;
-            docs.close(&params.text_document.uri);
+            let Some(params): Option<DidCloseTextDocumentParams> = notification_params(&notif)
+            else {
+                return Ok(());
+            };
+            let uri = params.text_document.uri.clone();
+            docs.close(&uri);
+            // The server owns its diagnostics: clear them so the client
+            // does not keep showing stale errors for a closed document.
+            publish(sender, uri, Vec::new())?;
         }
         DidSaveTextDocument::METHOD => {
-            let params: DidSaveTextDocumentParams = serde_json::from_value(notif.params)?;
+            let Some(params): Option<DidSaveTextDocumentParams> = notification_params(&notif)
+            else {
+                return Ok(());
+            };
             // Re-analyze on save in case the client only syncs then.
             if let Some(text) = params
                 .text
@@ -856,7 +1016,7 @@ fn handle_notification(
         }
         _ => {}
     }
-    Ok(false)
+    Ok(())
 }
 
 /// Run the LSP server over stdio. Blocks until the client sends `exit`.
@@ -882,18 +1042,19 @@ fn main_loop(connection: Connection) -> Result<(), Box<dyn Error + Send + Sync>>
         analyses: HashMap::new(),
         catalog: default_catalog(),
     };
+    let mut shutdown = false;
     for msg in &connection.receiver {
         match msg {
             Message::Request(req) => {
                 if req.method == Shutdown::METHOD {
-                    let resp = lsp_server::Response {
-                        id: req.id.clone(),
-                        result: Some(serde_json::Value::Null),
-                        error: None,
-                    };
-                    connection.sender.send(Message::Response(resp))?;
+                    shutdown = true;
+                    respond(
+                        &connection.sender,
+                        req.id.clone(),
+                        HandlerOutcome::Ok(serde_json::Value::Null),
+                    )?;
                 } else {
-                    handle_request(req, &docs, &connection.sender)?;
+                    handle_request(req, &docs, shutdown, &connection.sender)?;
                 }
             }
             Message::Notification(notif) => {
@@ -904,6 +1065,10 @@ fn main_loop(connection: Connection) -> Result<(), Box<dyn Error + Send + Sync>>
             }
             Message::Response(_) => {}
         }
+    }
+    // `exit` without a prior `shutdown` is a client protocol violation.
+    if !shutdown {
+        return Err("client sent `exit` without a prior `shutdown` request".into());
     }
     Ok(())
 }
@@ -993,7 +1158,7 @@ mod tests {
     fn clean_file_has_no_diagnostics_and_resolves() {
         let analysis = analyze_test("fun main() {}\n");
         assert!(analysis.diags.is_empty());
-        assert!(analysis.resolution.is_some());
+        assert!(!analysis.resolution.defs.is_empty());
         assert!(diagnostics_for(&analysis).is_empty());
     }
 
@@ -1059,12 +1224,153 @@ mod tests {
     fn completion_offers_keywords_and_scope_names() {
         let text = "fun helper() {}\nfun main() {}\n";
         let analysis = analyze_test(text);
-        let items = completion_at(&analysis, 0);
+        let items = completion_at(&analysis, text.len());
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         for keyword in ["fun", "return", "match"] {
             assert!(labels.contains(&keyword), "{labels:?}");
         }
         assert!(labels.contains(&"helper"), "{labels:?}");
+    }
+
+    #[test]
+    fn completion_hides_other_functions_locals() {
+        let text = "fun first(hidden: u64): u64 { val private = hidden; return private; }\nfun main() { return 1u64; }\n";
+        let analysis = analyze_test(text);
+        // Inside `main` (second line): neither `first`'s parameter nor its
+        // body local is visible.
+        let offset = text.find("return 1u64").unwrap();
+        let items = completion_at(&analysis, offset);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(!labels.contains(&"hidden"), "{labels:?}");
+        assert!(!labels.contains(&"private"), "{labels:?}");
+        assert!(labels.contains(&"first"), "{labels:?}");
+        // Inside `first`'s body both are visible.
+        let inner = text.find("return private").unwrap();
+        let inner_items = completion_at(&analysis, inner);
+        let inner_labels: Vec<&str> = inner_items.iter().map(|i| i.label.as_str()).collect();
+        assert!(inner_labels.contains(&"hidden"), "{inner_labels:?}");
+        assert!(inner_labels.contains(&"private"), "{inner_labels:?}");
+    }
+
+    #[test]
+    fn completion_hides_not_yet_declared_globals() {
+        let text = "fun main() {}\nval later = 1u64;\n";
+        let analysis = analyze_test(text);
+        let items = completion_at(&analysis, 0);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(!labels.contains(&"later"), "{labels:?}");
+        let after = completion_at(&analysis, text.len());
+        let after_labels: Vec<&str> = after.iter().map(|i| i.label.as_str()).collect();
+        assert!(after_labels.contains(&"later"), "{after_labels:?}");
+    }
+
+    #[test]
+    fn positions_handle_crlf_endings() {
+        let text = "fun main() {}\r\nval x = 1u64;\r\n";
+        // Start of the second line, past the CRLF.
+        let off = text.find("val").unwrap();
+        let pos = offset_to_position(text, off);
+        assert_eq!((pos.line, pos.character), (1, 0));
+        assert_eq!(position_to_offset(text, pos), off);
+        // Past-end clamps to the line content (no `\r` in columns).
+        let end = position_to_offset(
+            text,
+            Position {
+                line: 1,
+                character: 999,
+            },
+        );
+        assert_eq!(end, off + "val x = 1u64;".len());
+        assert_eq!(&text[end..end + 1], "\r");
+    }
+
+    #[test]
+    fn unknown_method_answers_method_not_found() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let docs = Documents {
+            docs: HashMap::new(),
+            analyses: HashMap::new(),
+            catalog: test_catalog(),
+        };
+        let req = Request {
+            id: lsp_server::RequestId::from(1),
+            method: "textDocument/nope".to_owned(),
+            params: serde_json::Value::Null,
+        };
+        handle_request(req, &docs, false, &sender).unwrap();
+        let Message::Response(resp) = receiver.try_recv().unwrap() else {
+            panic!("expected a response");
+        };
+        let error = resp.error.expect("unknown method must error");
+        assert_eq!(error.code, lsp_server::ErrorCode::MethodNotFound as i32);
+    }
+
+    #[test]
+    fn malformed_notifications_are_ignored_and_close_clears() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut docs = Documents {
+            docs: HashMap::new(),
+            analyses: HashMap::new(),
+            catalog: test_catalog(),
+        };
+        let uri: Url = "file:///close.vl".parse().unwrap();
+        // Malformed `didOpen` (empty params) must not kill the server.
+        handle_notification(
+            Notification {
+                method: DidOpenTextDocument::METHOD.to_owned(),
+                params: serde_json::json!({}),
+            },
+            &mut docs,
+            &sender,
+        )
+        .unwrap();
+        assert!(receiver.try_recv().is_err());
+        // Open for real, then close: the close must publish empty
+        // diagnostics to clear the client's stale errors.
+        handle_notification(
+            Notification {
+                method: DidOpenTextDocument::METHOD.to_owned(),
+                params: serde_json::to_value(DidOpenTextDocumentParams {
+                    text_document: lsp_types::TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "vl".to_owned(),
+                        version: 1,
+                        text: "val x = 1\n".to_owned(),
+                    },
+                })
+                .unwrap(),
+            },
+            &mut docs,
+            &sender,
+        )
+        .unwrap();
+        let open_notif = match receiver.try_recv().unwrap() {
+            Message::Notification(notif) => notif,
+            other => panic!("expected diagnostics, got {other:?}"),
+        };
+        let open_params: PublishDiagnosticsParams =
+            serde_json::from_value(open_notif.params).unwrap();
+        assert!(!open_params.diagnostics.is_empty());
+        handle_notification(
+            Notification {
+                method: DidCloseTextDocument::METHOD.to_owned(),
+                params: serde_json::to_value(DidCloseTextDocumentParams {
+                    text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                })
+                .unwrap(),
+            },
+            &mut docs,
+            &sender,
+        )
+        .unwrap();
+        let close_notif = match receiver.try_recv().unwrap() {
+            Message::Notification(notif) => notif,
+            other => panic!("expected diagnostics, got {other:?}"),
+        };
+        let close_params: PublishDiagnosticsParams =
+            serde_json::from_value(close_notif.params).unwrap();
+        assert_eq!(close_params.uri, uri);
+        assert!(close_params.diagnostics.is_empty());
     }
 
     #[test]
