@@ -12,6 +12,10 @@ pub enum TokenKind {
     Ident(String),
     Int(i64),
     I64(i64),
+    /// Magnitude `i64::MAX + 1`, held for parser coordination so unary `-`
+    /// can form the signed minimum without accepting it as a positive value.
+    IntMinMagnitude,
+    I64MinMagnitude,
     U64(u64),
     F64(u64),
     U8(u8),
@@ -280,19 +284,27 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
                     } else {
                         number
                             .parse::<f64>()
+                            .ok()
+                            .filter(|v| v.is_finite())
                             .map(|v| TokenKind::F64(v.to_bits()))
-                            .map_err(|_| "invalid f64 literal")
+                            .ok_or("invalid or out of range f64 literal")
                     }
                 } else {
                     match suffix {
-                        "" => number
-                            .parse::<i64>()
-                            .map(TokenKind::Int)
-                            .map_err(|_| "integer literal out of range"),
-                        "i64" => number
-                            .parse::<i64>()
-                            .map(TokenKind::I64)
-                            .map_err(|_| "i64 literal out of range"),
+                        "" => number.parse::<i64>().map(TokenKind::Int).or_else(|_| {
+                            if number.parse::<u64>().ok() == Some(1u64 << 63) {
+                                Ok(TokenKind::IntMinMagnitude)
+                            } else {
+                                Err("integer literal out of range")
+                            }
+                        }),
+                        "i64" => number.parse::<i64>().map(TokenKind::I64).or_else(|_| {
+                            if number.parse::<u64>().ok() == Some(1u64 << 63) {
+                                Ok(TokenKind::I64MinMagnitude)
+                            } else {
+                                Err("i64 literal out of range")
+                            }
+                        }),
                         "u64" => number
                             .parse::<u64>()
                             .map(TokenKind::U64)
@@ -703,5 +715,19 @@ mod tests {
             let s = format!("{k:?}");
             s.contains("Mut") || s.contains("Amp") || s.contains("Deref")
         }));
+    }
+
+    #[test]
+    fn rejects_float_overflow_and_retains_signed_i64_endpoint_magnitude() {
+        let overflow = format!("{}.0f64", "9".repeat(400));
+        let (tokens, diagnostics) = lex(&format!("1.7976931348623157f64 {overflow}"));
+        assert!(matches!(tokens[0].kind, TokenKind::F64(bits) if f64::from_bits(bits).is_finite()));
+        assert!(matches!(tokens[1].kind, TokenKind::Invalid));
+        assert_eq!(diagnostics.len(), 1);
+
+        let (tokens, diagnostics) = lex("9223372036854775808 -9223372036854775808i64");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(tokens[0].kind, TokenKind::IntMinMagnitude);
+        assert_eq!(tokens[2].kind, TokenKind::I64MinMagnitude);
     }
 }

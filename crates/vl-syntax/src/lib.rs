@@ -548,6 +548,7 @@ struct Parser<'a> {
     /// `known_types`). Error-set annotations (`E`, `E!u64`) resolve through
     /// this set; anything else is an object spelling.
     known_errors: std::collections::HashSet<String>,
+    nesting_depth: usize,
 }
 
 pub fn parse(toks: &[Token], src: &str) -> (Program, Vec<Diagnostic>) {
@@ -692,6 +693,7 @@ pub fn parse_with_module(toks: &[Token], _src: &str, module: &str) -> (Program, 
         known_types,
         known_unions,
         known_errors,
+        nesting_depth: 0,
     };
     let mut items = Vec::new();
     while !p.at_eof() {
@@ -729,6 +731,27 @@ pub fn parse_with_module(toks: &[Token], _src: &str, module: &str) -> (Program, 
 }
 
 impl<'a> Parser<'a> {
+    fn with_nesting<T>(
+        &mut self,
+        message: &'static str,
+        hint: &'static str,
+        parse: impl FnOnce(&mut Self) -> Option<T>,
+    ) -> Option<T> {
+        if self.nesting_depth >= 48 {
+            let span = self.peek().span;
+            self.diags.push(
+                Diagnostic::error(message)
+                    .with_label(span, hint)
+                    .with_code("E100"),
+            );
+            return None;
+        }
+        self.nesting_depth += 1;
+        let result = parse(self);
+        self.nesting_depth -= 1;
+        result
+    }
+
     fn peek(&self) -> &Token {
         &self.toks[self.pos.min(self.toks.len() - 1)]
     }
@@ -1361,6 +1384,14 @@ impl<'a> Parser<'a> {
     /// declaration boundary. `*T` over an unconstrained parameter parses
     /// fine and is rejected later by type checking.
     fn parse_type(&mut self, allowed: &[String], strict: bool) -> Option<(VlType, Span)> {
+        self.with_nesting(
+            "type nesting limit exceeded",
+            "reduce nested type constructors",
+            |p| p.parse_type_inner(allowed, strict),
+        )
+    }
+
+    fn parse_type_inner(&mut self, allowed: &[String], strict: bool) -> Option<(VlType, Span)> {
         if matches!(self.peek().kind, TokenKind::Question) {
             return self.parse_nullable_type(allowed, strict);
         }
@@ -2603,13 +2634,17 @@ impl<'a> Parser<'a> {
         };
         self.expect(&TokenKind::LBrace, "`{` for the function body")?;
         let mut body = Vec::new();
+        let signature_poisoned = self.diags.len() != header_diag_count;
         while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
+            let statement_start = self.pos;
             match self.parse_stmt(&allowed) {
                 Some(s) => body.push(s),
                 None => {
-                    let before = self.pos;
                     self.recover_to_stmt_boundary();
-                    if self.pos == before && !self.at_eof() {
+                    if self.pos == statement_start
+                        && !self.at_eof()
+                        && !matches!(self.peek().kind, TokenKind::RBrace)
+                    {
                         self.bump();
                     }
                 }
@@ -2623,13 +2658,21 @@ impl<'a> Parser<'a> {
             params,
             ret,
             ret_span,
-            signature_poisoned: self.diags.len() != header_diag_count,
+            signature_poisoned,
             body,
             span: Span::new(function_tok.span.start, close.span.end),
         })
     }
 
     fn parse_stmt(&mut self, allowed: &[String]) -> Option<Stmt> {
+        self.with_nesting(
+            "statement nesting limit exceeded",
+            "reduce nested statements",
+            |p| p.parse_stmt_inner(allowed),
+        )
+    }
+
+    fn parse_stmt_inner(&mut self, allowed: &[String]) -> Option<Stmt> {
         if matches!(self.peek().kind, TokenKind::Defer | TokenKind::ErrDefer) {
             return self.parse_defer_stmt(allowed);
         }
@@ -2781,9 +2824,9 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let end = else_body
-            .as_ref()
-            .and_then(|_| self.toks.get(self.pos.saturating_sub(1)))
+        let end = self
+            .toks
+            .get(self.pos.saturating_sub(1))
             .map_or_else(|| condition.span().end, |t| t.span.end);
         Some(Stmt::If {
             condition,
@@ -3004,15 +3047,26 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_block(&mut self, allowed: &[String]) -> Option<Vec<Stmt>> {
+        self.with_nesting(
+            "block nesting limit exceeded",
+            "reduce nested blocks",
+            |p| p.parse_block_inner(allowed),
+        )
+    }
+
+    fn parse_block_inner(&mut self, allowed: &[String]) -> Option<Vec<Stmt>> {
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut body = Vec::new();
         while !self.at_eof() && !matches!(self.peek().kind, TokenKind::RBrace) {
+            let statement_start = self.pos;
             match self.parse_stmt(allowed) {
                 Some(stmt) => body.push(stmt),
                 None => {
-                    let before = self.pos;
                     self.recover_to_stmt_boundary();
-                    if self.pos == before && !self.at_eof() {
+                    if self.pos == statement_start
+                        && !self.at_eof()
+                        && !matches!(self.peek().kind, TokenKind::RBrace)
+                    {
                         self.bump();
                     }
                 }
@@ -3101,7 +3155,11 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self) -> Option<Expr> {
-        self.parse_or()
+        self.with_nesting(
+            "expression nesting limit exceeded",
+            "reduce nested expressions",
+            |p| p.parse_or(),
+        )
     }
 
     fn parse_or(&mut self) -> Option<Expr> {
@@ -3122,15 +3180,23 @@ impl<'a> Parser<'a> {
 
     /// Fallible fallback (`expr catch fallback`): binds tighter than `||`
     /// (so `a || b catch c` is `a || (b catch c)`) and chains right
-    /// (`a catch b catch c` is `a catch (b catch c)`). The fallback is a
-    /// full `or` expression so `x catch y || z` reads as `x catch (y || z)`.
+    /// (`a catch b catch c` is `a catch (b catch c)`). Logical-or is
+    /// outside catch on its left, but a right-hand `b catch c` remains intact.
     fn parse_catch(&mut self) -> Option<Expr> {
+        self.with_nesting(
+            "catch expression nesting limit exceeded",
+            "reduce chained `catch` expressions",
+            |p| p.parse_catch_inner(),
+        )
+    }
+
+    fn parse_catch_inner(&mut self) -> Option<Expr> {
         let lhs = self.parse_and()?;
         if !matches!(self.peek().kind, TokenKind::Catch) {
             return Some(lhs);
         }
         self.bump(); // `catch`
-        let fallback = self.parse_or()?;
+        let fallback = self.parse_catch()?;
         let span = lhs.span().merge(fallback.span());
         Some(Expr::Catch {
             lhs: Box::new(lhs),
@@ -3267,9 +3333,31 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary(&mut self) -> Option<Expr> {
+        self.with_nesting(
+            "unary expression nesting limit exceeded",
+            "reduce chained unary operators",
+            |p| p.parse_unary_inner(),
+        )
+    }
+
+    fn parse_unary_inner(&mut self) -> Option<Expr> {
         match &self.peek().kind {
             TokenKind::Minus => {
                 let t = self.bump();
+                if matches!(
+                    self.peek().kind,
+                    TokenKind::IntMinMagnitude | TokenKind::I64MinMagnitude
+                ) {
+                    let magnitude = self.bump();
+                    let literal = match magnitude.kind {
+                        TokenKind::IntMinMagnitude => Scalar::Int(i64::MIN),
+                        _ => Scalar::I64(i64::MIN),
+                    };
+                    return Some(Expr::Literal(
+                        literal,
+                        Span::new(t.span.start, magnitude.span.end),
+                    ));
+                }
                 let rhs = self.parse_unary()?;
                 let span = Span::new(t.span.start, rhs.span().end);
                 Some(Expr::Unary {
@@ -3442,6 +3530,15 @@ impl<'a> Parser<'a> {
             TokenKind::I64(v) => {
                 self.bump();
                 Some(Expr::Literal(Scalar::I64(v), t.span))
+            }
+            TokenKind::IntMinMagnitude | TokenKind::I64MinMagnitude => {
+                self.bump();
+                self.diags.push(
+                    Diagnostic::error("integer literal is out of range")
+                        .with_label(t.span, "this magnitude is valid only after unary `-`")
+                        .with_code("E001"),
+                );
+                None
             }
             TokenKind::U64(v) => {
                 self.bump();
@@ -3670,6 +3767,9 @@ fn describe(k: &TokenKind) -> String {
         TokenKind::Ident(n) => format!("identifier `{n}`"),
         TokenKind::Int(v) => format!("integer `{v}`"),
         TokenKind::I64(v) => format!("i64 literal `{v}`"),
+        TokenKind::IntMinMagnitude | TokenKind::I64MinMagnitude => {
+            "integer literal magnitude `9223372036854775808`".into()
+        }
         TokenKind::U64(v) => format!("u64 literal `{v}`"),
         TokenKind::F64(v) => format!("f64 literal `{}`", f64::from_bits(*v)),
         TokenKind::U8(v) => format!("u8 literal `{v}`"),
@@ -4017,15 +4117,22 @@ mod tests {
     #[test]
     fn parses_try_and_catch_with_precedence() {
         // `try` is prefix (binds tightest); `catch` binds tighter than
-        // `||` and chains right: `(try f()) catch (g() || h())`.
+        // `||` and chains right: `((try f()) catch g()) || h()`.
         let (prog, diags) = parse_src("fun main() { val x = try f() catch g() || h(); x; }");
         assert!(diags.is_empty(), "{diags:?}");
         match &prog.items[0] {
             Item::Function { body, .. } => match &body[0] {
                 Stmt::Let { value, .. } => match value {
-                    Expr::Catch { lhs, fallback, .. } => {
-                        assert!(matches!(&**lhs, Expr::Try { .. }));
-                        assert!(matches!(&**fallback, Expr::Binary { .. }));
+                    Expr::Binary {
+                        op: BinOp::Or,
+                        lhs,
+                        rhs,
+                        ..
+                    } => {
+                        assert!(
+                            matches!(&**lhs, Expr::Catch { lhs, .. } if matches!(&**lhs, Expr::Try { .. }))
+                        );
+                        assert!(matches!(&**rhs, Expr::Call { .. }));
                     }
                     other => panic!("expected catch, got {other:?}"),
                 },
@@ -4033,6 +4140,15 @@ mod tests {
             },
             other => panic!("expected function, got {other:?}"),
         }
+        let (prog, diags) = parse_src("fun main() { val x = a catch b || c; x; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(matches!(
+            &prog.items[0],
+            Item::Function { body, .. }
+                if matches!(&body[0], Stmt::Let {
+                    value: Expr::Binary { op: BinOp::Or, lhs, .. }, ..
+                } if matches!(&**lhs, Expr::Catch { .. }))
+        ));
         // Right chains: `a catch b catch c` is `a catch (b catch c)`.
         let (prog, diags) = parse_src("fun main() { val x = a() catch b() catch c(); x; }");
         assert!(diags.is_empty(), "{diags:?}");
@@ -5272,5 +5388,111 @@ mod tests {
             }
             other => panic!("expected fn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn signed_i64_minimum_parses_but_positive_magnitude_fails() {
+        let (prog, diags) = parse_src("fun a(): i64 { return -9223372036854775808; } fun b(): i64 { return -9223372036854775808i64; } fun c(): i64 { return -0009223372036854775808i64; }");
+        assert!(diags.is_empty(), "{diags:?}");
+        for item in prog.items {
+            let Item::Function { body, .. } = item else {
+                panic!("expected function")
+            };
+            assert!(matches!(
+                &body[0],
+                Stmt::Return {
+                    value: Some(Expr::Literal(
+                        Scalar::Int(i64::MIN) | Scalar::I64(i64::MIN),
+                        _,
+                    )),
+                    ..
+                }
+            ));
+        }
+        let (_, diags) = parse_src("fun bad() { val x = 9223372036854775808; }");
+        assert!(
+            diags.iter().any(|d| d.code.as_deref() == Some("E001")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_next_statement_and_enclosing_brace() {
+        let (prog, diags) = parse_src("fun f() { val x = 1 val y = 2; return; } fun g() {}");
+        assert!(!diags.is_empty());
+        assert_eq!(prog.items.len(), 2);
+        let Item::Function { body, .. } = &prog.items[0] else {
+            panic!("expected function")
+        };
+        assert!(matches!(body.first(), Some(Stmt::Let { name, .. }) if name == "y"));
+
+        let (prog, diags) = parse_src("fun f() { val x = } fun g() {}");
+        assert!(!diags.is_empty());
+        assert_eq!(prog.items.len(), 2, "{diags:?}");
+    }
+
+    #[test]
+    fn body_errors_do_not_poison_function_signature() {
+        let (prog, diags) = parse_src("fun f(): u64 { val x = ; return 1u64; }");
+        assert!(!diags.is_empty());
+        assert!(matches!(
+            &prog.items[0],
+            Item::Function {
+                signature_poisoned: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn nesting_limit_reports_diagnostic_without_overflow() {
+        let nested = format!(
+            "fun f() {{ val x = {}1{}; }}",
+            "(".repeat(300),
+            ")".repeat(300)
+        );
+        let (_, diags) = parse_src(&nested);
+        assert!(
+            diags.iter().any(|d| d.message.contains("nesting limit")),
+            "{diags:?}"
+        );
+
+        let unary = format!("fun f() {{ val x = {}true; }}", "!".repeat(300));
+        let (_, diags) = parse_src(&unary);
+        assert!(diags.iter().any(|d| d.message.contains("nesting limit")));
+
+        let ty = format!("fun f(x: {}u64) {{}}", "?".repeat(300));
+        let (_, diags) = parse_src(&ty);
+        assert!(diags.iter().any(|d| d.message.contains("nesting limit")));
+
+        let branch = format!("fun f() {{ {}return; }}", "if (true) ".repeat(300));
+        let (_, diags) = parse_src(&branch);
+        assert!(diags.iter().any(|d| d.message.contains("nesting limit")));
+
+        let blocks = format!(
+            "fun f() {{ {}return;{} }}",
+            "if (true) { ".repeat(300),
+            " }".repeat(300)
+        );
+        let (_, diags) = parse_src(&blocks);
+        assert!(diags.iter().any(|d| d.message.contains("nesting limit")));
+
+        let catch_chain = format!("fun f() {{ val x = {}; }}", vec!["a"; 300].join(" catch "));
+        let (_, diags) = parse_src(&catch_chain);
+        assert!(diags.iter().any(|d| d.message.contains("nesting limit")));
+    }
+
+    #[test]
+    fn if_span_includes_then_branch_without_else() {
+        let src = "fun f() { if (true) { return; } }";
+        let (prog, diags) = parse_src(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        let Item::Function { body, .. } = &prog.items[0] else {
+            panic!("expected function")
+        };
+        let Stmt::If { span, .. } = &body[0] else {
+            panic!("expected if")
+        };
+        assert_eq!(span.end, src.find(" } }").unwrap() + 2);
     }
 }
