@@ -3183,6 +3183,21 @@ impl Checker {
                 span,
             } => {
                 let bt = self.infer_expr(base);
+                if ty_has_error(&bt) {
+                    let _ = self.infer_expr(value);
+                    self.record(*id, Ty::Error);
+                    return;
+                }
+                if bt.array_elem().is_some() && field == "len" {
+                    self.diags.push(
+                        Diagnostic::error("array length is read-only")
+                            .with_label(*span, "array length cannot be assigned")
+                            .with_code("E310"),
+                    );
+                    let _ = self.infer_expr(value);
+                    self.record(*id, Ty::Error);
+                    return;
+                }
                 // Named-tuple field write (`t.x = v;`); unnamed writes use TupleAssign.
                 if let Some(elems) = bt.tuple_elems() {
                     if ty_has_error(&bt) {
@@ -6275,6 +6290,14 @@ impl Checker {
                 span,
             } => {
                 let bt = self.infer_expr(base);
+                if ty_has_error(&bt) {
+                    return self.record(*id, Ty::Error);
+                }
+                // Array length is read-only metadata, available through both
+                // read-only and mutable views.
+                if bt.array_elem().is_some() && name == "len" {
+                    return self.record(*id, Ty::U64);
+                }
                 // Named-tuple field access (`u.x`) resolves positionally.
                 if let Some(elems) = bt.tuple_elems() {
                     if ty_has_error(&bt) {
@@ -8280,6 +8303,19 @@ mod tests {
             "fun sum(a: Array[u64]): u64 { return a[0u64]; } fun main() { val a: *Array[u64] = Array.new::[u64](3u64); a[0u64] = 1u64; val b = [1u64, 2u64]; sum(a); sum(b); }",
         );
         assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn array_len_reads_as_u64_and_is_read_only() {
+        let (_, diags) = check_src(
+            "fun length[T](a: Array[T]): u64 { return a.len; } fun main() { var a: *Array[u64] = Array.new(1u64); a.len = 2u64; }",
+        );
+        assert_eq!(
+            diags.iter().filter(|d| d.is_error()).count(),
+            1,
+            "{diags:?}"
+        );
+        assert_eq!(diags[0].code.as_deref(), Some("E310"), "{diags:?}");
     }
 
     fn check_importer(provider_src: &str, importer_src: &str) -> (TypedProgram, Vec<Diagnostic>) {

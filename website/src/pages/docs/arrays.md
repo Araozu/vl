@@ -59,21 +59,23 @@ fun main() {
 ```
 
 Indexes are `u64` values. Reading or writing outside the array bounds stops
-the program, so keep the length alongside the array when a loop needs it. A
-writable `*Array[T]` can be used where a read-only `Array[T]` is expected,
-never the other way around.
+the program. Use `values.len` to read the array's length when a loop needs
+it. The length is a read-only `u64` property through either view:
 
 ```vl
-fun sum(values: Array[u64], count: u64): u64 {
+fun sum(values: Array[u64]): u64 {
     var total = 0;
     var i = 0;
-    while (i < count) {
+    while (i < values.len) {
         total = total + values[i];
         i = i + 1;
     }
     return total;
 }
 ```
+
+A writable `*Array[T]` can be used where a read-only `Array[T]` is expected,
+never the other way around.
 
 ```vl
 fun fill(values: *Array[u64]) {

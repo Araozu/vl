@@ -70,7 +70,11 @@ actuals into the callee slots (`rv11` upwards for values, `rf31` upwards for
 values are reference values backed by Naravm memory containers: `new` lowers
 to `create` (value counts for value elements, ref counts for reference
 elements), literals to `createi` plus `setvati`/`setrfati` stores, reads to
-`getvat`/`getrfat`, and writes to `setvat`/`setrfat`. At most 15
+`getvat`/`getrfat`, and writes to `setvat`/`setrfat`. Value slot 0 stores
+the logical length, so scalar elements use value slots starting at 1;
+reference elements use their separate reference lane starting at 0.
+`a.len` reads the value header, and generated scalar indexes account for its
+offset while preserving out-of-bounds behavior. At most 15
 value and 9 reference parameters per function are supported. Registers are
 recycled past their last use so idiomatic programs fit the 32 value
 and 32 reference registers; liveness extends across loop back edges so values

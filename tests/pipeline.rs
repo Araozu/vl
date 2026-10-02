@@ -663,7 +663,13 @@ fn arrays_compile_through_frontend_to_naravm() {
     let src = std::fs::read_to_string("examples/arrays.vl").unwrap();
     let lir = frontend(&src).expect("arrays.vl must compile");
     let dump = lir.dump();
-    for op in ["new_array", "array_lit", "array_get", "array_set"] {
+    for op in [
+        "new_array",
+        "array_lit",
+        "array_get",
+        "array_set",
+        "array_len",
+    ] {
         assert!(dump.contains(op), "{op} missing in {dump}");
     }
 
@@ -676,6 +682,49 @@ fn arrays_compile_through_frontend_to_naravm() {
     for op in [0x26u8, 0x27, 0x28, 0x2du8] {
         assert!(bytes.contains(&op), "no {op:#x} in {bytes:?}");
     }
+}
+
+#[test]
+fn array_len_is_available_for_generic_empty_and_reference_arrays() {
+    let src = r#"
+use std;
+fun size[T](values: Array[T]): u64 { return values.len; }
+fun main() {
+    val numbers = [4u64, 9u64];
+    val no_strings: Array[String] = [];
+    val strings: Array[String] = ["vl"];
+    var mutable: *Array[u64] = Array.new(1u64);
+    mutable[0u64] = 12u64;
+    std.print_u64(size(numbers));
+    std.print_u64(no_strings.len);
+    std.print_u64(strings.len);
+    std.print_u64(mutable.len);
+}
+"#;
+    let lir = frontend(src).expect("array length must typecheck and monomorphize");
+    let dump = lir.dump();
+    assert!(dump.contains("array_len"), "{dump}");
+    assert!(dump.contains("size$u64"), "{dump}");
+    use vl_codegen::Target;
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
+}
+
+#[test]
+fn large_array_literals_shift_scalar_header_and_index_safely() {
+    use vl_codegen::Target;
+    let elements = vec!["item"; 256].join(", ");
+    let src = format!(
+        "fun main() {{ val item = 3u64; var values: *Array[u64] = [{elements}]; values[255u64] = values[254u64]; }}"
+    );
+    let lir = frontend(&src).expect("large array literal must compile");
+    assert!(lir.dump().contains("array_set"));
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    let bytes = artifact.unwrap().bytes.unwrap();
+    assert_eq!(&bytes[..4], b"nara");
 }
 
 #[test]

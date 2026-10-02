@@ -1465,6 +1465,7 @@ fn nara_last_use_fragment(
                 touch(*array, idx);
                 touch(*index, idx);
             }
+            I::ArrayLen { array, .. } => touch(*array, idx),
             I::ArraySet {
                 array,
                 index,
@@ -1548,6 +1549,7 @@ fn free_fragment_regs(e: &mut NaraEmit, instrs: &[Instr], result: &vl_lir::Reg) 
             | I::NewArray { dst, .. }
             | I::ArrayLit { dst, .. }
             | I::ArrayGet { dst, .. }
+            | I::ArrayLen { dst, .. }
             | I::TupleLit { dst, .. }
             | I::TupleGet { dst, .. }
             | I::NewVariant { dst, .. }
@@ -2160,6 +2162,9 @@ fn nara_last_use(func: &vl_lir::Function) -> std::collections::HashMap<vl_lir::R
                 touch(*array, idx);
                 touch(*index, idx);
             }
+            I::ArrayLen { array, .. } => {
+                touch(*array, idx);
+            }
             I::ArraySet {
                 array,
                 index,
@@ -2286,6 +2291,7 @@ fn nara_free_dead(e: &mut NaraEmit, ins: &Instr, idx: usize) {
             dead.push(*array);
             dead.push(*index);
         }
+        I::ArrayLen { array, .. } => dead.push(*array),
         I::ArraySet {
             array,
             index,
@@ -2728,9 +2734,29 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 e.invalid.insert(*dst);
                 return;
             }
-            let (Some(n), Some(zero)) = (e.value_reg(*len, *span), e.ensure_zero(*span)) else {
+            let Some(n) = e.value_reg(*len, *span) else {
                 e.invalid.insert(*dst);
                 return;
+            };
+            let one = e.ensure_one(*span);
+            let value_count = if elem_kind.is_ref() {
+                one
+            } else {
+                let (Some(one), Some(value_count)) = (one, e.fresh_rv(*span)) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x30, value_count, n, one]); // add_u64 len, 1
+                let Some(wrapped) = e.fresh_rv(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode
+                    .extend_from_slice(&[0x10, wrapped, value_count, n]); // ltu detects overflow
+                e.bytecode.extend_from_slice(&[0x24, wrapped, 0, 3]); // jz over fallback copy
+                e.bytecode.extend_from_slice(&[0x04, value_count, n]); // on overflow, request n (OOM)
+                e.free_rv.push(wrapped);
+                Some(value_count)
             };
             let Some(rf) = e.fresh_rf(*span) else {
                 e.invalid.insert(*dst);
@@ -2738,12 +2764,27 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             };
             e.rf_map.insert(*dst, rf);
             e.kinds.insert(*dst, array_kind);
-            // `create rf n_vals n_refs`: value elements fill the value
-            // slots, reference elements the ref slots.
+            // Value slot 0 stores the logical length. Scalar elements begin
+            // at value slot 1; reference elements retain their own zero-based
+            // lane, so they need one value slot for the header.
             if elem_kind.is_ref() {
-                e.bytecode.extend_from_slice(&[0x26, rf, zero, n]); // create
+                let Some(values) = value_count else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x26, rf, values, n]); // create
             } else {
-                e.bytecode.extend_from_slice(&[0x26, rf, n, zero]); // create
+                let (Some(values), Some(zero)) = (value_count, e.ensure_zero(*span)) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x26, rf, values, zero]); // create
+            }
+            e.bytecode.extend_from_slice(&[0x2d, rf, 0, n]); // setvati length header
+            if !elem_kind.is_ref() {
+                if let Some(value_count) = value_count {
+                    e.free_rv.push(value_count);
+                }
             }
         }
         Instr::ArrayLit {
@@ -2775,29 +2816,81 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             // One scratch value register covers the dynamic length and every
             // dynamic index of oversized literals (> 255 elements); the
             // common path stays on the immediate `createi`/`setvati` forms.
-            let scratch = if elems.len() > u8::MAX as usize {
+            let scalar_count = elems.len().checked_add(1);
+            let lane_count = if is_ref {
+                Some(elems.len())
+            } else {
+                scalar_count
+            };
+            let count_is_immediate = lane_count.is_some_and(|n| n <= u8::MAX as usize);
+            let scratch = if !count_is_immediate {
+                let count = if is_ref {
+                    elems.len()
+                } else {
+                    scalar_count.unwrap_or(usize::MAX)
+                };
                 let (Some(s), Some(len_idx), Some(zero)) = (
                     e.fresh_rv(*span),
-                    e.add_value(elems.len() as u64, *span),
+                    e.add_value(count as u64, *span),
                     e.ensure_zero(*span),
                 ) else {
                     e.invalid.insert(*dst);
                     return;
                 };
                 e.bytecode.extend_from_slice(&[0x02, s, len_idx as u8]); // lv
+                let (Some(value_count), Some(len)) =
+                    (e.ensure_one(*span), e.add_value(elems.len() as u64, *span))
+                else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                let Some(logical_len) = e.fresh_rv(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode
+                    .extend_from_slice(&[0x02, logical_len, len as u8]); // lv logical length
                 if is_ref {
-                    e.bytecode.extend_from_slice(&[0x26, rf, zero, s]); // create
+                    e.bytecode.extend_from_slice(&[0x26, rf, value_count, s]); // create
                 } else {
                     e.bytecode.extend_from_slice(&[0x26, rf, s, zero]); // create
                 }
+                e.bytecode.extend_from_slice(&[0x2d, rf, 0, logical_len]); // set length header
+                e.free_rv.push(logical_len);
                 Some(s)
             } else if is_ref {
                 e.bytecode
-                    .extend_from_slice(&[0x27, rf, 0, elems.len() as u8]); // createi
+                    .extend_from_slice(&[0x27, rf, 1, elems.len() as u8]); // createi
+                let Some(len_idx) = e.add_value(elems.len() as u64, *span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                let Some(length) = e.fresh_rv(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x02, length, len_idx as u8]); // lv length
+                e.bytecode.extend_from_slice(&[0x2d, rf, 0, length]); // set length header
+                e.free_rv.push(length);
                 None
             } else {
-                e.bytecode
-                    .extend_from_slice(&[0x27, rf, elems.len() as u8, 0]); // createi
+                e.bytecode.extend_from_slice(&[
+                    0x27,
+                    rf,
+                    scalar_count.expect("immediate count") as u8,
+                    0,
+                ]); // createi
+                let Some(len_idx) = e.add_value(elems.len() as u64, *span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                let Some(length) = e.fresh_rv(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x02, length, len_idx as u8]); // lv length
+                e.bytecode.extend_from_slice(&[0x2d, rf, 0, length]); // set length header
+                e.free_rv.push(length);
                 None
             };
             e.rf_map.insert(*dst, rf);
@@ -2849,11 +2942,12 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                         e.invalid.insert(*dst);
                         return;
                     };
-                    if i <= u8::MAX as usize {
-                        e.bytecode.extend_from_slice(&[0x2d, rf, i as u8, v]); // setvati
+                    if i < u8::MAX as usize {
+                        e.bytecode.extend_from_slice(&[0x2d, rf, (i + 1) as u8, v]);
+                    // setvati
                     } else {
                         let s = scratch.expect("scratch exists when a literal index exceeds u8");
-                        let Some(idx) = e.add_value(i as u64, *span) else {
+                        let Some(idx) = e.add_value(i as u64 + 1, *span) else {
                             e.invalid.insert(*dst);
                             return;
                         };
@@ -2861,6 +2955,9 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                         e.bytecode.extend_from_slice(&[0x29, rf, s, v]); // setvat
                     }
                 }
+            }
+            if let Some(scratch) = scratch {
+                e.free_rv.push(scratch);
             }
         }
         Instr::NewObject {
@@ -3113,6 +3210,23 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 e.bytecode.extend_from_slice(&[0x2d, obj, slot, src]);
             }
         }
+        Instr::ArrayLen { dst, array, span } => {
+            let Some((a, _)) = e.array_reg(*array, *span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            if !e.last_use.contains_key(dst) {
+                e.kinds.insert(*dst, NaraKind::U64);
+                return;
+            }
+            let Some(d) = e.fresh_rv(*span) else {
+                e.invalid.insert(*dst);
+                return;
+            };
+            e.bytecode.extend_from_slice(&[0x2c, d, a, 0]); // getvati header
+            e.rv_map.insert(*dst, d);
+            e.kinds.insert(*dst, NaraKind::U64);
+        }
         Instr::ArrayGet {
             dst,
             array,
@@ -3128,10 +3242,31 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 e.kinds.insert(*dst, elem_kind);
                 return;
             }
-            let (Some((a, _)), Some(i)) = (e.array_reg(*array, *span), e.value_reg(*index, *span))
+            let (Some((a, elem_kind)), Some(i)) =
+                (e.array_reg(*array, *span), e.value_reg(*index, *span))
             else {
                 e.invalid.insert(*dst);
                 return;
+            };
+            let mut index_scratch = None;
+            let i = if elem_kind.is_ref() {
+                i
+            } else {
+                let Some(one) = e.ensure_one(*span) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                let (Some(shifted), Some(wrapped)) = (e.fresh_rv(*span), e.fresh_rv(*span)) else {
+                    e.invalid.insert(*dst);
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x30, shifted, i, one]); // add_u64 index, 1
+                e.bytecode.extend_from_slice(&[0x10, wrapped, shifted, i]); // ltu detects wrap
+                e.bytecode.extend_from_slice(&[0x24, wrapped, 0, 3]); // jz over fallback copy
+                e.bytecode.extend_from_slice(&[0x04, shifted, i]); // preserve OOB on u64::MAX
+                e.free_rv.push(wrapped);
+                index_scratch = Some(shifted);
+                shifted
             };
             if elem_kind.is_ref() {
                 let Some(d) = e.fresh_rf(*span) else {
@@ -3150,12 +3285,15 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 e.kinds.insert(*dst, elem_kind);
                 e.bytecode.extend_from_slice(&[0x28, d, a, i]); // getvat
             }
+            if let Some(shifted) = index_scratch {
+                e.free_rv.push(shifted);
+            }
         }
         Instr::ArraySet {
             array,
             index,
             value,
-            elem,
+            elem: _,
             span,
         } => {
             // Statement-only: no destination to poison. Poisoned sides stay
@@ -3163,12 +3301,28 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             if e.invalid.contains(array) || e.invalid.contains(index) || e.invalid.contains(value) {
                 return;
             }
-            let Some(elem_kind) = NaraKind::of_ty(elem) else {
-                return;
-            };
-            let (Some((a, _)), Some(i)) = (e.array_reg(*array, *span), e.value_reg(*index, *span))
+            let (Some((a, elem_kind)), Some(i)) =
+                (e.array_reg(*array, *span), e.value_reg(*index, *span))
             else {
                 return;
+            };
+            let mut index_scratch = None;
+            let i = if elem_kind.is_ref() {
+                i
+            } else {
+                let Some(one) = e.ensure_one(*span) else {
+                    return;
+                };
+                let (Some(shifted), Some(wrapped)) = (e.fresh_rv(*span), e.fresh_rv(*span)) else {
+                    return;
+                };
+                e.bytecode.extend_from_slice(&[0x30, shifted, i, one]); // add_u64 index, 1
+                e.bytecode.extend_from_slice(&[0x10, wrapped, shifted, i]); // ltu detects wrap
+                e.bytecode.extend_from_slice(&[0x24, wrapped, 0, 3]); // jz over fallback copy
+                e.bytecode.extend_from_slice(&[0x04, shifted, i]); // preserve OOB on u64::MAX
+                e.free_rv.push(wrapped);
+                index_scratch = Some(shifted);
+                shifted
             };
             if elem_kind.is_ref() {
                 let Some(v) = e.ref_reg(*value, *span) else {
@@ -3194,6 +3348,9 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                     return;
                 };
                 e.bytecode.extend_from_slice(&[0x29, a, i, v]); // setvat
+            }
+            if let Some(shifted) = index_scratch {
+                e.free_rv.push(shifted);
             }
         }
         Instr::TupleLit {
@@ -5597,6 +5754,227 @@ pub fn reg_oob(span: Span, reg: u32) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_emitter() -> NaraEmit {
+        NaraEmit {
+            blob: Vec::new(),
+            values: Vec::new(),
+            value_index: std::collections::HashMap::new(),
+            constants: Vec::new(),
+            bytecode: Vec::new(),
+            diags: Vec::new(),
+            rv_map: std::collections::HashMap::new(),
+            rf_map: std::collections::HashMap::new(),
+            kinds: std::collections::HashMap::new(),
+            invalid: std::collections::HashSet::new(),
+            next_rv: 0,
+            next_rf: 0x20,
+            free_rv: Vec::new(),
+            free_rf: Vec::new(),
+            last_use: std::collections::HashMap::new(),
+            label_pos: std::collections::HashMap::new(),
+            patches: Vec::new(),
+            one_rv: None,
+            bias_rv: None,
+            zero_rv: None,
+            param_vi: 0,
+            param_ri: 0,
+        }
+    }
+
+    fn emit_test_instr(e: &mut NaraEmit, ins: &Instr) {
+        let func = vl_lir::Function {
+            name: "test".into(),
+            param_tys: Vec::new(),
+            ret: vl_typecheck::Ty::Void,
+            instrs: Vec::new(),
+        };
+        let sigs = std::collections::HashMap::new();
+        let fn_consts = std::collections::HashMap::new();
+        let imported_fn_consts = std::collections::HashMap::new();
+        let imports = std::collections::HashMap::new();
+        let objects = std::collections::HashMap::new();
+        let global_slots = std::collections::HashMap::new();
+        let global_tys = std::collections::HashMap::new();
+        let ctx = NaraFnCtx {
+            func: &func,
+            is_main: false,
+            sigs: &sigs,
+            fn_consts: &fn_consts,
+            imported_fn_consts: &imported_fn_consts,
+            imports: &imports,
+            module: "test",
+            objects: &objects,
+            print_fn_idx: 0,
+            print_u64_fn_idx: 0,
+            global_slots: &global_slots,
+            global_tys: &global_tys,
+            err_lanes: (0, 0),
+        };
+        nara_instr(e, ins, &ctx);
+    }
+
+    #[test]
+    fn naravm_array_header_and_scalar_index_guard_use_separate_slot_zero() {
+        let span = Span::empty(0);
+        let len = vl_lir::Reg(0);
+        let array = vl_lir::Reg(1);
+        let mut e = empty_emitter();
+        e.rv_map.insert(len, 7);
+        e.kinds.insert(len, NaraKind::U64);
+        e.last_use.insert(array, 1);
+        emit_test_instr(
+            &mut e,
+            &Instr::NewArray {
+                dst: array,
+                len,
+                elem: vl_typecheck::Ty::U64,
+                span,
+            },
+        );
+        let array_rf = e.rf_map[&array];
+        assert!(e
+            .bytecode
+            .windows(4)
+            .any(|i| i[0] == 0x2d && i[1] == array_rf && i[2] == 0 && i[3] == 7));
+        let add = e
+            .bytecode
+            .iter()
+            .position(|op| *op == 0x30)
+            .expect("length + 1");
+        let shifted_len = e.bytecode[add + 1];
+        assert!(e
+            .bytecode
+            .windows(4)
+            .any(|i| i[0] == 0x10 && i[2] == shifted_len && i[3] == 7));
+        assert!(e
+            .bytecode
+            .windows(4)
+            .any(|i| i[0] == 0x24 && i[2] == 0 && i[3] == 3));
+
+        let index = vl_lir::Reg(2);
+        let dst = vl_lir::Reg(3);
+        let mut e = empty_emitter();
+        e.rf_map.insert(array, array_rf);
+        e.kinds
+            .insert(array, NaraKind::Array(Box::new(NaraKind::U64)));
+        e.rv_map.insert(index, 8);
+        e.kinds.insert(index, NaraKind::U64);
+        e.last_use.insert(dst, 1);
+        emit_test_instr(
+            &mut e,
+            &Instr::ArrayGet {
+                dst,
+                array,
+                index,
+                elem: vl_typecheck::Ty::U64,
+                span,
+            },
+        );
+        let add = e
+            .bytecode
+            .iter()
+            .position(|op| *op == 0x30)
+            .expect("index + 1");
+        let shifted_index = e.bytecode[add + 1];
+        assert_eq!(e.bytecode[add + 2], 8);
+        assert!(e
+            .bytecode
+            .windows(4)
+            .any(|i| i[0] == 0x10 && i[2] == shifted_index && i[3] == 8));
+        assert!(e
+            .bytecode
+            .windows(4)
+            .any(|i| i[0] == 0x24 && i[2] == 0 && i[3] == 3));
+        assert!(e
+            .bytecode
+            .windows(4)
+            .any(|i| i[0] == 0x28 && i[2] == array_rf && i[3] == shifted_index));
+    }
+
+    #[test]
+    fn naravm_array_literal_immediate_limits_follow_element_lane() {
+        let span = Span::empty(0);
+        let elem = vl_lir::Reg(0);
+        let dst = vl_lir::Reg(1);
+        let mut scalar = empty_emitter();
+        scalar.rv_map.insert(elem, 6);
+        scalar.kinds.insert(elem, NaraKind::U64);
+        scalar.last_use.insert(dst, 1);
+        emit_test_instr(
+            &mut scalar,
+            &Instr::ArrayLit {
+                dst,
+                elems: vec![elem; 254],
+                elem: vl_typecheck::Ty::U64,
+                span,
+            },
+        );
+        assert!(scalar
+            .bytecode
+            .windows(4)
+            .any(|i| i[0] == 0x27 && i[2] == 255 && i[3] == 0));
+
+        let mut scalar_large = empty_emitter();
+        scalar_large.rv_map.insert(elem, 6);
+        scalar_large.kinds.insert(elem, NaraKind::U64);
+        scalar_large.last_use.insert(dst, 1);
+        emit_test_instr(
+            &mut scalar_large,
+            &Instr::ArrayLit {
+                dst,
+                elems: vec![elem; 255],
+                elem: vl_typecheck::Ty::U64,
+                span,
+            },
+        );
+        let create = scalar_large
+            .bytecode
+            .windows(4)
+            .position(|i| i[0] == 0x26)
+            .expect("dynamic scalar allocation");
+        let dynamic_index = scalar_large.bytecode[create + 2];
+        assert!(scalar_large.free_rv.contains(&dynamic_index));
+
+        let mut refs = empty_emitter();
+        refs.rf_map.insert(elem, 0x24);
+        refs.kinds.insert(elem, NaraKind::String);
+        refs.last_use.insert(dst, 1);
+        emit_test_instr(
+            &mut refs,
+            &Instr::ArrayLit {
+                dst,
+                elems: vec![elem; 255],
+                elem: vl_typecheck::Ty::String,
+                span,
+            },
+        );
+        assert!(refs
+            .bytecode
+            .windows(4)
+            .any(|i| i[0] == 0x27 && i[2] == 1 && i[3] == 255));
+
+        let mut refs_large = empty_emitter();
+        refs_large.rf_map.insert(elem, 0x24);
+        refs_large.kinds.insert(elem, NaraKind::String);
+        refs_large.last_use.insert(dst, 1);
+        emit_test_instr(
+            &mut refs_large,
+            &Instr::ArrayLit {
+                dst,
+                elems: vec![elem; 256],
+                elem: vl_typecheck::Ty::String,
+                span,
+            },
+        );
+        let create = refs_large
+            .bytecode
+            .windows(4)
+            .position(|i| i[0] == 0x26)
+            .expect("dynamic reference allocation");
+        let dynamic_index = refs_large.bytecode[create + 3];
+        assert!(refs_large.free_rv.contains(&dynamic_index));
+    }
 
     fn lir_of(src: &str) -> LirProgram {
         let (toks, _) = vl_lex::lex(src);

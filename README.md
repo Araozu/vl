@@ -153,6 +153,8 @@ heap array of `T`, while `*Array[T]` is the mutable view: `Array.new::[u64](n)`
 allocates a zero-filled array of `n` elements (no import needed), `[1, 2]` is an
 array literal, `a[i]` reads an element, and `a[i] = v;` writes through a
 `*Array[T]` view (see `examples/arrays.vl`). Indices are always `u64`.
+`a.len` reads the array's stored logical length as `u64` through either view;
+the length is read-only.
 Objects use declarations such as `type Counter = object { value: u64, label: String, };`
 and named literals such as `Counter { value = 1, label = "count" }`. Object values
 have reference semantics: assignment, parameters, and returns alias the same

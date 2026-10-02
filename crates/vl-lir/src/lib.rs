@@ -116,6 +116,12 @@ pub enum Instr {
         elem: Ty,
         span: Span,
     },
+    /// Read the stored logical length of an array.
+    ArrayLen {
+        dst: Reg,
+        array: Reg,
+        span: Span,
+    },
     /// Allocate a named object and initialize its fields.
     NewObject {
         dst: Reg,
@@ -633,6 +639,9 @@ fn fmt_instr(ins: &Instr) -> String {
                 "array_set %{}[%{}], %{} : {elem}",
                 array.0, index.0, value.0
             )
+        }
+        Instr::ArrayLen { dst, array, .. } => {
+            format!("%{} = array_len %{}", dst.0, array.0)
         }
         Instr::NewObject {
             dst, name, fields, ..
@@ -2860,6 +2869,16 @@ impl Lowerer<'_> {
             HirExpr::Field {
                 base, name, span, ..
             } => {
+                if name == "len" && self.array_elem_of(base.id()).is_some() {
+                    let array = self.lower_expr(base, typed)?;
+                    let dst = self.reg();
+                    self.instrs.push(Instr::ArrayLen {
+                        dst,
+                        array,
+                        span: *span,
+                    });
+                    return Some(dst);
+                }
                 // Named-tuple field reads lower to positional `TupleGet`
                 // (names are erased after typecheck); objects use `ObjectGet`.
                 if let Some(tys) = self.tuple_tys_of(base.id()) {
@@ -4496,7 +4515,7 @@ mod tests {
 
     #[test]
     fn arrays_lower_to_dedicated_instrs() {
-        let src = "fun get(a: *Array[u64]): u64 { a[0u64] = 1u64; return a[1u64]; } fun main() { val a: *Array[u64] = Array.new::[u64](2u64); val b = [1u64, 2u64]; }";
+        let src = "fun get(a: *Array[u64]): u64 { a[0u64] = 1u64; val x = a[1u64]; return a.len; } fun main() { val a: *Array[u64] = Array.new::[u64](2u64); val b = [1u64, 2u64]; }";
         let (toks, _) = vl_lex::lex(src);
         let (prog, pdiags) = vl_syntax::parse(&toks, src);
         assert!(pdiags.is_empty(), "{pdiags:?}");
@@ -4509,6 +4528,7 @@ mod tests {
         assert!(dump.contains("array_lit"), "{dump}");
         assert!(dump.contains("array_get"), "{dump}");
         assert!(dump.contains("array_set"), "{dump}");
+        assert!(dump.contains("array_len"), "{dump}");
         assert!(!dump.contains("Array.new"), "{dump}");
     }
 
