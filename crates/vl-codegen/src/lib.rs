@@ -771,7 +771,7 @@ fn nara_fallible_lanes(ok: &NaraKind, err_lanes: (usize, usize)) -> (usize, usiz
         kind if kind.is_ref() => (0, 1),
         _ => (1, 0),
     };
-    (1 + v.max(1).max(err_lanes.0), r.max(err_lanes.1))
+    ((1 + v).max(2 + err_lanes.0), r.max(err_lanes.1))
 }
 
 /// Payload position -> (uses-reference-lane, lane-local slot) for a
@@ -1169,6 +1169,95 @@ struct NaraPatch {
     len: usize,
     target: u32,
     span: Span,
+}
+
+/// Stage call arguments on Naravm's separate value/reference stacks before
+/// writing ABI registers, so one destination cannot destroy a later source.
+fn nara_stage_call_args(e: &mut NaraEmit, actuals: &[(bool, u8)]) {
+    let mut values = 0u8;
+    let mut refs = 0u8;
+    for (is_ref, src) in actuals {
+        if *is_ref {
+            e.bytecode.extend_from_slice(&[0x08, *src]);
+            refs += 1;
+        } else {
+            e.bytecode.extend_from_slice(&[0x06, *src]);
+            values += 1;
+        }
+    }
+    for (is_ref, _) in actuals.iter().rev() {
+        if *is_ref {
+            refs -= 1;
+            e.bytecode.extend_from_slice(&[0x09, 0x31 + refs]);
+        } else {
+            values -= 1;
+            e.bytecode.extend_from_slice(&[0x07, 0x11 + values]);
+        }
+    }
+}
+
+/// Capture fixed native result registers before any temporary allocation can
+/// reuse one of them. Values and references use independent VM stacks.
+fn nara_stage_native_results(
+    e: &mut NaraEmit,
+    results: &[(bool, u8)],
+    span: Span,
+) -> Option<Vec<u8>> {
+    for (is_ref, src) in results {
+        e.bytecode
+            .extend_from_slice(&[if *is_ref { 0x08 } else { 0x06 }, *src]);
+    }
+    let mut staged = Vec::with_capacity(results.len());
+    for (is_ref, _) in results {
+        staged.push(if *is_ref {
+            e.fresh_rf(span)?
+        } else {
+            e.fresh_rv(span)?
+        });
+    }
+    for (index, (is_ref, _)) in results.iter().enumerate().rev() {
+        e.bytecode
+            .extend_from_slice(&[if *is_ref { 0x09 } else { 0x07 }, staged[index]]);
+    }
+    Some(staged)
+}
+
+fn nara_spill_allocated(e: &mut NaraEmit) -> Vec<NaraSpill> {
+    let mut rvs: Vec<u8> = e.rv_map.values().copied().collect();
+    rvs.sort_unstable();
+    rvs.dedup();
+    let mut rfs: Vec<u8> = e.rf_map.values().copied().collect();
+    rfs.sort_unstable();
+    rfs.dedup();
+    let mut spills = Vec::new();
+    for rv in rvs {
+        e.bytecode.extend_from_slice(&[0x06, rv]);
+        spills.push(NaraSpill::V(rv));
+    }
+    for rv in [e.one_rv, e.bias_rv, e.zero_rv].into_iter().flatten() {
+        if spills
+            .iter()
+            .any(|spill| matches!(spill, NaraSpill::V(saved) if *saved == rv))
+        {
+            continue;
+        }
+        e.bytecode.extend_from_slice(&[0x06, rv]);
+        spills.push(NaraSpill::V(rv));
+    }
+    for rf in rfs {
+        e.bytecode.extend_from_slice(&[0x08, rf]);
+        spills.push(NaraSpill::F(rf));
+    }
+    spills
+}
+
+fn nara_restore_spills(e: &mut NaraEmit, spills: &[NaraSpill]) {
+    for spill in spills.iter().rev() {
+        match spill {
+            NaraSpill::V(rv) => e.bytecode.extend_from_slice(&[0x07, *rv]),
+            NaraSpill::F(rf) => e.bytecode.extend_from_slice(&[0x09, *rf]),
+        }
+    }
 }
 
 impl NaraEmit {
@@ -1842,6 +1931,7 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
                 for (frag_idx, ins) in g.init.iter().enumerate() {
                     let remapped = remap_labels(ins, base);
                     nara_instr(&mut e, &remapped, &ctx);
+                    nara_free_unused_result(&mut e, &remapped);
                     // Free against the fragment's liveness, not the main's.
                     // (Uses `e.last_use` currently holding the fragment map;
                     // indices below are fragment-relative, which is fine for
@@ -1935,6 +2025,7 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
             };
             for (idx, ins) in f.instrs.iter().enumerate() {
                 nara_instr(&mut e, ins, &ctx);
+                nara_free_unused_result(&mut e, ins);
                 nara_free_dead(&mut e, ins, idx);
                 if e.diags.iter().any(|d| d.is_error()) {
                     break;
@@ -1952,6 +2043,7 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
         }
         for (idx, ins) in f.instrs.iter().enumerate() {
             nara_instr(&mut e, ins, &ctx);
+            nara_free_unused_result(&mut e, ins);
             nara_free_dead(&mut e, ins, idx);
             if e.diags.iter().any(|d| d.is_error()) {
                 break;
@@ -2021,6 +2113,7 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
                 for (frag_idx, ins) in g.init.iter().enumerate() {
                     let remapped = remap_labels(ins, base);
                     nara_instr(&mut e, &remapped, &ctx);
+                    nara_free_unused_result(&mut e, &remapped);
                     nara_free_dead(&mut e, &remapped, frag_idx);
                     if e.diags.iter().any(|d| d.is_error()) {
                         break;
@@ -2419,6 +2512,49 @@ fn nara_free_dead(e: &mut NaraEmit, ins: &Instr, idx: usize) {
         if let Some(rf) = e.rf_map.remove(&reg) {
             e.free_rf.push(rf);
         }
+    }
+}
+
+/// Recycle a result register when its value is never used. The instruction
+/// itself has already run, preserving traps and side effects.
+fn nara_free_unused_result(e: &mut NaraEmit, ins: &Instr) {
+    let dst = match ins {
+        Instr::Const { dst, .. }
+        | Instr::StringConst { dst, .. }
+        | Instr::Param { dst, .. }
+        | Instr::GlobalLoad { dst, .. }
+        | Instr::Copy { dst, .. }
+        | Instr::Cast { dst, .. }
+        | Instr::Not { dst, .. }
+        | Instr::BinOp { dst, .. }
+        | Instr::Call { dst, .. }
+        | Instr::NewArray { dst, .. }
+        | Instr::ArrayLit { dst, .. }
+        | Instr::ArrayLen { dst, .. }
+        | Instr::ArrayGet { dst, .. }
+        | Instr::TupleLit { dst, .. }
+        | Instr::TupleGet { dst, .. }
+        | Instr::NewObject { dst, .. }
+        | Instr::ObjectGet { dst, .. }
+        | Instr::NewVariant { dst, .. }
+        | Instr::WrapOk { dst, .. }
+        | Instr::WrapErr { dst, .. }
+        | Instr::RewrapErr { dst, .. }
+        | Instr::UnwrapOk { dst, .. }
+        | Instr::UnwrapErr { dst, .. }
+        | Instr::TagOf { dst, .. }
+        | Instr::PayloadGet { dst, .. }
+        | Instr::ErrPayloadGet { dst, .. } => *dst,
+        _ => return,
+    };
+    if e.last_use.contains_key(&dst) {
+        return;
+    }
+    if let Some(rv) = e.rv_map.remove(&dst) {
+        e.free_rv.push(rv);
+    }
+    if let Some(rf) = e.rf_map.remove(&dst) {
+        e.free_rf.push(rf);
     }
 }
 
@@ -3097,7 +3233,20 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                         e.invalid.insert(*dst);
                         return;
                     };
-                    e.bytecode.extend_from_slice(&[0x2f, rf, slot, src]);
+                    if let Some(NaraKind::Tuple(kinds)) = e.kinds.get(value).cloned() {
+                        let Some(copy) = e.fresh_rf(*span) else {
+                            e.invalid.insert(*dst);
+                            return;
+                        };
+                        if !nara_tuple_copy_into(e, copy, src, &kinds, *span) {
+                            e.invalid.insert(*dst);
+                            return;
+                        }
+                        e.bytecode.extend_from_slice(&[0x2f, rf, slot, copy]);
+                        e.free_rf.push(copy);
+                    } else {
+                        e.bytecode.extend_from_slice(&[0x2f, rf, slot, src]);
+                    }
                 } else {
                     let Some(src) = e.value_reg(*value, *span) else {
                         e.invalid.insert(*dst);
@@ -3265,7 +3414,18 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 let Some(src) = e.ref_reg(*value, *span) else {
                     return;
                 };
-                e.bytecode.extend_from_slice(&[0x2f, obj, slot, src]);
+                if let Some(NaraKind::Tuple(kinds)) = e.kinds.get(value).cloned() {
+                    let Some(copy) = e.fresh_rf(*span) else {
+                        return;
+                    };
+                    if !nara_tuple_copy_into(e, copy, src, &kinds, *span) {
+                        return;
+                    }
+                    e.bytecode.extend_from_slice(&[0x2f, obj, slot, copy]);
+                    e.free_rf.push(copy);
+                } else {
+                    e.bytecode.extend_from_slice(&[0x2f, obj, slot, src]);
+                }
             } else {
                 let Some(src) = e.value_reg(*value, *span) else {
                     return;
@@ -4456,9 +4616,9 @@ fn nara_emit_jmp(e: &mut NaraEmit) -> usize {
     pos
 }
 
-/// Call a `std.net.tcp` native: move actuals into the native slots
-/// (`rv11+` for values, `rf31+` for references — the same convention as
-/// `nara_user_call`, minus spills since natives are leaves), `calli`, then
+/// Call a `std.net.tcp` native: stage actuals before filling the native slots
+/// (`rv11+` for values, `rf31+` for references), preserve live registers,
+/// `calli`, then
 /// check the `rv10` status: 0 builds the `TcpError!T` ok container from the
 /// result registers, nonzero maps to the matching `TcpError` variant code
 /// and builds the error container. `dst` always names the container.
@@ -4531,6 +4691,8 @@ fn nara_tcp_call(
         e.invalid.insert(dst);
         return;
     };
+    // Native calls share the VM register file too; preserve live allocations.
+    let spills = nara_spill_allocated(e);
     // Move actuals into the native slots, checking lanes against the import.
     let mut vi = 0u8;
     let mut ri = 0u8;
@@ -4565,7 +4727,7 @@ fn nara_tcp_call(
                 e.invalid.insert(dst);
                 return;
             };
-            e.bytecode.extend_from_slice(&[0x05, 0x31 + ri, src]); // cprf
+            e.bytecode.extend_from_slice(&[0x08, src]); // pushrf for staged arg
             ri += 1;
         } else {
             let Some(src) = e.rv_map.get(arg).copied() else {
@@ -4579,8 +4741,17 @@ fn nara_tcp_call(
                 e.invalid.insert(dst);
                 return;
             };
-            e.bytecode.extend_from_slice(&[0x04, 0x11 + vi, src]); // cpv
+            e.bytecode.extend_from_slice(&[0x06, src]); // pushv for staged arg
             vi += 1;
+        }
+    }
+    for ty in param_tys.iter().rev() {
+        if NaraKind::of_ty(ty).is_some_and(|k| k.is_ref()) {
+            ri -= 1;
+            e.bytecode.extend_from_slice(&[0x09, 0x31 + ri]);
+        } else {
+            vi -= 1;
+            e.bytecode.extend_from_slice(&[0x07, 0x11 + vi]);
         }
     }
     let Some(fn_idx) = ctx.imported_fn_consts.get(callee).copied() else {
@@ -4599,14 +4770,11 @@ fn nara_tcp_call(
         // Dead result (e.g. a bare `tcp.close(h);` statement): the call's
         // side effects stand, but no container is built.
         e.kinds.insert(dst, NaraKind::Fallible(Box::new(ok_kind)));
+        nara_restore_spills(e, &spills);
         return;
     }
     // Copy the status out of the reserved channel, then split ok/err.
-    let Some(status) = e.fresh_rv(span) else {
-        e.invalid.insert(dst);
-        return;
-    };
-    e.bytecode.extend_from_slice(&[0x04, status, 0x10]); // cpv status, rv10
+    let status = 0x10; // native status is already in the reserved register
     let to_ok = nara_emit_jz(e, status);
     // Err path: select the variant code for statuses 1-7; anything else the
     // VM may report in the future surfaces as `IoError`.
@@ -4693,7 +4861,7 @@ fn nara_tcp_call(
         return;
     }
     // Backend temporaries below die at the join; freed together there.
-    let mut temps_rv: Vec<u8> = vec![status, code, sc, tt];
+    let mut temps_rv: Vec<u8> = vec![code, sc, tt];
     let mut temps_rf: Vec<u8> = Vec::new();
     let ok_built = match callee.function.as_str() {
         // Single value result in `rv11` (handle or byte count).
@@ -4791,6 +4959,7 @@ fn nara_tcp_call(
     for rf in temps_rf {
         e.free_rf.push(rf);
     }
+    nara_restore_spills(e, &spills);
 }
 
 /// Wrap one value-reg payload into the `dst` fallible container (tag 0),
@@ -4870,12 +5039,15 @@ fn nara_tcp_wrap_tuple(
         );
         return false;
     }
+    let Some(staged) = nara_stage_native_results(e, elems, span) else {
+        return false;
+    };
     let Some(tup) = e.fresh_rf(span) else {
         return false;
     };
     e.bytecode
         .extend_from_slice(&[0x27, tup, values as u8, refs as u8]); // createi
-    for (i, (want_ref, src)) in elems.iter().enumerate() {
+    for (i, (want_ref, _src)) in elems.iter().enumerate() {
         let Some((is_ref, slot)) = tuple_slot(&kinds, i) else {
             return false;
         };
@@ -4898,17 +5070,11 @@ fn nara_tcp_wrap_tuple(
             return false;
         };
         if is_ref {
-            let Some(tmp) = e.fresh_rf(span) else {
-                return false;
-            };
-            e.bytecode.extend_from_slice(&[0x05, tmp, *src]); // cprf
+            let tmp = staged[i];
             e.bytecode.extend_from_slice(&[0x2f, tup, slot, tmp]); // setrfati
             temps_rf.push(tmp);
         } else {
-            let Some(tmp) = e.fresh_rv(span) else {
-                return false;
-            };
-            e.bytecode.extend_from_slice(&[0x04, tmp, *src]); // cpv
+            let tmp = staged[i];
             e.bytecode.extend_from_slice(&[0x2d, tup, slot, tmp]); // setvati
             temps_rv.push(tmp);
         }
@@ -4930,7 +5096,7 @@ fn nara_tcp_wrap_tuple(
 
 /// Call a single-result `rv10`-status native: move actuals into the native
 /// slots (`rv11+` for values, `rf31+` for references — the same convention
-/// as `nara_user_call`, minus spills since natives are leaves), `calli`,
+/// as `nara_user_call`), preserving allocated registers around `calli`,
 /// then check the `rv10` status: 0 builds the ok container from the result
 /// register, nonzero maps through `statuses` to the matching error variant
 /// code (unlisted statuses use `fallthrough`) and builds the error
@@ -5041,6 +5207,8 @@ fn nara_checked_call(
         e.invalid.insert(dst);
         return;
     };
+    // Native calls share the VM register file too; preserve live allocations.
+    let spills = nara_spill_allocated(e);
     // Move actuals into the native slots, checking lanes against the import.
     // All checked natives take `String` references plus `u64` values today.
     let mut vi = 0u8;
@@ -5078,7 +5246,7 @@ fn nara_checked_call(
                 e.invalid.insert(dst);
                 return;
             };
-            e.bytecode.extend_from_slice(&[0x05, 0x31 + ri, src]); // cprf
+            e.bytecode.extend_from_slice(&[0x08, src]); // pushrf for staged arg
             ri += 1;
         } else {
             let Some(src) = e.rv_map.get(arg).copied() else {
@@ -5092,8 +5260,17 @@ fn nara_checked_call(
                 e.invalid.insert(dst);
                 return;
             };
-            e.bytecode.extend_from_slice(&[0x04, 0x11 + vi, src]); // cpv
+            e.bytecode.extend_from_slice(&[0x06, src]); // pushv for staged arg
             vi += 1;
+        }
+    }
+    for ty in param_tys.iter().rev() {
+        if NaraKind::of_ty(ty).is_some_and(|k| k.is_ref()) {
+            ri -= 1;
+            e.bytecode.extend_from_slice(&[0x09, 0x31 + ri]);
+        } else {
+            vi -= 1;
+            e.bytecode.extend_from_slice(&[0x07, 0x11 + vi]);
         }
     }
     let Some(fn_idx) = ctx.imported_fn_consts.get(callee).copied() else {
@@ -5111,14 +5288,11 @@ fn nara_checked_call(
     if !e.last_use.contains_key(&dst) {
         // Dead result: the call's side effects stand, but no container is built.
         e.kinds.insert(dst, NaraKind::Fallible(Box::new(ok_kind)));
+        nara_restore_spills(e, &spills);
         return;
     }
     // Copy the status out of the reserved channel, then split ok/err.
-    let Some(status) = e.fresh_rv(span) else {
-        e.invalid.insert(dst);
-        return;
-    };
-    e.bytecode.extend_from_slice(&[0x04, status, 0x10]); // cpv status, rv10
+    let status = 0x10; // native status is already in the reserved register
     let to_ok = nara_emit_jz(e, status);
     // Err path: select the variant code per status; unlisted statuses use
     // the fallthrough variant.
@@ -5200,7 +5374,7 @@ fn nara_checked_call(
         e.invalid.insert(dst);
         return;
     }
-    let mut temps_rv: Vec<u8> = vec![status, code, sc, tt];
+    let mut temps_rv: Vec<u8> = vec![code, sc, tt];
     let mut temps_rf: Vec<u8> = Vec::new();
     let (result_ref, result_reg) = spec.result;
     // The checked natives declare single-lane payloads; anything else means
@@ -5253,6 +5427,7 @@ fn nara_checked_call(
     for rf in temps_rf {
         e.free_rf.push(rf);
     }
+    nara_restore_spills(e, &spills);
 }
 
 /// Call a user function: spill live caller registers (the register file is
@@ -5419,17 +5594,7 @@ fn nara_user_call(
         e.bytecode.extend_from_slice(&[0x08, rf]); // pushrf
         spills.push(NaraSpill::F(rf));
     }
-    let mut vi = 0u8;
-    let mut ri = 0u8;
-    for (is_ref, src) in &actuals {
-        if *is_ref {
-            e.bytecode.extend_from_slice(&[0x05, 0x31 + ri, *src]); // cprf
-            ri += 1;
-        } else {
-            e.bytecode.extend_from_slice(&[0x04, 0x11 + vi, *src]); // cpv
-            vi += 1;
-        }
-    }
+    nara_stage_call_args(e, &actuals);
     let fn_idx = if callee.module == ctx.module {
         ctx.fn_consts.get(&callee.function).copied()
     } else {
@@ -5689,7 +5854,11 @@ fn nara_binop(
                 return;
             };
             e.kinds.insert(dst, NaraKind::Bool);
-            e.bytecode.extend_from_slice(&[0x0a, d, l, r]); // eq
+            if kind == NaraKind::F64 {
+                nara_float_eq(e, d, l, r, false, span);
+            } else {
+                e.bytecode.extend_from_slice(&[0x0a, d, l, r]); // eq
+            }
         }
         LirOp::Ne => {
             if !matches!(
@@ -5711,12 +5880,73 @@ fn nara_binop(
                 return;
             };
             e.kinds.insert(dst, NaraKind::Bool);
-            e.bytecode.extend_from_slice(&[0x0a, d, l, r]); // eq
-            e.bytecode.extend_from_slice(&[0x12, d, d, one]); // xor 1
+            if kind == NaraKind::F64 {
+                nara_float_eq(e, d, l, r, true, span);
+            } else {
+                e.bytecode.extend_from_slice(&[0x0a, d, l, r]); // eq
+                e.bytecode.extend_from_slice(&[0x12, d, d, one]); // xor 1
+            }
         }
         LirOp::Lt | LirOp::Le | LirOp::Gt | LirOp::Ge => {
             nara_compare(e, dst, op, kind, l, r, span);
         }
+    }
+}
+
+/// IEEE equality from integer operations. `abs(bits)` is formed by subtracting
+/// the sign bias only when the sign bit is set. NaNs have absolute bit patterns
+/// greater than positive infinity; both signed zero patterns compare equal.
+fn nara_float_eq(e: &mut NaraEmit, dst: u8, lhs: u8, rhs: u8, negate: bool, span: Span) {
+    let (Some(bias), Some(zero), Some(one)) =
+        (e.ensure_bias(span), e.ensure_zero(span), e.ensure_one(span))
+    else {
+        return;
+    };
+    let (Some(abs_a), Some(abs_b), Some(flag), Some(mask), Some(work)) = (
+        e.fresh_rv(span),
+        e.fresh_rv(span),
+        e.fresh_rv(span),
+        e.fresh_rv(span),
+        e.fresh_rv(span),
+    ) else {
+        return;
+    };
+    // Start with bit equality, then compute absolute bit patterns.
+    e.bytecode.extend_from_slice(&[0x0a, dst, lhs, rhs]);
+    e.bytecode.extend_from_slice(&[0x10, flag, lhs, bias]); // positive iff lhs < sign bit
+    e.bytecode.extend_from_slice(&[0x12, flag, flag, one]); // negative sign bit
+    e.bytecode.extend_from_slice(&[0x36, mask, bias, flag]);
+    e.bytecode.extend_from_slice(&[0x33, abs_a, lhs, mask]); // abs lhs bits
+    e.bytecode.extend_from_slice(&[0x10, flag, rhs, bias]);
+    e.bytecode.extend_from_slice(&[0x12, flag, flag, one]);
+    e.bytecode.extend_from_slice(&[0x36, mask, bias, flag]);
+    e.bytecode.extend_from_slice(&[0x33, abs_b, rhs, mask]); // abs rhs bits
+    e.bytecode.extend_from_slice(&[0x0a, flag, abs_a, zero]);
+    e.bytecode.extend_from_slice(&[0x0a, mask, abs_b, zero]);
+    e.bytecode.extend_from_slice(&[0x36, work, flag, mask]); // both are zero
+    e.bytecode.extend_from_slice(&[0x30, work, dst, work]);
+    e.bytecode.extend_from_slice(&[0x10, dst, zero, work]); // raw equal OR both zero
+
+    let Some(inf_idx) = e.add_value(0x7ff0_0000_0000_0000, span) else {
+        return;
+    };
+    let Ok(inf_idx) = u8::try_from(inf_idx) else {
+        e.diags.push(
+            Diagnostic::error("Naravm constant pool exhausted (compiler bug)")
+                .with_label(span, "floating equality emitted here")
+                .with_code("E500"),
+        );
+        return;
+    };
+    e.bytecode.extend_from_slice(&[0x02, mask, inf_idx]);
+    e.bytecode.extend_from_slice(&[0x10, flag, mask, abs_a]); // lhs abs > +infinity => NaN
+    e.bytecode.extend_from_slice(&[0x12, flag, flag, one]); // lhs is not NaN
+    e.bytecode.extend_from_slice(&[0x36, dst, dst, flag]);
+    if negate {
+        e.bytecode.extend_from_slice(&[0x12, dst, dst, one]);
+    }
+    for rv in [abs_a, abs_b, flag, mask, work] {
+        e.free_rv.push(rv);
     }
 }
 
@@ -5767,6 +5997,8 @@ fn nara_compare(
         e.bytecode.extend_from_slice(&[0x12, ta, a, bias]); // xor sign
         e.bytecode.extend_from_slice(&[0x12, tb, b, bias]);
         e.bytecode.extend_from_slice(&[0x10, d, ta, tb]); // ltu
+        e.free_rv.push(ta);
+        e.free_rv.push(tb);
         if negate {
             let Some(one) = e.ensure_one(span) else {
                 e.invalid.insert(dst);
@@ -7062,6 +7294,48 @@ fun main() {
         assert!(
             artifact.unwrap().bytes.unwrap().contains(&0x2f),
             "no setrfati for the read data lane"
+        );
+    }
+
+    #[test]
+    fn fallible_value_lane_includes_error_code_and_payload() {
+        assert_eq!(nara_fallible_lanes(&NaraKind::U64, (1, 0)), (3, 0));
+        assert_eq!(nara_fallible_lanes(&NaraKind::String, (2, 1)), (4, 1));
+    }
+
+    #[test]
+    fn call_argument_staging_handles_overlapping_abi_destinations() {
+        let mut e = empty_emitter();
+        nara_stage_call_args(&mut e, &[(false, 0x12), (false, 0x12), (false, 0x15)]);
+        assert_eq!(
+            e.bytecode,
+            vec![0x06, 0x12, 0x06, 0x12, 0x06, 0x15, 0x07, 0x13, 0x07, 0x12, 0x07, 0x11]
+        );
+        e.bytecode.clear();
+        nara_stage_call_args(
+            &mut e,
+            &[(false, 0x12), (true, 0x35), (false, 0x13), (true, 0x36)],
+        );
+        assert_eq!(
+            e.bytecode,
+            vec![
+                0x06, 0x12, 0x08, 0x35, 0x06, 0x13, 0x08, 0x36, 0x09, 0x32, 0x07, 0x12, 0x09, 0x31,
+                0x07, 0x11
+            ]
+        );
+    }
+
+    #[test]
+    fn native_multi_results_are_staged_before_scratch_can_overlap_them() {
+        let mut e = empty_emitter();
+        e.next_rv = 0x12;
+        let temps =
+            nara_stage_native_results(&mut e, &[(false, 0x11), (false, 0x12)], Span::empty(0))
+                .expect("two temporary result registers");
+        assert_eq!(temps, vec![0x12, 0x13]);
+        assert_eq!(
+            e.bytecode,
+            vec![0x06, 0x11, 0x06, 0x12, 0x07, 0x13, 0x07, 0x12]
         );
     }
 }
