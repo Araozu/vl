@@ -41,6 +41,50 @@ vim.api.nvim_create_autocmd("LspAttach", {
 })
 ```
 
+### Testing the server locally
+
+Build the binary from the repo root, then point the plugin at it so you
+can iterate on the server without installing anything:
+
+```sh
+cargo build   # produces ./target/debug/vl
+```
+
+```lua
+-- before opening any .vl file (e.g. in your lazy spec's `init`):
+vim.g.vl_lsp_cmd = { vim.fn.expand("~/projects/rust/vl/target/debug/vl"), "lsp" }
+```
+
+Combined with a local plugin checkout, a full local wiring looks like:
+
+```lua
+{
+  dir = vim.fn.expand("~/projects/rust/vl"),
+  name = "vl",
+  lazy = false,
+  init = function(plugin)
+    vim.opt.runtimepath:append(plugin.dir .. "/editors/neovim")
+    vim.filetype.add({ extension = { vl = "vl" } })
+    vim.g.vl_lsp_cmd = { plugin.dir .. "/target/debug/vl", "lsp" }
+  end,
+}
+```
+
+Then verify, with a `.vl` file open:
+
+1. `:LspInfo` shows a `vl` client attached with the expected root dir
+   (nearest `vl.toml`, else nearest `.git`, else the file's directory).
+2. Break something (e.g. delete a `;`) — a diagnostic should appear;
+   `K` on a call shows its signature, `gd` jumps to the definition.
+3. After rebuilding the binary (`cargo build`), restart the server with
+   `:LspRestart vl` (Neovim 0.10+) instead of restarting the editor.
+4. If the client never attaches, check `:LspLog` and confirm
+   `target/debug/vl lsp` runs (it speaks LSP over stdio and stays silent
+   until a client talks to it).
+
+The server's own test suite (`cargo test -p vl-lsp`) covers positions,
+hover/goto, completion, formatting, and the stdio protocol handling.
+
 ## lazy.nvim
 
 Because the runtime files live in a subdirectory of the VL repository, add that
