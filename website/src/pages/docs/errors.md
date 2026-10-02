@@ -8,8 +8,9 @@ availability: VL 0.1+
 
 # Errors
 
-Some operations can fail: reading input, parsing a number, talking to the
-outside world. VL models failure with error sets, in the style of Zig.
+Some operations can fail: reading a file, accessing a string byte outside
+its bounds, or talking to a socket. VL models failure with error sets, in the
+style of Zig.
 
 Declare a set with `type` and `error`, listing the ways it can fail. Variant
 names start with an uppercase letter, and the declaration ends with a
@@ -93,6 +94,8 @@ code). Over a fallible, listed arms bind error payloads while `else`
 covers the ok value plus unlisted variants:
 
 ```vl
+use std;
+
 type Io = error { NotFound, Missing(String), };
 
 fun report(r: Io!u64) {

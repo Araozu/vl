@@ -38,35 +38,43 @@ results, and call one function from another.
 [Arrays and generics](/docs/arrays) introduces fixed-length arrays and the
 type parameters that let one function work with several element types.
 
-## 6. Model named data
+## 6. Group values in tuples
+
+[Tuples](/docs/tuples) introduces fixed-size positional and named groups,
+element access, and destructuring.
+
+## 7. Model named data
 
 [Objects](/docs/objects) explains object declarations, named literals, field
 access, and sharing.
 
-## 7. Model either-or data
+## 8. Model either-or data
 
 [Unions](/docs/unions) explains how to declare sum types, build variants,
 and choose between them with `match`.
 
-## 8. Handle failure
+## 9. Handle failure
 
 [Errors](/docs/errors) explains error sets, fallible functions, and handling
 failures with `try` and `catch`.
 
-## 9. Work with text
+## 10. Work with text
 
 [Strings](/docs/strings) covers string literals, escapes, and the standard
 string helpers.
 
-## 10. Organize a program
+## 11. Organize a program
 
 [Modules](/docs/modules) covers imports, source files, and the standard
 library.
 
-## 11. Use the command line
+## 12. Use the command line
 
 When you are ready to work with your own files, use the [CLI reference](/cli)
 to check, build, inspect, and select a target from the `vl` driver.
+
+For editor support, set up [VS Code or Neovim](/docs/editor-support) with the
+VL language server.
 
 ## Where to go next
 

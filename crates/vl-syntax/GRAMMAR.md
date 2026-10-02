@@ -157,8 +157,10 @@ Dot Colon Hash Backtick ColonColon Question Null Ident Int I64 U64 F64 U8 Bool S
   `E100`), take an optional parenthesized binding list (implicit `val`s, one
   optional trailing comma), and require brace blocks. `else` takes a branch
   (like `if`) and must be the last arm (trailing arms after `else` are one
-  `E100`). Typechecking requires `else` in this milestone; omitting it with
-  uncovered variants is an exhaustiveness error.
+  `E100`). A plain union or error-set match can omit `else` when every variant
+  is covered; uncovered variants are an exhaustiveness error. A match on a
+  fallible value always needs `else` for its success value and any unlisted
+  errors.
 * Objects declare associated functions inside the body
   (`type Counter = object { value: u64, fun bump(self: *Counter): *Counter { ... } };`).
   Fields and `fun` members share one namespace: a duplicate member name is one

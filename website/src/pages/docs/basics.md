@@ -62,6 +62,11 @@ operations make sense for it.
 | `String` | `"hello"` | Text |
 | `object` type | `Counter { value = 1 }` | Your own named data (see [Objects](/docs/objects)) |
 
+VL also has [tuples](/docs/tuples) for fixed groups of different types,
+[unions](/docs/unions) for one-of-many values, nullable types such as `?T`,
+and fallible types such as `Io!T`. The [errors guide](/docs/errors) explains
+how to propagate or handle a fallible result.
+
 You will also see a `*` in front of some types, as in `*Counter` or
 `*Array[u64]`. The `*` means "allowed to change the contents". A plain
 `Counter` can be read; a `*Counter` can also be written. The

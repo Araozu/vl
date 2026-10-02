@@ -4,23 +4,31 @@ Read this before touching code. Short on purpose.
 
 ## Language
 
-VL surface syntax uses `let`, `fun`, braces, and `//` comments.
-Semicolons are mandatory.
+VL surface syntax uses `var` and `val` bindings, `fun`, braces, and `//`
+comments. Semicolons are mandatory.
 
 ## Layout
 
 Workspace crates (dependency order, lower first):
 
 `vl-common` → `vl-lex` → `vl-syntax` → `vl-semantic` → `vl-hir` →
-`vl-typecheck` → `vl-lir` → `vl-codegen`, plus `vl-stdlib` (embedded
-`std/*.vl` modules over VM natives, merged into the catalog and linked
-inline by the driver), `vl-frontend` (in-memory `check_text` over
-lex..typecheck + world plan, `LineIndex`, JSON diagnostics for tooling;
-takes a pre-merged catalog, owns no I/O) and the `vl` driver binary
-(`src/main.rs`) that wires them together.
+`vl-typecheck` → `vl-lir` → `vl-codegen`, plus `vl-fmt` (canonical formatter
+over lex/syntax), `vl-stdlib` (embedded `std/*.vl` modules over VM natives,
+merged into the catalog and linked inline by the driver), `vl-frontend`
+(in-memory `check_text` over lex..typecheck + world plan, `LineIndex`, JSON
+diagnostics for tooling; takes a pre-merged catalog, owns no I/O), `vl-lsp`
+(stdio Language Server Protocol over the frontend, formatter and semantic
+results), and the `vl` driver binary (`src/main.rs`) that wires them together.
 
 - `vl-common`: `Span`, `Sources`, `Diagnostic`. Everyone depends on it.
-- Driver (`src/main.rs`): owns CLI, file I/O, exit codes, printing.
+- `vl-frontend`: in-memory compiler entrypoint for editors and other tools;
+  accepts a pre-merged module catalog and owns no I/O.
+- `vl-lsp`: owns stdio LSP transport and editor features; depends on the
+  frontend, formatter, standard library, and code generator.
+- Driver (`src/main.rs`): owns CLI, file I/O, exit codes, human diagnostics,
+  and starts the LSP server for `vl lsp`.
+- `website/src/grammars/vl.tmLanguage.json`: Shiki grammar; keep it aligned
+  with `vl-lex` and `vl-syntax`.
 - `examples/*.vl`: sample programs. `err_*.vl` must FAIL.
 - `tests/pipeline.rs` + `tests/golden/`: integration + golden tests.
 
@@ -33,8 +41,9 @@ All VL-side integration belongs in this repository, including
 
 ## Hard rules
 
-1. **Errors via Ariadne only.** Produce `vl_common::Diagnostic`, print with
-   `emit_all` in the driver. Do not add miette / custom renderers.
+1. **Use shared diagnostics.** Produce `vl_common::Diagnostic`. The driver
+   renders human output with `emit_all`; tooling may serialize diagnostics
+   through `vl-frontend` or LSP. Do not add miette / custom human renderers.
 2. **Respect the pipeline.** No crate imports from a later stage; no
    target-specific code outside `vl-codegen`; no printing inside libraries
    (return diagnostics, let the driver emit).
@@ -50,6 +59,7 @@ All VL-side integration belongs in this repository, including
 ./scripts/check.sh            # the gate (fmt, check, clippy, test, smoke)
 cargo test -p vl-<crate>      # fast loop on one crate
 cargo run -- check examples/hello.vl
+cargo run -- fmt examples/hello.vl --check
 cargo run -- build examples/arith.vl --emit lir
 ```
 

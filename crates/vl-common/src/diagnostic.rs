@@ -1,5 +1,6 @@
-//! Diagnostics. **All** user-facing errors go through here and render
-//! with Ariadne. Stages produce `Vec<Diagnostic>`; only the driver prints.
+//! Shared diagnostics. Compiler stages produce `Vec<Diagnostic>`; the CLI
+//! renders human output with Ariadne, while tooling can serialize the same
+//! values as JSON or LSP diagnostics. Libraries do not print diagnostics.
 
 use ariadne::{sources, Color, Label as ALabel, Report, ReportKind};
 

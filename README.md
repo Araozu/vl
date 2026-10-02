@@ -11,11 +11,11 @@ Ariadne error reporting, and a Naravm backend with target-neutral LIR.
   ▼  vl-syntax     tokens -> AST (recursive descent, per-item recovery)
   │  vl-semantic   AST -> name resolution (scopes, undefined/duplicate defs)
   ▼  vl-hir        resolved AST -> HIR (desugared, node ids, DefId links)
-  │  vl-typecheck  HIR -> types (scalars, `String`s, `File`, `Array[T]`, objects)
+  │  vl-typecheck  HIR -> types (scalars, arrays, tuples, objects, unions, errors)
   ▼  vl-lir        typed HIR -> three-address code (target-agnostic)
   │  vl-codegen    LIR -> backend output via `Target` trait
   ▼
-   vl (driver)      CLI wiring + the ONLY place that prints diagnostics
+   vl (driver)      CLI wiring + human diagnostic display and JSON output
     vl-frontend      in-memory `check_text` (lex..typecheck + world plan),
                      `LineIndex`, JSON diagnostics — the tooling/LSP foundation
     vl-lsp           stdio language server (`vl lsp`): diagnostics, hover,
@@ -128,12 +128,14 @@ cargo run -q -- build examples/arith.vl --emit lir > tests/golden/arith.lir
 
 then eyeball the diff before committing.
 
-## Error reporting (hard requirement)
+## Diagnostics and recovery
 
-All user-facing errors are `vl_common::Diagnostic` rendered with
-[Ariadne](https://crates.io/crates/ariadne). Stages return
-`Vec<Diagnostic>` and keep going; only `src/main.rs` prints (stderr,
-colours) and sets the exit code. Never add another reporting library.
+Compiler stages return `vl_common::Diagnostic` values and recover where they
+can. The CLI renders human-readable diagnostics with
+[Ariadne](https://crates.io/crates/ariadne), prints them, and chooses the exit
+code. The frontend and language server can serialize the same diagnostics for
+tools and editors. Libraries do not print directly; do not add another human
+diagnostic renderer.
 
 ## Language v0 (`examples/`)
 

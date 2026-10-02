@@ -21,6 +21,12 @@ const stdlibFunction = z.object({
   example: z.string().optional(),
 });
 
+const stdlibError = z.object({
+  name: z.string(),
+  variants: z.array(z.string()),
+  detail: z.string(),
+});
+
 const stdlib = defineCollection({
   loader: file('src/data/stdlib.yaml'),
   schema: z.object({
@@ -34,6 +40,7 @@ const stdlib = defineCollection({
     intro: z.string(),
     import_example: z.string(),
     functions: z.array(stdlibFunction),
+    errors: z.array(stdlibError).optional(),
     outro: z.string().optional(),
   }),
 });

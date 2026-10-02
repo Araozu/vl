@@ -91,5 +91,27 @@ for (const fn of mod.functions) {
       );
     })
   }
+  {mod.errors?.length ? (
+    <>
+      <h2 id="error-sets">Error sets</h2>
+      {mod.errors.map((error) => (
+        <Fragment>
+          <h3 id={slug(`${mod.module}.${error.name}`)}>
+            <code>{mod.module}.{error.name}</code>
+          </h3>
+          <p>
+            <strong>Variants</strong>{' '}
+            {error.variants.map((variant, index) => (
+              <>
+                {index > 0 ? ', ' : ''}
+                <code>{variant}</code>
+              </>
+            ))}
+          </p>
+          <Fragment set:html={renderParagraphs(error.detail)} />
+        </Fragment>
+      ))}
+    </>
+  ) : null}
   {mod.outro && <Fragment set:html={renderParagraphs(mod.outro)} />}
 </Docs>

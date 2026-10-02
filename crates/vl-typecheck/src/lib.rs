@@ -1,8 +1,9 @@
 //! vl-typecheck: type checking over HIR.
 //!
 //! Value types are the compiler-owned [`Ty`] (`u64`, `i64`, `f64`, `bool`,
-//! `u8`, `String`, `File`, named reference-semantic objects, `Array[T]`,
-//! `void`) converted from [`vl_common::VlType`].
+//! `u8`, `String`, `File`, arrays, copy-semantic tuples, named objects,
+//! unions, error sets, nullable values, fallible values, and `void`) converted
+//! from [`vl_common::VlType`].
 //! These are VL language types enforced here — deliberately distinct from any
 //! VM representation, which backends map to separately.
 //!

@@ -147,4 +147,5 @@ fun eq[T extends Comparable](a: T, b: T): bool {
 numbers, `bool`, and `String`. A `Numeric` value can be used where
 `Comparable` is expected, but an unconstrained `T` fits neither.
 
-Continue with [objects](/docs/objects).
+Continue with [tuples](/docs/tuples) for fixed groups of differently typed
+values, or [objects](/docs/objects) for named data with shared identity.

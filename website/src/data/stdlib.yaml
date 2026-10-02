@@ -110,7 +110,7 @@
           detail: Decimal string to parse.
       returns:
         type: u64
-      detail: Native conversion from a decimal byte string to `u64`.
+      detail: Native conversion from a decimal byte string to `u64`; invalid input traps.
     - name: hex_to_u64
       params:
         - name: value
@@ -118,7 +118,38 @@
           detail: Hexadecimal string to parse.
       returns:
         type: u64
-      detail: Native conversion from a hexadecimal byte string to `u64`.
+      detail: Native conversion from a hexadecimal byte string to `u64`; invalid input traps.
+    - name: byte_at
+      params:
+        - name: value
+          type: String
+          detail: String whose byte should be read.
+        - name: index
+          type: u64
+          detail: Zero-based byte index.
+      returns:
+        type: StringError!u8
+        detail: Byte at the given index, or a `StringError`.
+      detail: Bounds-checked byte read. `OutOfBounds` is returned when the index is outside the string.
+      example: |
+        val byte = std.string.byte_at("hello", 1u64) catch 0u8;
+    - name: slice
+      params:
+        - name: value
+          type: String
+          detail: String to slice.
+        - name: start
+          type: u64
+          detail: Inclusive starting byte index.
+        - name: end
+          type: u64
+          detail: Exclusive ending byte index.
+      returns:
+        type: StringError!String
+        detail: The selected byte range, or a `StringError`.
+      detail: Bounds-checked byte slice. `OutOfBounds` and `InvalidRange` report invalid endpoints and reversed ranges.
+      example: |
+        val part = std.string.slice("hello", 1u64, 4u64) catch "";
     - name: is_empty
       params:
         - name: s
@@ -144,6 +175,12 @@
         val same = std.string.strings_equal("VL", "VL");
   outro: |
     The helpers are implemented in [`string.vl`](https://github.com/Araozu/vl/tree/main/crates/vl-stdlib/src/std/string.vl); the remaining entries are target natives.
+  errors:
+    - name: StringError
+      variants: [OutOfBounds, InvalidRange]
+      detail: |
+        Checked string operations return this set when an index or range is
+        invalid. The VM currently maps multiple bounds statuses to `OutOfBounds`.
 
 - id: math
   order: 3
@@ -310,8 +347,8 @@
   description: File operations in the VL standard library.
   intro: |
     `std.fs` exposes the file operations available on native targets.
-    `open` returns a `File` handle; `read` returns the file's contents.
-    Import the module before using its qualified names:
+    `read_file` reads an entire file and reports I/O errors as a fallible
+    result. Import the module before using its qualified names:
 
     Native-only: available when running on linux-x86_64. Not available
     in the browser playground (wasm32-freestanding), which has no
@@ -320,36 +357,29 @@
     use std.fs;
 
     fun main() {
-        val handle = std.fs.open("data.txt");
-        val text = std.fs.read(handle);
+        val text = fs.read_file("data.txt") catch "could not read file";
     }
   functions:
-    - name: open
+    - name: read_file
       params:
         - name: path
           type: String
-          detail: Path of the file to open.
+          detail: Path of the file to read.
       returns:
-        type: File
-      detail: Native operation that opens a file and returns its handle.
+        type: FsError!String
+        detail: File contents, or an `FsError`.
+      detail: Native operation that reads the file into a string. Handle failure with `try`, `catch`, or `match`.
       example: |
-        val handle = std.fs.open("data.txt");
-    - name: read
-      params:
-        - name: file
-          type: File
-          detail: Open file handle.
-      returns:
-        type: String
-      detail: Native operation that reads a file's contents into a string.
-      example: |
-        val text = std.fs.read(handle);
+        val text = fs.read_file("data.txt") catch "";
   outro: |
-    The module has no VL source file; these functions are target-provided.
-    They are unavailable in wasm32-freestanding builds (including the
-    browser playground); run them on linux-x86_64 instead. TCP sockets
-    ([std.net.tcp](/std/tcp)) follow the same rule: native-only,
-    not available in the playground.
+    The module has no VL source file; this function is target-provided.
+    It is unavailable in wasm32-freestanding builds (including the
+    browser playground); use a native linux-x86_64 target for file access.
+    TCP sockets ([std.net.tcp](/std/tcp)) follow the same native-only rule.
+  errors:
+    - name: FsError
+      variants: [IoError]
+      detail: The VM reports one filesystem failure status, mapped to `IoError`.
 
 - id: tcp
   order: 6
@@ -461,3 +491,9 @@
     `OutOfMemory`, and `CapabilityUnavailable`. Unavailable in
     wasm32-freestanding builds (including the browser playground); run them
     on linux-x86_64 instead.
+  errors:
+    - name: TcpError
+      variants: [InvalidArgument, IoError, InvalidHandle, WrongHandleKind, TooManyHandles, OutOfMemory, CapabilityUnavailable]
+      detail: |
+        One variant is provided for each native TCP status code. TCP functions
+        return this error set when a socket operation fails.

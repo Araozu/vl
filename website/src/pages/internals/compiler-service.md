@@ -13,6 +13,10 @@ the Rust compiler with the `naravm` target and returns either a base64-encoded
 vmfile or the compiler's Ariadne diagnostics. The service only compiles;
 execution happens in the browser with the Naravm WASM artifact.
 
+This HTTP service is separate from the editor language server. The latter
+speaks LSP over stdio through the `vl lsp` command and analyzes open buffers
+with `vl-frontend`.
+
 ## Run
 
 `GET /naravm.wasm` serves the Luna WASM build that the docs host mounts

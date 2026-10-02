@@ -9,7 +9,12 @@
     { "include": "#comment" },
     { "include": "#string" },
     { "include": "#type-definition" },
+    { "include": "#union-definition" },
+    { "include": "#error-definition" },
     { "include": "#object-literal" },
+    { "include": "#tuple" },
+    { "include": "#tuple-index" },
+    { "include": "#match-arm" },
     { "include": "#function-definition" },
     { "include": "#keyword" },
     { "include": "#boolean" },
@@ -78,6 +83,75 @@
         }
       ]
     },
+    "union-definition": {
+      "name": "meta.type.union.definition.vl",
+      "begin": "\\b(type)\\s+([A-Za-z_][A-Za-z0-9_]*)(\\s*\\[[^\\]]+\\])?\\s*(=)\\s*(union)\\s*(\\{)",
+      "beginCaptures": {
+        "1": { "name": "keyword.declaration.vl" },
+        "2": { "name": "entity.name.type.vl" },
+        "3": { "name": "meta.type.parameters.vl" },
+        "4": { "name": "keyword.operator.assignment.vl" },
+        "5": { "name": "keyword.declaration.vl" },
+        "6": { "name": "punctuation.bracket.curly.vl" }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.bracket.curly.vl" }
+      },
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#type" },
+        { "include": "#tuple" },
+        {
+          "name": "constant.other.variant.vl",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        },
+        {
+          "name": "punctuation.bracket.round.vl",
+          "match": "[()]"
+        },
+        {
+          "name": "punctuation.separator.vl",
+          "match": ","
+        }
+      ]
+    },
+    "error-definition": {
+      "name": "meta.type.error.definition.vl",
+      "begin": "\\b(type)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(=)\\s*(error)\\s*(\\{)",
+      "beginCaptures": {
+        "1": { "name": "keyword.declaration.vl" },
+        "2": { "name": "entity.name.type.vl" },
+        "3": { "name": "keyword.operator.assignment.vl" },
+        "4": { "name": "keyword.declaration.vl" },
+        "5": { "name": "punctuation.bracket.curly.vl" }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.bracket.curly.vl" }
+      },
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#type" },
+        { "include": "#tuple" },
+        {
+          "name": "constant.other.variant.vl",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        },
+        {
+          "name": "punctuation.bracket.round.vl",
+          "match": "[()]"
+        },
+        {
+          "name": "punctuation.separator.annotation.vl",
+          "match": ":"
+        },
+        {
+          "name": "punctuation.separator.vl",
+          "match": ","
+        }
+      ]
+    },
     "block": {
       "name": "meta.block.vl",
       "begin": "\\{",
@@ -93,6 +167,9 @@
         { "include": "#comment" },
         { "include": "#string" },
         { "include": "#object-literal" },
+        { "include": "#tuple" },
+        { "include": "#tuple-index" },
+        { "include": "#match-arm" },
         { "include": "#keyword" },
         { "include": "#boolean" },
         { "include": "#number" },
@@ -119,6 +196,9 @@
         { "include": "#comment" },
         { "include": "#string" },
         { "include": "#object-literal" },
+        { "include": "#tuple" },
+        { "include": "#tuple-index" },
+        { "include": "#match-arm" },
         {
           "name": "meta.field.assign.vl",
           "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(=)",
@@ -137,6 +217,63 @@
         { "include": "#punctuation" }
       ]
     },
+    "tuple": {
+      "name": "meta.tuple.vl",
+      "begin": "(#)(\\s*)(\\()",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.tuple.vl" },
+        "3": { "name": "punctuation.bracket.round.vl" }
+      },
+      "end": "\\)",
+      "endCaptures": {
+        "0": { "name": "punctuation.bracket.round.vl" }
+      },
+      "patterns": [
+        { "include": "#tuple" },
+        { "include": "#comment" },
+        { "include": "#string" },
+        { "include": "#object-literal" },
+        { "include": "#tuple-index" },
+        { "include": "#match-arm" },
+        { "include": "#turbofish" },
+        { "include": "#function-call" },
+        { "include": "#keyword" },
+        { "include": "#boolean" },
+        { "include": "#number" },
+        { "include": "#type" },
+        {
+          "name": "variable.other.property.vl",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*[=:])"
+        },
+        {
+          "name": "punctuation.separator.annotation.vl",
+          "match": ":"
+        },
+        {
+          "name": "keyword.operator.assignment.vl",
+          "match": "="
+        },
+        { "include": "#operator" },
+        { "include": "#punctuation" }
+      ]
+    },
+    "tuple-index": {
+      "name": "meta.tuple.index.vl",
+      "match": "(\\.)(`)(\\d+)",
+      "captures": {
+        "1": { "name": "punctuation.accessor.dot.vl" },
+        "2": { "name": "punctuation.definition.tuple.index.vl" },
+        "3": { "name": "constant.numeric.integer.vl" }
+      }
+    },
+    "match-arm": {
+      "name": "meta.match.pattern.vl",
+      "match": "\\b([A-Z][A-Za-z0-9_]*)\\.([A-Z][A-Za-z0-9_]*)(?=\\s*(?:\\(|\\{))",
+      "captures": {
+        "1": { "name": "entity.name.type.vl" },
+        "2": { "name": "constant.other.variant.vl" }
+      }
+    },
     "function-definition": {
       "name": "meta.function.definition.vl",
       "begin": "\\b(fun)\\s+([A-Za-z_][A-Za-z0-9_]*)(?=\\s*[\\[(])",
@@ -151,6 +288,7 @@
       "patterns": [
         { "include": "#comment" },
         { "include": "#type-params" },
+        { "include": "#tuple" },
         { "include": "#keyword" },
         { "include": "#type" },
         {
@@ -226,6 +364,18 @@
     "type": {
       "patterns": [
         {
+          "name": "storage.type.nullable.vl",
+          "match": "\\?(?=\\s*(?:\\*|[A-Za-z_#]))"
+        },
+        {
+          "name": "storage.modifier.fallible.vl",
+          "match": "(?<=[A-Za-z0-9_\\]])!(?=\\s*(?:[A-Za-z_#?*]))"
+        },
+        {
+          "name": "storage.modifier.fallible.vl",
+          "match": "!(?=\\s*(?:\\*|\\?|#|u64\\b|i64\\b|f64\\b|bool\\b|u8\\b|void\\b|String\\b|File\\b|Array\\b|[A-Z]))"
+        },
+        {
           "name": "storage.modifier.capability.vl",
           "match": "\\*(?=\\s*(?:u64|i64|f64|bool|u8|void|String|File|Array|[A-Z]))"
         },
@@ -255,15 +405,19 @@
       "patterns": [
         {
           "name": "keyword.declaration.vl",
-          "match": "\\b(?:var|val|fun|use|type|object|as|extends)\\b"
+          "match": "\\b(?:var|val|fun|use|type|object|as|extends|self)\\b"
         },
         {
           "name": "keyword.control.conditional.vl",
-          "match": "\\b(?:if|else)\\b"
+          "match": "\\b(?:if|else|match|catch)\\b"
         },
         {
           "name": "keyword.control.loop.vl",
-          "match": "\\b(?:while|break|continue|return)\\b"
+          "match": "\\b(?:while|break|continue|return|try)\\b"
+        },
+        {
+          "name": "constant.language.null.vl",
+          "match": "\\bnull\\b"
         }
       ]
     },

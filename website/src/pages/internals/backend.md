@@ -23,17 +23,18 @@ Lowers the resolved syntax tree into a desugared tree with node ids and
 ## `vl-typecheck`
 
 Checks scalar types (`u64`, `i64`, `f64`, `bool`, and `u8`), byte strings,
-the built-in `File` handle, `Array[T]`, and nominal user-defined `object`
-types, producing typed HIR and diagnostics. Array literals must hold one
-uniform element type; indexing requires an `Array[T]` base and a `u64` index.
+the built-in `File` handle, arrays, tuples, objects, unions, error sets, and
+nullable and fallible values, producing typed HIR and diagnostics. Array
+literals must hold one uniform element type; indexing requires an `Array[T]`
+base and a `u64` index. Tuple arity and field names are fixed by their type.
 Object literals must initialize every declared field exactly once, and field
 reads and writes are checked against the object's nominal layout. Associated
 functions lower to ordinary `Fn` items named `Owner.method`, so they typecheck
 like free functions; `receiver.method(args)` sugar is validated against the
 first parameter (the self-type gate) and then treated as
-`Owner.method(receiver, args...)`. Objects and
-arrays remain reference values through this stage. Generic functions check
-once with opaque parameters and monomorphize per concrete call (`f$u64`, ...).
+`Owner.method(receiver, args...)`. Objects and arrays remain reference values;
+tuples are copied by value. Generic functions check once with opaque
+parameters and monomorphize per concrete call (`f$u64`, ...).
 
 ## `vl-lir`
 
@@ -44,6 +45,12 @@ backend will consume the program.
 
 Defines the `Target` trait and registers the `naravm` backend, which serializes
 Naravm 0.2 vmfiles.
+
+The backend lowers unions, nullable values, and error sets to tagged values.
+Fallible native calls map Naravm status results into typed error values;
+checked `std.string.byte_at`, `std.string.slice`, `std.fs.read_file`, and
+`std.net.tcp` calls use this path. Tuples lower to fixed value/reference
+containers, with copy semantics for the tuple itself.
 
 The Naravm backend compiles every `fun` item: `fun main()` (which
 takes no parameters) becomes the `<entrypoint>` function and each other user

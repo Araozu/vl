@@ -169,4 +169,5 @@ name (`use my_app.person.{Person}` then `Person.birthday(rose)`); the short
 receiver form (`rose.birthday()`) works from the value alone and needs no
 import.
 
-Continue with [unions](/docs/unions).
+Continue with [unions](/docs/unions) for values that can take one of several
+forms. For fixed value groups, see [tuples](/docs/tuples).

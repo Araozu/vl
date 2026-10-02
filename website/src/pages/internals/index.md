@@ -34,8 +34,9 @@ stage. The driver in `src/main.rs` wires the stages together.
 ## Diagnostics and recovery
 
 Stages return `Vec<Diagnostic>` and continue recovering where they can. The
-driver is the only layer that renders diagnostics with Ariadne and chooses the
-process exit code. Libraries do not print directly.
+CLI renders human diagnostics with Ariadne and chooses the process exit code;
+the frontend and language server serialize those diagnostics for tools and
+editors. Libraries do not print directly.
 
 When a stage cannot produce a meaningful node, later stages receive a poisoned
 value such as `Ty::Error` or a missing definition. That keeps one root cause
@@ -55,4 +56,5 @@ LIR do not branch on target names, which keeps adding a backend local to
 - [Driver](/internals/driver): CLI wiring, file I/O, diagnostics, and exit codes.
 - [Frontend crates](/internals/frontend): shared types, lexing, parsing, and name resolution.
 - [Backend crates](/internals/backend): HIR, type checking, LIR, and code generation.
+- [Language server](/internals/language-server): editor protocol over the shared frontend.
 - [Compiler service](/internals/compiler-service): the HTTP endpoint used by the playground.

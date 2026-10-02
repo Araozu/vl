@@ -1,60 +1,9 @@
 //! vl-syntax: recursive-descent parser, tokens -> AST.
 //!
-//! Grammar (v0 surface):
-//! ```text
-//! program := item*
-//! item    := `use` ... | (`var` | `val`) (ident | destructure) (`:` type)? `=` expr `;` | `fun` ident type-params? `(` params? `)` (`:` type)? block | `type` ident `=` `object` `{` object-member* `}` `;`
-//! object-member := object-field | assoc-fn
-//! object-field  := ident `:` type `,`? (the comma may be omitted before `fun` or `}`)
-//! assoc-fn      := `fun` ident type-params? `(` params? `)` (`:` type)? block `,`?
-//! destructure := `#` `(` destructure-binding (`,` destructure-binding)* `)`
-//! destructure-binding := ident (`:` ident)?
-//! type-params := `[` type-param (`,` type-param)* `]`
-//! type-param  := ident (`extends` (`Numeric` | `Comparable`))?
-//! object-fields := object-field (`,` object-field)* `,`?
-//! object-field := ident `:` type
-//! params  := param (`,` param)*
-//! param   := ident `:` type
-//! type    := nullable_type | mutable_type | type_atom
-//! nullable_type := `?` type              ; `?T` desugars to the builtin `Option` union
-//! mutable_type := `*` (type_atom | nullable_type)
-//! type_atom := `u64` | `i64` | `f64` | `bool` | `u8` | `String` | `File` | object-name | union-type | `Array` `[` type `]` | tuple-type | type-param | `void` (`void` only as return)
-//! union-type := ident (`[` type (`,` type)* `]`)? ; `Option` or `Option[u64]` when `ident` names a union
-//! union-item := `type` ident type-params? `=` `union` `{` union-variants? `}` `;`
-//! union-variants := union-variant (`,` union-variant)* `,`?
-//! union-variant := ident (`(` type (`,` type)* `)`) ?
-//! tuple-type := `#` `(` [(ident `:`)? type] (`,` …)* `)` — 2+ elements, uniform named-ness, no `void`
-//! block   := `{` stmt* `}`
-//! stmt    := (`var` | `val`) (ident | destructure) (`:` type)? `=` expr `;` | ident `=` expr `;` | index `=` expr `;` | field `=` expr `;` | tuple-index `=` expr `;`
-//!          | `if` `(` expr `)` branch (`else` branch)?
-//!          | `match` `(` expr `)` `{` match-arm* (`else` block)? `}`
-//!          | `while` `(` expr `)` branch | `break` `;` | `continue` `;`
-//!          | `return` expr? `;` | expr `;`
-//! match-arm := (path (`(` ident (`,` ident)* `,`? `)`)? | `null`) block
-//!             ; `path` is `Union.Variant` (2+ segments); bindings are implicit `val`s
-//!             ; `null` matches the empty case of a `?T` scrutinee (sugar for `Option.None`)
-//! branch  := block | stmt
-//! index   := ident (`[` expr `]`)+
-//! expr    := or
-//! or      := and (`||` and)*
-//! and     := equality (`&&` equality)*
-//! equality:= cast ((`==`|`!=`) cast)*
-//! cast    := comparison (`as` type)*
-//! comparison := term ((`<`|`<=`|`>`|`>=`) term)*
-//! term    := factor ((`+`|`-`) factor)*
-//! factor  := unary ((`*`|`/`) unary)*
-//! unary   := (`-`|`!`) unary | postfix
-//! postfix := primary (`[` expr `]` | `.` ident | backtick-index)*
-//! backtick-index := `.` `` ` `` int — e.g. ``t.`0`` (unnamed tuples only)
-//! primary := literal | string | `null` | array-literal | tuple-literal | object-literal | call | path | `(` expr `)`
-//!           ; `null` is the empty value of any `?T` (sugar for builtin `Option.None`)
-//! tuple-literal := `#` `(` [(ident `=`)? expr] (`,` …)* `)` — `=` mirrors object literals
-//! array-literal := `[` (expr (`,` expr)* `,`?)? `]`
-//! object-literal := ident `{` (ident `=` expr (`,` ident `=` expr)* `,`?)? `}`
-//! call    := path (`::` `[` type (`,` type)* `]`)? `(` args? `)`
-//! path    := ident (`.` ident)*
-//! args    := expr (`,` expr)*
-//! ```
+//! The parser accepts `use`, `var`/`val`, functions, object/union/error type
+//! declarations, generic/nullable/mutable/fallible types, arrays, tuples,
+//! destructuring, and `if`, `while`, and `match` statements. The complete
+//! grammar and recovery behavior are documented in `GRAMMAR.md`.
 //!
 //! `Array[T]` is a fixed-length heap array of `T`: `Array.new::[u64](n)`
 //! creates a zero-filled array of `n` elements, `[1u64, 2u64]` is an array
@@ -98,19 +47,21 @@
 //! payloads, `Option.None` for nullary variants, with an optional turbofish
 //! `Option.Some::[u64](...)`) and read through `match`:
 //! `match (opt) { Option.Some(v) { ... } Option.None { ... } else { ... } }`.
-//! Arm bindings are implicit `val`s; `else` is required in this milestone
-//! (full exhaustiveness checking without `else` is a follow-up).
+//! Arm bindings are implicit `val`s. A plain union match may omit `else` when
+//! it covers every variant; otherwise an `else` arm is required.
 //! Nullables are sugar over the builtin `Option` union (no declaration
 //! needed): `?u64` is the type, `null` the empty value, a plain `u64` value
 //! wraps as `Some` implicitly, `x == null` / `x != null` test the tag, and a
 //! `null` arm matches the empty case in `match`.
 //!
-//! Error sets are Zig-style (`type Io = error { NotFound, };`): plain
-//! uppercase variants with no payloads yet. `Io.NotFound` is an error value;
-//! `Io!u64` (or `!u64` for the inferred set) is a fallible value. `try expr`
-//! unwraps or returns the error from the enclosing fallible function;
-//! `expr catch fallback` handles it inline. `E!void` marks fallible side
-//! effects (`main` itself stays infallible).
+//! Error sets are Zig-style (`type Io = error { NotFound, Missing(String), };`)
+//! with uppercase variants and optional payloads. `Io.NotFound` is a plain
+//! error code; payloads are carried by fallible values such as `Io!u64` (or
+//! `!u64` for the inferred set). `try expr` unwraps or returns the error from
+//! the enclosing fallible function; `expr catch fallback` handles it inline.
+//! Plain error-set matches can omit `else` when they cover every variant;
+//! fallible matches need `else` for the success value. `E!void` marks fallible
+//! side effects (`main` itself stays infallible).
 //! Semicolons are mandatory: every binding, every `return`, and every
 //! expression statement ends with `;` (no bare trailing value like Rust).
 //! There are no implicit returns: a function yields a value only through an
@@ -386,8 +337,9 @@ pub enum Stmt {
     /// Union match: `match (scrut) { Union.Variant(binds) { ... } else { ... } }`.
     /// Each arm's path is `Union.Variant` (2+ segments; the last names the
     /// variant, the rest the union). Bindings are implicit `val`s bound to the
-    /// variant payloads positionally. Arm bodies are brace blocks; `else` is
-    /// required in this milestone (full exhaustiveness is a follow-up).
+    /// variant payloads positionally. Arm bodies are brace blocks; plain union
+    /// matches need `else` only when they do not cover every variant. Matches
+    /// on fallible values always need `else` for the success value.
     Match {
         scrutinee: Expr,
         arms: Vec<MatchArm>,
