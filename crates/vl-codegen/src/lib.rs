@@ -1125,6 +1125,9 @@ struct NaraEmit {
     blob: Vec<u8>,
     values: Vec<u64>,
     value_index: std::collections::HashMap<u64, usize>,
+    /// Pool indices keyed by exact string bytes and interned function names.
+    string_index: std::collections::HashMap<Vec<u8>, usize>,
+    function_index: std::collections::HashMap<(usize, usize), usize>,
     constants: Vec<NaraConstant>,
     /// Shared native constant for String equality operators across functions.
     string_eq_fn_idx: Option<usize>,
@@ -1322,6 +1325,9 @@ impl NaraEmit {
     }
 
     fn add_string(&mut self, value: &[u8], span: Span) -> Option<usize> {
+        if let Some(idx) = self.string_index.get(value) {
+            return Some(*idx);
+        }
         let offset = self.blob.len();
         self.blob.extend_from_slice(value);
         let idx = self.constants.len();
@@ -1338,6 +1344,7 @@ impl NaraEmit {
             );
             return None;
         }
+        self.string_index.insert(value.to_vec(), idx);
         Some(idx)
     }
 
@@ -1710,6 +1717,8 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
         blob: Vec::new(),
         values: Vec::new(),
         value_index: std::collections::HashMap::new(),
+        string_index: std::collections::HashMap::new(),
+        function_index: std::collections::HashMap::new(),
         constants: Vec::new(),
         string_eq_fn_idx: None,
         bytecode: Vec::new(),
@@ -1789,16 +1798,8 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
     let std_idx = e.add_string(b"std", Span::empty(0)).unwrap_or(0);
     let print_idx = e.add_string(b"print", Span::empty(0)).unwrap_or(0);
     let print_u64_idx = e.add_string(b"print_u64", Span::empty(0)).unwrap_or(0);
-    let print_fn_idx = e.constants.len();
-    e.constants.push(NaraConstant::Function {
-        module: std_idx,
-        function: print_idx,
-    });
-    let print_u64_fn_idx = e.constants.len();
-    e.constants.push(NaraConstant::Function {
-        module: std_idx,
-        function: print_u64_idx,
-    });
+    let print_fn_idx = nara_push_fn_const(&mut e, std_idx, print_idx)?;
+    let print_u64_fn_idx = nara_push_fn_const(&mut e, std_idx, print_u64_idx)?;
 
     // Pre-pass: intern every user function name plus a function constant so
     // recursive calls resolve even when the callee is emitted later. `main`
@@ -2165,6 +2166,9 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
 /// Push a `Function{module, function}` constant with the shared pool-limit
 /// diagnostic (E405) instead of silently overflowing the 16-bit index space.
 fn nara_push_fn_const(e: &mut NaraEmit, module: usize, function: usize) -> Option<usize> {
+    if let Some(idx) = e.function_index.get(&(module, function)) {
+        return Some(*idx);
+    }
     let idx = e.constants.len();
     e.constants
         .push(NaraConstant::Function { module, function });
@@ -2177,6 +2181,7 @@ fn nara_push_fn_const(e: &mut NaraEmit, module: usize, function: usize) -> Optio
         );
         return None;
     }
+    e.function_index.insert((module, function), idx);
     Some(idx)
 }
 
@@ -6052,11 +6057,83 @@ pub fn reg_oob(span: Span, reg: u32) -> Diagnostic {
 mod tests {
     use super::*;
 
+    #[test]
+    fn constants_are_interned_by_exact_identity() {
+        let mut e = empty_emitter();
+        let span = Span::empty(0);
+        for bytes in [b"".as_slice(), b"hello", b"hello\0", b"\xff"] {
+            let first = e.add_string(bytes, span).expect("string constant");
+            let owned = bytes.to_vec();
+            assert_eq!(e.add_string(&owned, span), Some(first));
+        }
+        assert_eq!(e.constants.len(), 4);
+        assert_eq!(e.blob, b"hellohello\0\xff");
+
+        // Numeric constants share raw bits, including across source types.
+        // Signed zero and distinct NaN payloads must retain their identities.
+        for bits in [
+            0,
+            1,
+            (-0.0f64).to_bits(),
+            0x7ff8_0000_0000_0001,
+            0x7ff8_0000_0000_0002,
+        ] {
+            let first = e.add_value(bits, span).expect("value constant");
+            assert_eq!(e.add_value(bits, span), Some(first));
+        }
+        assert_eq!(e.values.len(), 5);
+        assert_eq!(e.constants.len(), 9);
+
+        let module = e.add_string(b"std", span).expect("module name");
+        let other_module = e.add_string(b"other", span).expect("other module name");
+        let name = e.add_string(b"print", span).expect("function name");
+        let first = nara_push_fn_const(&mut e, module, name).expect("function constant");
+        assert_eq!(nara_push_fn_const(&mut e, module, name), Some(first));
+        assert_ne!(nara_push_fn_const(&mut e, other_module, name), Some(first));
+        assert_eq!(e.constants.len(), 14);
+        assert!(e.diags.is_empty());
+    }
+
+    #[test]
+    fn repeated_literals_share_the_serialized_pool_across_functions() {
+        fn pool(src: &str) -> Vec<u8> {
+            let (artifact, diags) = NaraVmTarget.emit(&lir_of(src));
+            assert!(diags.is_empty(), "{diags:?}");
+            let bytes = artifact.expect("artifact").bytes.expect("VM file");
+            let u32_at = |offset| {
+                u32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("u32 field"))
+                    as usize
+            };
+            let blob_header = 16 + u32_at(12) * 8;
+            let tags_header = (blob_header + 4 + u32_at(blob_header) + 3) & !3;
+            let count = u32_at(tags_header);
+            let payload = (tags_header + 4 + count + 3) & !3;
+            let end = payload
+                + bytes[tags_header + 4..tags_header + 4 + count]
+                    .iter()
+                    .map(|tag| if *tag == 1 { 4 } else { 8 })
+                    .sum::<usize>();
+            bytes[..end].to_vec()
+        }
+        let once =
+            "fun helper() { std.print(\"shared\"); std.print_u64(42); } fun main() { helper(); }";
+        let mut repeated = String::from(
+            "fun helper() { std.print(\"shared\"); std.print_u64(42); } fun main() { helper();",
+        );
+        for _ in 0..1000 {
+            repeated.push_str("std.print(\"shared\"); std.print_u64(42);");
+        }
+        repeated.push('}');
+        assert_eq!(pool(once), pool(&repeated));
+    }
+
     fn empty_emitter() -> NaraEmit {
         NaraEmit {
             blob: Vec::new(),
             values: Vec::new(),
             value_index: std::collections::HashMap::new(),
+            string_index: std::collections::HashMap::new(),
+            function_index: std::collections::HashMap::new(),
             constants: Vec::new(),
             string_eq_fn_idx: None,
             bytecode: Vec::new(),
@@ -6850,13 +6927,17 @@ fun main() {
             let mut e = empty_emitter();
             e.constants
                 .resize_with(u16::MAX as usize, || NaraConstant::Value { value_idx: 0 });
-            let add = |e: &mut NaraEmit| match kind {
-                0 => e.add_string(b"s", Span::empty(0)),
-                1 => e.add_value(e.values.len() as u64, Span::empty(0)),
-                _ => nara_push_fn_const(e, 0, 0),
+            let add = |e: &mut NaraEmit, identity: u64| match kind {
+                0 => e.add_string(identity.to_string().as_bytes(), Span::empty(0)),
+                1 => e.add_value(identity, Span::empty(0)),
+                _ => nara_push_fn_const(e, 0, identity as usize),
             };
-            assert_eq!(add(&mut e), Some(65535));
-            assert_eq!(add(&mut e), None);
+            assert_eq!(add(&mut e, 0), Some(65535));
+            // A full pool can still reuse an existing constant of any kind.
+            assert_eq!(add(&mut e, 0), Some(65535));
+            assert_eq!(e.constants.len(), 65536);
+            assert!(e.diags.is_empty());
+            assert_eq!(add(&mut e, 1), None);
             assert!(e.diags.iter().any(|d| d.code.as_deref() == Some("E405")));
         }
     }

@@ -2350,3 +2350,17 @@ fn more_than_256_string_and_value_constants_compile() {
     assert!(diags.is_empty(), "{diags:?}");
     assert!(artifact.is_some());
 }
+
+#[test]
+fn repeated_string_literals_do_not_exhaust_the_constant_pool() {
+    use vl_codegen::Target;
+    let mut src = String::from("use std; fun main() {");
+    for _ in 0..1000 {
+        src.push_str("std.print(\"same string\"); std.print_u64(42);");
+    }
+    src.push('}');
+    let lir = frontend(&src).expect("repeated constants must compile");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(artifact.is_some());
+}
