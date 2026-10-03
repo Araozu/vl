@@ -2319,3 +2319,34 @@ fn checked_call_sets_are_typed() {
         "std.fs must be emittable on naravm"
     );
 }
+
+#[test]
+fn more_than_256_string_and_value_constants_compile() {
+    use vl_codegen::Target;
+    let mut src = String::from("use std; use std.string; use std.fs; use std.net.tcp; type Io = error { Failed }; type Choice = union { A(u64), B }; fun main() {");
+    for i in 0..300 {
+        src.push_str(&format!("std.print(\"string {i}\"); std.print_u64({i});"));
+    }
+    // Exercise loads in arrays, float comparisons, union and fallible tags,
+    // and checked native status dispatch after crossing the u8 boundary.
+    src.push_str(
+        r#"
+        val a = [1u64, 2u64];
+        std.print_u64(a[1]);
+        if (1.0f64 == 1.0f64) { std.println("equal"); }
+        val choice = Choice.A(42u64);
+        match (choice) { Choice.A(v) { std.print_u64(v); } else {} }
+        val result: Io!u64 = Io.Failed;
+        std.print_u64(result catch 7u64);
+        val byte = string.byte_at("hi", 0u64) catch 0u8;
+        byte;
+        std.print(fs.read_file("missing") catch "fallback");
+        val socket = tcp.connect("localhost", 1u64) catch 0u64;
+        socket;
+    }"#,
+    );
+    let lir = frontend(&src).expect("large constant pool must compile");
+    let (artifact, diags) = vl_codegen::NaraVmTarget.emit(&lir);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(artifact.is_some());
+}

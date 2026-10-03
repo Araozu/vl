@@ -843,18 +843,10 @@ fn nara_fallible_tag(e: &mut NaraEmit, dst: u8, tag: u64, span: Span) -> bool {
     let Some(idx) = e.add_value(tag, span) else {
         return false;
     };
-    let Ok(idx) = u8::try_from(idx) else {
-        e.diags.push(
-            Diagnostic::error("Naravm value pool exhausted (compiler bug)")
-                .with_label(span, "fallible allocated here")
-                .with_code("E500"),
-        );
-        return false;
-    };
     let Some(rv) = e.fresh_rv(span) else {
         return false;
     };
-    e.bytecode.extend_from_slice(&[0x02, rv, idx]); // lv
+    e.load_constant(false, rv, idx);
     e.bytecode.extend_from_slice(&[0x2d, dst, 0, rv]); // setvati
     e.free_rv.push(rv);
     true
@@ -1337,11 +1329,11 @@ impl NaraEmit {
             offset,
             len: value.len(),
         });
-        if idx > u8::MAX as usize {
+        if idx > u16::MAX as usize {
             self.diags.push(
-                Diagnostic::error("Naravm constant pool has more than 256 entries")
+                Diagnostic::error("Naravm constant pool has more than 65536 entries")
                     .with_label(span, "defined here")
-                    .with_note("String references use an 8-bit constant index")
+                    .with_note("String references use a 16-bit constant index")
                     .with_code("E405"),
             );
             return None;
@@ -1358,16 +1350,30 @@ impl NaraEmit {
         let idx = self.constants.len();
         self.constants.push(NaraConstant::Value { value_idx });
         self.value_index.insert(bits, idx);
-        if idx > u8::MAX as usize {
+        if idx > u16::MAX as usize {
             self.diags.push(
-                Diagnostic::error("Naravm constant pool has more than 256 entries")
+                Diagnostic::error("Naravm constant pool has more than 65536 entries")
                     .with_label(span, "defined here")
-                    .with_note("value references use an 8-bit constant index")
+                    .with_note("value references use a 16-bit constant index")
                     .with_code("E405"),
             );
             return None;
         }
         Some(idx)
+    }
+
+    /// Use compact loads for low indices and the VM's big-endian u16 loads
+    /// for the rest. Constant insertion validates the index before emission.
+    fn load_constant(&mut self, is_ref: bool, reg: u8, idx: usize) {
+        if let Ok(idx) = u8::try_from(idx) {
+            self.bytecode
+                .extend_from_slice(&[if is_ref { 0x03 } else { 0x02 }, reg, idx]);
+        } else {
+            let idx = u16::try_from(idx).expect("constant insertion validates the u16 index");
+            self.bytecode
+                .extend_from_slice(&[if is_ref { 0x0d } else { 0x0c }, reg]);
+            put_u16(&mut self.bytecode, idx);
+        }
     }
 
     fn ensure_one(&mut self, span: Span) -> Option<u8> {
@@ -1377,7 +1383,7 @@ impl NaraEmit {
             None => self.fresh_rv(span)?,
         };
         // Reload at each use: the first use may be in a skipped branch.
-        self.bytecode.extend_from_slice(&[0x02, rv, idx as u8]);
+        self.load_constant(false, rv, idx);
         self.one_rv = Some(rv);
         Some(rv)
     }
@@ -1391,7 +1397,7 @@ impl NaraEmit {
             None => self.fresh_rv(span)?,
         };
         // Reload at each use: the first use may be in a skipped branch.
-        self.bytecode.extend_from_slice(&[0x02, rv, idx as u8]);
+        self.load_constant(false, rv, idx);
         self.zero_rv = Some(rv);
         Some(rv)
     }
@@ -1403,7 +1409,7 @@ impl NaraEmit {
             None => self.fresh_rv(span)?,
         };
         // Reload at each use: the first use may be in a skipped branch.
-        self.bytecode.extend_from_slice(&[0x02, rv, idx as u8]);
+        self.load_constant(false, rv, idx);
         self.bias_rv = Some(rv);
         Some(rv)
     }
@@ -2157,16 +2163,16 @@ fn nara_vmfile(prog: &LirProgram, diags: &mut Vec<Diagnostic>) -> Option<Vec<u8>
 }
 
 /// Push a `Function{module, function}` constant with the shared pool-limit
-/// diagnostic (E405) instead of silently overflowing the 8-bit index space.
+/// diagnostic (E405) instead of silently overflowing the 16-bit index space.
 fn nara_push_fn_const(e: &mut NaraEmit, module: usize, function: usize) -> Option<usize> {
     let idx = e.constants.len();
     e.constants
         .push(NaraConstant::Function { module, function });
-    if idx > u8::MAX as usize {
+    if idx > u16::MAX as usize {
         e.diags.push(
-            Diagnostic::error("Naravm constant pool has more than 256 entries")
+            Diagnostic::error("Naravm constant pool has more than 65536 entries")
                 .with_label(Span::empty(0), "defined here")
-                .with_note("function references use an 8-bit constant index")
+                .with_note("function references use a 16-bit constant index")
                 .with_code("E405"),
         );
         return None;
@@ -2581,7 +2587,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             };
             e.rv_map.insert(*dst, rv);
             e.kinds.insert(*dst, kind);
-            e.bytecode.extend_from_slice(&[0x02, rv, idx as u8]); // lv
+            e.load_constant(false, rv, idx);
         }
         Instr::StringConst { dst, value, span } => {
             if !e.last_use.contains_key(dst) {
@@ -2599,7 +2605,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
             };
             e.rf_map.insert(*dst, rf);
             e.kinds.insert(*dst, NaraKind::String);
-            e.bytecode.extend_from_slice(&[0x03, rf, idx as u8]); // lrf
+            e.load_constant(true, rf, idx);
         }
         Instr::Param { dst, index, span } => {
             if ctx.is_main {
@@ -2856,7 +2862,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                     e.invalid.insert(*dst);
                     return;
                 };
-                e.bytecode.extend_from_slice(&[0x03, nl, idx as u8]); // lrf
+                e.load_constant(true, nl, idx);
                 e.bytecode.extend_from_slice(&[0x05, 0x31, nl]); // cprf rf31, nl
                 nara_calli(e, ctx.print_fn_idx, *span);
                 // The newline register is a backend temporary, not a LIR
@@ -3036,7 +3042,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                     e.invalid.insert(*dst);
                     return;
                 };
-                e.bytecode.extend_from_slice(&[0x02, s, len_idx as u8]); // lv
+                e.load_constant(false, s, len_idx);
                 let (Some(value_count), Some(len)) =
                     (e.ensure_one(*span), e.add_value(elems.len() as u64, *span))
                 else {
@@ -3047,8 +3053,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                     e.invalid.insert(*dst);
                     return;
                 };
-                e.bytecode
-                    .extend_from_slice(&[0x02, logical_len, len as u8]); // lv logical length
+                e.load_constant(false, logical_len, len); // lv logical length
                 if is_ref {
                     e.bytecode.extend_from_slice(&[0x26, rf, value_count, s]); // create
                 } else {
@@ -3068,7 +3073,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                     e.invalid.insert(*dst);
                     return;
                 };
-                e.bytecode.extend_from_slice(&[0x02, length, len_idx as u8]); // lv length
+                e.load_constant(false, length, len_idx); // lv length
                 e.bytecode.extend_from_slice(&[0x2d, rf, 0, length]); // set length header
                 e.free_rv.push(length);
                 None
@@ -3087,7 +3092,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                     e.invalid.insert(*dst);
                     return;
                 };
-                e.bytecode.extend_from_slice(&[0x02, length, len_idx as u8]); // lv length
+                e.load_constant(false, length, len_idx); // lv length
                 e.bytecode.extend_from_slice(&[0x2d, rf, 0, length]); // set length header
                 e.free_rv.push(length);
                 None
@@ -3129,7 +3134,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                             e.invalid.insert(*dst);
                             return;
                         };
-                        e.bytecode.extend_from_slice(&[0x02, s, idx as u8]); // lv
+                        e.load_constant(false, s, idx);
                         e.bytecode.extend_from_slice(&[0x2b, rf, s, v]); // setrfat
                     }
                     // The array now references the copy; recycle the temp.
@@ -3150,7 +3155,7 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                             e.invalid.insert(*dst);
                             return;
                         };
-                        e.bytecode.extend_from_slice(&[0x02, s, idx as u8]); // lv
+                        e.load_constant(false, s, idx);
                         e.bytecode.extend_from_slice(&[0x29, rf, s, v]); // setvat
                     }
                 }
@@ -3839,20 +3844,11 @@ fn nara_instr(e: &mut NaraEmit, ins: &Instr, ctx: &NaraFnCtx) {
                 e.invalid.insert(*dst);
                 return;
             };
-            let Ok(tag_idx) = u8::try_from(tag_idx) else {
-                e.diags.push(
-                    Diagnostic::error("Naravm value pool exhausted (compiler bug)")
-                        .with_label(*span, "variant allocated here")
-                        .with_code("E500"),
-                );
-                e.invalid.insert(*dst);
-                return;
-            };
             let Some(tag_rv) = e.fresh_rv(*span) else {
                 e.invalid.insert(*dst);
                 return;
             };
-            e.bytecode.extend_from_slice(&[0x02, tag_rv, tag_idx]); // lv
+            e.load_constant(false, tag_rv, tag_idx);
             e.bytecode.extend_from_slice(&[0x2d, rf, 0, tag_rv]); // setvati
             e.free_rv.push(tag_rv);
             for (i, arg) in args.iter().enumerate() {
@@ -4792,20 +4788,10 @@ fn nara_tcp_call(
             e.invalid.insert(dst);
             return;
         };
-        let (Ok(status_idx), Ok(code_idx)) = (u8::try_from(status_idx), u8::try_from(code_idx))
-        else {
-            e.diags.push(
-                Diagnostic::error("Naravm constant pool exhausted (compiler bug)")
-                    .with_label(span, "call emitted here")
-                    .with_code("E500"),
-            );
-            e.invalid.insert(dst);
-            return;
-        };
-        e.bytecode.extend_from_slice(&[0x02, sc, status_idx]); // lv
+        e.load_constant(false, sc, status_idx);
         e.bytecode.extend_from_slice(&[0x0a, tt, status, sc]); // eq
         let to_next = nara_emit_jz(e, tt);
-        e.bytecode.extend_from_slice(&[0x02, code, code_idx]); // lv
+        e.load_constant(false, code, code_idx);
         to_have_code.push(nara_emit_jmp(e));
         if !nara_patch_jump(e, to_next, 4, e.bytecode.len(), span) {
             e.invalid.insert(dst);
@@ -4821,16 +4807,7 @@ fn nara_tcp_call(
         e.invalid.insert(dst);
         return;
     };
-    let Ok(fallthrough_idx) = u8::try_from(fallthrough_idx) else {
-        e.diags.push(
-            Diagnostic::error("Naravm constant pool exhausted (compiler bug)")
-                .with_label(span, "call emitted here")
-                .with_code("E500"),
-        );
-        e.invalid.insert(dst);
-        return;
-    };
-    e.bytecode.extend_from_slice(&[0x02, code, fallthrough_idx]); // lv
+    e.load_constant(false, code, fallthrough_idx);
     let have_code = e.bytecode.len();
     for jmp in to_have_code {
         if !nara_patch_jump(e, jmp, 3, have_code, span) {
@@ -5310,20 +5287,10 @@ fn nara_checked_call(
             e.invalid.insert(dst);
             return;
         };
-        let (Ok(status_idx), Ok(code_idx)) = (u8::try_from(status_idx), u8::try_from(code_idx))
-        else {
-            e.diags.push(
-                Diagnostic::error("Naravm constant pool exhausted (compiler bug)")
-                    .with_label(span, "call emitted here")
-                    .with_code("E500"),
-            );
-            e.invalid.insert(dst);
-            return;
-        };
-        e.bytecode.extend_from_slice(&[0x02, sc, status_idx]); // lv
+        e.load_constant(false, sc, status_idx);
         e.bytecode.extend_from_slice(&[0x0a, tt, status, sc]); // eq
         let to_next = nara_emit_jz(e, tt);
-        e.bytecode.extend_from_slice(&[0x02, code, code_idx]); // lv
+        e.load_constant(false, code, code_idx);
         to_have_code.push(nara_emit_jmp(e));
         if !nara_patch_jump(e, to_next, 4, e.bytecode.len(), span) {
             e.invalid.insert(dst);
@@ -5335,16 +5302,7 @@ fn nara_checked_call(
         e.invalid.insert(dst);
         return;
     };
-    let Ok(fallthrough_idx) = u8::try_from(fallthrough_idx) else {
-        e.diags.push(
-            Diagnostic::error("Naravm constant pool exhausted (compiler bug)")
-                .with_label(span, "call emitted here")
-                .with_code("E500"),
-        );
-        e.invalid.insert(dst);
-        return;
-    };
-    e.bytecode.extend_from_slice(&[0x02, code, fallthrough_idx]); // lv
+    e.load_constant(false, code, fallthrough_idx);
     let have_code = e.bytecode.len();
     for jmp in to_have_code {
         if !nara_patch_jump(e, jmp, 3, have_code, span) {
@@ -5930,15 +5888,7 @@ fn nara_float_eq(e: &mut NaraEmit, dst: u8, lhs: u8, rhs: u8, negate: bool, span
     let Some(inf_idx) = e.add_value(0x7ff0_0000_0000_0000, span) else {
         return;
     };
-    let Ok(inf_idx) = u8::try_from(inf_idx) else {
-        e.diags.push(
-            Diagnostic::error("Naravm constant pool exhausted (compiler bug)")
-                .with_label(span, "floating equality emitted here")
-                .with_code("E500"),
-        );
-        return;
-    };
-    e.bytecode.extend_from_slice(&[0x02, mask, inf_idx]);
+    e.load_constant(false, mask, inf_idx);
     e.bytecode.extend_from_slice(&[0x10, flag, mask, abs_a]); // lhs abs > +infinity => NaN
     e.bytecode.extend_from_slice(&[0x12, flag, flag, one]); // lhs is not NaN
     e.bytecode.extend_from_slice(&[0x36, dst, dst, flag]);
@@ -6871,19 +6821,56 @@ fun main() {
     }
 
     #[test]
-    fn naravm_rejects_constant_pool_indices_that_do_not_fit() {
-        let mut src = String::from("fun main() {");
-        for i in 0..252 {
-            src.push_str(&format!("val s{i} = \"s{i}\";"));
+    fn constant_loads_choose_width_and_encode_big_endian_indices() {
+        let mut e = empty_emitter();
+        for (idx, value, reference) in [
+            (255, vec![0x02, 1, 0xff], vec![0x03, 0x21, 0xff]),
+            (256, vec![0x0c, 1, 1, 0], vec![0x0d, 0x21, 1, 0]),
+            (
+                0x1234,
+                vec![0x0c, 1, 0x12, 0x34],
+                vec![0x0d, 0x21, 0x12, 0x34],
+            ),
+            (
+                65535,
+                vec![0x0c, 1, 0xff, 0xff],
+                vec![0x0d, 0x21, 0xff, 0xff],
+            ),
+        ] {
+            e.bytecode.clear();
+            e.load_constant(false, 1, idx);
+            e.load_constant(true, 0x21, idx);
+            assert_eq!(e.bytecode, [value, reference].concat());
         }
-        src.push_str("std.print(\"target\");}");
-        let lir = lir_of(&src);
-        let (artifact, diags) = NaraVmTarget.emit(&lir);
-        assert!(artifact.is_none());
-        assert!(
-            diags.iter().any(|d| d.code.as_deref() == Some("E405")),
-            "{diags:?}"
-        );
+    }
+
+    #[test]
+    fn constant_pool_accepts_u16_max_and_rejects_overflow() {
+        for kind in 0..3 {
+            let mut e = empty_emitter();
+            e.constants
+                .resize_with(u16::MAX as usize, || NaraConstant::Value { value_idx: 0 });
+            let add = |e: &mut NaraEmit| match kind {
+                0 => e.add_string(b"s", Span::empty(0)),
+                1 => e.add_value(e.values.len() as u64, Span::empty(0)),
+                _ => nara_push_fn_const(e, 0, 0),
+            };
+            assert_eq!(add(&mut e), Some(65535));
+            assert_eq!(add(&mut e), None);
+            assert!(e.diags.iter().any(|d| d.code.as_deref() == Some("E405")));
+        }
+    }
+
+    #[test]
+    fn naravm_emits_more_than_256_constants() {
+        let mut src = String::from("fun main() {");
+        for i in 0..300 {
+            src.push_str(&format!("std.print(\"s{i}\"); std.print_u64({i});"));
+        }
+        src.push('}');
+        let (artifact, diags) = NaraVmTarget.emit(&lir_of(&src));
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(artifact.is_some());
     }
 
     #[test]
