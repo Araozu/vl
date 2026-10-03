@@ -1,0 +1,178 @@
+id: array
+order: 5
+module: std.array
+type_names: [Array]
+source: crates/vl-stdlib/src/std/array.vl
+summary: Fixed-length array helpers for copying, searching, folding, and sorting.
+title: std.array module
+description: Array algorithms in the VL standard library.
+intro: |
+  `std.array` adds algorithms for VL's fixed-length `Array[T]`. Functions
+  that inspect values take a read-only array view; functions that change
+  elements require `*Array[T]`. Arrays are shared references, while
+  `clone` allocates a separate array and copies each element.
+import_example: |
+  use std.array;
+
+  fun main() {
+      val values: *Array[u64] = [3u64, 1u64, 2u64];
+      array.sort(values);
+      val total = array.sum_u64(values);
+  }
+functions:
+  - name: is_empty
+    params:
+      - name: a
+        detail: Array to inspect.
+    detail: Returns true when the array length is zero.
+    example: |
+      val empty_array: Array[u64] = [];
+      val empty = array.is_empty(empty_array);
+  - name: clone
+    params:
+      - name: a
+        detail: Array whose elements are copied.
+    detail: Allocates a new mutable array of the same length and copies elements into it. The new array can be changed independently; reference-valued elements still refer to the same objects.
+    example: |
+      val values: *Array[u64] = [3u64, 1u64, 2u64];
+      val duplicate = array.clone(values);
+  - name: slice
+    params:
+      - name: source
+        detail: Array to copy a range from.
+      - name: start
+        detail: Inclusive start index.
+      - name: end
+        detail: Exclusive end index.
+    returns:
+      detail: New array containing the selected range, or `ArrayError.InvalidRange` if `start > end` or `end > source.len`.
+    detail: Copies the range `start..end` into a new mutable array. Empty ranges are valid, including `source.len..source.len`.
+    example: |
+      val source: *Array[u64] = [3u64, 1u64, 2u64];
+      val part = array.slice(source, 1u64, 3u64) catch Array.new::[u64](0u64);
+  - name: concat
+    params:
+      - name: left
+        detail: First array.
+      - name: right
+        detail: Second array.
+    returns:
+      detail: New concatenated array, or `ArrayError.Overflow` if the combined length exceeds `u64::MAX`.
+    detail: Allocates a new array and copies the elements from `left` followed by `right`. The source arrays are unchanged.
+    example: |
+      val left: *Array[u64] = [1u64, 2u64];
+      val right: *Array[u64] = [3u64];
+      val all = array.concat(left, right) catch Array.new::[u64](0u64);
+  - name: copy
+    params:
+      - name: source
+        detail: Array to copy from.
+      - name: destination
+        detail: Writable array to copy into.
+      - name: destination_start
+        detail: Destination offset for the first copied element.
+    detail: Copies all elements if they fit starting at `destination_start`; otherwise returns false and makes no writes. Arrays remain fixed length. Copying overlapping ranges in the same array proceeds from low to high indices, so use a temporary clone if overlap matters.
+    example: |
+      val source: *Array[u64] = [3u64, 1u64];
+      var destination: *Array[u64] = Array.new::[u64](3u64);
+      val copied = array.copy(source, destination, 1u64);
+  - name: fill
+    params:
+      - name: a
+        detail: Array to fill.
+      - name: value
+        detail: Value written at every index.
+    detail: Replaces every element with `value`; an empty array performs no writes.
+    example: |
+      var values: *Array[u64] = [3u64, 1u64, 2u64];
+      array.fill(values, 0u64);
+  - name: reverse
+    params:
+      - name: a
+        detail: Array to reverse in place.
+    detail: Reverses the element order in place. Empty and one-element arrays are unchanged.
+    example: |
+      var values: *Array[u64] = [3u64, 1u64, 2u64];
+      array.reverse(values);
+  - name: find
+    params:
+      - name: a
+        detail: Array to search.
+      - name: value
+        detail: Value to compare.
+    returns:
+      detail: First matching index, or `a.len` when the value is absent.
+    detail: Returns the index of the first element equal to `value`; values use VL `==` equality.
+    example: |
+      val values: *Array[u64] = [3u64, 8u64, 2u64];
+      val index = array.find(values, 8u64);
+  - name: contains
+    params:
+      - name: a
+        detail: Array to search.
+      - name: value
+        detail: Value to compare.
+    detail: Returns whether any element equals `value` under VL `==` equality.
+    example: |
+      val values: *Array[u64] = [3u64, 8u64, 2u64];
+      val found = array.contains(values, 8u64);
+  - name: equal
+    params:
+      - name: a
+        detail: First array.
+      - name: b
+        detail: Second array.
+    detail: Returns true when lengths match and every pair of elements compares equal with `==`.
+    example: |
+      val left: *Array[u64] = [1u64, 2u64];
+      val right: *Array[u64] = [1u64, 2u64];
+      val same = array.equal(left, right);
+  - name: sum_u64
+    params:
+      - name: a
+        detail: Unsigned integer array to add.
+    detail: Adds all values from left to right. The empty array returns zero; arithmetic follows VL `u64` overflow behavior.
+    example: |
+      val values: *Array[u64] = [1u64, 2u64, 3u64];
+      val total = array.sum_u64(values);
+  - name: sum_i64
+    params:
+      - name: a
+        detail: Signed integer array to add.
+    detail: Adds all values from left to right. The empty array returns zero; arithmetic follows VL `i64` overflow behavior.
+    example: |
+      val values: *Array[i64] = [1i64, -2i64, 3i64];
+      val total = array.sum_i64(values);
+  - name: min
+    params:
+      - name: a
+        detail: Numeric array to inspect.
+      - name: fallback
+        detail: Value to return when the array is empty.
+    detail: Returns the smallest element, or `fallback` for an empty array. Naravm currently lowers numeric ordering for `u64`, `i64`, and `u8`; `f64` ordering still needs backend support.
+    example: |
+      val values: *Array[u64] = [1u64, 2u64, 3u64];
+      val smallest = array.min(values, 0u64);
+  - name: max
+    params:
+      - name: a
+        detail: Numeric array to inspect.
+      - name: fallback
+        detail: Value to return when the array is empty.
+    detail: Returns the largest element, or `fallback` for an empty array. Naravm currently lowers numeric ordering for `u64`, `i64`, and `u8`; `f64` ordering still needs backend support.
+    example: |
+      val values: *Array[u64] = [1u64, 2u64, 3u64];
+      val largest = array.max(values, 0u64);
+  - name: sort
+    params:
+      - name: a
+        detail: Numeric array to sort.
+    detail: Sorts elements in ascending order in place using stable insertion sort. It is O(n²) and requires a writable array view. Naravm currently lowers numeric ordering for `u64`, `i64`, and `u8`; `f64` ordering still needs backend support.
+    example: |
+      var values: *Array[u64] = [3u64, 1u64, 2u64];
+      array.sort(values);
+errors:
+  - name: ArrayError
+    detail: "`slice` returns `InvalidRange` for reversed or out-of-bounds endpoints. `concat` returns `Overflow` when the combined length cannot fit in `u64`."
+outro: |
+  Arrays have a fixed length. Growth can be built by allocating a new array and copying elements, but each resize costs a full copy; a VM resize operation could make that cheaper.

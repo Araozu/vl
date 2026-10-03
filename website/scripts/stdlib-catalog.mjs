@@ -22,6 +22,7 @@ export function mergeCatalog(api, editorial) {
       id: prose?.id ?? leaf,
       order: prose?.order ?? editorial.length + index + 1,
       module: module.module,
+      type_names: prose?.type_names ?? [],
       source: prose?.source,
       summary: prose?.summary ?? `Functions exported by ${module.module}.`,
       title: prose?.title ?? `${module.module} module`,
@@ -57,7 +58,7 @@ export function mergeCatalog(api, editorial) {
     };
   });
   if (new Set(result.map((module) => module.id)).size !== result.length) {
-    throw new Error('Duplicate stdlib page IDs; assign unique IDs in stdlib.yaml.');
+    throw new Error('Duplicate stdlib page IDs; assign unique IDs in src/data/stdlib/*.yaml.');
   }
   return result;
 }

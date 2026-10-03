@@ -1,0 +1,39 @@
+id: std
+order: 1
+module: std
+summary: Output functions for command-line programs.
+title: std module
+description: Standard output functions for VL programs.
+intro: |
+  `std` contains the output functions available on the Naravm target.
+  Import the module before calling its functions:
+import_example: |
+  use std;
+
+  fun main() {
+      std.println("Hello, world!");
+  }
+functions:
+  - name: print
+    params:
+      - name: value
+        detail: Byte string to write. No newline is added.
+    detail: Writes a string to standard output without adding a newline.
+    example: |
+      std.print("ready");
+  - name: println
+    params:
+      - name: value
+        detail: Byte string to write.
+    detail: Writes a string to standard output followed by a newline.
+    example: |
+      std.println("ready");
+  - name: print_u64
+    params:
+      - name: value
+        detail: Unsigned integer to write.
+    detail: Writes an unsigned integer to standard output.
+    example: |
+      std.print_u64(42u64);
+outro: |
+  The module has no VL source file; these functions are target-provided.

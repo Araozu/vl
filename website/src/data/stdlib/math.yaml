@@ -1,0 +1,206 @@
+id: math
+order: 7
+module: std.math
+source: crates/vl-stdlib/src/std/math.vl
+summary: Native remainder plus generic comparisons, integer helpers, and checked unsigned arithmetic.
+title: std.math module
+description: Numeric operations and helpers in the VL standard library.
+intro: |
+  `std.math` contains one target-native remainder operation and helpers
+  written in VL. Checked multiplication, least common multiple, and
+  exponentiation return `MathError!u64` on overflow.
+import_example: |
+  use std.math;
+
+  fun main() {
+      val larger = math.max_u64(3u64, 8u64);
+  }
+functions:
+  - name: mod_u64
+    params:
+      - name: a
+        detail: Dividend.
+      - name: b
+        detail: Non-zero divisor.
+    detail: Native unsigned remainder operation.
+    example: |
+      val remainder = math.mod_u64(17u64, 5u64);
+  - name: max_u64
+    params:
+      - name: a
+        detail: First value.
+      - name: b
+        detail: Second value.
+    detail: VL helper returning the larger unsigned integer.
+    example: |
+      val larger = math.max_u64(3u64, 8u64);
+  - name: min_u64
+    params:
+      - name: a
+        detail: First value.
+      - name: b
+        detail: Second value.
+    detail: VL helper returning the smaller unsigned integer.
+    example: |
+      val smaller = math.min_u64(3u64, 8u64);
+  - name: clamp_u64
+    params:
+      - name: v
+        detail: Value to clamp.
+      - name: lo
+        detail: Lower bound.
+      - name: hi
+        detail: Upper bound.
+    detail: VL helper limiting a value to an inclusive range. Bounds are not validated; pass `lo <= hi`.
+    example: |
+      val bounded = math.clamp_u64(9u64, 0u64, 5u64);
+  - name: max_i64
+    params:
+      - name: a
+        detail: First value.
+      - name: b
+        detail: Second value.
+    detail: VL helper returning the larger signed integer.
+    example: |
+      val larger = math.max_i64(-3i64, 8i64);
+  - name: min_i64
+    params:
+      - name: a
+        detail: First value.
+      - name: b
+        detail: Second value.
+    detail: VL helper returning the smaller signed integer.
+    example: |
+      val smaller = math.min_i64(-3i64, 8i64);
+  - name: abs_i64
+    params:
+      - name: a
+        detail: Signed integer.
+    detail: VL helper returning the absolute value. The minimum `i64` value cannot be represented as a positive `i64` and wraps to itself.
+    example: |
+      val magnitude = math.abs_i64(-8i64);
+  - name: is_even
+    params:
+      - name: v
+        detail: Unsigned integer to test.
+    detail: VL helper testing whether a number is even.
+    example: |
+      val even = math.is_even(42u64);
+  - name: max
+    params:
+      - name: a
+        detail: First numeric value.
+      - name: b
+        detail: Second numeric value.
+    detail: Generic VL helper for any `T extends Numeric`. Naravm currently lowers numeric ordering for `u64`, `i64`, and `u8`; `f64` ordering still needs backend support.
+    example: |
+      val larger = math.max(3u64, 8u64);
+  - name: min
+    params:
+      - name: a
+        detail: First numeric value.
+      - name: b
+        detail: Second numeric value.
+    detail: Generic VL helper returning the smaller of two values whose type extends `Numeric`. Naravm currently lowers numeric ordering for `u64`, `i64`, and `u8`; `f64` ordering still needs backend support.
+    example: |
+      val smaller = math.min(3u64, 8u64);
+  - name: clamp
+    params:
+      - name: v
+        detail: Value to clamp.
+      - name: lo
+        detail: Lower bound; expected to be no greater than `hi`.
+      - name: hi
+        detail: Upper bound; expected to be no less than `lo`.
+    detail: Generic VL helper returning `v` limited to the inclusive range `lo..hi`. Bounds are not validated; pass `lo <= hi`. Naravm currently lowers numeric ordering for `u64`, `i64`, and `u8`; `f64` ordering still needs backend support.
+    example: |
+      val bounded = math.clamp(9u64, 0u64, 5u64);
+  - name: gcd_u64
+    params:
+      - name: a
+        detail: First non-negative integer.
+      - name: b
+        detail: Second non-negative integer.
+    detail: Computes the greatest common divisor with the Euclidean algorithm. `gcd_u64(0, 0)` is zero.
+    example: |
+      val divisor = math.gcd_u64(48u64, 18u64);
+  - name: checked_mul_u64
+    params:
+      - name: a
+        detail: First factor.
+      - name: b
+        detail: Second factor.
+    returns:
+      detail: Product, or `MathError.Overflow` if it exceeds `u64::MAX`.
+    detail: Multiplies unsigned integers after checking overflow.
+    example: |
+      val product = math.checked_mul_u64(6u64, 7u64) catch 0u64;
+  - name: checked_add_u64
+    params:
+      - name: a
+        detail: First unsigned integer.
+      - name: b
+        detail: Second unsigned integer.
+    returns:
+      detail: Sum, or `MathError.Overflow` if it exceeds `u64::MAX`.
+    detail: Adds unsigned integers after checking overflow.
+    example: |
+      val total = math.checked_add_u64(20u64, 22u64) catch 0u64;
+  - name: checked_sub_u64
+    params:
+      - name: a
+        detail: Minuend.
+      - name: b
+        detail: Subtrahend.
+    returns:
+      detail: Difference, or `MathError.Overflow` when `b > a`.
+    detail: Subtracts unsigned integers after checking underflow.
+    example: |
+      val difference = math.checked_sub_u64(9u64, 4u64) catch 0u64;
+  - name: checked_div_u64
+    params:
+      - name: a
+        detail: Dividend.
+      - name: b
+        detail: Divisor.
+    returns:
+      detail: Quotient, or `MathError.DivisionByZero` if `b` is zero.
+    detail: Divides unsigned integers and reports a zero divisor as a typed error.
+    example: |
+      val quotient = math.checked_div_u64(20u64, 4u64) catch 0u64;
+  - name: checked_abs_i64
+    params:
+      - name: value
+        detail: Signed integer to make non-negative.
+    returns:
+      detail: Absolute value, or `MathError.Overflow` for `i64::MIN`.
+    detail: Computes signed absolute value with an explicit error for the one value whose positive magnitude does not fit in `i64`.
+    example: |
+      val magnitude = math.checked_abs_i64(-42i64) catch 0i64;
+  - name: lcm_u64
+    params:
+      - name: a
+        detail: First non-negative integer.
+      - name: b
+        detail: Second non-negative integer.
+    returns:
+      detail: Least common multiple, or `MathError.Overflow` if it exceeds `u64::MAX`.
+    detail: Returns zero when either input is zero; otherwise divides by the greatest common divisor before checked multiplication.
+    example: |
+      val multiple = math.lcm_u64(12u64, 18u64) catch 0u64;
+  - name: pow_u64
+    params:
+      - name: base
+        detail: Value to raise.
+      - name: exponent
+        detail: Non-negative integer exponent.
+    returns:
+      detail: Power, or `MathError.Overflow` if it exceeds `u64::MAX`.
+    detail: Computes integer powers by repeated squaring. Exponent zero returns one, including `0^0`.
+    example: |
+      val square = math.pow_u64(12u64, 2u64) catch 0u64;
+errors:
+  - name: MathError
+    detail: Checked addition, subtraction, multiplication, LCM, exponentiation, and absolute value return `Overflow` when their result is out of range. Checked division returns `DivisionByZero` for a zero divisor.
+outro: |
+  The helpers are implemented in [`math.vl`](https://github.com/Araozu/vl/tree/main/crates/vl-stdlib/src/std/math.vl).

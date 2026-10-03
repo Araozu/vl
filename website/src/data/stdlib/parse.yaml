@@ -1,0 +1,55 @@
+id: parse
+order: 4
+module: std.parse
+source: crates/vl-stdlib/src/std/parse.vl
+summary: Checked parsers for signed and unsigned integers and boolean text.
+title: std.parse module
+description: Fallible parsing helpers in the VL standard library.
+intro: |
+  `std.parse` provides checked conversions from complete byte strings.
+  The parsers consume the whole input, return typed errors instead of
+  trapping, and report overflow for values outside the destination type.
+import_example: |
+  use std.parse;
+
+  fun main() {
+      val count = parse.u64("42") catch 0u64;
+      val enabled = parse.bool("true") catch false;
+  }
+functions:
+  - name: u64
+    params:
+      - name: value
+        detail: Full decimal representation to parse.
+    detail: Parses an unsigned base-10 integer. Empty input returns `Empty`; non-decimal bytes return `InvalidDigit`; values above `u64::MAX` return `Overflow`. Signs, whitespace, and trailing bytes are rejected.
+    example: |
+      val count = parse.u64("42") catch 0u64;
+  - name: hex_u64
+    params:
+      - name: value
+        detail: Full hexadecimal representation to parse.
+    detail: Parses an unsigned base-16 integer using `0`–`9`, `A`–`F`, or `a`–`f`. No `0x` prefix is accepted. Empty input returns `Empty`; invalid bytes return `InvalidDigit`; values above `u64::MAX` return `Overflow`.
+    example: |
+      val flags = parse.hex_u64("ff") catch 0u64;
+  - name: i64
+    params:
+      - name: value
+        detail: Full signed decimal representation to parse.
+    detail: Parses a signed base-10 integer, accepting one leading `-` but rejecting `+` as `InvalidSign`. Empty input or a lone minus returns `Empty`; invalid digits return `InvalidDigit`; values outside `i64::MIN..i64::MAX` return `Overflow`. The minimum signed value is handled exactly.
+    example: |
+      val delta = parse.i64("-42") catch 0i64;
+  - name: bool
+    params:
+      - name: value
+        detail: Boolean spelling to parse.
+    detail: Accepts exactly the lowercase byte strings `true` and `false`. Every other input returns `InvalidDigit`.
+    example: |
+      val enabled = parse.bool("true") catch false;
+errors:
+  - name: ParseError
+    detail: |
+      `Empty` marks empty input, `InvalidDigit` marks an unsupported byte or
+      spelling, `Overflow` marks a value too large for the destination, and
+      `InvalidSign` marks a leading plus sign in signed decimal input.
+outro: |
+  These parsers are implemented in VL over byte access and ASCII helpers, so they do not require new VM natives.

@@ -2,7 +2,7 @@ import { defineCollection } from 'astro:content';
 import { file } from 'astro/loaders';
 import { z } from 'astro/zod';
 
-// Compiler-derived catalog enriched with `src/data/stdlib.yaml` prose. Every `std` docs
+// Compiler-derived catalog enriched with `src/data/stdlib/*.yaml` prose. Every `std` docs
 // page, the section overview, and the sidebar are generated from this
 // collection, so prose and structure cannot drift apart.
 const stdlibParam = z.object({
@@ -34,6 +34,7 @@ const stdlib = defineCollection({
     id: z.string(),
     order: z.number(),
     module: z.string(),
+    type_names: z.array(z.string()),
     source: z.string().optional(),
     summary: z.string(),
     title: z.string(),

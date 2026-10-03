@@ -1,0 +1,112 @@
+id: ascii
+order: 3
+module: std.ascii
+source: crates/vl-stdlib/src/std/ascii.vl
+summary: Byte-oriented ASCII classification and case conversion.
+title: std.ascii module
+description: ASCII byte classification and case conversion helpers.
+intro: |
+  `std.ascii` classifies and changes the case of individual `u8` values, and
+  can check whether a string contains only ASCII bytes. These helpers do not
+  decode UTF-8 or apply locale-specific rules.
+import_example: |
+  use std.ascii;
+
+  fun main() {
+      val letter = ascii.is_alpha(65u8);
+      val lower = ascii.to_lower(65u8);
+  }
+functions:
+  - name: is_ascii
+    params:
+      - name: s
+        detail: String to inspect.
+    detail: Returns true when every byte is in the ASCII range 0 through 127; the empty string passes.
+    example: |
+      val ascii_only = ascii.is_ascii("plain text");
+  - name: is_alpha
+    params:
+      - name: b
+        detail: Byte to classify.
+    detail: Returns true for ASCII `A` through `Z` or `a` through `z`.
+    example: |
+      val is_letter = ascii.is_alpha(65u8);
+  - name: is_lower
+    params:
+      - name: b
+        detail: Byte to classify.
+    detail: Returns true for ASCII lowercase letters `a` through `z`.
+    example: |
+      val lower = ascii.is_lower(97u8);
+  - name: is_upper
+    params:
+      - name: b
+        detail: Byte to classify.
+    detail: Returns true for ASCII uppercase letters `A` through `Z`.
+    example: |
+      val upper = ascii.is_upper(65u8);
+  - name: is_alnum
+    params:
+      - name: b
+        detail: Byte to classify.
+    detail: Returns true for ASCII letters or decimal digits.
+    example: |
+      val alphanumeric = ascii.is_alnum(57u8);
+  - name: is_digit
+    params:
+      - name: b
+        detail: Byte to classify.
+    detail: Returns true for ASCII decimal digits `0` through `9`.
+    example: |
+      val is_number = ascii.is_digit(55u8);
+  - name: is_hex_digit
+    params:
+      - name: b
+        detail: Byte to classify.
+    detail: Returns true for ASCII decimal digits and letters `A` through `F` or `a` through `f`.
+    example: |
+      val is_hex = ascii.is_hex_digit(102u8);
+  - name: is_whitespace
+    params:
+      - name: b
+        detail: Byte to classify.
+    detail: Returns true for ASCII space, horizontal tab, line feed, carriage return, vertical tab, or form feed.
+    example: |
+      val is_space = ascii.is_whitespace(32u8);
+  - name: is_control
+    params:
+      - name: b
+        detail: Byte to classify.
+    detail: Returns true for ASCII control bytes 0 through 31 and DEL (127).
+    example: |
+      val control = ascii.is_control(10u8);
+  - name: is_printable
+    params:
+      - name: b
+        detail: Byte to classify.
+    detail: Returns true for visible ASCII bytes 32 through 126, including spaces and punctuation.
+    example: |
+      val printable = ascii.is_printable(65u8);
+  - name: is_punctuation
+    params:
+      - name: b
+        detail: Byte to classify.
+    detail: "Returns true for four ASCII punctuation ranges: exclamation mark through slash, colon through at sign, left bracket through grave accent, and left brace through tilde."
+    example: |
+      val punctuation = ascii.is_punctuation(33u8);
+  - name: to_lower
+    params:
+      - name: b
+        detail: Byte to convert.
+    detail: Converts ASCII uppercase letters to lowercase; all other byte values are returned unchanged.
+    example: |
+      val lower = ascii.to_lower(65u8);
+  - name: to_upper
+    params:
+      - name: b
+        detail: Byte to convert.
+    detail: Converts ASCII lowercase letters to uppercase; all other byte values are returned unchanged.
+    example: |
+      val upper = ascii.to_upper(97u8);
+outro: |
+  This module contains VL helpers and requires no VM native beyond ordinary byte operations.

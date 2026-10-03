@@ -13,7 +13,7 @@ pnpm build
 
 - `src/pages/index.astro` — landing + Svelte playground
 - `src/pages/docs/` — learning path, getting-started, and language guide (markdown only)
-- `src/data/stdlib.yaml` — editorial stdlib descriptions and examples; no duplicated signatures
+- `src/data/stdlib/*.yaml` — editorial stdlib descriptions and examples; no duplicated signatures
 - `scripts/generate-stdlib.mjs` + `src/content.config.ts` — compiler-derived, Zod-validated stdlib catalog
 - `src/pages/std/` — generated standard library pages (`[id].astro` per module, `index.astro` overview)
 - `src/pages/cli/` — CLI reference
@@ -33,6 +33,12 @@ generic bounds and error variants. The generator adds optional prose from YAML
 and writes ignored `src/data/stdlib.generated.json`; new modules and functions
 appear automatically. Removed exports or renamed parameters with stale prose
 fail generation so descriptions cannot silently attach to the wrong API.
+Each YAML file contains one module object (for example, `string.yaml` describes
+`std.string`). Files are discovered automatically; `order` controls navigation.
+Optional `type_names` associates types such as `String` with a module page.
+Error type links are derived from the compiler catalog and target their declarations;
+built-in types and generic bounds link to the language guide. Signature, parameter,
+and return types share the same link renderer.
 After changing the crate during a running dev session, run `pnpm docs:generate`
 to refresh the reference. `pnpm test` checks the catalog merge behavior.
 

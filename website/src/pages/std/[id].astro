@@ -4,16 +4,7 @@ import Docs from '../../layouts/Docs.astro';
 import { renderInline, renderParagraphs, slug } from '../../lib/md';
 import { highlightVl } from '../../lib/vl-code';
 
-function signature(module: string, fn: {
-  name: string;
-  type_params?: string[];
-  params: Array<{ name: string; type: string }>;
-  returns: { type: string };
-}): string {
-  const params = fn.params.map((p) => `${p.name}: ${p.type}`).join(', ');
-  const typeParams = fn.type_params?.length ? `[${fn.type_params.join(', ')}]` : '';
-  return `${module}.${fn.name}${typeParams}(${params}) -> ${fn.returns.type}`;
-}
+import { createTypeLinks, renderSignature, renderType, signature } from '../../lib/stdlib-links.mjs';
 
 export async function getStaticPaths() {
   const modules = await getCollection('stdlib');
@@ -25,6 +16,7 @@ export async function getStaticPaths() {
 
 const { entry } = Astro.props;
 const mod = entry.data;
+const links = createTypeLinks((await getCollection('stdlib')).map((entry) => entry.data));
 const importHtml = await highlightVl(mod.import_example);
 const exampleHtml = new Map<string, string>();
 for (const fn of mod.functions) {
@@ -47,10 +39,12 @@ for (const fn of mod.functions) {
   {
     mod.functions.map((fn) => {
       const head = signature(mod.module, fn);
+      const generics = (fn.type_params ?? []).map((param) => param.split(/\s/)[0]);
+      const typeHtml = (type: string) => renderType(type, mod.module, links, generics);
       return (
         <Fragment>
           <h2 id={slug(head)}>
-            <code>{head}</code>
+            <code set:html={renderSignature(mod.module, fn, links)} />
           </h2>
           <table>
             <thead>
@@ -67,7 +61,7 @@ for (const fn of mod.functions) {
                     <code>{p.name}</code>
                   </td>
                   <td>
-                    <code>{p.type}</code>
+                    <code set:html={typeHtml(p.type)} />
                   </td>
                   <td>
                     {p.detail ? <Fragment set:html={renderInline(p.detail)} /> : null}
@@ -77,7 +71,7 @@ for (const fn of mod.functions) {
             </tbody>
           </table>
           <p>
-            <strong>Returns</strong> <code>{fn.returns.type}</code>
+            <strong>Returns</strong> <code set:html={typeHtml(fn.returns.type)} />
             {fn.returns.detail ? (
               <>
                 {' — '}

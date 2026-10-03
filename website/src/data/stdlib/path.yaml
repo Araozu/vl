@@ -1,0 +1,58 @@
+id: path
+order: 6
+module: std.path
+source: crates/vl-stdlib/src/std/path.vl
+summary: POSIX-style path string operations without filesystem access.
+title: std.path module
+description: Pure POSIX-style path helpers in the VL standard library.
+intro: |
+  `std.path` manipulates path strings using `/` separators. It does not
+  inspect the filesystem, normalize `.` or `..`, or interpret platform
+  specific separators.
+import_example: |
+  use std.path;
+
+  fun main() {
+      val name = path.basename("/tmp/report.txt");
+      val parent = path.dirname("/tmp/report.txt");
+  }
+functions:
+  - name: is_absolute
+    params:
+      - name: path
+        detail: Path string to inspect.
+    detail: Returns true when the first byte is `/`. An empty string is relative.
+    example: |
+      val absolute = path.is_absolute("/tmp/data");
+  - name: basename
+    params:
+      - name: path
+        detail: Path string to inspect.
+    detail: Returns the final path component after stripping trailing `/` bytes, except that `/` remains `/`. Empty input returns the empty string. It does not normalize `.` or `..`.
+    example: |
+      val name = path.basename("/tmp/report.txt");
+  - name: dirname
+    params:
+      - name: path
+        detail: Path string to inspect.
+    detail: Returns the parent portion before the final component, with trailing separators removed. Empty input and paths without a parent return `.`; a root parent returns `/`.
+    example: |
+      val parent = path.dirname("/tmp/report.txt");
+  - name: extension
+    params:
+      - name: path
+        detail: Path string to inspect.
+    detail: Returns the final basename suffix after its last dot, without the dot. A leading dot alone is not an extension (`.profile` returns empty); a later dot is (`archive.tar.gz` returns `gz`).
+    example: |
+      val suffix = path.extension("archive.tar.gz");
+  - name: join
+    params:
+      - name: left
+        detail: Base path.
+      - name: right
+        detail: Path component to append, or an absolute path.
+    detail: Returns the non-empty side when either side is empty. An absolute `right` replaces `left`; otherwise inserts `/` only when `left` does not already end in `/`. It preserves repeated separators and `.` / `..` components.
+    example: |
+      val full = path.join("/tmp", "report.txt");
+outro: |
+  These are pure string helpers; path joining and splitting do not access files and do not require VM filesystem support.

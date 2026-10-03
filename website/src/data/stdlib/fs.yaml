@@ -1,0 +1,38 @@
+id: fs
+order: 9
+module: std.fs
+summary: Native file operations for native targets (not wasm32).
+title: std.fs module
+description: File operations in the VL standard library.
+intro: |
+  `std.fs` exposes the file operations available on native targets.
+  `read_file` reads an entire file and reports I/O errors as a fallible
+  result. Import the module before using its qualified names:
+
+  Native-only: available when running on linux-x86_64. Not available
+  in the browser playground (wasm32-freestanding), which has no
+  filesystem or socket support.
+import_example: |
+  use std.fs;
+
+  fun main() {
+      val text = fs.read_file("data.txt") catch "could not read file";
+  }
+functions:
+  - name: read_file
+    params:
+      - name: path
+        detail: Path of the file to read.
+    returns:
+      detail: File contents, or an `FsError`.
+    detail: Native operation that reads the file into a string. Handle failure with `try`, `catch`, or `match`.
+    example: |
+      val text = fs.read_file("data.txt") catch "";
+outro: |
+  The module has no VL source file; this function is target-provided.
+  It is unavailable in wasm32-freestanding builds (including the
+  browser playground); use a native linux-x86_64 target for file access.
+  TCP sockets ([std.net.tcp](/std/tcp)) follow the same native-only rule.
+errors:
+  - name: FsError
+    detail: The VM reports one filesystem failure status, mapped to `IoError`.

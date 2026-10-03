@@ -1,0 +1,76 @@
+id: fmt
+order: 8
+module: std.fmt
+source: crates/vl-stdlib/src/std/fmt.vl
+summary: VL conversions for booleans and integers, hexadecimal formatting, and byte-width padding.
+title: std.fmt module
+description: Formatting helpers in the VL standard library.
+intro: |
+  `std.fmt` formats values using VL helpers over the VM's unsigned decimal
+  conversion native and byte-string operations.
+import_example: |
+  use std.fmt;
+
+  fun main() {
+      val text = fmt.u64_to_string(42u64);
+  }
+functions:
+  - name: u64_to_s
+    params:
+      - name: value
+        detail: Unsigned integer to convert.
+    detail: Target-native unsigned integer to string conversion.
+    example: |
+      val text = fmt.u64_to_s(42u64);
+  - name: u64_to_string
+    params:
+      - name: v
+        detail: Unsigned integer to convert.
+    detail: VL helper wrapping `u64_to_s`.
+    example: |
+      val text = fmt.u64_to_string(42u64);
+  - name: bool_to_string
+    params:
+      - name: v
+        detail: Boolean value to convert.
+    detail: Returns the lowercase spelling `true` or `false`.
+    example: |
+      val text = fmt.bool_to_string(false);
+  - name: i64_to_string
+    params:
+      - name: v
+        detail: Signed integer to convert.
+    detail: Returns the base-10 signed spelling, including a leading minus sign for negative values.
+    example: |
+      val text = fmt.i64_to_string(-42i64);
+  - name: hex_u64_to_string
+    params:
+      - name: value
+        detail: Unsigned integer to convert.
+    detail: Returns lowercase hexadecimal with a `0x` prefix and no unnecessary leading zeroes; zero is `0x0`.
+    example: |
+      val text = fmt.hex_u64_to_string(255u64);
+  - name: pad_left
+    params:
+      - name: value
+        detail: String to pad.
+      - name: width
+        detail: Minimum output width in bytes.
+      - name: pad
+        detail: Non-empty byte string repeated to fill the width.
+    detail: Prepends repeated `pad` bytes until the output has at least `width` bytes. If `pad` is empty or `value` already meets the width, returns `value`. A multi-byte pad may be cut at a byte boundary.
+    example: |
+      val text = fmt.pad_left("7", 3u64, "0");
+  - name: pad_right
+    params:
+      - name: value
+        detail: String to pad.
+      - name: width
+        detail: Minimum output width in bytes.
+      - name: pad
+        detail: Non-empty byte string repeated to fill the width.
+    detail: Appends repeated `pad` bytes until the output has at least `width` bytes. If `pad` is empty or `value` already meets the width, returns `value`. A multi-byte pad may be cut at a byte boundary.
+    example: |
+      val text = fmt.pad_right("7", 3u64, "0");
+outro: |
+  The helper is implemented in [`fmt.vl`](https://github.com/Araozu/vl/tree/main/crates/vl-stdlib/src/std/fmt.vl).

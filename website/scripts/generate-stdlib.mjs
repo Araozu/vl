@@ -1,8 +1,8 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { parse } from 'yaml';
 import { mergeCatalog } from './stdlib-catalog.mjs';
+import { loadEditorial } from './stdlib-editorial.mjs';
 
 const repo = fileURLToPath(new URL('../../', import.meta.url));
 // Docker builds export the catalog in the Rust stage. Local commands invoke
@@ -12,7 +12,7 @@ const api = JSON.parse(process.env.VL_STDLIB_CATALOG
   : execFileSync('cargo', ['run', '--quiet', '--locked', '--bin', 'vl', '--', 'stdlib'], {
     cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'],
   }));
-const editorial = parse(readFileSync(new URL('../src/data/stdlib.yaml', import.meta.url), 'utf8'));
+const editorial = loadEditorial(fileURLToPath(new URL('../src/data/stdlib/', import.meta.url)));
 const catalog = mergeCatalog(api, editorial);
 writeFileSync(new URL('../src/data/stdlib.generated.json', import.meta.url),
   `${JSON.stringify(catalog, null, 2)}\n`);

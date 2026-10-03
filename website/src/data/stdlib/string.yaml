@@ -1,0 +1,218 @@
+id: string
+order: 2
+module: std.string
+type_names: [String]
+source: crates/vl-stdlib/src/std/string.vl
+summary: Native byte-string operations and VL search, trimming, and replacement helpers.
+title: std.string module
+description: String operations and helpers in the VL standard library.
+intro: |
+  `std.string` combines target-provided operations with helpers implemented
+  in VL. Import the module before using its qualified names:
+import_example: |
+  use std.string;
+
+  fun main() {
+      val message = "hello";
+      val size = string.len(message);
+      val empty = string.is_empty(message);
+  }
+functions:
+  - name: len
+    params:
+      - name: value
+        detail: String whose byte length should be measured.
+    detail: Native operation that returns the byte length of a string.
+    example: |
+      val n = string.len("hi");
+  - name: concat
+    params:
+      - name: a
+        detail: First string.
+      - name: b
+        detail: Second string.
+    detail: Native operation that concatenates two byte strings.
+  - name: eq
+    params:
+      - name: a
+        detail: First string.
+      - name: b
+        detail: Second string.
+    detail: Native operation that compares two byte strings.
+  - name: to_u64
+    params:
+      - name: value
+        detail: Decimal string to parse.
+    detail: Native conversion from a decimal byte string to `u64`; invalid input traps.
+  - name: hex_to_u64
+    params:
+      - name: value
+        detail: Hexadecimal string to parse.
+    detail: Native conversion from a hexadecimal byte string to `u64`; invalid input traps.
+  - name: byte_at
+    params:
+      - name: value
+        detail: String whose byte should be read.
+      - name: index
+        detail: Zero-based byte index.
+    returns:
+      detail: Byte at the given index, or a `StringError`.
+    detail: Bounds-checked byte read. `OutOfBounds` is returned when the index is outside the string.
+    example: |
+      val byte = string.byte_at("hello", 1u64) catch 0u8;
+  - name: slice
+    params:
+      - name: value
+        detail: String to slice.
+      - name: start
+        detail: Inclusive starting byte index.
+      - name: end
+        detail: Exclusive ending byte index.
+    returns:
+      detail: The selected byte range, or a `StringError`.
+    detail: Bounds-checked byte slice. `OutOfBounds` and `InvalidRange` report invalid endpoints and reversed ranges.
+    example: |
+      val part = string.slice("hello", 1u64, 4u64) catch "";
+  - name: is_empty
+    params:
+      - name: s
+        detail: String to test.
+    detail: VL helper returning whether the string has zero bytes.
+    example: |
+      val empty = string.is_empty("hi");
+  - name: strings_equal
+    params:
+      - name: a
+        detail: First string.
+      - name: b
+        detail: Second string.
+    detail: VL helper built on the native string equality operation.
+    example: |
+      val same = string.strings_equal("VL", "VL");
+  - name: to_bytes
+    params:
+      - name: s
+        detail: UTF-8 byte string to copy.
+    detail: Copies every string byte into a new mutable fixed-length array. Mutating the array does not change the original string; no reverse byte-array-to-string helper is provided.
+    example: |
+      val bytes = string.to_bytes("hi");
+  - name: starts_with
+    params:
+      - name: value
+        detail: String to search.
+      - name: prefix
+        detail: Candidate prefix.
+    detail: Returns whether `value` begins with all bytes in `prefix`. An empty prefix matches every string.
+    example: |
+      val has_prefix = string.starts_with("hello", "he");
+  - name: ends_with
+    params:
+      - name: value
+        detail: String to search.
+      - name: suffix
+        detail: Candidate suffix.
+    detail: Returns whether `value` ends with all bytes in `suffix`. An empty suffix matches every string.
+    example: |
+      val has_suffix = string.ends_with("hello", "lo");
+  - name: find
+    params:
+      - name: value
+        detail: String to search.
+      - name: needle
+        detail: Byte sequence to find.
+    returns:
+      detail: Starting byte offset of the first match, or `value`'s byte length when there is no match.
+    detail: Searches from byte offset zero. An empty needle matches at offset zero. Indices are byte offsets, not Unicode character positions.
+    example: |
+      val offset = string.find("banana", "na");
+  - name: find_from
+    params:
+      - name: value
+        detail: String to search.
+      - name: needle
+        detail: Byte sequence to find.
+      - name: from
+        detail: Starting byte offset.
+    returns:
+      detail: Starting byte offset of the first match at or after `from`, or `value`'s byte length when there is no match.
+    detail: If `from` exceeds the byte length, returns that length. An empty needle matches at `from` when `from` is within the string, including at the end. Indices count bytes.
+    example: |
+      val offset = string.find_from("banana", "na", 3u64);
+  - name: contains
+    params:
+      - name: value
+        detail: String to search.
+      - name: needle
+        detail: Byte sequence to find.
+    detail: Returns whether `needle` occurs in `value`; an empty needle is always present.
+    example: |
+      val found = string.contains("banana", "nan");
+  - name: trim
+    params:
+      - name: value
+        detail: String to trim.
+    detail: Removes ASCII space, tab, LF, CR, VT, and FF bytes from both ends. It leaves all other bytes unchanged and does not recognize Unicode whitespace.
+    example: |
+      val clean = string.trim("  hello\n");
+  - name: trim_start
+    params:
+      - name: value
+        detail: String to trim.
+    detail: Removes ASCII space, tab, LF, CR, VT, and FF bytes from the beginning. It leaves all other bytes unchanged and does not recognize Unicode whitespace.
+    example: |
+      val clean = string.trim_start("  hello");
+  - name: trim_end
+    params:
+      - name: value
+        detail: String to trim.
+    detail: Removes ASCII space, tab, LF, CR, VT, and FF bytes from the end. It leaves all other bytes unchanged and does not recognize Unicode whitespace.
+    example: |
+      val clean = string.trim_end("hello\n");
+  - name: repeat
+    params:
+      - name: value
+        detail: Byte string to repeat.
+      - name: count
+        detail: Number of copies.
+    detail: Concatenates `count` copies of `value`; zero copies returns the empty string. Large counts can require substantial time and memory.
+    example: |
+      val line = string.repeat("-", 5u64);
+  - name: replace
+    params:
+      - name: value
+        detail: String whose matches are replaced.
+      - name: needle
+        detail: Non-overlapping byte sequence to find.
+      - name: replacement
+        detail: Text inserted for each match.
+    detail: Replaces non-overlapping byte matches from left to right. An empty `needle` returns `value` unchanged. Search offsets count bytes, not Unicode characters.
+    example: |
+      val greeting = string.replace("hello, Ada", "Ada", "VL");
+  - name: split
+    params:
+      - name: value
+        detail: Byte string to split.
+      - name: separator
+        detail: Non-overlapping byte sequence used as the separator.
+    returns:
+      detail: New mutable fixed-length array of fields.
+    detail: Splits at non-overlapping separator matches and keeps trailing empty fields. An empty separator returns a one-element array containing the input; empty input with a non-empty separator also returns one empty field.
+    example: |
+      val fields = string.split("a,b,", ",");
+  - name: join
+    params:
+      - name: parts
+        detail: Strings to combine.
+      - name: separator
+        detail: Bytes inserted between adjacent strings.
+    detail: Joins array elements with `separator` between each pair. Empty input returns the empty string, and a single element is returned unchanged.
+    example: |
+      val fields: *Array[String] = ["red", "blue"];
+      val text = string.join(fields, ",");
+outro: |
+  The helpers are implemented in [`string.vl`](https://github.com/Araozu/vl/tree/main/crates/vl-stdlib/src/std/string.vl); the remaining entries are target natives.
+errors:
+  - name: StringError
+    detail: |
+      Checked string operations return this set when an index or range is
+      invalid. The VM currently maps multiple bounds statuses to `OutOfBounds`.
